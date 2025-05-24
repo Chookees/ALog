@@ -124,5 +124,5 @@ MIT © Artur Zubert / Chookees
 
 ## 👤 Maintainer
 
-Built and maintained by **[Your Name]**  
-Contact: [your.email@example.com]
+Built and maintained by **Artur Zubert / Chookees**  
+Contact: https://de.linkedin.com/in/artur-bobb-4b333b266?trk=people-guest_people_search-card
