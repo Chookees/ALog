@@ -4,6 +4,12 @@
     <TargetFramework>net8.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <Title>ALog</Title>
+    <Authors>Artur Zubert</Authors>
+    <Description>ALog is a powerful and extensible logging framework built for .NET 8+.
+It is designed to be simple to use, highly configurable, and ready for modern development across platforms including Windows, Linux, macOS, iOS, and Android.</Description>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/Chookees/ALog</PackageProjectUrl>
   </PropertyGroup>
 
   <ItemGroup>
@@ -11,6 +17,13 @@
     <Folder Include="Platform\iOS\" />
     <Folder Include="Platform\Android\" />
     <Folder Include="Platform\Windows\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
   </ItemGroup>
 
 </Project>
