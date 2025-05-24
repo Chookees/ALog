@@ -15,5 +15,3 @@ global using ALog.Writers.File;
 
 // Formatters
 global using ALog.Formatters;
-
-namespace ALog;

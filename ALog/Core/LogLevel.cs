@@ -1,4 +1,4 @@
-﻿namespace ALog.Core;
+﻿namespace ALog;
 
 public enum LogLevel
 {

@@ -1,9 +1,5 @@
 ﻿using ALog;
-using ALog.Formatters;
-using ALog.Writers.Console;
-using ALog.Writers.File;
 using ALog.Config;
-using ALog.Core;
 
 internal class Program
 {
