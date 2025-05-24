@@ -118,7 +118,7 @@ For ideas like new formatters or writers, feel free to open a discussion first.
 
 ## 📄 License
 
-MIT © [Your Name or Organization]
+MIT © Artur Zubert / Chookees
 
 ---
 
