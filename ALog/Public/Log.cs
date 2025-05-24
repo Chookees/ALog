@@ -14,14 +14,14 @@ public static class Log
         _logger = new LoggerEngine(config);
     }
 
-    // 🔹 Hauptmethode – Kurzform: Log("...")
+    // 🔹 Main – short: Log("...")
     public static void Invoke(string message, LogLevel level = LogLevel.Info)
     {
         EnsureInitialized();
         _logger!.Log(message, level);
     }
 
-    public static async Task LogAsync(string message, LogLevel level = LogLevel.Info)
+    public static async Task WriteAsync(string message, LogLevel level = LogLevel.Info)
     {
         EnsureInitialized();
         await _logger!.LogAsync(message, level);
@@ -33,17 +33,17 @@ public static class Log
         _logger!.Log(exception, message, level);
     }
 
-    public static async Task LogAsync(Exception exception, string message, LogLevel level = LogLevel.Error)
+    public static async Task WriteAsync(Exception exception, string message, LogLevel level = LogLevel.Error)
     {
         EnsureInitialized();
         await _logger!.LogAsync(exception, message, level);
     }
 
-    // Alias: erlaubt einfaches "Write(...)"
+    // Alias: allows for simple "Write(...)"
     public static void Write(string message, LogLevel level = LogLevel.Info) => Invoke(message, level);
     public static void Write(Exception exception, string message, LogLevel level = LogLevel.Error) => Invoke(exception, message, level);
 
-    // Sicherheit: init vergessen?
+    // Safety: forgot init?
     private static void EnsureInitialized()
     {
         if (_logger == null)
