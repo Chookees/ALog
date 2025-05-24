@@ -2,4 +2,5 @@
 
 internal interface IPlatformHelper
 {
+    // TBD
 }

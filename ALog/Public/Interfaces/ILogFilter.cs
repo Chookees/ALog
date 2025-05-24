@@ -1,6 +1,4 @@
-﻿using ALog.Core;
-
-namespace ALog.Public.Interfaces;
+﻿namespace ALog.Public.Interfaces;
 
 public interface ILogFilter
 {

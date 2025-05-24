@@ -14,7 +14,7 @@ public static class Log
         _logger = new LoggerEngine(config);
     }
 
-    // 🔹 Main – short: Log("...")
+    // Main – short: Log("...")
     public static void Invoke(string message, LogLevel level = LogLevel.Info)
     {
         EnsureInitialized();

@@ -1,8 +1,8 @@
 ﻿namespace ALog;
 
-using ALog.Config;
-
-// Fassade: explicitly “pass on” everything
+/// <summary>
+/// Fassade: explicitly “pass on” everything
+/// </summary>
 public static class LogExports
 {
     // Nothing here – serves only to house the namespace and enable:

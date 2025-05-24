@@ -1,7 +1,4 @@
-﻿using ALog.Public.Interfaces;
-using ALog.Core;
-
-namespace ALog.Config;
+﻿namespace ALog.Config;
 
 public interface ILogConfiguration
 {
