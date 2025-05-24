@@ -35,7 +35,7 @@ public class ConsoleLogWriter : ILogWriter
 
     public Task WriteAsync(LogEvent logEvent)
     {
-        Write(logEvent); // Console.WriteLine ist synchron, also kein echter Vorteil hier
+        Write(logEvent); // Console.WriteLine is synchronous, so no real benefit here.
         return Task.CompletedTask;
     }
 
