@@ -150,11 +150,10 @@ For ideas like new formatters or writers, feel free to open a discussion first.
 
 ## 📄 License
 
-MIT © [Your Name or Organization]
+MIT © Artur Zubert / Chookees
 
 ---
 
 ## 👤 Maintainer
 
-Built and maintained by **[Your Name]**  
-Contact: [your.email@example.com]
+Built and maintained by **Artur Zubert / Chookees**  
