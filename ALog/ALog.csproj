@@ -13,13 +13,6 @@ It is designed to be simple to use, highly configurable, and ready for modern de
   </PropertyGroup>
 
   <ItemGroup>
-    <Folder Include="Platform\Linux\" />
-    <Folder Include="Platform\iOS\" />
-    <Folder Include="Platform\Android\" />
-    <Folder Include="Platform\Windows\" />
-  </ItemGroup>
-
-  <ItemGroup>
     <None Include="..\README.md">
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
