@@ -1,39 +1,55 @@
 ﻿namespace ALog.Core;
 
+using System;
+using System.Threading.Tasks;
 using ALog.Config;
 using ALog.Public.Interfaces;
 
 public class LoggerEngine : ILogger
 {
     private readonly ILogConfiguration _config;
+    private readonly LogDispatcher _dispatcher;
 
     public LoggerEngine(ILogConfiguration config)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
+        _dispatcher = new LogDispatcher(config.Writers);
     }
 
     public void Log(string message, LogLevel level = LogLevel.Info)
     {
         var logEvent = CreateLogEvent(message, null, level);
-        Process(logEvent);
+        if (!ShouldLog(logEvent)) return;
+
+        var formatted = Format(logEvent);
+        _dispatcher.Dispatch(formatted);
     }
 
     public async Task LogAsync(string message, LogLevel level = LogLevel.Info)
     {
         var logEvent = CreateLogEvent(message, null, level);
-        await ProcessAsync(logEvent);
+        if (!ShouldLog(logEvent)) return;
+
+        var formatted = Format(logEvent);
+        await _dispatcher.DispatchAsync(formatted);
     }
 
     public void Log(Exception exception, string message, LogLevel level = LogLevel.Error)
     {
         var logEvent = CreateLogEvent(message, exception, level);
-        Process(logEvent);
+        if (!ShouldLog(logEvent)) return;
+
+        var formatted = Format(logEvent);
+        _dispatcher.Dispatch(formatted);
     }
 
     public async Task LogAsync(Exception exception, string message, LogLevel level = LogLevel.Error)
     {
         var logEvent = CreateLogEvent(message, exception, level);
-        await ProcessAsync(logEvent);
+        if (!ShouldLog(logEvent)) return;
+
+        var formatted = Format(logEvent);
+        await _dispatcher.DispatchAsync(formatted);
     }
 
     private LogEvent CreateLogEvent(string message, Exception? exception, LogLevel level)
@@ -49,58 +65,13 @@ public class LoggerEngine : ILogger
         );
     }
 
-    private void Process(LogEvent logEvent)
+    private LogEvent Format(LogEvent logEvent)
     {
-        if (!ShouldLog(logEvent))
-            return;
+        if (_config.Formatter is null)
+            return logEvent;
 
-        foreach (var writer in _config.Writers)
-        {
-            try
-            {
-                if (_config.Formatter is not null)
-                {
-                    var formatted = _config.Formatter.Format(logEvent);
-                    var formattedEvent = logEvent with { Message = formatted };
-                    writer.Write(formattedEvent);
-                }
-                else
-                {
-                    writer.Write(logEvent);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[LoggerEngine] Write failed: {ex}");
-            }
-        }
-    }
-
-    private async Task ProcessAsync(LogEvent logEvent)
-    {
-        if (!ShouldLog(logEvent))
-            return;
-
-        foreach (var writer in _config.Writers)
-        {
-            try
-            {
-                if (_config.Formatter is not null)
-                {
-                    var formatted = _config.Formatter.Format(logEvent);
-                    var formattedEvent = logEvent with { Message = formatted };
-                    await writer.WriteAsync(formattedEvent);
-                }
-                else
-                {
-                    await writer.WriteAsync(logEvent);
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.Error.WriteLine($"[LoggerEngine] Async write failed: {ex}");
-            }
-        }
+        var formatted = _config.Formatter.Format(logEvent);
+        return logEvent with { Message = formatted };
     }
 
     private bool ShouldLog(LogEvent logEvent)
