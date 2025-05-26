@@ -1,7 +1,7 @@
 # ALog – A Modern, Modular, Cross-Platform Logger for .NET 8+
 
 **ALog** is a powerful and extensible logging framework built for .NET 8+.  
-It is designed to be simple to use, highly configurable, and ready for modern development across platforms including Windows, Linux, macOS, iOS, and Android.
+It is designed to be simple to use, highly configurable, and ready for modern development across platforms including Windows, Linux, and iOS.
 
 ---
 
@@ -65,6 +65,38 @@ Log.ClearContext();
 
 ---
 
+## 🌐 Platform-Specific Paths (Optional)
+
+You can use built-in `IPlatformHelper` implementations to resolve safe, writeable log paths:
+
+### Windows
+
+```csharp
+using ALog.Platform.Windows;
+
+var logPath = new WindowsPlatformHelper().ResolveLogFilePath("logs/app.log");
+```
+
+### Linux
+
+```csharp
+using ALog.Platform.Linux;
+
+var logPath = new LinuxPlatformHelper().ResolveLogFilePath("logs/app.log");
+```
+
+### iOS (MAUI / Xamarin)
+
+```csharp
+using ALog.Platform.iOS;
+
+var logPath = new IOSPlatformHelper().ResolveLogFilePath("logs/app.log");
+```
+
+> You control the log location – ALog does not enforce platform helpers. They are optional and recommended for mobile or portable environments.
+
+---
+
 ## 📦 Writers
 
 | Writer             | Description                                                |
@@ -125,4 +157,3 @@ MIT © Artur Zubert / Chookees
 ## 👤 Maintainer
 
 Built and maintained by **Artur Zubert / Chookees**  
-Contact: https://de.linkedin.com/in/artur-bobb-4b333b266?trk=people-guest_people_search-card
