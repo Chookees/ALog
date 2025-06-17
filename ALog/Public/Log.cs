@@ -2,6 +2,7 @@
 
 using ALog.Config;
 using ALog.Core;
+using ALog.Internal;
 using ALog.Public.Interfaces;
 
 public static class Log
@@ -50,13 +51,13 @@ public static class Log
             throw new InvalidOperationException("Log.Init(...) must be called before using Log.");
     }
 
-    public static void WithContext(string key, object value)
-    {
-        Internal.ContextManager.Set(key, value);
-    }
-
     public static void ClearContext()
     {
         Internal.ContextManager.Clear();
+    }
+
+    public static ILogScope BeginScope(string key, object value)
+    {
+        return new ScopeContext(key, value);
     }
 }

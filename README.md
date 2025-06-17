@@ -9,7 +9,7 @@ It is designed to be simple to use, highly configurable, and ready for modern de
 
 - ✅ Intuitive API: `Log.Write(...)`, `Log.WriteAsync(...)`
 - ✅ Fully async- and sync-capable
-- ✅ Structured logging with contextual data (`WithContext(...)`)
+- ✅ Structured logging with scoped contextual data (`BeginScope(...)`)
 - ✅ Exception logging included
 - ✅ Formatter support (PlainText, JSON, or custom)
 - ✅ Console and file writers (with optional color + rolling)
@@ -52,15 +52,16 @@ Log.Init(config);
 ```csharp
 Log.Write("Application started");
 
-Log.WithContext("userId", 42);
-Log.WithContext("feature", "Login");
-
-Log.Write("User successfully authenticated");
-Log.Write(new Exception("Test failure"), "Something went wrong", LogLevel.Error);
+using (Log.BeginScope("userId", 42))
+{
+    using (Log.BeginScope("feature", "Login"))
+    {
+        Log.Write("User successfully authenticated");
+        Log.Write(new Exception("Test failure"), "Something went wrong", LogLevel.Error);
+    }
+}
 
 await Log.WriteAsync("Async log message");
-
-Log.ClearContext();
 ```
 
 ---
@@ -117,12 +118,14 @@ var logPath = new IOSPlatformHelper().ResolveLogFilePath("logs/app.log");
 
 ## 🧠 Contextual Logging
 
-Add contextual data to all following log entries:
+Scoped logging adds temporary key-value pairs that are automatically removed when their scope ends:
 
 ```csharp
-Log.WithContext("sessionId", "abc123");
-Log.Write("User clicked 'Buy'");
-Log.ClearContext();
+using (Log.BeginScope("sessionId", "abc123"))
+{
+    Log.Write("User clicked 'Buy'");
+}
+// sessionId is no longer attached here
 ```
 
 > Works automatically with supported formatters like JSON or plain text.
@@ -131,7 +134,7 @@ Log.ClearContext();
 
 ## ⚙️ Roadmap
 
-- [ ] Scope-based logging (`using Log.BeginScope(...)`)
+- [x] Scope-based logging (`using Log.BeginScope(...)`)
 - [ ] Channel-based async background log queue
 - [ ] Additional writers (e.g., HTTP, SQL, cloud-based)
 - [ ] External config via JSON or environment

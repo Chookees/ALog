@@ -2,24 +2,34 @@
 
 internal static class ContextManager
 {
-    private static readonly AsyncLocal<Dictionary<string, object>?> _context
-        = new();
+    private static readonly AsyncLocal<Stack<KeyValuePair<string, object>>> _contextStack = new();
 
-    public static void Set(string key, object value)
+    public static void Push(KeyValuePair<string, object> entry)
     {
-        _context.Value ??= new Dictionary<string, object>();
-        _context.Value[key] = value;
+        _contextStack.Value ??= new();
+        _contextStack.Value.Push(entry);
     }
 
-    public static IReadOnlyDictionary<string, object>? GetContext()
+    public static void Pop(KeyValuePair<string, object> expected)
     {
-        return _context.Value != null
-            ? new Dictionary<string, object>(_context.Value)
-            : null;
+        if (_contextStack.Value?.Count > 0 && _contextStack.Value.Peek().Equals(expected))
+        {
+            _contextStack.Value.Pop();
+        }
     }
 
-    public static void Clear()
+    public static IReadOnlyDictionary<string, object> GetContext()
     {
-        _context.Value = null;
+        var dict = new Dictionary<string, object>();
+
+        if (_contextStack.Value != null)
+        {
+            foreach (var entry in _contextStack.Value)
+                dict[entry.Key] = entry.Value;
+        }
+
+        return dict;
     }
+
+    public static void Clear() => _contextStack.Value?.Clear();
 }

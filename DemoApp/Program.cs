@@ -24,8 +24,11 @@ internal class Program
         Log.Init(config);
 
         Log.Write("System started.");
-        Log.WithContext("UserId", 42);
-        Log.WithContext("Feature", "Demo");
+
+        using (Log.BeginScope("userId", 123))
+        {
+            Log.Write("Inside scoped block");
+        }
 
         Log.Write("User login successfull.", LogLevel.Info);
 
