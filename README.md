@@ -1,9 +1,10 @@
+[![Download ALog](https://a.fsdn.com/con/app/sf-download-button)](https://sourceforge.net/projects/alog/files/latest/download)
+![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/chookees/alog/total)
+
 # ALog – A Modern, Modular, Cross-Platform Logger for .NET 8+
 
 **ALog** is a powerful and extensible logging framework built for .NET 8+.  
 It is designed to be simple to use, highly configurable, and ready for modern development across platforms including Windows, Linux, and iOS.
-[![Download ALog](https://a.fsdn.com/con/app/sf-download-button)](https://sourceforge.net/projects/alog/files/latest/download)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/chookees/alog/total)
 
 ---
 
