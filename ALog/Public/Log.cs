@@ -60,4 +60,13 @@ public static class Log
     {
         return new ScopeContext(key, value);
     }
+
+    public static async Task FlushAsync()
+    {
+        EnsureInitialized();
+        if (_logger is LoggerEngine engine)
+        {
+            await engine.FlushAsync();
+        }
+    }
 }

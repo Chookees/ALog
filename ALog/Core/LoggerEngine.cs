@@ -5,15 +5,25 @@ using System.Threading.Tasks;
 using ALog.Config;
 using ALog.Public.Interfaces;
 
-public class LoggerEngine : ILogger
+public class LoggerEngine : ILogger, IDisposable
 {
     private readonly ILogConfiguration _config;
     private readonly LogDispatcher _dispatcher;
+    private readonly BackgroundLogQueue? _backgroundQueue;
 
     public LoggerEngine(ILogConfiguration config)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _dispatcher = new LogDispatcher(config.Writers);
+        
+        if (_config.UseBackgroundQueue)
+        {
+            _backgroundQueue = new BackgroundLogQueue(
+                config.Writers,
+                config.BackgroundQueueCapacity,
+                config.BackgroundQueueBatchSize,
+                config.BackgroundQueueFlushInterval);
+        }
     }
 
     public void Log(string message, LogLevel level = LogLevel.Info)
@@ -22,7 +32,15 @@ public class LoggerEngine : ILogger
         if (!ShouldLog(logEvent)) return;
 
         var formatted = Format(logEvent);
-        _dispatcher.Dispatch(formatted);
+        
+        if (_backgroundQueue != null)
+        {
+            _backgroundQueue.TryEnqueue(formatted);
+        }
+        else
+        {
+            _dispatcher.Dispatch(formatted);
+        }
     }
 
     public async Task LogAsync(string message, LogLevel level = LogLevel.Info)
@@ -31,7 +49,15 @@ public class LoggerEngine : ILogger
         if (!ShouldLog(logEvent)) return;
 
         var formatted = Format(logEvent);
-        await _dispatcher.DispatchAsync(formatted);
+        
+        if (_backgroundQueue != null)
+        {
+            await _backgroundQueue.EnqueueAsync(formatted);
+        }
+        else
+        {
+            await _dispatcher.DispatchAsync(formatted);
+        }
     }
 
     public void Log(Exception exception, string message, LogLevel level = LogLevel.Error)
@@ -40,7 +66,15 @@ public class LoggerEngine : ILogger
         if (!ShouldLog(logEvent)) return;
 
         var formatted = Format(logEvent);
-        _dispatcher.Dispatch(formatted);
+        
+        if (_backgroundQueue != null)
+        {
+            _backgroundQueue.TryEnqueue(formatted);
+        }
+        else
+        {
+            _dispatcher.Dispatch(formatted);
+        }
     }
 
     public async Task LogAsync(Exception exception, string message, LogLevel level = LogLevel.Error)
@@ -49,7 +83,15 @@ public class LoggerEngine : ILogger
         if (!ShouldLog(logEvent)) return;
 
         var formatted = Format(logEvent);
-        await _dispatcher.DispatchAsync(formatted);
+        
+        if (_backgroundQueue != null)
+        {
+            await _backgroundQueue.EnqueueAsync(formatted);
+        }
+        else
+        {
+            await _dispatcher.DispatchAsync(formatted);
+        }
     }
 
     private LogEvent CreateLogEvent(string message, Exception? exception, LogLevel level)
@@ -83,5 +125,18 @@ public class LoggerEngine : ILogger
             return false;
 
         return true;
+    }
+
+    public async Task FlushAsync()
+    {
+        if (_backgroundQueue != null)
+        {
+            await _backgroundQueue.FlushAsync();
+        }
+    }
+
+    public void Dispose()
+    {
+        _backgroundQueue?.Dispose();
     }
 }

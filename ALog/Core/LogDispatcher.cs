@@ -44,4 +44,31 @@ public class LogDispatcher
             }
         }
     }
+
+    public async Task DispatchBatchAsync(IEnumerable<LogEvent> logEvents)
+    {
+        var tasks = new List<Task>();
+
+        foreach (var writer in _writers)
+        {
+            tasks.Add(ProcessBatchForWriterAsync(writer, logEvents));
+        }
+
+        await Task.WhenAll(tasks);
+    }
+
+    private async Task ProcessBatchForWriterAsync(ILogWriter writer, IEnumerable<LogEvent> logEvents)
+    {
+        try
+        {
+            foreach (var logEvent in logEvents)
+            {
+                await writer.WriteAsync(logEvent);
+            }
+        }
+        catch (Exception ex)
+        {
+            System.Console.Error.WriteLine($"[ALog Dispatcher] Batch write failed for {writer.GetType().Name}: {ex}");
+        }
+    }
 }

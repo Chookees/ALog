@@ -67,6 +67,60 @@ using (Log.BeginScope("userId", 42))
 await Log.WriteAsync("Async log message");
 ```
 
+### Step 3: Background Queue (Optional)
+
+For high-performance scenarios, enable the background queue:
+
+```csharp
+var config = new LoggerConfig()
+    .AddWriter(new ConsoleLogWriter())
+    .AddWriter(new FileLogWriter("logs/app.log"))
+    .UseBackgroundQueue(enabled: true, capacity: 1000, batchSize: 10, flushInterval: TimeSpan.FromMilliseconds(100))
+    .SetMinimumLevel(LogLevel.Debug);
+
+Log.Init(config);
+
+// Logs are queued and processed in background
+Log.Write("This will be processed asynchronously");
+
+// Flush remaining logs before shutdown
+await Log.FlushAsync();
+```
+
+### Step 4: Advanced Writers
+
+```csharp
+// HTTP Writer
+var httpWriter = new HttpLogWriter(
+    endpoint: "https://api.example.com/logs",
+    method: HttpMethod.Post,
+    headers: new Dictionary<string, string> { ["Authorization"] = "Bearer token" }
+);
+
+// SQL Writer
+var sqlWriter = new SqlLogWriter(
+    connectionString: "Server=localhost;Database=Logs;Integrated Security=true;",
+    tableName: "ApplicationLogs"
+);
+
+// Azure Application Insights
+var azureWriter = new AzureLogWriter(
+    instrumentationKey: "your-instrumentation-key"
+);
+
+// AWS CloudWatch
+var awsWriter = new AwsCloudWatchWriter(
+    logGroupName: "/aws/application/myapp",
+    logStreamName: "main-stream"
+);
+
+var config = new LoggerConfig()
+    .AddWriter(httpWriter)
+    .AddWriter(sqlWriter)
+    .AddWriter(azureWriter)
+    .AddWriter(awsWriter);
+```
+
 ---
 
 ## 🌐 Platform-Specific Paths (Optional)
@@ -103,10 +157,14 @@ var logPath = new IOSPlatformHelper().ResolveLogFilePath("logs/app.log");
 
 ## 📦 Writers
 
-| Writer             | Description                                                |
-|--------------------|------------------------------------------------------------|
-| `ConsoleLogWriter` | Outputs to console with optional color and formatting      |
-| `FileLogWriter`    | Outputs to file with optional rolling and formatter support|
+| Writer                | Description                                                |
+|-----------------------|------------------------------------------------------------|
+| `ConsoleLogWriter`    | Outputs to console with optional color and formatting      |
+| `FileLogWriter`       | Outputs to file with optional rolling and formatter support|
+| `HttpLogWriter`       | Sends logs to HTTP endpoints (REST APIs, webhooks)         |
+| `SqlLogWriter`        | Stores logs in SQL Server database                         |
+| `AzureLogWriter`      | Sends logs to Azure Application Insights                   |
+| `AwsCloudWatchWriter` | Sends logs to AWS CloudWatch                               |
 
 ---
 
@@ -138,8 +196,8 @@ using (Log.BeginScope("sessionId", "abc123"))
 ## ⚙️ Roadmap
 
 - [x] Scope-based logging (`using Log.BeginScope(...)`)
-- [ ] Channel-based async background log queue
-- [ ] Additional writers (e.g., HTTP, SQL, cloud-based)
+- [x] Channel-based async background log queue
+- [x] Additional writers (HTTP, SQL, Azure Application Insights, AWS CloudWatch)
 - [ ] External config via JSON or environment
 - [ ] NuGet package & logo
 - [ ] Full unit test coverage
@@ -156,10 +214,10 @@ For ideas like new formatters or writers, feel free to open a discussion first.
 
 ## 📄 License
 
-MIT © Artur Zubert / Chookees
+MIT © Artur Bobb / Chookees
 
 ---
 
 ## 👤 Maintainer
 
-Built and maintained by **Artur Zubert / Chookees**  
+Built and maintained by **Artur Bobb / Chookees**  
