@@ -11,7 +11,7 @@ public class LoggerConfig : ILogConfiguration
     public ILogFormatter? Formatter { get; private set; }
 
     public bool AsyncEnabled { get; private set; } = true;
-    public bool UseBackgroundQueue { get; private set; } = false;
+    public bool BackgroundQueueEnabled { get; private set; } = false;
     public int BackgroundQueueCapacity { get; private set; } = 1000;
     public int BackgroundQueueBatchSize { get; private set; } = 10;
     public TimeSpan BackgroundQueueFlushInterval { get; private set; } = TimeSpan.FromMilliseconds(100);
@@ -48,7 +48,7 @@ public class LoggerConfig : ILogConfiguration
 
     public LoggerConfig UseBackgroundQueue(bool enabled, int capacity = 1000, int batchSize = 10, TimeSpan? flushInterval = null)
     {
-        UseBackgroundQueue = enabled;
+        BackgroundQueueEnabled = enabled;
         BackgroundQueueCapacity = capacity;
         BackgroundQueueBatchSize = batchSize;
         BackgroundQueueFlushInterval = flushInterval ?? TimeSpan.FromMilliseconds(100);

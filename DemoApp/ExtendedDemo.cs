@@ -15,16 +15,9 @@ public class ExtendedDemo
     {
         Console.WriteLine("=== ALog Extended Demo ===\n");
 
-        // Demo 1: Background Queue
         await DemoBackgroundQueue();
-
-        // Demo 2: HTTP Writer
         await DemoHttpWriter();
-
-        // Demo 3: SQL Writer (commented out - requires SQL Server)
-        // await DemoSqlWriter();
-
-        // Demo 4: Cloud Writers
+        // await DemoSqlWriter(); // requires SQL Server; tableName must match ^[A-Za-z_][A-Za-z0-9_]*$
         await DemoCloudWriters();
 
         Console.WriteLine("\n=== Demo completed ===");
@@ -43,17 +36,15 @@ public class ExtendedDemo
 
         Log.Init(config);
 
-        // Generate many log messages quickly
         for (int i = 1; i <= 20; i++)
         {
             Log.Write($"Background queue message {i}", LogLevel.Info);
             await Log.WriteAsync($"Async background message {i}", LogLevel.Debug);
         }
 
-        Console.WriteLine("Waiting for background queue to process...");
-        await Task.Delay(2000);
-
+        Console.WriteLine("Flushing background queue...");
         await Log.FlushAsync();
+        Log.Shutdown();
         Console.WriteLine("Background queue demo completed.\n");
     }
 
@@ -62,7 +53,6 @@ public class ExtendedDemo
         Console.WriteLine("2. HTTP Writer Demo");
         Console.WriteLine("===================");
 
-        // Note: This will fail unless you have a real HTTP endpoint
         var httpWriter = new HttpLogWriter(
             endpoint: "https://httpbin.org/post",
             method: HttpMethod.Post,
@@ -89,6 +79,8 @@ public class ExtendedDemo
             Log.Write("HTTP request with context");
         }
 
+        await Log.FlushAsync();
+        Log.Shutdown();
         Console.WriteLine("HTTP Writer demo completed.\n");
     }
 
@@ -97,7 +89,7 @@ public class ExtendedDemo
         Console.WriteLine("3. SQL Writer Demo");
         Console.WriteLine("==================");
 
-        // Note: This requires a SQL Server instance
+        // tableName must match ^[A-Za-z_][A-Za-z0-9_]*$ (max 128)
         var sqlWriter = new SqlLogWriter(
             connectionString: "Server=localhost;Database=Logs;Integrated Security=true;",
             tableName: "ApplicationLogs",
@@ -119,25 +111,32 @@ public class ExtendedDemo
             Log.Write("User action logged to database");
         }
 
+        await Log.FlushAsync();
+        Log.Shutdown();
         Console.WriteLine("SQL Writer demo completed.\n");
     }
 
     private static async Task DemoCloudWriters()
     {
-        Console.WriteLine("4. Cloud Writers Demo");
-        Console.WriteLine("=====================");
+        Console.WriteLine("4. Cloud Writers (shipping)");
+        Console.WriteLine("===========================");
+        Console.WriteLine("Uses transport/HTTP clients. Without real credentials/endpoints, writes fail closed to stderr.\n");
 
-        // Azure Application Insights (requires instrumentation key)
+        // Demo with injectable AWS transport (no live AWS call).
+        var demoTransport = new DemoAwsTransport();
+        var azureHandler = new DemoHttpHandler();
+        using var azureClient = new HttpClient(azureHandler);
+
         var azureWriter = new AzureLogWriter(
-            instrumentationKey: "your-instrumentation-key-here",
+            instrumentationKey: "00000000-0000-0000-0000-000000000000",
+            httpClient: azureClient,
             formatter: new JsonFormatter(pretty: false)
         );
 
-        // AWS CloudWatch (requires AWS credentials)
         var awsWriter = new AwsCloudWatchWriter(
             logGroupName: "/aws/application/alog-demo",
             logStreamName: "demo-stream",
-            region: "us-east-1"
+            transport: demoTransport
         );
 
         var config = new LoggerConfig()
@@ -151,13 +150,46 @@ public class ExtendedDemo
         Log.Write("Cloud logging test message");
         await Log.WriteAsync("Async cloud message");
 
-        using (Log.BeginScope("environment", "production"))
+        await Log.FlushAsync();
+        Log.Shutdown();
+
+        Console.WriteLine($"Azure POSTs captured: {azureHandler.Count}");
+        Console.WriteLine($"AWS PutLogEvent calls: {demoTransport.Count}");
+        Console.WriteLine("Cloud writers demo completed.\n");
+    }
+
+    private sealed class DemoAwsTransport : IAwsCloudWatchLogsTransport
+    {
+        public int Count { get; private set; }
+
+        public Task PutLogEventAsync(
+            string logGroupName,
+            string logStreamName,
+            string message,
+            long timestampUnixMs,
+            CancellationToken cancellationToken = default)
         {
-            Log.Write("Production environment log");
+            Count++;
+            Console.WriteLine($"[DemoAwsTransport] {logGroupName}/{logStreamName}: {message}");
+            return Task.CompletedTask;
         }
 
-        Log.Write(new Exception("Test cloud exception"), "Exception logged to cloud services", LogLevel.Error);
+        public void Dispose() { }
+    }
 
-        Console.WriteLine("Cloud Writers demo completed.\n");
+    private sealed class DemoHttpHandler : HttpMessageHandler
+    {
+        public int Count { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request,
+            CancellationToken cancellationToken)
+        {
+            Count++;
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"itemsReceived\":1,\"itemsAccepted\":1}")
+            });
+        }
     }
 }

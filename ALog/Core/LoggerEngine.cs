@@ -10,19 +10,38 @@ public class LoggerEngine : ILogger, IDisposable
     private readonly ILogConfiguration _config;
     private readonly LogDispatcher _dispatcher;
     private readonly BackgroundLogQueue? _backgroundQueue;
+    private bool _disposed;
 
     public LoggerEngine(ILogConfiguration config)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
-        _dispatcher = new LogDispatcher(config.Writers);
-        
-        if (_config.UseBackgroundQueue)
+
+        ApplyDefaultFormatter(config);
+
+        _dispatcher = new LogDispatcher(config.Writers, config.AsyncEnabled);
+
+        if (_config.BackgroundQueueEnabled)
         {
             _backgroundQueue = new BackgroundLogQueue(
                 config.Writers,
                 config.BackgroundQueueCapacity,
                 config.BackgroundQueueBatchSize,
-                config.BackgroundQueueFlushInterval);
+                config.BackgroundQueueFlushInterval,
+                config.AsyncEnabled);
+        }
+    }
+
+    private static void ApplyDefaultFormatter(ILogConfiguration config)
+    {
+        if (config.Formatter is null)
+            return;
+
+        foreach (var writer in config.Writers)
+        {
+            if (writer is IFormattableLogWriter formattable && formattable.Formatter is null)
+            {
+                formattable.Formatter = config.Formatter;
+            }
         }
     }
 
@@ -31,15 +50,13 @@ public class LoggerEngine : ILogger, IDisposable
         var logEvent = CreateLogEvent(message, null, level);
         if (!ShouldLog(logEvent)) return;
 
-        var formatted = Format(logEvent);
-        
         if (_backgroundQueue != null)
         {
-            _backgroundQueue.TryEnqueue(formatted);
+            _backgroundQueue.TryEnqueue(logEvent);
         }
         else
         {
-            _dispatcher.Dispatch(formatted);
+            _dispatcher.Dispatch(logEvent);
         }
     }
 
@@ -48,15 +65,17 @@ public class LoggerEngine : ILogger, IDisposable
         var logEvent = CreateLogEvent(message, null, level);
         if (!ShouldLog(logEvent)) return;
 
-        var formatted = Format(logEvent);
-        
         if (_backgroundQueue != null)
         {
-            await _backgroundQueue.EnqueueAsync(formatted);
+            await _backgroundQueue.EnqueueAsync(logEvent);
+        }
+        else if (!_config.AsyncEnabled)
+        {
+            _dispatcher.Dispatch(logEvent);
         }
         else
         {
-            await _dispatcher.DispatchAsync(formatted);
+            await _dispatcher.DispatchAsync(logEvent);
         }
     }
 
@@ -65,15 +84,13 @@ public class LoggerEngine : ILogger, IDisposable
         var logEvent = CreateLogEvent(message, exception, level);
         if (!ShouldLog(logEvent)) return;
 
-        var formatted = Format(logEvent);
-        
         if (_backgroundQueue != null)
         {
-            _backgroundQueue.TryEnqueue(formatted);
+            _backgroundQueue.TryEnqueue(logEvent);
         }
         else
         {
-            _dispatcher.Dispatch(formatted);
+            _dispatcher.Dispatch(logEvent);
         }
     }
 
@@ -82,15 +99,17 @@ public class LoggerEngine : ILogger, IDisposable
         var logEvent = CreateLogEvent(message, exception, level);
         if (!ShouldLog(logEvent)) return;
 
-        var formatted = Format(logEvent);
-        
         if (_backgroundQueue != null)
         {
-            await _backgroundQueue.EnqueueAsync(formatted);
+            await _backgroundQueue.EnqueueAsync(logEvent);
+        }
+        else if (!_config.AsyncEnabled)
+        {
+            _dispatcher.Dispatch(logEvent);
         }
         else
         {
-            await _dispatcher.DispatchAsync(formatted);
+            await _dispatcher.DispatchAsync(logEvent);
         }
     }
 
@@ -105,15 +124,6 @@ public class LoggerEngine : ILogger, IDisposable
             Exception: exception,
             Context: context
         );
-    }
-
-    private LogEvent Format(LogEvent logEvent)
-    {
-        if (_config.Formatter is null)
-            return logEvent;
-
-        var formatted = _config.Formatter.Format(logEvent);
-        return logEvent with { Message = formatted };
     }
 
     private bool ShouldLog(LogEvent logEvent)
@@ -137,6 +147,22 @@ public class LoggerEngine : ILogger, IDisposable
 
     public void Dispose()
     {
+        if (_disposed)
+            return;
+
+        _disposed = true;
         _backgroundQueue?.Dispose();
+
+        foreach (var writer in _config.Writers)
+        {
+            try
+            {
+                writer.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[LoggerEngine] Writer dispose failed: {ex}");
+            }
+        }
     }
 }

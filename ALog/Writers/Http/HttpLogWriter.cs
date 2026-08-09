@@ -7,19 +7,22 @@ using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using ALog.Core;
+using ALog.Formatters;
 using ALog.Public.Interfaces;
 
 /// <summary>
 /// HTTP-based log writer for sending logs to web endpoints
 /// </summary>
-public class HttpLogWriter : ILogWriter
+public class HttpLogWriter : ILogWriter, IFormattableLogWriter
 {
     private readonly HttpClient _httpClient;
+    private readonly bool _ownsHttpClient;
     private readonly string _endpoint;
     private readonly Dictionary<string, string> _headers;
-    private readonly ILogFormatter? _formatter;
     private readonly HttpMethod _method;
     private readonly TimeSpan _timeout;
+
+    public ILogFormatter? Formatter { get; set; }
 
     public HttpLogWriter(
         string endpoint,
@@ -32,16 +35,20 @@ public class HttpLogWriter : ILogWriter
         _endpoint = endpoint ?? throw new ArgumentNullException(nameof(endpoint));
         _method = method ?? HttpMethod.Post;
         _headers = headers ?? new Dictionary<string, string>();
-        _formatter = formatter;
+        Formatter = formatter;
         _timeout = timeout ?? TimeSpan.FromSeconds(30);
+        _ownsHttpClient = httpClient is null;
         _httpClient = httpClient ?? new HttpClient();
-        
-        _httpClient.Timeout = _timeout;
-        
-        // Set default headers
-        foreach (var header in _headers)
+
+        // Only mutate owned clients — injected/shared HttpClient must stay unchanged.
+        if (_ownsHttpClient)
         {
-            _httpClient.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
+            _httpClient.Timeout = _timeout;
+
+            foreach (var header in _headers)
+            {
+                _httpClient.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
+            }
         }
     }
 
@@ -67,7 +74,6 @@ public class HttpLogWriter : ILogWriter
                 Content = httpContent
             };
 
-            // Add custom headers to request
             foreach (var header in _headers)
             {
                 request.Headers.TryAddWithoutValidation(header.Key, header.Value);
@@ -92,12 +98,11 @@ public class HttpLogWriter : ILogWriter
 
     private string PrepareContent(LogEvent logEvent)
     {
-        if (_formatter != null)
+        if (Formatter != null)
         {
-            return _formatter.Format(logEvent);
+            return Formatter.Format(logEvent);
         }
 
-        // Default JSON formatting
         var logData = new
         {
             timestamp = logEvent.Timestamp.ToString("o"),
@@ -121,14 +126,17 @@ public class HttpLogWriter : ILogWriter
 
     private string GetContentType()
     {
-        if (_formatter is JsonFormatter)
+        if (Formatter is JsonFormatter)
             return "application/json";
-        
+
         return "text/plain";
     }
 
     public void Dispose()
     {
-        _httpClient?.Dispose();
+        if (_ownsHttpClient)
+        {
+            _httpClient.Dispose();
+        }
     }
 }

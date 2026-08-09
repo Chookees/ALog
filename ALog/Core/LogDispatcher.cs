@@ -9,10 +9,12 @@ using ALog.Public.Interfaces;
 public class LogDispatcher
 {
     private readonly IReadOnlyList<ILogWriter> _writers;
+    private readonly bool _asyncEnabled;
 
-    public LogDispatcher(IEnumerable<ILogWriter> writers)
+    public LogDispatcher(IEnumerable<ILogWriter> writers, bool asyncEnabled = true)
     {
         _writers = writers.ToList();
+        _asyncEnabled = asyncEnabled;
     }
 
     public void Dispatch(LogEvent logEvent)
@@ -32,6 +34,12 @@ public class LogDispatcher
 
     public async Task DispatchAsync(LogEvent logEvent)
     {
+        if (!_asyncEnabled)
+        {
+            Dispatch(logEvent);
+            return;
+        }
+
         foreach (var writer in _writers)
         {
             try
@@ -47,6 +55,15 @@ public class LogDispatcher
 
     public async Task DispatchBatchAsync(IEnumerable<LogEvent> logEvents)
     {
+        if (!_asyncEnabled)
+        {
+            foreach (var logEvent in logEvents)
+            {
+                Dispatch(logEvent);
+            }
+            return;
+        }
+
         var tasks = new List<Task>();
 
         foreach (var writer in _writers)

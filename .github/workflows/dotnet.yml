@@ -1,0 +1,43 @@
+# Library CI for ALog (.NET 10)
+
+name: .NET
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: Y
+          MSSQL_SA_PASSWORD: "Your_strong_Password123"
+        ports:
+          - 1433:1433
+
+    env:
+      ALOG_SQL_TEST_CONNECTION: "Server=127.0.0.1,1433;User Id=sa;Password=Your_strong_Password123;TrustServerCertificate=True;Encrypt=False;"
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Restore
+      run: dotnet restore ALog.sln
+
+    - name: Build
+      run: dotnet build ALog.sln -c Release --no-restore
+
+    - name: Test
+      run: dotnet test ALog.sln -c Release --no-build --verbosity normal

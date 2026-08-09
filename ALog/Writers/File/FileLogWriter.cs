@@ -7,16 +7,18 @@ using System.Threading.Tasks;
 using ALog.Core;
 using ALog.Public.Interfaces;
 
-public class FileLogWriter : ILogWriter
+public class FileLogWriter : ILogWriter, IFormattableLogWriter
 {
     private readonly string _filePath;
     private readonly long? _maxFileSizeInBytes;
-    private readonly ILogFormatter? _formatter;
+    private readonly object _writeLock = new();
+
+    public ILogFormatter? Formatter { get; set; }
 
     public FileLogWriter(string filePath, ILogFormatter? formatter = null, long? maxFileSizeInBytes = null)
     {
         _filePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
-        _formatter = formatter;
+        Formatter = formatter;
         _maxFileSizeInBytes = maxFileSizeInBytes;
 
         EnsureDirectoryExists(_filePath);
@@ -32,15 +34,29 @@ public class FileLogWriter : ILogWriter
     {
         try
         {
-            var line = _formatter?.Format(logEvent) ?? FormatFallback(logEvent);
+            var line = Formatter?.Format(logEvent) ?? FormatFallback(logEvent);
             var lineWithNewline = line + Environment.NewLine;
 
-            RotateIfNeeded();
-
             if (asyncMode)
-                await File.AppendAllTextAsync(_filePath, lineWithNewline);
+            {
+                // Serialize rotate+append; async wait outside lock after preparing content
+                await Task.Run(() =>
+                {
+                    lock (_writeLock)
+                    {
+                        RotateIfNeeded();
+                        System.IO.File.AppendAllText(_filePath, lineWithNewline);
+                    }
+                });
+            }
             else
-                File.AppendAllText(_filePath, lineWithNewline);
+            {
+                lock (_writeLock)
+                {
+                    RotateIfNeeded();
+                    System.IO.File.AppendAllText(_filePath, lineWithNewline);
+                }
+            }
         }
         catch (Exception ex)
         {
@@ -80,7 +96,7 @@ public class FileLogWriter : ILogWriter
 
             var rotated = Path.Combine(directory ?? ".", $"{filename}_{timestamp}{ext}");
 
-            File.Move(_filePath, rotated, overwrite: true);
+            System.IO.File.Move(_filePath, rotated, overwrite: true);
         }
         catch (Exception ex)
         {
@@ -102,5 +118,10 @@ public class FileLogWriter : ILogWriter
         {
             Console.Error.WriteLine($"[FileLogWriter] Failed to create directory: {ex}");
         }
+    }
+
+    public void Dispose()
+    {
+        // no unmanaged resources
     }
 }

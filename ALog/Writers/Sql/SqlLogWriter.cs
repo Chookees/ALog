@@ -1,17 +1,21 @@
 namespace ALog.Writers.Sql;
 
 using System;
-using System.Data;
-using System.Data.SqlClient;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using ALog.Core;
 using ALog.Public.Interfaces;
+using Microsoft.Data.SqlClient;
 
 /// <summary>
 /// SQL Server-based log writer for storing logs in database
 /// </summary>
 public class SqlLogWriter : ILogWriter
 {
+    private static readonly Regex TableNamePattern = new(
+        @"^[A-Za-z_][A-Za-z0-9_]*$",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
     private readonly string _connectionString;
     private readonly string _tableName;
     private readonly bool _autoCreateTable;
@@ -22,13 +26,28 @@ public class SqlLogWriter : ILogWriter
         bool autoCreateTable = true)
     {
         _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
-        _tableName = tableName ?? throw new ArgumentNullException(nameof(tableName));
+        _tableName = ValidateTableName(tableName);
         _autoCreateTable = autoCreateTable;
 
         if (_autoCreateTable)
         {
             EnsureTableExists();
         }
+    }
+
+    internal static string ValidateTableName(string tableName)
+    {
+        if (tableName is null)
+            throw new ArgumentNullException(nameof(tableName));
+
+        if (tableName.Length == 0 || tableName.Length > 128 || !TableNamePattern.IsMatch(tableName))
+        {
+            throw new ArgumentException(
+                $"tableName must match ^[A-Za-z_][A-Za-z0-9_]*$ and be at most 128 characters. Got: '{tableName}'.",
+                nameof(tableName));
+        }
+
+        return tableName;
     }
 
     public void Write(LogEvent logEvent)
@@ -52,7 +71,7 @@ public class SqlLogWriter : ILogWriter
                 (@Timestamp, @Level, @Message, @Exception, @Context, @CreatedAt)";
 
             using var connection = new SqlConnection(_connectionString);
-            
+
             if (asyncMode)
             {
                 await connection.OpenAsync();
@@ -63,13 +82,13 @@ public class SqlLogWriter : ILogWriter
             }
 
             using var command = new SqlCommand(sql, connection);
-            
+
             command.Parameters.AddWithValue("@Timestamp", logEvent.Timestamp);
             command.Parameters.AddWithValue("@Level", logEvent.Level.ToString());
             command.Parameters.AddWithValue("@Message", logEvent.Message);
-            command.Parameters.AddWithValue("@Exception", 
+            command.Parameters.AddWithValue("@Exception",
                 logEvent.Exception != null ? $"{logEvent.Exception.GetType().FullName}: {logEvent.Exception.Message}" : (object)DBNull.Value);
-            command.Parameters.AddWithValue("@Context", 
+            command.Parameters.AddWithValue("@Context",
                 logEvent.Context != null ? System.Text.Json.JsonSerializer.Serialize(logEvent.Context) : (object)DBNull.Value);
             command.Parameters.AddWithValue("@CreatedAt", DateTime.UtcNow);
 
@@ -108,7 +127,7 @@ public class SqlLogWriter : ILogWriter
 
             using var connection = new SqlConnection(_connectionString);
             connection.Open();
-            
+
             using var command = new SqlCommand(createTableSql, connection);
             command.ExecuteNonQuery();
         }
@@ -116,5 +135,10 @@ public class SqlLogWriter : ILogWriter
         {
             Console.Error.WriteLine($"[SqlLogWriter] Failed to create table: {ex}");
         }
+    }
+
+    public void Dispose()
+    {
+        // connections are per-write
     }
 }

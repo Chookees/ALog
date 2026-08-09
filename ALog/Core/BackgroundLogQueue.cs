@@ -18,17 +18,21 @@ public class BackgroundLogQueue : IDisposable
     private readonly Task _backgroundTask;
     private readonly int _batchSize;
     private readonly TimeSpan _flushInterval;
+    private int _inflight;
+    private TaskCompletionSource<bool>? _flushTcs;
+    private CancellationTokenSource _wakeCts = new();
     private bool _disposed;
 
     public BackgroundLogQueue(
         IReadOnlyList<ILogWriter> writers,
         int capacity = 1000,
         int batchSize = 10,
-        TimeSpan? flushInterval = null)
+        TimeSpan? flushInterval = null,
+        bool asyncEnabled = true)
     {
         _batchSize = batchSize;
         _flushInterval = flushInterval ?? TimeSpan.FromMilliseconds(100);
-        
+
         var options = new BoundedChannelOptions(capacity)
         {
             FullMode = BoundedChannelFullMode.Wait,
@@ -37,9 +41,9 @@ public class BackgroundLogQueue : IDisposable
         };
 
         _channel = Channel.CreateBounded<LogEvent>(options);
-        _dispatcher = new LogDispatcher(writers);
+        _dispatcher = new LogDispatcher(writers, asyncEnabled);
         _cancellationTokenSource = new CancellationTokenSource();
-        
+
         _backgroundTask = ProcessLogsAsync(_cancellationTokenSource.Token);
     }
 
@@ -49,6 +53,7 @@ public class BackgroundLogQueue : IDisposable
             throw new ObjectDisposedException(nameof(BackgroundLogQueue));
 
         await _channel.Writer.WriteAsync(logEvent);
+        WakeProcessor();
     }
 
     public bool TryEnqueue(LogEvent logEvent)
@@ -56,46 +61,98 @@ public class BackgroundLogQueue : IDisposable
         if (_disposed)
             return false;
 
-        return _channel.Writer.TryWrite(logEvent);
+        // Fast path when space is available.
+        if (_channel.Writer.TryWrite(logEvent))
+        {
+            WakeProcessor();
+            return true;
+        }
+
+        // BoundedChannelFullMode.Wait does not make TryWrite block; sync callers
+        // must wait for capacity so events are not silently dropped.
+        try
+        {
+            _channel.Writer.WriteAsync(logEvent).AsTask().GetAwaiter().GetResult();
+            WakeProcessor();
+            return true;
+        }
+        catch (ChannelClosedException)
+        {
+            return false;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+    }
+
+    private void WakeProcessor()
+    {
+        try
+        {
+            _wakeCts.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // ignore during teardown
+        }
     }
 
     private async Task ProcessLogsAsync(CancellationToken cancellationToken)
     {
         var batch = new List<LogEvent>(_batchSize);
-        var timer = new PeriodicTimer(_flushInterval);
+        using var timer = new PeriodicTimer(_flushInterval);
 
         try
         {
             while (!cancellationToken.IsCancellationRequested)
             {
-                // Collect batch of log events
                 while (batch.Count < _batchSize && _channel.Reader.TryRead(out var logEvent))
                 {
                     batch.Add(logEvent);
                 }
 
-                // Process batch if we have items
                 if (batch.Count > 0)
                 {
-                    await ProcessBatchAsync(batch);
-                    batch.Clear();
-                }
-
-                // Wait for next flush interval or cancellation
-                if (batch.Count == 0)
-                {
+                    Interlocked.Increment(ref _inflight);
                     try
                     {
-                        await timer.WaitForNextTickAsync(cancellationToken);
+                        await ProcessBatchAsync(batch);
                     }
-                    catch (OperationCanceledException)
+                    finally
                     {
-                        break;
+                        Interlocked.Decrement(ref _inflight);
                     }
+
+                    batch.Clear();
+                    TryCompleteFlushIfIdle();
+                    continue;
+                }
+
+                TryCompleteFlushIfIdle();
+
+                try
+                {
+                    using var linked = CancellationTokenSource.CreateLinkedTokenSource(
+                        cancellationToken,
+                        _wakeCts.Token);
+
+                    await timer.WaitForNextTickAsync(linked.Token);
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    // Woken by enqueue/flush — replace wake CTS
+                    ReplaceWakeCts();
+                    // Cancel() may resume this method inline on the enqueuer thread.
+                    // Yield before dispatch so blocking Write cannot hang TryEnqueue/Log.Write.
+                    await Task.Yield();
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
                 }
             }
 
-            // Process remaining items
             while (_channel.Reader.TryRead(out var logEvent))
             {
                 batch.Add(logEvent);
@@ -103,17 +160,30 @@ public class BackgroundLogQueue : IDisposable
 
             if (batch.Count > 0)
             {
-                await ProcessBatchAsync(batch);
+                Interlocked.Increment(ref _inflight);
+                try
+                {
+                    await ProcessBatchAsync(batch);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref _inflight);
+                }
             }
+
+            TryCompleteFlushIfIdle();
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[BackgroundLogQueue] Processing error: {ex}");
         }
-        finally
-        {
-            timer.Dispose();
-        }
+    }
+
+    private void ReplaceWakeCts()
+    {
+        var old = _wakeCts;
+        _wakeCts = new CancellationTokenSource();
+        old.Dispose();
     }
 
     private async Task ProcessBatchAsync(List<LogEvent> batch)
@@ -128,19 +198,35 @@ public class BackgroundLogQueue : IDisposable
         }
     }
 
+    private void TryCompleteFlushIfIdle()
+    {
+        if (_channel.Reader.Count > 0 || Volatile.Read(ref _inflight) > 0)
+            return;
+
+        var tcs = Interlocked.Exchange(ref _flushTcs, null);
+        tcs?.TrySetResult(true);
+    }
+
     public async Task FlushAsync()
     {
         if (_disposed)
             return;
 
-        // Wait for channel to be empty
-        while (_channel.Reader.Count > 0)
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref _flushTcs, tcs);
+        WakeProcessor();
+
+        // Fast path: already idle
+        TryCompleteFlushIfIdle();
+
+        var completed = await Task.WhenAny(tcs.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+        if (completed != tcs.Task)
         {
-            await Task.Delay(10);
+            Interlocked.CompareExchange(ref _flushTcs, null, tcs);
+            tcs.TrySetResult(false);
         }
 
-        // Give background task time to process
-        await Task.Delay(50);
+        await tcs.Task;
     }
 
     public void Dispose()
@@ -150,8 +236,9 @@ public class BackgroundLogQueue : IDisposable
 
         _disposed = true;
         _channel.Writer.Complete();
+        WakeProcessor();
         _cancellationTokenSource.Cancel();
-        
+
         try
         {
             _backgroundTask.Wait(TimeSpan.FromSeconds(5));
@@ -162,5 +249,6 @@ public class BackgroundLogQueue : IDisposable
         }
 
         _cancellationTokenSource.Dispose();
+        _wakeCts.Dispose();
     }
 }

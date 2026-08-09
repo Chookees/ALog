@@ -9,7 +9,7 @@ public interface ILogConfiguration
     ILogFormatter? Formatter { get; }
 
     bool AsyncEnabled { get; }
-    bool UseBackgroundQueue { get; }
+    bool BackgroundQueueEnabled { get; }
     int BackgroundQueueCapacity { get; }
     int BackgroundQueueBatchSize { get; }
     TimeSpan BackgroundQueueFlushInterval { get; }

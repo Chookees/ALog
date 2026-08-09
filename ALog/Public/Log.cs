@@ -12,6 +12,12 @@ public static class Log
     public static void Init(LoggerConfig config)
     {
         if (config == null) throw new ArgumentNullException(nameof(config));
+
+        if (_logger is IDisposable previous)
+        {
+            previous.Dispose();
+        }
+
         _logger = new LoggerEngine(config);
     }
 
@@ -69,4 +75,22 @@ public static class Log
             await engine.FlushAsync();
         }
     }
+
+    /// <summary>
+    /// Disposes the current engine/writers and clears the static façade (idempotent).
+    /// </summary>
+    public static void Shutdown()
+    {
+        if (_logger is IDisposable disposable)
+        {
+            disposable.Dispose();
+        }
+
+        _logger = null;
+    }
+
+    /// <summary>
+    /// Alias for <see cref="Shutdown"/>.
+    /// </summary>
+    public static void Reset() => Shutdown();
 }

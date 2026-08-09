@@ -361,3 +361,8 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# Custom secrects
+**/.cursor/
+# Local agent runtime artifacts
+/inDev/

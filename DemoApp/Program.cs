@@ -18,7 +18,7 @@ internal class Program
 
         if (choice == "2")
         {
-            await ExtendedDemo.RunAsync();
+            await DemoApp.ExtendedDemo.RunAsync();
         }
         else
         {
@@ -67,5 +67,8 @@ internal class Program
         Log.ClearContext();
 
         Log.Write("Continued Logging Without Context.");
+
+        await Log.FlushAsync();
+        Log.Shutdown();
     }
 }

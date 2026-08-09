@@ -6,15 +6,16 @@ using System.Threading.Tasks;
 using ALog.Core;
 using ALog.Public.Interfaces;
 
-public class ConsoleLogWriter : ILogWriter
+public class ConsoleLogWriter : ILogWriter, IFormattableLogWriter
 {
-    private readonly ILogFormatter? _formatter;
     private readonly bool _useColors;
+
+    public ILogFormatter? Formatter { get; set; }
 
     public ConsoleLogWriter(bool useColors = false, ILogFormatter? formatter = null)
     {
         _useColors = useColors;
-        _formatter = formatter;
+        Formatter = formatter;
     }
 
     public void Write(LogEvent logEvent)
@@ -35,13 +36,13 @@ public class ConsoleLogWriter : ILogWriter
 
     public Task WriteAsync(LogEvent logEvent)
     {
-        Write(logEvent); // Console.WriteLine is synchronous, so no real benefit here.
+        Write(logEvent);
         return Task.CompletedTask;
     }
 
     private string Format(LogEvent logEvent)
     {
-        return _formatter?.Format(logEvent) ?? FormatFallback(logEvent);
+        return Formatter?.Format(logEvent) ?? FormatFallback(logEvent);
     }
 
     private static ConsoleColor GetColor(LogLevel level) => level switch
@@ -69,5 +70,10 @@ public class ConsoleLogWriter : ILogWriter
         };
 
         return string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
+    }
+
+    public void Dispose()
+    {
+        // no unmanaged resources
     }
 }

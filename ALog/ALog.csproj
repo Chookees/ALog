@@ -1,15 +1,21 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net8.0</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <PackageId>ALog</PackageId>
+    <Version>0.1.0</Version>
     <Title>ALog</Title>
     <Authors>Artur Zubert</Authors>
-    <Description>ALog is a powerful and extensible logging framework built for .NET 8+.
-It is designed to be simple to use, highly configurable, and ready for modern development across platforms including Windows, Linux, macOS, iOS, and Android.</Description>
+    <Description>ALog is a powerful and extensible logging framework built for .NET 10+.
+It is designed to be simple to use, highly configurable, and ready for modern development across platforms including Windows, Linux, and iOS.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <PackageProjectUrl>https://github.com/Chookees/ALog</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/Chookees/ALog</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageTags>logging;dotnet;logger;structured-logging</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,6 +23,11 @@ It is designed to be simple to use, highly configurable, and ready for modern de
       <Pack>True</Pack>
       <PackagePath>\</PackagePath>
     </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="AWSSDK.CloudWatchLogs" Version="3.7.410.7" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="6.0.2" />
   </ItemGroup>
 
 </Project>
