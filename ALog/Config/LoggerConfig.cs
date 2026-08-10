@@ -1,10 +1,14 @@
 ﻿namespace ALog.Config;
 
+using ALog.Public.Interfaces;
+
 public class LoggerConfig : ILogConfiguration
 {
     private readonly List<ILogWriter> _writers = new();
+    private readonly List<ILogEnricher> _enrichers = new();
 
     public IReadOnlyList<ILogWriter> Writers => _writers.AsReadOnly();
+    public IReadOnlyList<ILogEnricher> Enrichers => _enrichers.AsReadOnly();
     public LogLevel MinimumLevel { get; private set; } = LogLevel.Info;
 
     public ILogFilter? Filter { get; private set; }
@@ -19,6 +23,13 @@ public class LoggerConfig : ILogConfiguration
     public LoggerConfig AddWriter(ILogWriter writer)
     {
         _writers.Add(writer);
+        return this;
+    }
+
+    public LoggerConfig AddEnricher(ILogEnricher enricher)
+    {
+        ArgumentNullException.ThrowIfNull(enricher);
+        _enrichers.Add(enricher);
         return this;
     }
 

@@ -21,6 +21,12 @@ public static class Log
         _logger = new LoggerEngine(config);
     }
 
+    public static void Init(ALogOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        Init(LoggerConfigFactory.FromOptions(options));
+    }
+
     // Main – short: Log("...")
     public static void Invoke(string message, LogLevel level = LogLevel.Info)
     {
@@ -46,11 +52,28 @@ public static class Log
         await _logger!.LogAsync(exception, message, level);
     }
 
-    // Alias: allows for simple "Write(...)"
     public static void Write(string message, LogLevel level = LogLevel.Info) => Invoke(message, level);
     public static void Write(Exception exception, string message, LogLevel level = LogLevel.Error) => Invoke(exception, message, level);
 
-    // Safety: forgot init?
+    /// <summary>Structured template: <c>Log.Write(LogLevel.Info, "User {UserId} logged in", userId)</c>.</summary>
+    public static void Write(LogLevel level, string messageTemplate, params object?[] propertyValues)
+    {
+        EnsureInitialized();
+        _logger!.Log(messageTemplate, level, propertyValues);
+    }
+
+    public static async Task WriteAsync(LogLevel level, string messageTemplate, params object?[] propertyValues)
+    {
+        EnsureInitialized();
+        await _logger!.LogAsync(messageTemplate, level, propertyValues);
+    }
+
+    public static void Write(Exception? exception, LogLevel level, string messageTemplate, params object?[] propertyValues)
+    {
+        EnsureInitialized();
+        _logger!.Log(exception, messageTemplate, level, propertyValues);
+    }
+
     private static void EnsureInitialized()
     {
         if (_logger == null)
@@ -59,7 +82,7 @@ public static class Log
 
     public static void ClearContext()
     {
-        Internal.ContextManager.Clear();
+        ContextManager.Clear();
     }
 
     public static ILogScope BeginScope(string key, object value)
@@ -76,9 +99,6 @@ public static class Log
         }
     }
 
-    /// <summary>
-    /// Disposes the current engine/writers and clears the static façade (idempotent).
-    /// </summary>
     public static void Shutdown()
     {
         if (_logger is IDisposable disposable)
@@ -89,8 +109,5 @@ public static class Log
         _logger = null;
     }
 
-    /// <summary>
-    /// Alias for <see cref="Shutdown"/>.
-    /// </summary>
     public static void Reset() => Shutdown();
 }

@@ -5,7 +5,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>ALog</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
+    <PackageReleaseNotes>0.2.0: message templates, enrichers, ALogOptions/JSON config factory, MEL provider package, benchmarks.</PackageReleaseNotes>
     <Title>ALog</Title>
     <Authors>Artur Zubert</Authors>
     <Description>ALog is a powerful and extensible logging framework built for .NET 10+.

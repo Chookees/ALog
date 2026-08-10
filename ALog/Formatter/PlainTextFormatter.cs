@@ -20,8 +20,12 @@ public class PlainTextFormatter : ILogFormatter
         {
             $"[{logEvent.Timestamp.ToString(_dateTimeFormat)}]",
             $"[{logEvent.Level}]",
+            string.IsNullOrEmpty(logEvent.Category) ? null : $"[{logEvent.Category}]",
             logEvent.Message,
             logEvent.Exception != null ? FormatException(logEvent.Exception) : null,
+            logEvent.Properties != null && logEvent.Properties.Count > 0
+                ? $"props: {string.Join(", ", logEvent.Properties.Select(kv => $"{kv.Key}={kv.Value}"))}"
+                : null,
             logEvent.Context != null && logEvent.Context.Any()
                 ? $"ctx: {string.Join(", ", logEvent.Context.Select(kv => $"{kv.Key}={kv.Value}"))}"
                 : null

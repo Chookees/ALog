@@ -26,12 +26,15 @@ public class JsonFormatter : ILogFormatter
             timestamp = logEvent.Timestamp.ToString("o"),
             level = logEvent.Level.ToString(),
             message = logEvent.Message,
+            messageTemplate = logEvent.MessageTemplate,
+            category = logEvent.Category,
             exception = logEvent.Exception != null ? new
             {
                 type = logEvent.Exception.GetType().FullName,
                 message = logEvent.Exception.Message,
                 stackTrace = logEvent.Exception.StackTrace
             } : null,
+            properties = logEvent.Properties,
             context = logEvent.Context
         };
 

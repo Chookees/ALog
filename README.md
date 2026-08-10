@@ -11,28 +11,33 @@ It is designed to be simple to use, highly configurable, and ready for modern de
 ## Features
 
 - Intuitive API: `Log.Write(...)`, `Log.WriteAsync(...)`
-- Fully async- and sync-capable (`UseAsync` / `AsyncEnabled`)
-- Structured logging with scoped contextual data (`BeginScope(...)`)
-- Exception logging included
-- Formatter support (PlainText, JSON, or custom)
-- Console and file writers (with optional color + rolling)
-- Log level filtering
-- Cross-platform compatible (Windows, Linux, iOS helpers)
-- Fluent, builder-style configuration
-- Background queue via `UseBackgroundQueue(...)` (`BackgroundQueueEnabled`)
-- Deterministic shutdown: `FlushAsync` + `Log.Shutdown()`
+- Message templates: `Log.Write(LogLevel.Info, "User {UserId} logged in", userId)`
+- Enrichers (`MachineName`, `ThreadId`, `ProcessId`, `Activity`, custom)
+- JSON/env options via `ALogOptions` / `LoggerConfigFactory`
+- `Microsoft.Extensions.Logging` provider (`ALog.Extensions.Logging`) + ASP.NET sample
+- Formatters, scopes, background queue with backpressure, `FlushAsync` / `Shutdown`
+- Writers: Console, File, HTTP, SQL, Azure App Insights, AWS CloudWatch
+- Benchmarks: `ALog.Benchmarks`
 
 ---
 
 ## Installation
 
-> ALog is currently under development. You can use it via project reference:
-
 ```bash
-git clone https://github.com/yourusername/ALog.git
+dotnet add package ALog --version 0.2.0
+dotnet add package ALog.Extensions.Logging --version 0.2.0
 ```
 
-Reference `ALog.csproj` in your .NET 10+ project.
+Source: https://github.com/Chookees/ALog · Optional future sink split: [`docs/PACKAGE_SPLIT.md`](docs/PACKAGE_SPLIT.md)
+
+### ASP.NET Core
+
+```csharp
+builder.Logging.ClearProviders();
+builder.Logging.AddALog(builder.Configuration); // binds "ALog" section
+```
+
+See `samples/ALog.AspNetSample`.
 
 ---
 
@@ -223,10 +228,13 @@ using (Log.BeginScope("sessionId", "abc123"))
 - [x] Scope-based logging (`using Log.BeginScope(...)`)
 - [x] Channel-based async background log queue
 - [x] Shipping writers (HTTP, SQL, Azure App Insights track, AWS CloudWatch Logs)
-- [x] Core unit tests
-- [x] Live SQL integration tests (Testcontainers)
-- [ ] External config via JSON or environment
-- [ ] NuGet package & logo
+- [x] Core unit tests + live SQL integration tests
+- [x] External config via JSON / environment (`ALog` section)
+- [x] MEL provider + ASP.NET sample
+- [x] Message templates + enrichers
+- [x] Benchmarks project
+- [ ] Modular sink packages (see `docs/PACKAGE_SPLIT.md`)
+- [ ] NuGet logo / package icon
 
 ---
 

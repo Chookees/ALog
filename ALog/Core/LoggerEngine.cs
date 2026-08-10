@@ -46,57 +46,58 @@ public class LoggerEngine : ILogger, IDisposable
     }
 
     public void Log(string message, LogLevel level = LogLevel.Info)
-    {
-        var logEvent = CreateLogEvent(message, null, level);
-        if (!ShouldLog(logEvent)) return;
-
-        if (_backgroundQueue != null)
-        {
-            _backgroundQueue.TryEnqueue(logEvent);
-        }
-        else
-        {
-            _dispatcher.Dispatch(logEvent);
-        }
-    }
+        => Emit(CreateLogEvent(message, null, level, null, null, null));
 
     public async Task LogAsync(string message, LogLevel level = LogLevel.Info)
-    {
-        var logEvent = CreateLogEvent(message, null, level);
-        if (!ShouldLog(logEvent)) return;
-
-        if (_backgroundQueue != null)
-        {
-            await _backgroundQueue.EnqueueAsync(logEvent);
-        }
-        else if (!_config.AsyncEnabled)
-        {
-            _dispatcher.Dispatch(logEvent);
-        }
-        else
-        {
-            await _dispatcher.DispatchAsync(logEvent);
-        }
-    }
+        => await EmitAsync(CreateLogEvent(message, null, level, null, null, null));
 
     public void Log(Exception exception, string message, LogLevel level = LogLevel.Error)
+        => Emit(CreateLogEvent(message, exception, level, null, null, null));
+
+    public async Task LogAsync(Exception exception, string message, LogLevel level = LogLevel.Error)
+        => await EmitAsync(CreateLogEvent(message, exception, level, null, null, null));
+
+    public void Log(string messageTemplate, LogLevel level, params object?[] propertyValues)
+        => Emit(CreateFromTemplate(messageTemplate, null, level, propertyValues, null));
+
+    public async Task LogAsync(string messageTemplate, LogLevel level, params object?[] propertyValues)
+        => await EmitAsync(CreateFromTemplate(messageTemplate, null, level, propertyValues, null));
+
+    public void Log(Exception? exception, string messageTemplate, LogLevel level, params object?[] propertyValues)
+        => Emit(CreateFromTemplate(messageTemplate, exception, level, propertyValues, null));
+
+    /// <summary>Used by MEL adapter to pass category + template properties.</summary>
+    public void LogStructured(
+        string? category,
+        LogLevel level,
+        Exception? exception,
+        string messageTemplate,
+        params object?[] propertyValues)
+        => Emit(CreateFromTemplate(messageTemplate, exception, level, propertyValues, category));
+
+    private LogEvent CreateFromTemplate(
+        string messageTemplate,
+        Exception? exception,
+        LogLevel level,
+        object?[]? propertyValues,
+        string? category)
     {
-        var logEvent = CreateLogEvent(message, exception, level);
+        var (rendered, props) = MessageTemplate.Format(messageTemplate, propertyValues ?? Array.Empty<object?>());
+        return CreateLogEvent(rendered, exception, level, props, messageTemplate, category);
+    }
+
+    private void Emit(LogEvent logEvent)
+    {
         if (!ShouldLog(logEvent)) return;
 
         if (_backgroundQueue != null)
-        {
             _backgroundQueue.TryEnqueue(logEvent);
-        }
         else
-        {
             _dispatcher.Dispatch(logEvent);
-        }
     }
 
-    public async Task LogAsync(Exception exception, string message, LogLevel level = LogLevel.Error)
+    private async Task EmitAsync(LogEvent logEvent)
     {
-        var logEvent = CreateLogEvent(message, exception, level);
         if (!ShouldLog(logEvent)) return;
 
         if (_backgroundQueue != null)
@@ -113,17 +114,33 @@ public class LoggerEngine : ILogger, IDisposable
         }
     }
 
-    private LogEvent CreateLogEvent(string message, Exception? exception, LogLevel level)
+    private LogEvent CreateLogEvent(
+        string message,
+        Exception? exception,
+        LogLevel level,
+        IReadOnlyDictionary<string, object>? properties,
+        string? messageTemplate,
+        string? category)
     {
         var context = Internal.ContextManager.GetContext();
+        var props = properties is null
+            ? new Dictionary<string, object>(StringComparer.Ordinal)
+            : new Dictionary<string, object>(properties, StringComparer.Ordinal);
 
-        return new LogEvent(
+        var preliminary = new LogEvent(
             Timestamp: DateTime.UtcNow,
             Level: level,
             Message: message,
             Exception: exception,
-            Context: context
-        );
+            Context: context,
+            Properties: props,
+            MessageTemplate: messageTemplate,
+            Category: category);
+
+        foreach (var enricher in _config.Enrichers)
+            enricher.Enrich(props, preliminary);
+
+        return preliminary with { Properties = props };
     }
 
     private bool ShouldLog(LogEvent logEvent)
@@ -161,7 +178,7 @@ public class LoggerEngine : ILogger, IDisposable
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"[LoggerEngine] Writer dispose failed: {ex}");
+                System.Console.Error.WriteLine($"[LoggerEngine] Writer dispose failed: {ex}");
             }
         }
     }
