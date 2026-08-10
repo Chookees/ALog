@@ -63,6 +63,13 @@ project.lock.json
 project.fragment.lock.json
 artifacts/
 
+# Local build/pack output (keep scripts tracked)
+.build/*
+!.build/*.ps1
+!.build/*.sh
+!.build/README.md
+**/.build/
+
 # ASP.NET Scaffolding
 ScaffoldingReadMe.txt
 
