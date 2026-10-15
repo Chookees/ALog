@@ -11,6 +11,7 @@
 - Added: `LogContext.Push(IEnumerable<KeyValuePair<string, object?>>)` and `LogContext.PushScope(object)`, both returning `IDisposable`
 - Changed: the Microsoft.Extensions.Logging bridge uses the public `LogContext` API. `ALog.Extensions.Logging` depends on ALog `>= 0.2.1` (not an exact pin). Direct `LogContext` scopes are attached when they begin
 - Fixed: `ALogLoggerProvider` implements `ISupportExternalScope` again, so the patch does not drop that interface. Factory scopes, including Activity TraceId, SpanId, and ParentId, are copied onto the event at emit time, after the level gate. `LogContext` scopes come first; external scopes follow
+- Changed: Scopes from `ILogger.BeginScope` apply to MEL events; for `Log.*` use `LogContext.Push`
 - Changed: `GetContext()` returns one shared empty dictionary when there is no scope. Each scope node stores its depth so the depth limit is a single comparison
 
 ## 0.2.0
