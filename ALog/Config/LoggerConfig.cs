@@ -9,7 +9,15 @@ public class LoggerConfig : ILogConfiguration
 
     public IReadOnlyList<ILogWriter> Writers => _writers.AsReadOnly();
     public IReadOnlyList<ILogEnricher> Enrichers => _enrichers.AsReadOnly();
-    public LogLevel MinimumLevel { get; private set; } = LogLevel.Info;
+
+    // Volatile so a reload on another thread is visible to the level gate.
+    private volatile int _minimumLevel = (int)LogLevel.Info;
+
+    public LogLevel MinimumLevel
+    {
+        get => (LogLevel)_minimumLevel;
+        private set => _minimumLevel = (int)value;
+    }
 
     public ILogFilter? Filter { get; private set; }
     public ILogFormatter? Formatter { get; private set; }

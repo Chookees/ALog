@@ -1,4 +1,6 @@
-﻿namespace ALog.Internal;
+﻿using System.Collections.ObjectModel;
+
+namespace ALog.Internal;
 
 /// <summary>
 /// Ambient log scope for the current async flow.
@@ -20,10 +22,10 @@
 /// </para>
 /// <para>
 /// Duplicate keys: the innermost frame wins. Inside one frame the last pair
-/// wins. The dictionary is materialized at emit time as
-/// <see cref="IReadOnlyDictionary{TKey,TValue}"/> of <c>string</c> to <c>object</c>
-/// (the <see cref="Core.LogEvent.Context"/> contract; no public type change).
-/// A scope with no keys returns <see cref="NoOpLogScope.Instance"/> and allocates nothing.
+/// wins. A scope that is not key/value pairs is stored as text and emitted as
+/// the <c>Scope</c> context entry: a string array, outer to inner.
+/// With no scopes, <see cref="GetContext"/> returns one shared empty dictionary.
+/// Each frame stores <see cref="ScopeFrame.Depth"/> so the push limit is O(1).
 /// Walks stop at <see cref="MaxScopeDepth"/>. Trace and activity fields are not
 /// stored here; that work is 0.3.0.
 /// </para>
@@ -31,8 +33,13 @@
 internal static class ContextManager
 {
     internal const int MaxScopeDepth = 64;
+    internal const string ScopePropertyName = "Scope";
 
     private static readonly AsyncLocal<ScopeFrame?> CurrentFrame = new();
+
+    // One shared instance. ReadOnlyDictionary rejects mutation, and JSON treats it as an object.
+    private static readonly IReadOnlyDictionary<string, object> EmptyContext =
+        new ReadOnlyDictionary<string, object>(new Dictionary<string, object>(0));
 
     internal static ScopeFrame? Current
     {
@@ -42,19 +49,12 @@ internal static class ContextManager
 
     public static IReadOnlyDictionary<string, object> GetContext()
     {
-        var frame = CurrentFrame.Value;
+        var head = CurrentFrame.Value;
+        if (head is null)
+            return EmptyContext;
+
         var dict = new Dictionary<string, object>(StringComparer.Ordinal);
-        var depth = 0;
-        while (frame is not null && depth < MaxScopeDepth)
-        {
-            CopyNewKeys(dict, frame.Properties);
-            frame = frame.Parent;
-            depth++;
-        }
-
-        if (frame is not null)
-            ReportDepth("Scope chain exceeded " + MaxScopeDepth + ".");
-
+        Collect(dict, head);
         return dict;
     }
 
@@ -79,16 +79,52 @@ internal static class ContextManager
 
     public static void Clear() => CurrentFrame.Value = null;
 
-    internal static int Depth(ScopeFrame? frame)
+    private static void Collect(Dictionary<string, object> dict, ScopeFrame head)
     {
-        var depth = 0;
-        while (frame is not null && depth < MaxScopeDepth)
+        var textCount = 0;
+        var guard = 0;
+        var frame = head;
+
+        while (frame is not null && guard < MaxScopeDepth)
         {
-            depth++;
+            CopyNewKeys(dict, frame.Properties);
+            if (frame.Text is not null)
+                textCount++;
+
             frame = frame.Parent;
+            guard++;
         }
 
-        return depth;
+        if (frame is not null)
+            ReportDepth("Scope chain exceeded " + MaxScopeDepth + ".");
+
+        if (textCount == 0)
+            return;
+
+        // The array is the carrier for non-KVP scopes, so it keeps this name
+        // even when a key/value scope also used "Scope".
+        dict[ScopePropertyName] = TextsOuterToInner(head, textCount);
+    }
+
+    private static string[] TextsOuterToInner(ScopeFrame head, int textCount)
+    {
+        // The walk is inner to outer. Fill from the end so index 0 is the outer scope.
+        // A reference array cannot live on the stack, so this is the one allocation.
+        var texts = new string[textCount];
+        var index = textCount;
+        var guard = 0;
+        var frame = head;
+
+        while (frame is not null && guard < MaxScopeDepth && index > 0)
+        {
+            if (frame.Text is not null)
+                texts[--index] = frame.Text;
+
+            frame = frame.Parent;
+            guard++;
+        }
+
+        return texts;
     }
 
     private static void CopyNewKeys(

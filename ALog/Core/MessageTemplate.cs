@@ -2,7 +2,6 @@ namespace ALog.Core;
 
 using System.Globalization;
 using System.Text.RegularExpressions;
-using ALog.Internal;
 
 /// <summary>
 /// Parses Serilog-style message templates: "User {UserId} logged in".

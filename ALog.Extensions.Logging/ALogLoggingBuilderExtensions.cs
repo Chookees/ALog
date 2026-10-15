@@ -4,6 +4,7 @@ using ALog.Config;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 public static class ALogLoggingBuilderExtensions
 {
@@ -14,7 +15,8 @@ public static class ALogLoggingBuilderExtensions
     {
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(config);
-        builder.Services.AddSingleton<ILoggerProvider>(_ => new ALogLoggerProvider(config, ownsEngine: true));
+        builder.Services.AddSingleton<ILoggerProvider>(sp =>
+            new ALogLoggerProvider(config, ownsEngine: true, sp.GetService<IOptionsMonitor<LoggerFilterOptions>>()));
         return builder;
     }
 

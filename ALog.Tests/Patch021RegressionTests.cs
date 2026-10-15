@@ -2,6 +2,7 @@ using ALog.Config;
 using ALog.Core;
 using ALog.Extensions.Logging;
 using ALog.Internal;
+using ALog.Public.Interfaces;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using MelLogLevel = Microsoft.Extensions.Logging.LogLevel;
@@ -25,10 +26,12 @@ public sealed class Patch021RegressionTests : IDisposable
     {
         Log.ClearContext();
         Log.Shutdown();
+        SelfLog.Target = null;
     }
 
     public void Dispose()
     {
+        SelfLog.Target = null;
         Log.ClearContext();
         Log.Shutdown();
     }
@@ -165,6 +168,93 @@ public sealed class Patch021RegressionTests : IDisposable
     }
 
     [Fact]
+    public void LogContext_Push_And_PushScope_Dispose_Restores()
+    {
+        var writer = new RecordingWriter();
+        Log.Init(new LoggerConfig().AddWriter(writer).SetMinimumLevel(LogLevel.Trace));
+
+        using (LogContext.Push(new[] { new KeyValuePair<string, object?>("user", "outer") }))
+        {
+            using (LogContext.PushScope("Batch 7"))
+            using (LogContext.Push(new[] { new KeyValuePair<string, object?>("user", "inner") }))
+            {
+                Log.Write("inside");
+            }
+
+            Log.Write("after-inner");
+        }
+
+        Log.Write("cleared");
+
+        var inside = ContextOf(writer, "inside");
+        Assert.Equal("inner", inside["user"]);
+        Assert.Equal(new[] { "Batch 7" }, Assert.IsType<string[]>(inside["Scope"]));
+
+        var after = ContextOf(writer, "after-inner");
+        Assert.Equal("outer", after["user"]);
+        Assert.False(after.ContainsKey("Scope"));
+
+        var cleared = ContextOf(writer, "cleared");
+        Assert.False(cleared.ContainsKey("user"));
+        Assert.False(cleared.ContainsKey("Scope"));
+    }
+
+    [Fact]
+    public void SelfLog_Enable_Receives_The_Filter_Failure_Line()
+    {
+        var lines = new List<string>();
+        SelfLog.Enable(lines.Add);
+        try
+        {
+            var writer = new RecordingWriter();
+            Log.Init(new LoggerConfig()
+                .AddWriter(writer)
+                .SetFilter(new BoomFilter())
+                .SetMinimumLevel(LogLevel.Trace));
+
+            var ex = Record.Exception(() => Log.Write("secret"));
+            Assert.Null(ex);
+            Assert.Empty(writer.Events);
+            Assert.Single(lines);
+            Assert.Contains("filter-boom", lines[0], StringComparison.Ordinal);
+        }
+        finally
+        {
+            SelfLog.Target = null;
+        }
+    }
+
+    [Fact]
+    public void SelfLog_Disable_Stops_Output()
+    {
+        var lines = new List<string>();
+        SelfLog.Enable(lines.Add);
+        SelfLog.Disable();
+        var previous = Console.Error;
+        var buffer = new StringWriter();
+        Console.SetError(buffer);
+        try
+        {
+            var writer = new RecordingWriter();
+            Log.Init(new LoggerConfig()
+                .AddWriter(writer)
+                .SetFilter(new BoomFilter())
+                .SetMinimumLevel(LogLevel.Trace));
+
+            var ex = Record.Exception(() => Log.Write("secret"));
+            Assert.Null(ex);
+            Assert.Empty(writer.Events);
+            Assert.Empty(lines);
+            Assert.DoesNotContain("[ALog]", buffer.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(previous);
+            SelfLog.Target = null;
+        }
+    }
+
+    [Fact]
     public void Enabled_Log_Does_Not_Allocate_More_Than_Master()
     {
         var writer = new RecordingWriter();
@@ -226,5 +316,10 @@ public sealed class Patch021RegressionTests : IDisposable
         Assert.NotNull(found);
         Assert.NotNull(found!.Context);
         return new Dictionary<string, object>(found.Context!, StringComparer.Ordinal);
+    }
+
+    private sealed class BoomFilter : ILogFilter
+    {
+        public bool ShouldLog(LogEvent logEvent) => throw new InvalidOperationException("filter-boom");
     }
 }

@@ -3,6 +3,7 @@
 using System;
 using System.Threading.Tasks;
 using ALog.Config;
+using ALog.Internal;
 using ALog.Public.Interfaces;
 
 public class LoggerEngine : ILogger, IDisposable
@@ -10,11 +11,13 @@ public class LoggerEngine : ILogger, IDisposable
     private readonly ILogConfiguration _config;
     private readonly LogDispatcher _dispatcher;
     private readonly BackgroundLogQueue? _backgroundQueue;
+    private readonly MinimumLevelCache _levels;
     private bool _disposed;
 
     public LoggerEngine(ILogConfiguration config)
     {
         _config = config ?? throw new ArgumentNullException(nameof(config));
+        _levels = new MinimumLevelCache(config);
 
         ApplyDefaultFormatter(config);
 
@@ -46,25 +49,60 @@ public class LoggerEngine : ILogger, IDisposable
     }
 
     public void Log(string message, LogLevel level = LogLevel.Info)
-        => Emit(CreateLogEvent(message, null, level, null, null, null));
+    {
+        if (!_levels.Allows(level))
+            return;
 
-    public async Task LogAsync(string message, LogLevel level = LogLevel.Info)
-        => await EmitAsync(CreateLogEvent(message, null, level, null, null, null));
+        WriteSync(Enrich(CreatePlain(Plain(message, null, level))));
+    }
+
+    public Task LogAsync(string message, LogLevel level = LogLevel.Info)
+    {
+        if (!_levels.Allows(level))
+            return Task.CompletedTask;
+
+        return WriteAsync(Enrich(CreatePlain(Plain(message, null, level))));
+    }
 
     public void Log(Exception exception, string message, LogLevel level = LogLevel.Error)
-        => Emit(CreateLogEvent(message, exception, level, null, null, null));
+    {
+        if (!_levels.Allows(level))
+            return;
 
-    public async Task LogAsync(Exception exception, string message, LogLevel level = LogLevel.Error)
-        => await EmitAsync(CreateLogEvent(message, exception, level, null, null, null));
+        WriteSync(Enrich(CreatePlain(Plain(message, exception, level))));
+    }
+
+    public Task LogAsync(Exception exception, string message, LogLevel level = LogLevel.Error)
+    {
+        if (!_levels.Allows(level))
+            return Task.CompletedTask;
+
+        return WriteAsync(Enrich(CreatePlain(Plain(message, exception, level))));
+    }
 
     public void Log(string messageTemplate, LogLevel level, params object?[] propertyValues)
-        => Emit(CreateFromTemplate(messageTemplate, null, level, propertyValues, null));
+    {
+        if (!_levels.Allows(level))
+            return;
 
-    public async Task LogAsync(string messageTemplate, LogLevel level, params object?[] propertyValues)
-        => await EmitAsync(CreateFromTemplate(messageTemplate, null, level, propertyValues, null));
+        WriteSync(Enrich(CreateFromTemplate(messageTemplate, null, level, propertyValues, null)));
+    }
+
+    public Task LogAsync(string messageTemplate, LogLevel level, params object?[] propertyValues)
+    {
+        if (!_levels.Allows(level))
+            return Task.CompletedTask;
+
+        return WriteAsync(Enrich(CreateFromTemplate(messageTemplate, null, level, propertyValues, null)));
+    }
 
     public void Log(Exception? exception, string messageTemplate, LogLevel level, params object?[] propertyValues)
-        => Emit(CreateFromTemplate(messageTemplate, exception, level, propertyValues, null));
+    {
+        if (!_levels.Allows(level))
+            return;
+
+        WriteSync(Enrich(CreateFromTemplate(messageTemplate, exception, level, propertyValues, null)));
+    }
 
     /// <summary>Used by MEL adapter to pass category + template properties.</summary>
     public void LogStructured(
@@ -73,7 +111,12 @@ public class LoggerEngine : ILogger, IDisposable
         Exception? exception,
         string messageTemplate,
         params object?[] propertyValues)
-        => Emit(CreateFromTemplate(messageTemplate, exception, level, propertyValues, category));
+    {
+        if (!_levels.Allows(level))
+            return;
+
+        WriteSync(Enrich(CreateFromTemplate(messageTemplate, exception, level, propertyValues, category)));
+    }
 
     private LogEvent CreateFromTemplate(
         string messageTemplate,
@@ -86,21 +129,45 @@ public class LoggerEngine : ILogger, IDisposable
         {
             var values = propertyValues ?? Array.Empty<object?>();
             var (rendered, props) = MessageTemplate.Format(messageTemplate, values);
-            return CreateLogEvent(rendered, exception, level, props, messageTemplate, category);
+            return CreatePlain(new Seed
+            {
+                Message = rendered,
+                Exception = exception,
+                Level = level,
+                Properties = props,
+                MessageTemplate = messageTemplate,
+                Category = category
+            });
         }
         catch (Exception ex)
         {
             // Per-argument failures are handled inside Format. This is the backstop
             // for a bad template so the call still produces a line.
-            Internal.SelfLog.Report("MessageTemplate", ex);
+            SelfLog.Report("MessageTemplate", ex);
             var fallback = messageTemplate ?? string.Empty;
-            return CreateLogEvent(fallback, exception, level, null, messageTemplate, category);
+            return CreatePlain(new Seed
+            {
+                Message = fallback,
+                Exception = exception,
+                Level = level,
+                MessageTemplate = messageTemplate,
+                Category = category
+            });
         }
     }
 
-    private void Emit(LogEvent logEvent)
+    private static Seed Plain(string message, Exception? exception, LogLevel level)
+        => new()
+        {
+            Message = message,
+            Exception = exception,
+            Level = level
+        };
+
+    private void WriteSync(LogEvent logEvent)
     {
-        if (!ShouldLog(logEvent)) return;
+        if (!PassesFilter(logEvent))
+            return;
 
         if (_backgroundQueue != null)
             _backgroundQueue.TryEnqueue(logEvent);
@@ -108,9 +175,10 @@ public class LoggerEngine : ILogger, IDisposable
             _dispatcher.Dispatch(logEvent);
     }
 
-    private async Task EmitAsync(LogEvent logEvent)
+    private async Task WriteAsync(LogEvent logEvent)
     {
-        if (!ShouldLog(logEvent)) return;
+        if (!PassesFilter(logEvent))
+            return;
 
         if (_backgroundQueue != null)
         {
@@ -126,31 +194,36 @@ public class LoggerEngine : ILogger, IDisposable
         }
     }
 
-    private LogEvent CreateLogEvent(
-        string message,
-        Exception? exception,
-        LogLevel level,
-        IReadOnlyDictionary<string, object>? properties,
-        string? messageTemplate,
-        string? category)
+    private static LogEvent CreatePlain(in Seed seed)
     {
-        var context = Internal.ContextManager.GetContext();
-        var props = properties is null
+        var context = ContextManager.GetContext();
+        var props = seed.Properties is null
             ? new Dictionary<string, object>(StringComparer.Ordinal)
-            : new Dictionary<string, object>(properties, StringComparer.Ordinal);
+            : new Dictionary<string, object>(seed.Properties, StringComparer.Ordinal);
 
-        var preliminary = new LogEvent(
+        return new LogEvent(
             Timestamp: DateTime.UtcNow,
-            Level: level,
-            Message: message,
-            Exception: exception,
+            Level: seed.Level,
+            Message: seed.Message,
+            Exception: seed.Exception,
             Context: context,
             Properties: props,
-            MessageTemplate: messageTemplate,
-            Category: category);
+            MessageTemplate: seed.MessageTemplate,
+            Category: seed.Category);
+    }
+
+    private LogEvent Enrich(LogEvent preliminary)
+    {
+        if (preliminary.Properties is not Dictionary<string, object> props)
+        {
+            props = preliminary.Properties is null
+                ? new Dictionary<string, object>(StringComparer.Ordinal)
+                : new Dictionary<string, object>(preliminary.Properties, StringComparer.Ordinal);
+            preliminary = preliminary with { Properties = props };
+        }
 
         ApplyEnrichers(_config.Enrichers, props, preliminary);
-        return preliminary with { Properties = props };
+        return preliminary;
     }
 
     private static void ApplyEnrichers(
@@ -171,16 +244,13 @@ public class LoggerEngine : ILogger, IDisposable
             catch (Exception ex)
             {
                 // Skip this enricher only. Later enrichers and the event still run.
-                Internal.SelfLog.Report("Enricher " + enricher.GetType().Name, ex);
+                SelfLog.Report("Enricher " + enricher.GetType().Name, ex);
             }
         }
     }
 
-    private bool ShouldLog(LogEvent logEvent)
+    private bool PassesFilter(LogEvent logEvent)
     {
-        if (logEvent.Level < _config.MinimumLevel)
-            return false;
-
         var filter = _config.Filter;
         if (filter is null)
             return true;
@@ -191,10 +261,10 @@ public class LoggerEngine : ILogger, IDisposable
         }
         catch (Exception ex)
         {
-            // Fail open: a throw is not a decision to drop the line. A filter
-            // that returns false still suppresses the event.
-            Internal.SelfLog.Report("Filter " + filter.GetType().Name, ex);
-            return true;
+            // Fail closed. A broken filter may be the PII filter; logging the
+            // event would leak the data the filter was meant to hold back.
+            SelfLog.Report("Filter " + filter.GetType().Name, ex);
+            return false;
         }
     }
 
@@ -225,5 +295,16 @@ public class LoggerEngine : ILogger, IDisposable
                 System.Console.Error.WriteLine($"[LoggerEngine] Writer dispose failed: {ex}");
             }
         }
+    }
+
+    /// <summary>Arguments for one event. Kept together so log methods stay within the parameter limit.</summary>
+    private readonly struct Seed
+    {
+        public string Message { get; init; }
+        public Exception? Exception { get; init; }
+        public LogLevel Level { get; init; }
+        public IReadOnlyDictionary<string, object>? Properties { get; init; }
+        public string? MessageTemplate { get; init; }
+        public string? Category { get; init; }
     }
 }
