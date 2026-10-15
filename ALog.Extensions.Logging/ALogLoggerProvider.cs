@@ -11,7 +11,7 @@ using MelLogLevel = Microsoft.Extensions.Logging.LogLevel;
 /// <summary>
 /// Bridges Microsoft.Extensions.Logging to a shared <see cref="LoggerEngine"/>.
 /// </summary>
-public sealed class ALogLoggerProvider : ILoggerProvider
+public sealed class ALogLoggerProvider : ILoggerProvider, ISupportExternalScope
 {
     private readonly LoggerEngine _engine;
     private readonly bool _ownsEngine;
@@ -19,6 +19,7 @@ public sealed class ALogLoggerProvider : ILoggerProvider
     private readonly ConcurrentDictionary<string, ALogLogger> _loggers = new(StringComparer.Ordinal);
     private readonly IDisposable? _reload;
     private volatile LevelTable _table;
+    private volatile IExternalScopeProvider? _scopes;
     private int _generation;
 
     public ALogLoggerProvider(LoggerConfig config, bool ownsEngine = true)
@@ -53,6 +54,13 @@ public sealed class ALogLoggerProvider : ILoggerProvider
     public ILogger CreateLogger(string categoryName)
         => _loggers.GetOrAdd(categoryName ?? string.Empty, Create);
 
+    /// <summary>
+    /// The factory calls this when the provider is registered. Later BeginScope
+    /// calls on a factory logger go to that provider, not to <see cref="ALogLogger"/>.
+    /// </summary>
+    public void SetScopeProvider(IExternalScopeProvider scopeProvider)
+        => _scopes = scopeProvider;
+
     public void Dispose()
     {
         _reload?.Dispose();
@@ -62,11 +70,12 @@ public sealed class ALogLoggerProvider : ILoggerProvider
 
     private ALogLogger Create(string category)
     {
-        var table = _table;
-        return new ALogLogger(category, _engine, _floorConfig, table.Threshold(category), CurrentTable);
+        return new ALogLogger(category, _engine, _floorConfig, CurrentTable, CurrentScopes);
     }
 
     private LevelTable CurrentTable() => _table;
+
+    private IExternalScopeProvider? CurrentScopes() => _scopes;
 
     private void OnReload(LoggerFilterOptions options)
     {
@@ -91,27 +100,32 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
     private readonly LoggerEngine _engine;
     private readonly FloorConfiguration? _levels;
     private readonly Func<LevelTable> _current;
-    private volatile int _categoryMin;
+    private readonly Func<IExternalScopeProvider?> _scopes;
+    private volatile int _categoryMin = LevelTable.UseGlobal;
     private volatile int _seen = -1;
 
     public ALogLogger(
         string category,
         LoggerEngine engine,
         FloorConfiguration? levels,
-        int categoryMin,
-        Func<LevelTable> current)
+        Func<LevelTable> current,
+        Func<IExternalScopeProvider?> scopes)
     {
         _category = category;
         _engine = engine;
         _levels = levels;
-        _categoryMin = categoryMin;
         _current = current;
+        _scopes = scopes;
     }
 
     public IDisposable BeginScope<TState>(TState state) where TState : notnull
     {
-        // Scopes are pushed onto the LogContext chain when they begin.
-        // Log does not copy them again.
+        // The factory does not call this after SetScopeProvider. Direct use of
+        // this logger must push onto that same provider, or ForEachScope misses it.
+        var external = _scopes();
+        if (external is not null)
+            return external.Push(state);
+
         return MelScopeAdapter.BeginLocal(state);
     }
 
@@ -154,6 +168,10 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
 
         var message = formatter(state, exception);
         var alogLevel = LogLevelMapper.ToALog(logLevel);
+
+        // The level gate already returned. Factory scopes, including the
+        // activity scope, are copied only for this emit and then removed.
+        using var external = MelScopeAdapter.AttachExternal(_scopes());
         Write(state, exception, message, alogLevel);
     }
 

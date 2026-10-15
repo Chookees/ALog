@@ -26,8 +26,8 @@ namespace ALog.Internal;
 /// the <c>Scope</c> context entry: a string array, outer to inner.
 /// With no scopes, <see cref="GetContext"/> returns one shared empty dictionary.
 /// Each frame stores <see cref="ScopeFrame.Depth"/> so the push limit is O(1).
-/// Walks stop at <see cref="MaxScopeDepth"/>. Trace and activity fields are not
-/// stored here; that work is 0.3.0.
+/// Walks stop at <see cref="MaxScopeDepth"/>. Activity fields are not stored on
+/// this chain. The MEL bridge copies the factory activity scope at emit time.
 /// </para>
 /// </remarks>
 internal static class ContextManager
