@@ -87,7 +87,12 @@ public static class Log
 
     public static ILogScope BeginScope(string key, object value)
     {
-        return new ScopeContext(key, value);
+        ArgumentNullException.ThrowIfNull(key);
+        var properties = new KeyValuePair<string, object?>[]
+        {
+            new(key, value)
+        };
+        return ScopeContext.Begin(properties);
     }
 
     public static async Task FlushAsync()

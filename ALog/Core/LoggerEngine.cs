@@ -82,8 +82,20 @@ public class LoggerEngine : ILogger, IDisposable
         object?[]? propertyValues,
         string? category)
     {
-        var (rendered, props) = MessageTemplate.Format(messageTemplate, propertyValues ?? Array.Empty<object?>());
-        return CreateLogEvent(rendered, exception, level, props, messageTemplate, category);
+        try
+        {
+            var values = propertyValues ?? Array.Empty<object?>();
+            var (rendered, props) = MessageTemplate.Format(messageTemplate, values);
+            return CreateLogEvent(rendered, exception, level, props, messageTemplate, category);
+        }
+        catch (Exception ex)
+        {
+            // Per-argument failures are handled inside Format. This is the backstop
+            // for a bad template so the call still produces a line.
+            Internal.SelfLog.Report("MessageTemplate", ex);
+            var fallback = messageTemplate ?? string.Empty;
+            return CreateLogEvent(fallback, exception, level, null, messageTemplate, category);
+        }
     }
 
     private void Emit(LogEvent logEvent)
@@ -137,10 +149,31 @@ public class LoggerEngine : ILogger, IDisposable
             MessageTemplate: messageTemplate,
             Category: category);
 
-        foreach (var enricher in _config.Enrichers)
-            enricher.Enrich(props, preliminary);
-
+        ApplyEnrichers(_config.Enrichers, props, preliminary);
         return preliminary with { Properties = props };
+    }
+
+    private static void ApplyEnrichers(
+        IReadOnlyList<ILogEnricher> enrichers,
+        IDictionary<string, object> properties,
+        LogEvent preliminary)
+    {
+        for (var i = 0; i < enrichers.Count; i++)
+        {
+            var enricher = enrichers[i];
+            if (enricher is null)
+                continue;
+
+            try
+            {
+                enricher.Enrich(properties, preliminary);
+            }
+            catch (Exception ex)
+            {
+                // Skip this enricher only. Later enrichers and the event still run.
+                Internal.SelfLog.Report("Enricher " + enricher.GetType().Name, ex);
+            }
+        }
     }
 
     private bool ShouldLog(LogEvent logEvent)
@@ -148,10 +181,21 @@ public class LoggerEngine : ILogger, IDisposable
         if (logEvent.Level < _config.MinimumLevel)
             return false;
 
-        if (_config.Filter is not null && !_config.Filter.ShouldLog(logEvent))
-            return false;
+        var filter = _config.Filter;
+        if (filter is null)
+            return true;
 
-        return true;
+        try
+        {
+            return filter.ShouldLog(logEvent);
+        }
+        catch (Exception ex)
+        {
+            // Fail open: a throw is not a decision to drop the line. A filter
+            // that returns false still suppresses the event.
+            Internal.SelfLog.Report("Filter " + filter.GetType().Name, ex);
+            return true;
+        }
     }
 
     public async Task FlushAsync()

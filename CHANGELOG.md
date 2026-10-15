@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.1
+
+- Fixed: inner scope wins on duplicate keys; scopes are isolated across parallel tasks; dispose restores the correct parent
+- Fixed: logging never throws into the application; errors go to SelfLog
+
 ## 0.2.0
 
 - Message templates (`Log.Write(LogLevel, template, args...)`) and `LogEvent.Properties`

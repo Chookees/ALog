@@ -1,6 +1,7 @@
 using ALog.Config;
 using ALog.Core;
 using ALog.Extensions.Logging;
+using ALog.Internal;
 using ALog.Public.Interfaces;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -177,6 +178,41 @@ public sealed class ScopeAndNeverThrowTests : IDisposable
     }
 
     [Fact]
+    public async Task ClearContext_Does_Not_Clear_A_Sibling_Flow()
+    {
+        var writer = Init();
+        var entered = NewSignal();
+        var release = NewSignal();
+
+        using (Log.BeginScope("root", "R"))
+        {
+            var child = Task.Run(() =>
+            {
+                using (Log.BeginScope("child", "C"))
+                {
+                    entered.TrySetResult();
+                    Assert.True(release.Task.Wait(TimeSpan.FromSeconds(5)), "child was not released");
+                    Log.Write("child-after-clear");
+                }
+            });
+
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Log.ClearContext();
+            Log.Write("parent-after-clear");
+            release.TrySetResult();
+            await child.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        var parent = ContextOf(writer, "parent-after-clear");
+        Assert.False(parent.ContainsKey("root"));
+        Assert.False(parent.ContainsKey("child"));
+
+        var childContext = ContextOf(writer, "child-after-clear");
+        Assert.Equal("R", childContext["root"]);
+        Assert.Equal("C", childContext["child"]);
+    }
+
+    [Fact]
     public async Task Scope_Remains_Visible_After_Await()
     {
         var writer = Init();
@@ -338,7 +374,7 @@ public sealed class ScopeAndNeverThrowTests : IDisposable
 
         Assert.Contains("[ALog]", stderr, StringComparison.Ordinal);
         Assert.Contains("format-boom", stderr, StringComparison.Ordinal);
-        Assert.Equal("{When:<format error>}", writer.Events[0].Message);
+        Assert.Equal("At {When:<format error>}", writer.Events[0].Message);
     }
 
     [Fact]
@@ -365,6 +401,86 @@ public sealed class ScopeAndNeverThrowTests : IDisposable
 
         Assert.Single(writer.Events);
         Assert.Equal("still-safe", writer.Events[0].Message);
+    }
+
+    [Fact]
+    public void Scope_With_No_Keys_Reuses_Cached_NoOp()
+    {
+        var empty = Array.Empty<KeyValuePair<string, object?>>();
+        _ = ScopeContext.Begin(empty);
+
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var first = ScopeContext.Begin(empty);
+        var second = ScopeContext.Begin(null);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Same(NoOpLogScope.Instance, first);
+        Assert.Same(first, second);
+        Assert.Equal(0, allocated);
+        first.Dispose();
+        second.Dispose();
+    }
+
+    [Fact]
+    public void SelfLog_Target_Receives_One_Line_And_Cannot_Throw()
+    {
+        var lines = new List<string>();
+        var previous = SelfLog.Target;
+        SelfLog.Target = line =>
+        {
+            lines.Add(line);
+            throw new InvalidOperationException("target-boom");
+        };
+
+        try
+        {
+            var writer = new RecordingWriter();
+            Log.Init(new LoggerConfig()
+                .AddWriter(writer)
+                .AddEnricher(new ThrowingEnricher())
+                .SetMinimumLevel(LogLevel.Trace));
+
+            var ex = Record.Exception(() => Log.Write("via-target"));
+            Assert.Null(ex);
+            Assert.Single(lines);
+            Assert.Contains("enrich-boom", lines[0], StringComparison.Ordinal);
+            Assert.DoesNotContain("\n", lines[0], StringComparison.Ordinal);
+            Assert.Single(writer.Events);
+        }
+        finally
+        {
+            SelfLog.Target = previous;
+        }
+    }
+
+    [Fact]
+    public void Scope_Depth_Is_Bounded_And_Reported()
+    {
+        var lines = new List<string>();
+        var previous = SelfLog.Target;
+        SelfLog.Target = lines.Add;
+        var scopes = new List<ILogScope>(ContextManager.MaxScopeDepth + 1);
+        try
+        {
+            for (var i = 0; i < ContextManager.MaxScopeDepth; i++)
+                scopes.Add(Log.BeginScope("k", i));
+
+            var extra = Log.BeginScope("k", "too-deep");
+            Assert.Same(NoOpLogScope.Instance, extra);
+            Assert.Contains(lines, line => line.Contains("depth", StringComparison.OrdinalIgnoreCase));
+
+            var writer = Init();
+            Log.Write("deep");
+            Assert.Equal(ContextManager.MaxScopeDepth - 1, Assert.IsType<int>(ContextOf(writer, "deep")["k"]));
+        }
+        finally
+        {
+            for (var i = scopes.Count - 1; i >= 0; i--)
+                scopes[i].Dispose();
+
+            SelfLog.Target = previous;
+            Log.ClearContext();
+        }
     }
 
     private static async Task RunIsolatedIteration(RecordingWriter writer, int iteration)
