@@ -1,8 +1,8 @@
 namespace ALog.Core;
 
 using System.Globalization;
-using System.Text;
 using System.Text.RegularExpressions;
+using ALog.Internal;
 
 /// <summary>
 /// Parses Serilog-style message templates: "User {UserId} logged in".
@@ -30,18 +30,38 @@ public static class MessageTemplate
                 return match.Value;
 
             var name = match.Groups["name"].Value;
-            var value = args[argIndex++];
+            var value = args[argIndex];
+            argIndex++;
             properties[name] = value ?? string.Empty;
 
-            var format = match.Groups["format"].Success ? match.Groups["format"].Value.TrimStart(':') : null;
-            if (value is IFormattable formattable && !string.IsNullOrEmpty(format))
-                return formattable.ToString(format, CultureInfo.InvariantCulture) ?? string.Empty;
-
-            return Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
+            var format = match.Groups["format"].Success
+                ? match.Groups["format"].Value.TrimStart(':')
+                : null;
+            return RenderArgument(name, value, format);
         });
 
         // Positional leftovers (no holes left) are ignored; unused holes keep raw text.
         return (rendered, properties);
+    }
+
+    private static string RenderArgument(string name, object? value, string? format)
+    {
+        try
+        {
+            if (value is null)
+                return string.Empty;
+
+            if (!string.IsNullOrEmpty(format) && value is IFormattable formattable)
+                return formattable.ToString(format, CultureInfo.InvariantCulture) ?? string.Empty;
+
+            return Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty;
+        }
+        catch (Exception ex)
+        {
+            // Convert.ToString / IFormattable can throw. Keep the rest of the message.
+            SelfLog.Report("Message template argument '" + name + "'", ex);
+            return "{" + name + ":<format error>}";
+        }
     }
 
     public static bool HasHoles(string template) =>

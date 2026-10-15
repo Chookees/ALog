@@ -53,7 +53,16 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
     }
 
     public IDisposable? BeginScope<TState>(TState state) where TState : notnull
-        => _scopeProvider()?.Push(state) ?? NullScope.Instance;
+    {
+        // When a scope provider is installed, the factory pushes there and does
+        // not call this method. Direct use (provider still null) must hit the
+        // same immutable chain Log.BeginScope uses.
+        var provider = _scopeProvider();
+        if (provider is not null)
+            return provider.Push(state);
+
+        return MelScopeAdapter.BeginLocal(state);
+    }
 
     public bool IsEnabled(MelLogLevel logLevel) => logLevel != MelLogLevel.None;
 
@@ -68,6 +77,10 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
             return;
 
         ArgumentNullException.ThrowIfNull(formatter);
+
+        // Factory scopes live on the external provider. Hold them on our chain
+        // only for this call so emit sees them and sibling flows do not.
+        using var _ = MelScopeAdapter.PushExternal(_scopeProvider());
 
         var message = formatter(state, exception);
         var alogLevel = LogLevelMapper.ToALog(logLevel);
@@ -96,11 +109,5 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
         }
 
         _engine.LogStructured(_category, alogLevel, exception, message);
-    }
-
-    private sealed class NullScope : IDisposable
-    {
-        public static readonly NullScope Instance = new();
-        public void Dispose() { }
     }
 }
