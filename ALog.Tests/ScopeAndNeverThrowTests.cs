@@ -303,7 +303,7 @@ public sealed class ScopeAndNeverThrowTests : IDisposable
     }
 
     [Fact]
-    public void Throwing_Filter_Does_Not_Throw_And_Event_Is_Still_Logged()
+    public void Throwing_Filter_Does_Not_Throw_And_Event_Is_Dropped()
     {
         var writer = new RecordingWriter();
         Log.Init(new LoggerConfig()
@@ -319,8 +319,8 @@ public sealed class ScopeAndNeverThrowTests : IDisposable
 
         Assert.Contains("[ALog]", stderr, StringComparison.Ordinal);
         Assert.Contains("filter-boom", stderr, StringComparison.Ordinal);
-        Assert.Single(writer.Events);
-        Assert.Equal("kept", writer.Events[0].Message);
+        // A broken filter can be a PII filter. Drop the event (NLog/Serilog).
+        Assert.Empty(writer.Events);
     }
 
     [Fact]

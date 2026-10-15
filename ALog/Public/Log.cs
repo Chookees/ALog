@@ -88,11 +88,11 @@ public static class Log
     public static ILogScope BeginScope(string key, object value)
     {
         ArgumentNullException.ThrowIfNull(key);
-        var properties = new KeyValuePair<string, object?>[]
-        {
-            new(key, value)
-        };
-        return ScopeContext.Begin(properties);
+        var pushed = LogContext.Push(new KeyValuePair<string, object?>[] { new(key, value) });
+        if (pushed is ILogScope scope)
+            return scope;
+
+        return NoOpLogScope.Instance;
     }
 
     public static async Task FlushAsync()

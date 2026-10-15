@@ -6,7 +6,7 @@
     <Nullable>enable</Nullable>
     <PackageId>ALog</PackageId>
     <Version>0.2.1</Version>
-    <PackageReleaseNotes>0.2.1: inner scope wins and parallel scope isolation; logging does not throw into the caller (SelfLog).</PackageReleaseNotes>
+    <PackageReleaseNotes>0.2.1: throwing filters drop the event; non-KVP scopes are kept; level gate before work; factory activity scopes are captured at emit; SelfLog.Enable/Disable and LogContext.Push/PushScope.</PackageReleaseNotes>
     <Title>ALog</Title>
     <Authors>Artur Zubert</Authors>
     <Description>ALog is a powerful and extensible logging framework built for .NET 10+.
@@ -28,7 +28,6 @@ It is designed to be simple to use, highly configurable, and ready for modern de
 
   <ItemGroup>
     <InternalsVisibleTo Include="ALog.Tests" />
-    <InternalsVisibleTo Include="ALog.Extensions.Logging" />
   </ItemGroup>
 
   <ItemGroup>

@@ -1,10 +1,15 @@
 ﻿namespace ALog.Internal;
 
+using ALog.Public.Interfaces;
+
 /// <summary>
 /// Pushes one immutable frame and, on dispose, removes that same frame.
 /// </summary>
 internal sealed class ScopeContext : ILogScope
 {
+    internal static readonly KeyValuePair<string, object?>[] EmptyProperties =
+        Array.Empty<KeyValuePair<string, object?>>();
+
     private readonly object _id;
     private int _disposed;
 
@@ -18,7 +23,17 @@ internal sealed class ScopeContext : ILogScope
         if (properties is null || properties.Length == 0 || !HasUsableKey(properties))
             return NoOpLogScope.Instance;
 
-        if (ContextManager.Depth(ContextManager.Current) >= ContextManager.MaxScopeDepth)
+        return BeginOwned(Copy(properties), text: null);
+    }
+
+    /// <summary>
+    /// The arrays are owned by the new frame. Callers must not mutate them.
+    /// </summary>
+    internal static ILogScope BeginOwned(KeyValuePair<string, object?>[] properties, string? text)
+    {
+        var parent = ContextManager.Current;
+        // Depth lives on the node, so this check does not walk the chain.
+        if (parent is not null && parent.Depth >= ContextManager.MaxScopeDepth)
         {
             SelfLog.Report(
                 "ContextManager",
@@ -28,8 +43,7 @@ internal sealed class ScopeContext : ILogScope
         }
 
         var id = new object();
-        var frame = new ScopeFrame(id, Copy(properties), ContextManager.Current);
-        ContextManager.Current = frame;
+        ContextManager.Current = new ScopeFrame(id, properties, text, parent);
         return new ScopeContext(id);
     }
 
