@@ -25,8 +25,12 @@ also decode decimal ``&#NN;``, hex ``&#xHH;``, and the named XML entities
 once, before the format characters are removed. An added MSBuild line that
 contains ``<Using`` and either ``Alias=`` or ``$(`` is a hit even when the
 token is not written out, because a Using alias or a property can assemble
-the attribute name. In CI the body is read from the pulls API, not from the
-event payload.
+the attribute name. Paths under ``eng/`` are not scanned for those tokens,
+because that tree is not measured. A change to a gate file
+(``eng/coverage-*`` except the ratchet, ``eng/coverage-metadata/**``, or a
+coverage step in ``.github/workflows/dotnet.yml``) needs the same general
+reason. The ratchet file stays on rule (a), so a pure raise needs no reason.
+In CI the body is read from the pulls API, not from the event payload.
 """
 
 from __future__ import annotations
@@ -46,6 +50,20 @@ from typing import Mapping
 RATCHET = "eng/coverage-ratchet.json"
 RUNSETTINGS = "coverage.runsettings"
 POLICY_FILES = ("coverage.runsettings", "coverage.config")
+WORKFLOW = ".github/workflows/dotnet.yml"
+COVERAGE_STEP_MARKERS = (
+    "coverage-gate.py",
+    "coverage-exception-check.py",
+    "coverage.runsettings",
+    "coverage-ratchet",
+    "coverage-metadata",
+    "XPlat Code Coverage",
+    "COVERAGE_ENFORCE",
+    "COVERAGE_BASE",
+)
+MAX_WORKFLOW_LINES = 5000
+MAX_WORKFLOW_STEPS = 200
+HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 # Normalized ExcludeByAttribute name. The one-time large-drop exception keys off this.
 COMPILER_GENERATED = "compilergenerated"
 ATTRIBUTE_SUFFIX = "attribute"
@@ -592,6 +610,28 @@ def exclusion_token_added(diff_text: str) -> bool:
     return False
 
 
+def measured_source_path(path: str) -> bool:
+    """Return whether a path is scanned for exclusion tokens.
+
+    Args:
+        path: Repo-relative path from the diff.
+
+    Returns:
+        True for a ``.cs`` or MSBuild file outside ``eng/``. Files under
+        ``eng/`` are not measured; gate files there use the gate-file rule.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    normalized = path.replace("\\", "/")
+    if normalized == "eng" or normalized.startswith("eng/"):
+        return False
+    return normalized.lower().endswith(SOURCE_SUFFIXES)
+
+
 def source_diff(repo: Path, base: str, paths: list[str]) -> str:
     """Return the unified diff of source files that can carry the tokens.
 
@@ -603,9 +643,10 @@ def source_diff(repo: Path, base: str, paths: list[str]) -> str:
         references and ``<Using`` lines are interpreted.
 
     Returns:
-        The diff text. Empty when none of those files changed. More than 500
-        matching files returns a marker that the caller treats as a hit. The
-        marker has no ``+++`` header, so it is scanned as a non-MSBuild line.
+        The diff text. Empty when none of those files changed. Paths under
+        ``eng/`` are skipped. More than 500 matching files returns a marker
+        that the caller treats as a hit. The marker has no ``+++`` header, so
+        it is scanned as a non-MSBuild line.
 
     Raises:
         ValueError: Git cannot diff the selected files.
@@ -615,7 +656,7 @@ def source_diff(repo: Path, base: str, paths: list[str]) -> str:
     """
     selected: list[str] = []
     for path in paths:
-        if not path.lower().endswith(SOURCE_SUFFIXES):
+        if not measured_source_path(path):
             continue
         selected.append(path)
         if len(selected) > MAX_SOURCE_FILES:
@@ -1104,6 +1145,295 @@ def unauthorized_drops(
     return problems
 
 
+def is_gate_script_path(path: str) -> bool:
+    """Return whether a path is a coverage gate file other than the ratchet.
+
+    Args:
+        path: Repo-relative path.
+
+    Returns:
+        True for ``eng/coverage-*`` and for everything under
+        ``eng/coverage-metadata``. ``eng/coverage-ratchet.json`` is false so a
+        pure raise stays on rule (a) and needs no reason.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    normalized = path.replace("\\", "/")
+    if normalized == RATCHET:
+        return False
+    if normalized.startswith("eng/coverage-metadata/"):
+        return True
+    parent, _, name = normalized.rpartition("/")
+    return parent == "eng" and name.startswith("coverage-")
+
+
+def gate_file_changed(paths: list[str]) -> bool:
+    """Return whether the diff touches a coverage gate file.
+
+    Args:
+        paths: Changed repo-relative paths.
+
+    Returns:
+        True when one path is a gate script or metadata file. The ratchet file
+        is not a gate file here.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    for path in paths:
+        if is_gate_script_path(path):
+            return True
+    return False
+
+
+def marker_present(text: str) -> bool:
+    """Return whether text names a coverage gate or its workflow step.
+
+    Args:
+        text: A step body or one diff line.
+
+    Returns:
+        True when a coverage marker appears as a substring.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return any(marker in text for marker in COVERAGE_STEP_MARKERS)
+
+
+def collect_coverage_steps(
+    lines: list[str],
+    index: int,
+    indent: str,
+    ranges: list[tuple[int, int]],
+) -> int:
+    """Append coverage-step ranges from one ``steps:`` block.
+
+    Args:
+        lines: Workflow lines.
+        index: Zero-based index of the first line after ``steps:``.
+        indent: Whitespace before ``steps:``. A step item is that plus ``- ``.
+        ranges: Output list of 1-based inclusive line ranges.
+
+    Returns:
+        The zero-based index of the first line after this steps block.
+
+    Raises:
+        ValueError: The block has more than 200 steps.
+
+    Side effects:
+        Appends to ``ranges``.
+    """
+    prefix = indent + "- "
+    steps = 0
+    while index < len(lines):
+        line = lines[index]
+        if line.strip() == "":
+            index += 1
+            continue
+        if not line.startswith(prefix):
+            return index
+        steps += 1
+        if steps > MAX_WORKFLOW_STEPS:
+            raise ValueError("workflow has more than 200 steps.")
+        start = index
+        index += 1
+        while index < len(lines) and not lines[index].startswith(prefix):
+            if lines[index] and not lines[index].startswith(indent):
+                break
+            index += 1
+        if marker_present("\n".join(lines[start:index])):
+            ranges.append((start + 1, index))
+    return index
+
+
+def coverage_step_ranges(text: str) -> list[tuple[int, int]]:
+    """Return 1-based inclusive ranges of workflow steps that run coverage.
+
+    Args:
+        text: Workflow YAML. The indent of ``steps:`` defines the step prefix.
+
+    Returns:
+        Ranges whose step text contains a coverage marker. Empty when the file
+        has no such step.
+
+    Raises:
+        ValueError: The file is longer than 5000 lines.
+
+    Side effects:
+        None.
+    """
+    lines = text.splitlines()
+    if len(lines) > MAX_WORKFLOW_LINES:
+        raise ValueError("workflow is too large to scan.")
+    ranges: list[tuple[int, int]] = []
+    index = 0
+    while index < len(lines):
+        matched = re.match(r"^(\s*)steps:\s*$", lines[index])
+        if matched is None:
+            index += 1
+            continue
+        index = collect_coverage_steps(lines, index + 1, matched.group(1), ranges)
+    return ranges
+
+
+def line_in_ranges(number: int, ranges: list[tuple[int, int]]) -> bool:
+    """Return whether a 1-based line number sits in a coverage step.
+
+    Args:
+        number: 1-based line number from a diff hunk.
+        ranges: Inclusive ranges from ``coverage_step_ranges``.
+
+    Returns:
+        True when ``number`` is inside one range.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    for start, end in ranges:
+        if start <= number <= end:
+            return True
+    return False
+
+
+def hunk_starts(line: str) -> tuple[int, int]:
+    """Read the old and new start lines from a unified-diff hunk header.
+
+    Args:
+        line: A line that starts with ``@@``.
+
+    Returns:
+        Old start line and new start line. A new file starts the old side at 0.
+
+    Raises:
+        ValueError: The header is not a unified hunk.
+
+    Side effects:
+        None.
+    """
+    match = HUNK_RE.match(line)
+    if match is None:
+        raise ValueError("workflow diff hunk is not readable.")
+    return int(match.group(1)), int(match.group(3))
+
+
+def diff_touches_coverage(
+    diff_text: str,
+    base_ranges: list[tuple[int, int]],
+    head_ranges: list[tuple[int, int]],
+) -> bool:
+    """Return whether a workflow diff edits a coverage step.
+
+    Args:
+        diff_text: Unified diff with zero context lines.
+        base_ranges: Coverage steps in the base file.
+        head_ranges: Coverage steps in the head file.
+
+    Returns:
+        True when an added line is in a head coverage step, a removed line is
+        in a base coverage step, or the changed line itself contains a marker.
+        A huge diff is a hit.
+
+    Raises:
+        ValueError: A hunk header cannot be read.
+
+    Side effects:
+        None.
+    """
+    if len(diff_text) > MAX_DIFF_CHARS:
+        return True
+    old_line = 0
+    new_line = 0
+    seen = 0
+    for line in diff_text.splitlines():
+        seen += 1
+        if seen > MAX_DIFF_LINES:
+            return True
+        if line.startswith("@@"):
+            old_line, new_line = hunk_starts(line)
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            if line_in_ranges(new_line, head_ranges) or marker_present(line[1:]):
+                return True
+            new_line += 1
+            continue
+        if line.startswith("-") and not line.startswith("---"):
+            if line_in_ranges(old_line, base_ranges) or marker_present(line[1:]):
+                return True
+            old_line += 1
+            continue
+        if line.startswith("\\"):
+            continue
+        old_line += 1
+        new_line += 1
+    return False
+
+
+def read_head_text(repo: Path, path: str) -> str:
+    """Return a working-tree file, or empty text when it is absent.
+
+    Args:
+        repo: Repository root.
+        path: Repo-relative path.
+
+    Returns:
+        UTF-8 text. Empty when the path is not a file.
+
+    Raises:
+        OSError: The file exists but cannot be read.
+
+    Side effects:
+        Reads the working tree.
+    """
+    target = repo / path
+    if not target.is_file():
+        return ""
+    return target.read_text(encoding="utf-8")
+
+
+def workflow_coverage_changed(repo: Path, base: str) -> bool:
+    """Return whether a coverage step in the library workflow changed.
+
+    Args:
+        repo: Repository root.
+        base: Git ref to diff against.
+
+    Returns:
+        True when an added or removed line sits in a step that contains a
+        coverage marker, or the line itself contains one. A workflow that is
+        too large to parse is a hit. False when the workflow did not change.
+
+    Raises:
+        ValueError: Git cannot show the file or the diff.
+
+    Side effects:
+        Reads git and the working tree.
+    """
+    diff = git_output(repo, ["diff", "-U0", base, "--", WORKFLOW])
+    if not diff:
+        return False
+    base_text = show_git_text(repo, base, WORKFLOW) or ""
+    try:
+        base_ranges = coverage_step_ranges(base_text)
+        head_ranges = coverage_step_ranges(read_head_text(repo, WORKFLOW))
+    except ValueError:
+        return True
+    return diff_touches_coverage(diff, base_ranges, head_ranges)
+
+
 def decide(
     repo: Path,
     base: str,
@@ -1124,9 +1454,10 @@ def decide(
         Trigger names. ``floor-lower`` means a drop is missing its floor line,
         is larger than one percentage point without the one-time baseline
         exception, or sits below the measured coverage. ``exclude-attribute-added``
-        means ``ExcludeByAttribute`` gained a name; a reason does not clear it.
-        A general reason does not clear ``floor-lower``. Empty when the diff is
-        clean or authorized.
+        means         ``ExcludeByAttribute`` gained a name; a reason does not clear it.
+        ``coverage-gate-file`` means a gate script, coverage metadata, or a
+        coverage workflow step changed. A general reason does not clear
+        ``floor-lower``. Empty when the diff is clean or authorized.
 
     Raises:
         ValueError: Git or JSON cannot be read.
@@ -1145,6 +1476,8 @@ def decide(
         found.append("coverage-settings")
     if exclusion_token_added(source_diff(repo, base, paths)):
         found.append("exclusion-attribute")
+    if gate_file_changed(paths) or workflow_coverage_changed(repo, base):
+        found.append("coverage-gate-file")
     missing: list[str] = []
     if found and not valid_reason(body):
         missing.extend(found)

@@ -150,6 +150,7 @@ def expect(
     body: str,
     blocked: bool,
     base_ratchet: str = RATCHET,
+    base_extra: dict[str, str] | None = None,
 ) -> None:
     """Fail the process when a fixture does not match the expected gate.
 
@@ -159,6 +160,7 @@ def expect(
         body: Pull-request body.
         blocked: True when the check must return trigger names.
         base_ratchet: Ratchet JSON stored in the base commit.
+        base_extra: Extra files stored in the base commit before the head change.
 
     Returns:
         None.
@@ -169,7 +171,7 @@ def expect(
     Side effects:
         Writes a temporary git repository.
     """
-    repo, base = commit_tree(files, base_ratchet)
+    repo, base = commit_tree(files, base_ratchet, base_extra)
     missing = module.decide(repo, base, body)
     if blocked and not missing:
         raise SystemExit(f"{label} was allowed without a reason")
@@ -236,6 +238,7 @@ def main() -> None:
     expect_format_and_msbuild()
     expect_luecken_baseline()
     expect_exclude_attribute_additions()
+    expect_gate_files()
     print("coverage exception tests passed")
 
 
@@ -697,6 +700,88 @@ def expect_luecken_baseline() -> None:
             base_extra=base_with,
             measured=measured_ok,
         )
+    )
+
+
+def expect_gate_files() -> None:
+    """Gate files need a reason, and eng/ source tokens do not.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: A gate-file fixture has the wrong result.
+
+    Side effects:
+        Writes temporary git repositories.
+    """
+    token = "namespace Eng;\n[ExcludeFromCodeCoverage]\npublic class Skip {}\n"
+    expect("token under eng does not trigger", {"eng/NotMeasured.cs": token}, "", False)
+    expect(
+        "coverage gate script without reason",
+        {"eng/coverage-gate.py": "# changed gate\n"},
+        "",
+        True,
+    )
+    expect(
+        "coverage gate script with reason",
+        {"eng/coverage-gate.py": "# changed gate\n"},
+        REASON,
+        False,
+    )
+    expect(
+        "coverage metadata without reason",
+        {"eng/coverage-metadata/Tool.cs": "namespace Tool;\n"},
+        "",
+        True,
+    )
+    expect(
+        "coverage metadata with reason",
+        {"eng/coverage-metadata/Tool.cs": "namespace Tool;\n"},
+        REASON,
+        False,
+    )
+    expect(
+        "exception check test is not a gate file",
+        {"eng/test_coverage_exception_check.py": "# test only\n"},
+        "",
+        False,
+    )
+    workflow = (
+        "name: .NET\n"
+        "jobs:\n"
+        "  build:\n"
+        "    steps:\n"
+        "    - name: Test\n"
+        "      run: |\n"
+        "        echo setup\n"
+        "        dotnet test --settings coverage.runsettings\n"
+        "    - name: Smoke\n"
+        "      run: echo smoke\n"
+    )
+    expect(
+        "workflow coverage step without reason",
+        {".github/workflows/dotnet.yml": workflow.replace("echo setup", "echo setup-now")},
+        "",
+        True,
+        base_extra={".github/workflows/dotnet.yml": workflow},
+    )
+    expect(
+        "workflow coverage step with reason",
+        {".github/workflows/dotnet.yml": workflow.replace("echo setup", "echo setup-now")},
+        REASON,
+        False,
+        base_extra={".github/workflows/dotnet.yml": workflow},
+    )
+    expect(
+        "unrelated workflow step without reason",
+        {".github/workflows/dotnet.yml": workflow.replace("echo smoke", "echo smoke-now")},
+        "",
+        False,
+        base_extra={".github/workflows/dotnet.yml": workflow},
     )
 
 
