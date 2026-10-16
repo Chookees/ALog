@@ -91,6 +91,7 @@ jobs:
       env:
         GITHUB_TOKEN: ${{ github.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
       run: |
         args=(--cobertura-dir TestResults --ratchet eng/coverage-ratchet.json --summary "$GITHUB_STEP_SUMMARY")
         if [ -n "${COVERAGE_BASELINE}" ]; then

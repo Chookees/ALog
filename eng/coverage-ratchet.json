@@ -1,5 +1,5 @@
 {
-  "note": "Floors are the S4 CI measurement rounded down to a whole percent. That rounding is the only tolerance. A pull request may only raise them. linesTarget is strict greater-than and branchesTarget is greater-than-or-equal, and only when COVERAGE_ENFORCE=true. S4 leaves that switch false.",
+  "note": "Floors are the S4 CI measurement rounded down to a whole percent. That rounding is the only tolerance. A pull request may raise a floor freely. Lowering one metric by at most 1 percentage point needs a coverage-exception floor line naming package, metric, old, and new. linesTarget is strict greater-than and branchesTarget is greater-than-or-equal, and only when COVERAGE_ENFORCE=true. S4 leaves that switch false. On push to master the floor comparison is a warning.",
   "linesTarget": 90,
   "branchesTarget": 80,
   "packages": {

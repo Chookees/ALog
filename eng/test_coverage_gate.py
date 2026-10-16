@@ -388,42 +388,69 @@ class CoverageGateTests(unittest.TestCase):
             )
             self.assertEqual(code, 1)
 
-    def test_lowered_floor_passes_only_with_a_real_reason(self) -> None:
-        """A lower floor is allowed when the body has a real exception reason.
+    def test_lowered_floor_passes_only_with_a_matching_floor_line(self) -> None:
+        """A one-point drop passes only when the floor line names that drop.
 
-        A placeholder reason does not waive the lower. Raising stays allowed
-        with no reason, which the fixture test above already covers.
+        Two points, a missing line, a placeholder, a short reason, and the wrong
+        old or new value stay red on a pull request. The same gap on a push is
+        a warning and exits 0.
 
         Side effects:
-            Reads the ratchet and Cobertura fixtures.
+            Writes temporary ratchet files and reads one Cobertura fixture.
         """
         with tempfile.TemporaryDirectory() as raw:
-            source = Path(raw) / "src"
+            root = Path(raw)
+            source = root / "src"
             source.mkdir()
             write_cs(source / "Clean.cs", "class Clean {}\n")
-            args = [
+            baseline = root / "baseline.json"
+            one = root / "one.json"
+            two = root / "two.json"
+            baseline.write_text(ratchet_text(50, 40), encoding="utf-8")
+            one.write_text(ratchet_text(49, 40), encoding="utf-8")
+            two.write_text(ratchet_text(48, 40), encoding="utf-8")
+            summary = root / "summary.md"
+            one_args = gate_args(one, baseline, source, summary)
+            two_args = gate_args(two, baseline, source, summary)
+            match = "coverage-exception: floor ALog lines 50 -> 49: measured drop after the filter\n"
+            self.assertEqual(run_gate(one_args, match), 0)
+            self.assertEqual(run_gate(two_args, match.replace("49", "48")), 1)
+            self.assertEqual(run_gate(one_args, ""), 1)
+            self.assertEqual(
+                run_gate(one_args, "coverage-exception: SQL branches fell after the filter change.\n"),
+                1,
+            )
+            self.assertEqual(run_gate(one_args, "coverage-exception: <reason>\n"), 1)
+            self.assertEqual(run_gate(one_args, "coverage-exception: short\n"), 1)
+            wrong = "coverage-exception: floor ALog lines 50 -> 47: measured drop after the filter\n"
+            self.assertEqual(run_gate(one_args, wrong), 1)
+            code, text = run_gate_text(
+                one_args,
+                {"COVERAGE_ENFORCE": "false", "GITHUB_EVENT_NAME": "push", "PR_BODY": ""},
+            )
+            self.assertEqual(code, 0)
+            self.assertIn("::warning::", text)
+            self.assertIn("no matching coverage-exception floor line", text)
+            self.assertIn("Ratchet comparison (reported on push, not a failure):", summary.read_text(encoding="utf-8"))
+            high = root / "high.json"
+            high.write_text(ratchet_text(90, 80), encoding="utf-8")
+            high_args = [
                 "--cobertura",
                 str(DATA / "cobertura-assembly-name.xml"),
                 "--ratchet",
-                str(DATA / "ratchet-lowered.json"),
-                "--baseline",
-                str(DATA / "ratchet-baseline.json"),
+                str(high),
                 "--source-root",
                 str(source),
+                "--summary",
+                str(summary),
             ]
-            allowed = GATE.main(
-                args,
-                {
-                    "COVERAGE_ENFORCE": "false",
-                    "PR_BODY": "coverage-exception: SQL branches fell after the filter change.\n",
-                },
+            self.assertEqual(run_gate(high_args, ""), 1)
+            soft, soft_text = run_gate_text(
+                high_args,
+                {"COVERAGE_ENFORCE": "false", "GITHUB_EVENT_NAME": "push"},
             )
-            self.assertEqual(allowed, 0)
-            blocked = GATE.main(
-                args,
-                {"COVERAGE_ENFORCE": "false", "PR_BODY": "coverage-exception: <reason>\n"},
-            )
-            self.assertEqual(blocked, 1)
+            self.assertEqual(soft, 0)
+            self.assertIn("::warning::ALog lines 60.2 are below floor 90.0.", soft_text)
 
     def test_real_ratchet_file_has_both_packages_and_targets(self) -> None:
         """The committed ratchet parses and names the two shipped packages.
@@ -535,6 +562,114 @@ def ratchet_for(coverage: dict) -> object:
         for name, rates in coverage.items()
     }
     return GATE.Ratchet(Decimal("90"), Decimal("80"), packages)
+
+
+def ratchet_text(alog_lines: int, alog_branches: int) -> str:
+    """Build a two-package ratchet whose ALog floors are the given percents.
+
+    Args:
+        alog_lines: ALog line floor.
+        alog_branches: ALog branch floor.
+
+    Returns:
+        JSON text. Extensions stays above the Cobertura fixture.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return json.dumps(
+        {
+            "linesTarget": 90,
+            "branchesTarget": 80,
+            "packages": {
+                "ALog": {"lines": alog_lines, "branches": alog_branches},
+                "ALog.Extensions.Logging": {"lines": 60, "branches": 50},
+            },
+        }
+    )
+
+
+def gate_args(ratchet: Path, baseline: Path, source: Path, summary: Path) -> list[str]:
+    """Build a coverage-gate command for one ratchet pair.
+
+    Args:
+        ratchet: Candidate ratchet.
+        baseline: Base ratchet.
+        source: Directory with no exclusion attribute.
+        summary: Job-summary path.
+
+    Returns:
+        Arguments for ``GATE.main``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return [
+        "--cobertura",
+        str(DATA / "cobertura-assembly-name.xml"),
+        "--ratchet",
+        str(ratchet),
+        "--baseline",
+        str(baseline),
+        "--source-root",
+        str(source),
+        "--summary",
+        str(summary),
+    ]
+
+
+def run_gate(args: list[str], body: str) -> int:
+    """Run the gate as a pull request and return the exit code.
+
+    Args:
+        args: Command arguments.
+        body: Pull-request body.
+
+    Returns:
+        The process exit code.
+
+    Raises:
+        None.
+
+    Side effects:
+        Reads the files named in ``args`` and writes the summary.
+    """
+    code, _text = run_gate_text(
+        args,
+        {"COVERAGE_ENFORCE": "false", "GITHUB_EVENT_NAME": "pull_request", "PR_BODY": body},
+    )
+    return code
+
+
+def run_gate_text(args: list[str], env: dict[str, str]) -> tuple[int, str]:
+    """Run the gate and capture stdout.
+
+    Args:
+        args: Command arguments.
+        env: Environment passed to ``GATE.main``. Replaces the process environment.
+
+    Returns:
+        Exit code and stdout text.
+
+    Raises:
+        None.
+
+    Side effects:
+        Reads inputs and writes the summary file named in ``args``.
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    captured = io.StringIO()
+    with redirect_stdout(captured):
+        code = GATE.main(args, env)
+    return code, captured.getvalue()
 
 
 def write_cs(path: Path, text: str) -> None:

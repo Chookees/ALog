@@ -37,6 +37,15 @@ RATCHET = """{
 """
 RAISED = RATCHET.replace('"lines": 50', '"lines": 51', 1)
 LOWERED = RATCHET.replace('"lines": 50', '"lines": 49', 1)
+LOWERED_TWO = RATCHET.replace('"lines": 50', '"lines": 48', 1)
+LOWERED_BOTH = LOWERED.replace('"branches": 40', '"branches": 39', 1)
+FLOOR_ONE = "coverage-exception: floor ALog lines 50 -> 49: measured drop after the filter\n"
+FLOOR_WRONG = "coverage-exception: floor ALog lines 50 -> 48: measured drop after the filter\n"
+FLOOR_TWO = "coverage-exception: floor ALog lines 50 -> 48: measured drop after the filter\n"
+FLOOR_SHORT = "coverage-exception: floor ALog lines 50 -> 49: short\n"
+FLOOR_PLACEHOLDER = "coverage-exception: floor ALog lines 50 -> 49: <reason text that is long enough>\n"
+FLOOR_LINES = "coverage-exception: floor ALog lines 50 -> 49: line floor dropped by one point\n"
+FLOOR_BRANCHES = "coverage-exception: floor ALog branches 40 -> 39: branch floor dropped by one point\n"
 
 
 def git(repo: Path, *args: str) -> str:
@@ -169,7 +178,7 @@ def main() -> None:
     expect("pure raise without reason", {"eng/coverage-ratchet.json": RAISED}, "", False)
     expect("pure raise with reason", {"eng/coverage-ratchet.json": RAISED}, REASON, False)
     expect("lowered floor without reason", {"eng/coverage-ratchet.json": LOWERED}, "", True)
-    expect("lowered floor with reason", {"eng/coverage-ratchet.json": LOWERED}, REASON, False)
+    expect("lowered floor with only a general reason", {"eng/coverage-ratchet.json": LOWERED}, REASON, True)
     expect(
         "runsettings without reason",
         {"coverage.runsettings": "<RunSettings></RunSettings>\n"},
@@ -205,6 +214,7 @@ def main() -> None:
     expect("empty reason", {"coverage.runsettings": "<RunSettings></RunSettings>\n"}, empty, True)
     expect_bypasses()
     expect_reason_shapes()
+    expect_floor_policy()
     print("coverage exception tests passed")
 
 
@@ -270,7 +280,42 @@ def expect_reason_shapes() -> None:
     expect("reason hidden in html comment", trigger, hidden, True)
     visible = "<!-- coverage-exception: <reason> -->\ncoverage-exception: SQL coverage dropped with the new filter.\n"
     expect("reason outside html comment", trigger, visible, False)
+    expect("reason shorter than 10", trigger, "coverage-exception: 123456789\n", True)
+    expect("reason of 10 characters", trigger, "coverage-exception: 1234567890\n", False)
+    bracketed = "coverage-exception: this reason has a < bracket in it\n"
+    expect("angle bracket in a long reason", trigger, bracketed, True)
     test_fetch_uses_pulls_endpoint()
+
+
+def expect_floor_policy() -> None:
+    """A one-point drop is green only with an exact floor line.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: A one-point drop is rejected, or a two-point drop, a missing
+        line, or the wrong old and new values are accepted.
+
+    Side effects:
+        Writes temporary git repositories.
+    """
+    one = {"eng/coverage-ratchet.json": LOWERED}
+    two = {"eng/coverage-ratchet.json": LOWERED_TWO}
+    expect("lower by 1 point with floor line", one, FLOOR_ONE, False)
+    expect("lower by 2 points with floor line", two, FLOOR_TWO, True)
+    expect("lowered without the floor line", one, "", True)
+    expect("floor line with wrong old and new", one, FLOOR_WRONG, True)
+    expect("floor line reason too short", one, FLOOR_SHORT, True)
+    expect("floor line placeholder", one, FLOOR_PLACEHOLDER, True)
+    both = {"eng/coverage-ratchet.json": LOWERED_BOTH}
+    expect("one of two metrics named", both, FLOOR_LINES, True)
+    expect("each lowered metric named", both, FLOOR_LINES + FLOOR_BRANCHES, False)
+    settings = {"coverage.runsettings": "<RunSettings></RunSettings>\n"}
+    expect("runsettings with only a floor line", settings, FLOOR_ONE, True)
 
 
 def test_fetch_uses_pulls_endpoint() -> None:

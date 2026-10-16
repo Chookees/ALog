@@ -177,6 +177,11 @@ if ! grep -F -q 'eng/coverage-exception-check.py' "$workflow"; then
 else
   pass "coverage exception check"
 fi
+if ! grep -F -q 'GITHUB_EVENT_NAME: ${{ github.event_name }}' "$workflow"; then
+  fail "coverage gate event name missing"
+else
+  pass "coverage gate reads the event name"
+fi
 if ! grep -F -q '/eng/consumer-smoke/console' .github/dependabot.yml; then
   fail "dependabot consumer directory missing"
 else

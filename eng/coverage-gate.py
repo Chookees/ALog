@@ -6,8 +6,10 @@ in ``.dll`` are normalized, line and branch percents are compared with
 ``eng/coverage-ratchet.json``, and every ``[ExcludeFromCodeCoverage]`` in the
 library sources needs ``// Coverage-Ausnahme: <reason>`` on the line above it.
 ``COVERAGE_ENFORCE=true`` also applies the targets (lines > 90, branches >= 80).
-S4 leaves that switch false. Allocation is deliberate: the script runs once per
-job and exits. Next file: ``eng/coverage-ratchet.json``.
+S4 leaves that switch false. Floor versus measured, and floor versus the base
+ratchet, fail the job only on a pull request. A push writes those gaps to the
+job summary and emits ``::warning::`` without failing. Allocation is deliberate:
+the script runs once per job and exits. Next file: ``eng/coverage-ratchet.json``.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ import os
 import re
 import sys
 import xml.etree.ElementTree as ElementTree
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Mapping
@@ -69,10 +71,11 @@ class ScanLimits:
 
 @dataclass(frozen=True)
 class GateResult:
-    """Text for the job summary and the problems that make the gate red."""
+    """Text for the job summary, hard failures, and push-only ratchet warnings."""
 
     summary: str
     problems: list[str]
+    warnings: list[str] = field(default_factory=list)
 
 
 def normalize_package_name(name: str) -> str:
@@ -909,8 +912,9 @@ def evaluate_gate(
         source_roots: Library directories for the exclusion comment check.
 
     Returns:
-        Summary text and the combined problem list. The summary is produced even
-        when the list is not empty, so a red job still shows the numbers.
+        Summary text and the problem list for targets, enforcement, and comments.
+        Floor versus measured, and floor versus the base ratchet, are applied
+        by the caller so a push to master can report them without failing.
 
     Raises:
         ValueError: The source walk hits a cap or a root is missing.
@@ -922,7 +926,6 @@ def evaluate_gate(
     problems.extend(target_problems(ratchet))
     if baseline is not None:
         problems.extend(target_problems(baseline))
-    problems.extend(floor_problems(coverage, ratchet))
     problems.extend(enforce_problems(coverage, ratchet, enforce))
     problems.extend(scan_exemptions(source_roots))
     summary = format_summary(coverage, ratchet, enforce, problems)
@@ -1018,15 +1021,16 @@ def load_exception_check():
     return module
 
 
-def floor_lower_is_allowed(env: Mapping[str, str]) -> bool:
-    """Return whether a valid coverage-exception reason waives a lowered floor.
+def load_pull_request_body(env: Mapping[str, str]) -> str:
+    """Read the pull-request body from the API or from ``PR_BODY``.
 
     Args:
-        env: Environment. A GitHub token and pull-request number select the API.
-        Otherwise ``PR_BODY`` is used. A fetch error does not waive the lower.
+        env: Environment. A GitHub token, repository, and pull-request number
+        select the API. Otherwise ``PR_BODY`` is used. A fetch error yields an
+        empty body, which does not authorize a drop.
 
     Returns:
-        True only for a non-empty, non-placeholder reason.
+        Body text, or an empty string when it cannot be read.
 
     Raises:
         None.
@@ -1037,24 +1041,22 @@ def floor_lower_is_allowed(env: Mapping[str, str]) -> bool:
     try:
         module = load_exception_check()
         if env.get("GITHUB_TOKEN") and env.get("PR_NUMBER") and env.get("GITHUB_REPOSITORY"):
-            body = module.fetch_pull_request_body(env)
-        else:
-            body = env.get("PR_BODY", "")
-        return bool(module.valid_reason(body))
+            return str(module.fetch_pull_request_body(env))
+        return env.get("PR_BODY", "")
     except (OSError, ValueError, RuntimeError, json.JSONDecodeError):
-        return False
+        return ""
 
 
-def merge_lowering(problems: list[str], extra: list[str], allowed: bool) -> list[str]:
-    """Append lowering problems unless a valid exception reason waives them.
+def comparison_is_hard(env: Mapping[str, str]) -> bool:
+    """Return whether floor comparisons fail the job.
 
     Args:
-        problems: Failures already found by the other checks.
-        extra: Problems from ``lowering_problems``. Empty leaves the list as it is.
-        allowed: True when the pull-request body has a real reason.
+        env: Process environment. ``GITHUB_EVENT_NAME`` is ``pull_request`` or
+        ``push`` in GitHub Actions. A missing value is treated as a pull request
+        so a local run stays strict.
 
     Returns:
-        The combined problem list. Raising produces an empty ``extra``.
+        True only for a pull request. A push to master reports and does not fail.
 
     Raises:
         None.
@@ -1062,9 +1064,165 @@ def merge_lowering(problems: list[str], extra: list[str], allowed: bool) -> list
     Side effects:
         None.
     """
-    if not extra or allowed:
-        return problems
-    return [*problems, *extra]
+    return env.get("GITHUB_EVENT_NAME", "pull_request") == "pull_request"
+
+
+def lowered_metrics(
+    baseline: Ratchet, candidate: Ratchet
+) -> list[tuple[str, str, Decimal, Decimal]]:
+    """List package metrics whose floor went down.
+
+    Args:
+        baseline: Floors on the base branch.
+        candidate: Floors in this commit.
+
+    Returns:
+        ``(package, metric, old, new)`` for each drop. At most 40.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    names = sorted(set(baseline.packages) & set(candidate.packages))
+    if len(names) > 40:
+        names = names[:40]
+    found: list[tuple[str, str, Decimal, Decimal]] = []
+    for name in names:
+        old = baseline.packages[name]
+        new = candidate.packages[name]
+        if new.lines < old.lines:
+            found.append((name, "lines", old.lines, new.lines))
+        if new.branches < old.branches:
+            found.append((name, "branches", old.branches, new.branches))
+    return found
+
+
+def baseline_drop_problems(
+    baseline: Ratchet | None, candidate: Ratchet, env: Mapping[str, str]
+) -> list[str]:
+    """Return removals and drops the pull-request body does not authorize.
+
+    Args:
+        baseline: Base ratchet. ``None`` means there is nothing to lower.
+        candidate: This commit's ratchet.
+        env: Body source. A general ``coverage-exception:`` line does not
+        authorize a drop; each metric needs its own floor line.
+
+    Returns:
+        Problem strings. A drop of at most one percentage point with a matching
+        floor line is omitted. Removing a package is always listed.
+
+    Raises:
+        None.
+
+    Side effects:
+        May send one HTTPS GET.
+    """
+    if baseline is None:
+        return []
+    removed = lowering_problems(baseline, candidate)
+    problems = [item for item in removed if "removed the floor" in item]
+    module = load_exception_check()
+    body = load_pull_request_body(env)
+    problems.extend(module.unauthorized_drops(lowered_metrics(baseline, candidate), body))
+    return problems
+
+
+def collect_ratchet_comparison(
+    coverage: dict[str, PackageRates],
+    ratchet: Ratchet,
+    baseline: Ratchet | None,
+    env: Mapping[str, str],
+) -> list[str]:
+    """Compare floors with the measurement and with the base ratchet.
+
+    Args:
+        coverage: Measured percents.
+        ratchet: Floors in this commit.
+        baseline: Floors on the base branch. ``None`` skips that half.
+        env: Body source for an authorized one-point drop.
+
+    Returns:
+        Problem strings. An authorized drop is not included.
+
+    Raises:
+        None.
+
+    Side effects:
+        May send one HTTPS GET.
+    """
+    problems = floor_problems(coverage, ratchet)
+    problems.extend(baseline_drop_problems(baseline, ratchet, env))
+    return problems
+
+
+def append_ratchet_report(summary: str, problems: list[str]) -> str:
+    """Add the push report under the coverage table.
+
+    Args:
+        summary: Summary that already ends with a newline.
+        problems: Floor and baseline gaps. Empty returns the summary unchanged.
+
+    Returns:
+        Summary plus a report section. This section is not a failure heading.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if not problems:
+        return summary
+    lines = [summary.rstrip("\n"), "", "Ratchet comparison (reported on push, not a failure):"]
+    seen = 0
+    for problem in problems:
+        seen += 1
+        if seen > 80:
+            lines.append("- further ratchet gaps were omitted")
+            break
+        lines.append(f"- {problem}")
+    return "\n".join(lines) + "\n"
+
+
+def apply_ratchet_comparison(
+    result: GateResult,
+    comparison: list[str],
+    hard: bool,
+    failure_summary: str,
+) -> GateResult:
+    """Keep ratchet gaps as failures or as a push report.
+
+    Args:
+        result: Checks other than the ratchet comparison.
+        comparison: Floor versus measured, and floor versus base.
+        hard: True on a pull request.
+        failure_summary: Summary that already lists the gaps as failures.
+
+    Returns:
+        A failing result, or the original failures plus warning text.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if not comparison:
+        return result
+    if hard:
+        return GateResult(
+            summary=failure_summary,
+            problems=[*result.problems, *comparison],
+            warnings=[],
+        )
+    return GateResult(
+        summary=append_ratchet_report(result.summary, comparison),
+        problems=list(result.problems),
+        warnings=list(comparison),
+    )
 
 
 def run_gate(args: argparse.Namespace, env: Mapping[str, str]) -> GateResult:
@@ -1072,16 +1230,18 @@ def run_gate(args: argparse.Namespace, env: Mapping[str, str]) -> GateResult:
 
     Args:
         args: Parsed command line.
-        env: Environment used for ``COVERAGE_ENFORCE``.
+        env: Environment used for ``COVERAGE_ENFORCE`` and ``GITHUB_EVENT_NAME``.
 
     Returns:
-        The gate result. Callers write the summary and choose the exit code.
+        The gate result. On a push, ratchet gaps are warnings. Callers write
+        the summary and choose the exit code.
 
     Raises:
         ValueError: An input is missing or inconsistent.
 
     Side effects:
-        Reads Cobertura, ratchet, optional baseline, and source files.
+        Reads Cobertura, ratchet, optional baseline, and source files. May GET
+        the pull-request body.
     """
     paths = collect_cobertura(list(args.cobertura), list(args.cobertura_dir))
     coverage = load_cobertura(paths)
@@ -1097,17 +1257,9 @@ def run_gate(args: argparse.Namespace, env: Mapping[str, str]) -> GateResult:
         enforce,
         resolve_source_roots(args.source_root),
     )
-    problems = merge_lowering(
-        result.problems,
-        lowering_problems(baseline, ratchet),
-        floor_lower_is_allowed(env),
-    )
-    if problems == result.problems:
-        return result
-    return GateResult(
-        summary=format_summary(coverage, ratchet, enforce, problems),
-        problems=problems,
-    )
+    comparison = collect_ratchet_comparison(coverage, ratchet, baseline, env)
+    failure = format_summary(coverage, ratchet, enforce, [*result.problems, *comparison])
+    return apply_ratchet_comparison(result, comparison, comparison_is_hard(env), failure)
 
 
 def main(argv: list[str], env: Mapping[str, str] | None = None) -> int:
@@ -1126,7 +1278,7 @@ def main(argv: list[str], env: Mapping[str, str] | None = None) -> int:
 
     Side effects:
         Writes the summary to stdout and, when requested, to the summary file.
-        Problems also go to stderr.
+        Push ratchet gaps are ``::warning::`` lines. Failures also go to stderr.
     """
     args = parse_args(argv)
     environment = os.environ if env is None else env
@@ -1139,6 +1291,12 @@ def main(argv: list[str], env: Mapping[str, str] | None = None) -> int:
         return 2
     print(result.summary, end="")
     write_summary(args.summary or None, result.summary)
+    seen = 0
+    for warning in result.warnings:
+        seen += 1
+        if seen > 80:
+            break
+        print(f"::warning::{warning}")
     if result.problems:
         for problem in result.problems:
             print(problem, file=sys.stderr)

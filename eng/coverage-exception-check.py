@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Require ``coverage-exception: <reason>`` when a PR changes coverage policy.
+"""Require a coverage-exception line when a PR changes coverage policy.
 
-Raising ratchet floors needs no reason. Lowering a floor, any other ratchet
-edit, and any change to ``coverage.runsettings`` or ``coverage.config`` need a
-real reason. Added or changed lines in ``*.cs``, ``*.props``, and ``*.targets``
-that contain the tokens ``ExcludeFromCodeCoverage``, ``GeneratedCode``, or
-``CompilerGenerated`` need one too, including comments, aliases, and qualifiers.
+Raising ratchet floors needs no reason. Each lowered metric needs its own
+``coverage-exception: floor <package> <lines|branches> <old> -> <new>: <reason>``
+line, and the drop may be at most one percentage point. Any other ratchet edit,
+and any change to ``coverage.runsettings`` or ``coverage.config``, needs a
+general reason of at least 10 characters with no ``<`` or ``>``. Added or
+changed lines in ``*.cs``, ``*.props``, and ``*.targets`` that contain the
+tokens ``ExcludeFromCodeCoverage``, ``GeneratedCode``, or ``CompilerGenerated``
+need that general reason too, including comments, aliases, and qualifiers.
 In CI the body is read from the pulls API, not from the event payload.
 """
 
@@ -29,7 +32,13 @@ TOKEN_RE = re.compile(
     "(?<![A-Za-z0-9_])(?:" + "|".join(EXCLUSION_TOKENS) + ")(?:Attribute)?(?![A-Za-z0-9_])"
 )
 HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-PLACEHOLDER = re.compile(r"<[^>\n]*>")
+FLOOR_LINE = re.compile(
+    r"^coverage-exception:\s*floor\s+(\S+)\s+(lines|branches)\s+"
+    r"([0-9]+(?:\.[0-9]+)?)\s+->\s+([0-9]+(?:\.[0-9]+)?)\s*:\s*(.*)$"
+)
+MIN_REASON_LENGTH = 10
+MAX_FLOOR_DROP = Decimal("1")
+MAX_LISTED = 40
 MAX_DIFF_CHARS = 2_000_000
 MAX_DIFF_LINES = 20_000
 MAX_SOURCE_FILES = 500
@@ -56,15 +65,37 @@ def strip_html_comments(body: str) -> str:
     return HTML_COMMENT.sub("", body)
 
 
+def usable_reason(text: str) -> bool:
+    """Return whether a reason is long enough and has no angle brackets.
+
+    Args:
+        text: Reason text already stripped of surrounding space.
+
+    Returns:
+        True when the text has at least 10 characters and contains neither
+        ``<`` nor ``>``. A placeholder such as ``<reason>`` fails both ways.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if "<" in text or ">" in text:
+        return False
+    return len(text) >= MIN_REASON_LENGTH
+
+
 def valid_reason(body: str) -> bool:
-    """Return whether the body has a usable coverage-exception reason.
+    """Return whether the body has a usable general coverage-exception reason.
 
     Args:
         body: Pull-request text, including any HTML comments.
 
     Returns:
         True when a line starts with ``coverage-exception:`` and the text after
-        it is non-empty and not a single placeholder such as ``<reason>``.
+        it has at least 10 characters and no angle brackets. A floor line is
+        not a general reason.
 
     Raises:
         ValueError: The body is larger than 1000000 characters.
@@ -78,13 +109,46 @@ def valid_reason(body: str) -> bool:
         seen += 1
         if seen > 5000:
             return False
-        if not line.startswith("coverage-exception:"):
+        stripped = line.strip()
+        if FLOOR_LINE.match(stripped) is not None:
             continue
-        reason = line.split(":", 1)[1].strip()
-        if not reason or PLACEHOLDER.fullmatch(reason):
+        if not stripped.startswith("coverage-exception:"):
             continue
-        return True
+        if usable_reason(stripped.split(":", 1)[1].strip()):
+            return True
     return False
+
+
+def parse_floor_lines(body: str) -> list[tuple[str, str, Decimal, Decimal]]:
+    """Read floor lines whose reason is usable.
+
+    Args:
+        body: Pull-request text. HTML comments are removed first.
+
+    Returns:
+        ``(package, metric, old, new)`` for each matching line. At most 40.
+        A short reason or a reason that contains ``<`` or ``>`` drops the line.
+
+    Raises:
+        ValueError: The body is larger than 1000000 characters.
+
+    Side effects:
+        None.
+    """
+    text = strip_html_comments(body)
+    found: list[tuple[str, str, Decimal, Decimal]] = []
+    seen = 0
+    for line in text.splitlines():
+        seen += 1
+        if seen > 5000 or len(found) >= MAX_LISTED:
+            break
+        match = FLOOR_LINE.match(line.strip())
+        if match is None or not usable_reason(match.group(5).strip()):
+            continue
+        found.append(
+            (match.group(1), match.group(2), Decimal(match.group(3)), Decimal(match.group(4)))
+        )
+    return found
 
 
 def load_ratchet_text(text: str) -> tuple[Decimal, Decimal, dict[str, tuple[Decimal, Decimal]]]:
@@ -261,23 +325,22 @@ def source_diff(repo: Path, base: str, paths: list[str]) -> str:
     return git_output(repo, ["diff", "-U0", base, "--", *selected])
 
 
-def ratchet_needs_reason(repo: Path, base: str) -> bool:
-    """Return whether the ratchet diff is something other than a pure raise.
+def show_base_ratchet(repo: Path, base: str) -> str | None:
+    """Return the ratchet file at the base ref, or None when it is absent.
 
     Args:
         repo: Repository root.
         base: Git ref that may or may not contain the ratchet file.
 
     Returns:
-        True when the file changed and the change is not only higher floors.
+        File text. None when git cannot show that path.
 
     Raises:
-        ValueError: The candidate file is not a ratchet, or git fails.
+        None.
 
     Side effects:
-        Reads git and the working tree file.
+        Reads git.
     """
-    candidate = load_ratchet_text((repo / RATCHET).read_text(encoding="utf-8"))
     show = subprocess.run(
         ["git", "-C", str(repo), "show", f"{base}:{RATCHET}"],
         check=False,
@@ -285,40 +348,151 @@ def ratchet_needs_reason(repo: Path, base: str) -> bool:
         text=True,
     )
     if show.returncode != 0:
-        return True
-    baseline = load_ratchet_text(show.stdout)
-    return not is_pure_raise(baseline, candidate)
+        return None
+    return show.stdout
 
 
-def triggers(repo: Path, base: str) -> list[str]:
-    """Collect the coverage-policy changes that need a reason.
+def lowered_metrics(
+    baseline: tuple[Decimal, Decimal, dict[str, tuple[Decimal, Decimal]]],
+    candidate: tuple[Decimal, Decimal, dict[str, tuple[Decimal, Decimal]]],
+) -> list[tuple[str, str, Decimal, Decimal]]:
+    """List package metrics whose floor went down.
 
     Args:
-        repo: Repository root.
-        base: Git ref to diff against.
+        baseline: Targets and floors on the base ref.
+        candidate: Targets and floors in the working tree.
 
     Returns:
-        Short trigger names. Empty when the diff needs no exception line.
+        ``(package, metric, old, new)`` for each drop. At most 40 metrics.
 
     Raises:
-        ValueError: Git or the ratchet JSON cannot be read.
+        None.
 
     Side effects:
-        Reads git and the working tree.
+        None.
     """
-    paths = changed_paths(repo, base)
-    found: list[str] = []
-    if RATCHET in paths and ratchet_needs_reason(repo, base):
-        found.append("coverage-ratchet")
-    if any(path in paths for path in POLICY_FILES):
-        found.append("coverage-settings")
-    if exclusion_token_added(source_diff(repo, base, paths)):
-        found.append("exclusion-attribute")
+    names = sorted(set(baseline[2]) & set(candidate[2]))
+    if len(names) > MAX_LISTED:
+        names = names[:MAX_LISTED]
+    found: list[tuple[str, str, Decimal, Decimal]] = []
+    for name in names:
+        old = baseline[2][name]
+        new = candidate[2][name]
+        if new[0] < old[0]:
+            found.append((name, "lines", old[0], new[0]))
+        if new[1] < old[1]:
+            found.append((name, "branches", old[1], new[1]))
     return found
 
 
+def ratchet_parts(
+    repo: Path, base: str
+) -> tuple[bool, list[tuple[str, str, Decimal, Decimal]]]:
+    """Split a ratchet diff into a general-reason flag and the lowered metrics.
+
+    Args:
+        repo: Repository root.
+        base: Git ref to compare.
+
+    Returns:
+        Whether something other than a pure raise or a plain floor drop needs
+        a general reason, and the lowered metrics. A new file needs a general
+        reason and has no old values to name.
+
+    Raises:
+        ValueError: A ratchet file is not valid JSON.
+
+    Side effects:
+        Reads git and the working tree file.
+    """
+    candidate = load_ratchet_text((repo / RATCHET).read_text(encoding="utf-8"))
+    shown = show_base_ratchet(repo, base)
+    if shown is None:
+        return True, []
+    baseline = load_ratchet_text(shown)
+    if is_pure_raise(baseline, candidate):
+        return False, []
+    lowered = lowered_metrics(baseline, candidate)
+    same_targets = baseline[0] == candidate[0] and baseline[1] == candidate[1]
+    same_packages = set(baseline[2]) == set(candidate[2])
+    if same_targets and same_packages and lowered:
+        return False, lowered
+    return True, lowered
+
+
+def drop_is_listed(
+    drop: tuple[str, str, Decimal, Decimal],
+    lines: list[tuple[str, str, Decimal, Decimal]],
+) -> bool:
+    """Return whether one drop has a floor line with the same package and numbers.
+
+    Args:
+        drop: ``(package, metric, old, new)`` from the ratchet diff.
+        lines: Parsed floor lines. At most 40 are inspected.
+
+    Returns:
+        True when package, metric, old, and new all match. Numeric equality
+        treats ``50`` and ``50.0`` as the same floor.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    seen = 0
+    for line in lines:
+        seen += 1
+        if seen > MAX_LISTED:
+            return False
+        if line[0] == drop[0] and line[1] == drop[1] and line[2] == drop[2] and line[3] == drop[3]:
+            return True
+    return False
+
+
+def unauthorized_drops(
+    lowered: list[tuple[str, str, Decimal, Decimal]],
+    body: str,
+) -> list[str]:
+    """Return drops that are larger than one point or lack a matching floor line.
+
+    Args:
+        lowered: Metrics that went down. Each entry is package, metric, old, new.
+        body: Pull-request text.
+
+    Returns:
+        One problem per drop that this body does not authorize. Empty when
+        every drop is at most one percentage point and named exactly.
+
+    Raises:
+        ValueError: The body is larger than 1000000 characters.
+
+    Side effects:
+        None.
+    """
+    lines = parse_floor_lines(body)
+    problems: list[str] = []
+    seen = 0
+    for drop in lowered:
+        seen += 1
+        if seen > MAX_LISTED:
+            problems.append("More than 40 lowered floors.")
+            break
+        package, metric, old, new = drop
+        if old - new > MAX_FLOOR_DROP:
+            problems.append(
+                f"{package} {metric} drop {old} -> {new} exceeds 1 percentage point."
+            )
+            continue
+        if not drop_is_listed(drop, lines):
+            problems.append(
+                f"{package} {metric} {old} -> {new} has no matching coverage-exception floor line."
+            )
+    return problems
+
+
 def decide(repo: Path, base: str, body: str) -> list[str]:
-    """Return trigger names that are missing a reason line.
+    """Return policy changes that are still missing their exception line.
 
     Args:
         repo: Repository root.
@@ -326,8 +500,9 @@ def decide(repo: Path, base: str, body: str) -> list[str]:
         body: Pull-request body.
 
     Returns:
-        Triggers that still need ``coverage-exception:``. Empty when the diff
-        is clean, is a pure floor raise, or the body carries a reason.
+        Trigger names. ``floor-lower`` means a drop is missing its floor line
+        or is larger than one percentage point. A general reason does not
+        clear ``floor-lower``. Empty when the diff is clean or authorized.
 
     Raises:
         ValueError: Git or JSON cannot be read.
@@ -335,10 +510,23 @@ def decide(repo: Path, base: str, body: str) -> list[str]:
     Side effects:
         Reads git and the working tree.
     """
-    found = triggers(repo, base)
-    if not found or valid_reason(body):
-        return []
-    return found
+    paths = changed_paths(repo, base)
+    found: list[str] = []
+    lowered: list[tuple[str, str, Decimal, Decimal]] = []
+    if RATCHET in paths:
+        needs_reason, lowered = ratchet_parts(repo, base)
+        if needs_reason:
+            found.append("coverage-ratchet")
+    if any(path in paths for path in POLICY_FILES):
+        found.append("coverage-settings")
+    if exclusion_token_added(source_diff(repo, base, paths)):
+        found.append("exclusion-attribute")
+    missing: list[str] = []
+    if found and not valid_reason(body):
+        missing.extend(found)
+    if unauthorized_drops(lowered, body):
+        missing.append("floor-lower")
+    return missing
 
 
 def fetch_pull_request_body(env: Mapping[str, str] | None = None) -> str:
@@ -412,6 +600,38 @@ def load_body(env: Mapping[str, str] | None = None) -> str:
     return source.get("PR_BODY", "")
 
 
+def format_failure(missing: list[str]) -> str:
+    """Describe which exception lines are still missing.
+
+    Args:
+        missing: Trigger names from ``decide``. ``floor-lower`` is special.
+
+    Returns:
+        A multi-line message for stderr. Empty when nothing is missing.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    lines: list[str] = []
+    if "floor-lower" in missing:
+        lines.append(
+            "Each lowered floor needs `coverage-exception: floor <package> "
+            "<lines|branches> <old> -> <new>: <reason>`, and the drop must be "
+            "at most 1 percentage point.\n"
+        )
+    others = [item for item in missing if item != "floor-lower"]
+    if others:
+        lines.append(
+            "PR changes coverage policy (" + ", ".join(others) + ") without a "
+            "`coverage-exception:` reason of at least 10 characters and no "
+            "angle brackets.\n"
+        )
+    return "".join(lines)
+
+
 def main(argv: list[str]) -> int:
     """Diff the repo against a base ref and require a reason when needed.
 
@@ -454,10 +674,7 @@ def main(argv: list[str]) -> int:
         sys.stderr.write(f"coverage exception check failed: {exc}\n")
         return 1
     if missing:
-        sys.stderr.write(
-            "PR changes coverage policy (" + ", ".join(missing) + ") "
-            "without a line `coverage-exception: <reason>` in the pull request body.\n"
-        )
+        sys.stderr.write(format_failure(missing))
         return 1
     sys.stdout.write("coverage exception check passed\n")
     return 0
