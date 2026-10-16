@@ -18,6 +18,11 @@ Mapping used by these fixtures:
 A lambda, an async method, and a hand-written ``CompilerGenerated`` attribute
 stay off the metadata list. Removing an attribute stays green. A missing or
 unreadable assembly fails the check instead of being skipped.
+
+Assembly and module custom attributes are listed too. ``ExcludeFromCodeCoverage``
+is not legal C# on a module (CS0592), so that module attribute is emitted with
+``PersistedAssemblyBuilder``. Each new assembly or module line is red without a
+coverage-exception reason and green with one.
 """
 
 from __future__ import annotations
@@ -435,8 +440,236 @@ def run_fixtures(work: Path) -> None:
     if module.metadata_requires_reason(new_lines, REASON):
         raise SystemExit("the combined metadata diff was blocked with a reason")
     print("ok all new entries allowed with a reason")
+    assert_scope_attributes(work)
     assert_clean_shapes(work)
     assert_unreadable(work)
+
+
+def named_line(assembly: str, kind: str, member: str, attribute: str) -> str:
+    """Build one expected metadata line for a named assembly.
+
+    Args:
+        assembly: Simple assembly name.
+        kind: ``assembly``, ``module``, ``type``, ``method``, ``property``, ``event``, or ``field``.
+        member: Resolved member name. For an assembly attribute this is the assembly name.
+        attribute: Resolved attribute type name.
+
+    Returns:
+        The tab-separated line the tool must print.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return f"{assembly}\t{kind}\t{member}\t{attribute}"
+
+
+def scope_source() -> str:
+    """Return C# with assembly attributes and a module ``GeneratedCode`` attribute.
+
+    Args:
+        None.
+
+    Returns:
+        Source that the C# compiler accepts. A module ``ExcludeFromCodeCoverage``
+        attribute is not included because the compiler rejects it with CS0592.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        "[assembly: System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]\n"
+        "[assembly: System.CodeDom.Compiler.GeneratedCode(\"fixture\", \"1\")]\n"
+        "[module: System.CodeDom.Compiler.GeneratedCode(\"fixture\", \"1\")]\n"
+        "public class Anchor {}\n"
+    )
+
+
+def emit_project() -> str:
+    """Return the project that emits a module-level exclusion attribute.
+
+    Args:
+        None.
+
+    Returns:
+        Project XML for an executable named ``EmitScope``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup>"
+        "<TargetFramework>net10.0</TargetFramework>"
+        "<OutputType>Exe</OutputType>"
+        "<ImplicitUsings>enable</ImplicitUsings>"
+        "<Nullable>enable</Nullable>"
+        "<AssemblyName>EmitScope</AssemblyName>"
+        "<IsPackable>false</IsPackable>"
+        "</PropertyGroup></Project>\n"
+    )
+
+
+def emit_source() -> str:
+    """Return the program that writes ``ScopeIl.dll`` with a module attribute.
+
+    Args:
+        None.
+
+    Returns:
+        C# for ``PersistedAssemblyBuilder``. The attribute cannot be written
+        in ordinary C# because its targets omit modules.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        "using System.Diagnostics.CodeAnalysis;\n"
+        "using System.Reflection;\n"
+        "using System.Reflection.Emit;\n"
+        "if (args.Length != 1 || args[0].Length == 0 || args[0].Length > 500)\n"
+        "{\n"
+        "    throw new InvalidOperationException(\"emit path is missing.\");\n"
+        "}\n"
+        "var builder = new PersistedAssemblyBuilder(new AssemblyName(\"ScopeIl\"), typeof(object).Assembly);\n"
+        "var module = builder.DefineDynamicModule(\"ScopeIl.dll\");\n"
+        "var ctor = typeof(ExcludeFromCodeCoverageAttribute).GetConstructor(System.Type.EmptyTypes);\n"
+        "if (ctor is null)\n"
+        "{\n"
+        "    throw new InvalidOperationException(\"attribute constructor is missing.\");\n"
+        "}\n"
+        "module.SetCustomAttribute(new CustomAttributeBuilder(ctor, System.Array.Empty<object>()));\n"
+        "module.DefineType(\"Anchor\", TypeAttributes.Public).CreateType();\n"
+        "builder.Save(args[0]);\n"
+    )
+
+
+def assert_scope_attributes(work: Path) -> None:
+    """Require assembly and module attributes to follow the reason rule.
+
+    Args:
+        work: Temporary directory that can hold three more projects.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: A scope attribute is missing, allowed without a reason, or
+            rejected when a reason is present.
+        ValueError: An assembly cannot be read.
+
+    Side effects:
+        Writes build output under ``work``.
+    """
+    assert_csharp_scope(work)
+    assert_emitted_module(work)
+
+
+def assert_csharp_scope(work: Path) -> None:
+    """Check the two assembly attributes and the module ``GeneratedCode`` attribute.
+
+    Args:
+        work: Temporary directory.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: One of the three lines is missing or the reason rule fails.
+        ValueError: An assembly cannot be read.
+
+    Side effects:
+        Compiles two projects under ``work``.
+    """
+    dll = build_fixture_source(work / "scope", "Scope", scope_source())
+    empty = build_fixture_source(work / "scope-empty", "Empty", "public class Empty {}\n")
+    new_lines = module.entries_new_in_head(
+        module.read_metadata_lines(REPO, [empty]),
+        module.read_metadata_lines(REPO, [dll]),
+    )
+    expected = (
+        ("assembly ExcludeFromCodeCoverage", named_line("Scope", "assembly", "Scope", ATTRIBUTE)),
+        ("assembly GeneratedCode", named_line("Scope", "assembly", "Scope", GENERATED)),
+        ("module GeneratedCode", named_line("Scope", "module", "Scope.dll", GENERATED)),
+    )
+    require_lines("scope", expected, new_lines)
+
+
+def assert_emitted_module(work: Path) -> None:
+    """Check a module ``ExcludeFromCodeCoverage`` attribute written by Reflection.Emit.
+
+    Args:
+        work: Temporary directory.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: The emitter fails or the module line does not follow the reason rule.
+        ValueError: The emitted assembly cannot be read.
+
+    Side effects:
+        Compiles the emitter and writes ``ScopeIl.dll`` under ``work``.
+    """
+    root = work / "emit"
+    write_project(root, "EmitScope", {"Program.cs": emit_source()}, emit_project())
+    emitter = build_fixture(root)
+    emitted = work / "ScopeIl.dll"
+    completed = run(["dotnet", "exec", str(emitter), str(emitted)], root)
+    if completed.returncode != 0:
+        raise SystemExit(completed.stdout + completed.stderr)
+    lines = module.read_metadata_lines(REPO, [emitted])
+    expected = (
+        (
+            "module ExcludeFromCodeCoverage",
+            named_line(
+                "ScopeIl",
+                "module",
+                "ScopeIl.dll",
+                ATTRIBUTE,
+            ),
+        ),
+    )
+    require_lines("emitted module", expected, lines)
+
+
+def require_lines(label: str, expected: tuple[tuple[str, str], ...], new_lines: list[str]) -> None:
+    """Require every expected line to be present and to need a reason.
+
+    Args:
+        label: Fixture group printed when a line is missing.
+        expected: Pairs of display name and metadata line. At most 8.
+        new_lines: Lines that are new versus the base assembly.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: A line is missing or the reason rule does not hold.
+
+    Side effects:
+        Prints one success line per expected entry.
+    """
+    if len(expected) > 8:
+        raise SystemExit("scope fixture expects more than 8 lines")
+    missing = [name for name, entry in expected if entry not in new_lines]
+    if missing:
+        raise SystemExit(label + " metadata list is missing: " + ", ".join(missing) + "\n" + "\n".join(new_lines))
+    index = 0
+    while index < len(expected) and index < 8:
+        name, entry = expected[index]
+        expect_blocks(name, entry)
+        index += 1
 
 
 def build_fixture_source(root: Path, assembly: str, source: str) -> Path:

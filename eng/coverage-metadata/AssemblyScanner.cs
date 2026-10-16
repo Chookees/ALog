@@ -46,7 +46,7 @@ internal static class AssemblyScanner
     /// <param name="path">Path to a PE assembly. Must exist and be at most 30 MB.</param>
     /// <returns>
     /// Lines of <c>assembly\tkind\tmember\tattribute</c>.
-    /// Kinds are <c>type</c>, <c>method</c>, <c>property</c>, <c>event</c>, and <c>field</c>.
+    /// Kinds are <c>assembly</c>, <c>module</c>, <c>type</c>, <c>method</c>, <c>property</c>, <c>event</c>, and <c>field</c>.
     /// An assembly with no tracked attributes returns an empty list.
     /// </returns>
     /// <exception cref="ArgumentException">Thrown when <paramref name="path"/> is null or empty.</exception>
@@ -91,8 +91,46 @@ internal static class AssemblyScanner
             Names = new TypeNameProvider(reader),
             Lines = new List<string>(),
         };
+        CollectAssembly(bag);
+        CollectModule(bag);
         CollectTypes(bag);
         return bag.Lines;
+    }
+
+    /// <summary>
+    /// Lists tracked custom attributes stored on the assembly definition.
+    /// </summary>
+    /// <param name="bag">Open scan. Must not be null.</param>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="bag"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the assembly name cannot be a line field.</exception>
+    /// <remarks>
+    /// Reads the single assembly row. <c>[assembly: ExcludeFromCodeCoverage]</c> and
+    /// <c>[assembly: GeneratedCode]</c> live here, not on a type.
+    /// </remarks>
+    private static void CollectAssembly(ScanBag bag)
+    {
+        ArgumentNullException.ThrowIfNull(bag);
+        var definition = bag.Reader.GetAssemblyDefinition();
+        CollectAttributes(bag, definition.GetCustomAttributes(), "assembly", bag.AssemblyName);
+    }
+
+    /// <summary>
+    /// Lists tracked custom attributes stored on the module definition.
+    /// </summary>
+    /// <param name="bag">Open scan. Must not be null.</param>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="bag"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the module name cannot be a line field.</exception>
+    /// <remarks>
+    /// A CLI assembly has one module row. <c>[module: GeneratedCode]</c> is written by the
+    /// C# compiler. <c>[module: ExcludeFromCodeCoverage]</c> is not legal C# (CS0592) but is
+    /// still listed when the attribute is present in metadata.
+    /// </remarks>
+    private static void CollectModule(ScanBag bag)
+    {
+        ArgumentNullException.ThrowIfNull(bag);
+        var module = bag.Reader.GetModuleDefinition();
+        var name = RequireIdentifier(bag.Reader.GetString(module.Name));
+        CollectAttributes(bag, module.GetCustomAttributes(), "module", name);
     }
 
     /// <summary>
@@ -241,7 +279,7 @@ internal static class AssemblyScanner
     /// </summary>
     /// <param name="bag">Open scan.</param>
     /// <param name="attributes">Attributes of the member. At most 64 are accepted.</param>
-    /// <param name="kind">One of type, method, property, event, field.</param>
+    /// <param name="kind">One of assembly, module, type, method, property, event, field.</param>
     /// <param name="member">Display name of the member.</param>
     /// <exception cref="InvalidOperationException">
     /// Thrown when the member has more than 64 attributes or the output exceeds 100000 lines.

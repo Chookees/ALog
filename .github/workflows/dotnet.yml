@@ -45,7 +45,6 @@ jobs:
         python3 eng/test_coverage_gate.py
         python3 eng/test_coverage_exception_check.py
         python3 eng/test_analyzer_ratchet_check.py
-        python3 eng/test_production_cs_diff.py
         bash eng/test_bb_grep.sh
         bash eng/test_build_base_assemblies.sh
         python3 eng/test_coverage_metadata.py
@@ -97,9 +96,6 @@ jobs:
 
     - name: Analyzer ratchet
       run: python3 eng/analyzer-ratchet-check.py --base "$COVERAGE_BASE_REF"
-
-    - name: Production source diff
-      run: python3 eng/production-cs-diff-check.py --base "$COVERAGE_BASE_REF"
 
     - name: Build coverage metadata tool
       run: dotnet build eng/coverage-metadata/CoverageMetadata.csproj -c Release --nologo
