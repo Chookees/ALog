@@ -10,7 +10,7 @@ namespace ALog.Tests;
 /// Live SQL Server integration for LIM-003.
 /// Prefers <c>ALOG_SQL_TEST_CONNECTION</c> (CI generates that string and masks the password).
 /// Otherwise Testcontainers starts <see cref="SqlServerImage"/> with a random password.
-/// On CI, missing SQL fails the test. Locally without Docker the test is a no-op pass with a console note.
+/// When ALOG_REQUIRE_SQL=1, missing SQL fails the test. Locally without that variable a missing server is a no-op pass with a console note.
 /// The image digest is the single reference in this file; the workflow holds the other one.
 /// </summary>
 public sealed class SqlLiveIntegrationTests : IAsyncLifetime
@@ -24,9 +24,10 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
     {
         ';', '=', ' ', '\'', '"', '{', '}', '$', '`', '\\', '\r', '\n'
     };
-    private static bool IsCi =>
-        string.Equals(Environment.GetEnvironmentVariable("CI"), "true", StringComparison.OrdinalIgnoreCase)
-        || string.Equals(Environment.GetEnvironmentVariable("GITHUB_ACTIONS"), "true", StringComparison.OrdinalIgnoreCase);
+    private static int _integrationProofWritten;
+
+    private static bool RequiresSql =>
+        string.Equals(Environment.GetEnvironmentVariable("ALOG_REQUIRE_SQL"), "1", StringComparison.Ordinal);
 
     private MsSqlContainer? _container;
     private string? _connectionString;
@@ -70,12 +71,12 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
 
     /// <summary>
     /// Connects to the SQL Server this fixture will write to.
-    /// CI uses <c>ALOG_SQL_TEST_CONNECTION</c> and fails the test when that server stays unreachable.
+    /// <c>ALOG_REQUIRE_SQL=1</c> fails the test when SQL stays unreachable. CI sets that variable.
     /// Without the variable, Testcontainers starts the pinned image with <see cref="CreateSqlPassword"/>.
     /// </summary>
     /// <returns>A completed task after the connection string is stored, or after a local skip is recorded.</returns>
     /// <exception cref="InvalidOperationException">
-    /// Thrown on CI when SQL does not become reachable. Local runs record the reason and return.
+    /// Thrown when <c>ALOG_REQUIRE_SQL=1</c> and SQL does not become reachable. Otherwise the reason is stored.
     /// </exception>
     /// <remarks>
     /// May start a Docker container and open a TCP connection. xUnit builds one instance per test.
@@ -94,7 +95,7 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
             catch (Exception ex)
             {
                 _unavailableReason = $"ALOG_SQL_TEST_CONNECTION set but SQL not reachable: {ex.Message}";
-                if (IsCi)
+                if (RequiresSql)
                     throw new InvalidOperationException(_unavailableReason, ex);
                 return;
             }
@@ -120,7 +121,7 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
                 _container = null;
             }
 
-            if (IsCi)
+            if (RequiresSql)
                 throw new InvalidOperationException(_unavailableReason, ex);
         }
     }
@@ -136,7 +137,8 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
     {
         if (_unavailableReason is not null)
         {
-            // Local only — CI throws in InitializeAsync instead.
+            if (RequiresSql)
+                throw new InvalidOperationException(_unavailableReason);
             Console.WriteLine($"[SqlLiveIntegrationTests] skipped: {_unavailableReason}");
             return;
         }
@@ -175,6 +177,57 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
         msgCmd.Parameters.AddWithValue("@m", "live-sql-message");
         var message = (string?)await msgCmd.ExecuteScalarAsync();
         Assert.Equal("live-sql-message", message);
+        await WriteSqlIntegrationProofOnceAsync();
+    }
+
+    /// <summary>
+    /// Builds the single SQL proof line from <c>@@VERSION</c>.
+    /// Only the first line is kept, so the test log contains exactly one proof line.
+    /// </summary>
+    /// <param name="versionText">Raw <c>@@VERSION</c> text, which SQL Server returns as several lines.</param>
+    /// <returns><c>ALOG-SQL-INTEGRATION ran server=</c> plus the first version line.</returns>
+    /// <exception cref="ArgumentException">Thrown when the text is empty.</exception>
+    /// <exception cref="InvalidOperationException">Thrown when the first line is empty or longer than 400 characters.</exception>
+    /// <remarks>
+    /// No I/O. Does not print. Safe to call from any thread; it does not share state.
+    /// </remarks>
+    internal static string FormatSqlIntegrationLine(string versionText)
+    {
+        if (string.IsNullOrWhiteSpace(versionText))
+            throw new ArgumentException("SQL version text is empty.", nameof(versionText));
+        if (versionText.Length > 4000)
+            throw new InvalidOperationException("SQL version text is too long.");
+
+        var first = versionText.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+        var line = first.Split('\n')[0].Trim();
+        if (line.Length == 0 || line.Length > 400)
+            throw new InvalidOperationException("SQL version line is not usable.");
+        return "ALOG-SQL-INTEGRATION ran server=" + line;
+    }
+
+    /// <summary>
+    /// Prints the SQL proof line once per process after the live write succeeds.
+    /// </summary>
+    /// <returns>A completed task after the line is printed, or immediately when it was already printed.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the version query returns nothing usable.</exception>
+    /// <remarks>
+    /// Opens one extra connection. The static flag stops a second test in the same process from printing again.
+    /// </remarks>
+    private async Task WriteSqlIntegrationProofOnceAsync()
+    {
+        if (Volatile.Read(ref _integrationProofWritten) != 0)
+            return;
+        if (string.IsNullOrWhiteSpace(_connectionString))
+            throw new InvalidOperationException("SQL integration proof has no connection.");
+
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+        await using var command = new SqlCommand("SELECT @@VERSION", connection);
+        var raw = (string?)await command.ExecuteScalarAsync();
+        var line = FormatSqlIntegrationLine(raw ?? string.Empty);
+        if (Interlocked.Exchange(ref _integrationProofWritten, 1) != 0)
+            return;
+        Console.WriteLine(line);
     }
 
     private static async Task WaitForSqlAsync(string connectionString, TimeSpan timeout)

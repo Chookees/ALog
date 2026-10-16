@@ -180,7 +180,31 @@ cat > "$work/bad.csproj" << EOF
   </ItemGroup>
 </Project>
 EOF
-expect_fail "project reference" assert_consumer_project "$work/bad.csproj" "$version"
+expect_fail "missing smoke switch" assert_consumer_project "$work/bad.csproj" "$version"
+
+assets="$work/assets.json"
+feed="$work/feed"
+mkdir -p "$feed"
+printf 'packed-bytes' > "$feed/ALog.${version}.nupkg"
+sha=$(python3 - "$feed/ALog.${version}.nupkg" << 'PY'
+import base64, hashlib, sys
+print(base64.b64encode(hashlib.sha512(open(sys.argv[1], "rb").read()).digest()).decode("ascii"))
+PY
+)
+cat > "$assets" << EOF
+{"libraries":{"ALog/${version}":{"type":"package","sha512":"${sha}"},"ALog.Extensions.Logging/${version}":{"type":"package"}},"sources":{"${feed}":{}}}
+EOF
+proof=$(python3 eng/smoke-assets-check.py "$assets" "$version" "$feed")
+if [ "$proof" != "SMOKE-PACKAGE ALog ${version} from-feed" ]; then
+  echo "FAIL package proof: ${proof}" >&2
+  failures=$((failures + 1))
+else
+  pass "package proof line"
+fi
+cat > "$assets" << EOF
+{"libraries":{"ALog/1.0.0":{"type":"project","path":"ALog/ALog.csproj"}},"sources":{"${feed}":{}}}
+EOF
+expect_fail "project assets entry" python3 eng/smoke-assets-check.py "$assets" "$version" "$feed"
 
 if [ "$failures" -ne 0 ]; then
   echo "${failures} consumer-smoke tests failed" >&2

@@ -70,7 +70,7 @@ marker=$(printf '%s%s' '@' 'sha256:')
 password=$(printf '%s%s%s' 'Your_' 'strong_' 'Password123')
 moving_tag=$(printf '%s%s' ':2022-' 'latest')
 secret_assignment=$(printf '%s%s' 'MSSQL_SA_PASSWORD' ':')
-comment='# bis 2a-2 (DC-AB2) gemergt'
+comment='# bis A2a-65 (2a-2)'
 
 require_absent "saved SQL password" "$password"
 require_absent "moving SQL tag" "$moving_tag"
@@ -147,15 +147,56 @@ else
 fi
 
 consumer="eng/consumer-smoke/console/ALog.ConsumerSmoke.csproj"
-if grep -F -q 'ProjectReference' "$consumer"; then
-  fail "consumer has a project reference"
+if ! grep -F -q 'ALogSmokeFromFeed' "$consumer"; then
+  fail "consumer smoke switch missing"
 else
-  pass "consumer has no project reference"
+  pass "consumer smoke switch"
 fi
-if grep -F -q 'ALog.ConsumerSmoke' ALog.sln; then
-  fail "consumer is in the solution"
+if ! grep -F -q 'ProjectReference' "$consumer"; then
+  fail "consumer project reference missing"
 else
-  pass "consumer is not in the solution"
+  pass "consumer project reference for the normal build"
+fi
+if ! grep -F -q 'ALog.ConsumerSmoke' ALog.sln; then
+  fail "consumer is not in the solution"
+else
+  pass "consumer is in the solution"
+fi
+if ! grep -F -q 'ALOG_REQUIRE_SQL: "1"' "$workflow"; then
+  fail "ALOG_REQUIRE_SQL is not set"
+else
+  pass "ALOG_REQUIRE_SQL=1"
+fi
+if ! grep -F -q 'smoke-file:' "$workflow" || ! grep -F -q 'smoke-console:' "$workflow"; then
+  fail "smoke jobs missing"
+else
+  pass "smoke-file and smoke-console"
+fi
+if ! grep -F -q 'eng/coverage-exception-check.py' "$workflow"; then
+  fail "coverage exception check missing"
+else
+  pass "coverage exception check"
+fi
+if ! grep -F -q '/eng/consumer-smoke/console' .github/dependabot.yml; then
+  fail "dependabot consumer directory missing"
+else
+  pass "dependabot consumer directory"
+fi
+ssh_comment='SSH.NET 2026.0.0: GHSA-q939-rpr3-3284 (CVE-2026-48798), GHSA-mggc-4xg6-vcxf (CVE-2026-85756) (High), transitiv über Testcontainers. Entfernen, sobald Testcontainers eine Version mit SSH.NET >= 2026.0.0 mitbringt.'
+if ! grep -F -q "$ssh_comment" ALog.Tests/ALog.Tests.csproj; then
+  fail "SSH.NET comment missing"
+else
+  pass "SSH.NET comment"
+fi
+if ! grep -F -q 'SMOKE-PACKAGE ALog' eng/smoke-assets-check.py; then
+  fail "package proof line missing"
+else
+  pass "package proof line"
+fi
+if ! grep -F -q 'SMOKE-CONSOLE count=' eng/consumer-smoke.sh; then
+  fail "console count line missing"
+else
+  pass "console count line"
 fi
 
 push_cmd=$(printf '%s %s' 'nuget' 'push')

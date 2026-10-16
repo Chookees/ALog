@@ -16,6 +16,7 @@ jobs:
     timeout-minutes: 30
     env:
       COVERAGE_ENFORCE: "false"
+      ALOG_REQUIRE_SQL: "1"
       ALOG_SQL_IMAGE: mcr.microsoft.com/mssql/server@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
 
     steps:
@@ -34,6 +35,7 @@ jobs:
         bash eng/test_consumer_smoke.sh
         bash eng/test_s4_grep.sh
         python3 eng/test_coverage_gate.py
+        python3 eng/test_coverage_exception_check.py
 
     - name: Start SQL Server
       run: bash eng/start-sql.sh "$ALOG_SQL_IMAGE"
@@ -46,17 +48,42 @@ jobs:
 
     - name: Test
       id: test
-      run: dotnet test ALog.sln -c Release --no-build --verbosity normal --results-directory TestResults --logger trx --collect "XPlat Code Coverage" --settings coverage.runsettings --blame-hang-timeout 5m --blame-hang-dump-type mini
-
-    - name: Fetch master ratchet
       run: |
-        git fetch --no-tags --depth=1 origin master
-        if git cat-file -e origin/master:eng/coverage-ratchet.json; then
-          git show origin/master:eng/coverage-ratchet.json > "$RUNNER_TEMP/coverage-ratchet-baseline.json"
+        set +e
+        dotnet test ALog.sln -c Release --no-build --verbosity normal --results-directory TestResults --logger trx --collect "XPlat Code Coverage" --settings coverage.runsettings --blame-hang-timeout 5m --blame-hang-dump-type mini > "$RUNNER_TEMP/test-log.txt" 2>&1
+        status=$?
+        set -e
+        cat "$RUNNER_TEMP/test-log.txt"
+        if [ "$status" -eq 0 ]; then
+          count=$(grep -F -c 'ALOG-SQL-INTEGRATION ran server=' "$RUNNER_TEMP/test-log.txt" || true)
+          if [ "$count" -ne 1 ]; then
+            echo "Expected exactly one SQL integration proof line, found ${count}." >&2
+            exit 1
+          fi
+        fi
+        exit "$status"
+
+    - name: Fetch base branch
+      run: |
+        if [ -n "${{ github.base_ref }}" ]; then
+          base="${{ github.base_ref }}"
+        else
+          base="master"
+        fi
+        git fetch --no-tags --depth=1 origin "$base"
+        echo "COVERAGE_BASE_REF=origin/${base}" >> "$GITHUB_ENV"
+        if git cat-file -e "origin/${base}:eng/coverage-ratchet.json"; then
+          git show "origin/${base}:eng/coverage-ratchet.json" > "$RUNNER_TEMP/coverage-ratchet-baseline.json"
           echo "COVERAGE_BASELINE=$RUNNER_TEMP/coverage-ratchet-baseline.json" >> "$GITHUB_ENV"
         else
           echo "COVERAGE_BASELINE=" >> "$GITHUB_ENV"
         fi
+
+    - name: Coverage exception check
+      if: github.event_name == 'pull_request'
+      env:
+        PR_BODY: ${{ github.event.pull_request.body }}
+      run: python3 eng/coverage-exception-check.py --base "$COVERAGE_BASE_REF"
 
     - name: Coverage gate
       run: |
@@ -94,10 +121,9 @@ jobs:
     - name: Vulnerable package check
       run: bash eng/vuln-check.sh
 
-  consumer-smoke:
+  smoke-file:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    continue-on-error: true # bis 2a-2 (DC-AB2) gemergt
 
     steps:
     - name: Checkout
@@ -108,5 +134,22 @@ jobs:
       with:
         dotnet-version: 10.0.x
 
-    - name: Consumer smoke
-      run: bash eng/consumer-smoke.sh
+    - name: Consumer smoke file
+      run: bash eng/consumer-smoke.sh file
+
+  smoke-console:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true # bis A2a-65 (2a-2)
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Consumer smoke console
+      run: bash eng/consumer-smoke.sh console

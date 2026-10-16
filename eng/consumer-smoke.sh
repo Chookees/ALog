@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Packs ALog and runs the console consumer that arc_spec 4.1 point 7 describes.
+# Usage: eng/consumer-smoke.sh file|console
 #
-# Green means the process exits 0, SMOKE-<guid> appears once in stdout+stderr,
-# and the same token appears once in the ALog file. On the S4 tree the console
-# line is counted twice, so this script exits 1. The workflow keeps that job
-# green with continue-on-error until the console default changes. The consumer
-# project is not in ALog.sln and has no ProjectReference.
-# Next: eng/consumer-smoke/console/Program.cs.
+# Both modes restore with -p:ALogSmokeFromFeed=true and print
+# SMOKE-PACKAGE ALog <version> from-feed after checking project.assets.json.
+# file is green when SMOKE-<guid> appears once in the ALog file and the process
+# exits 0. console prints SMOKE-CONSOLE count=<n> and is green only when n is 1.
+# On the S4 tree the console count is 2. The normal solution build uses the
+# project reference; only this script selects the packed package.
 
 set -euo pipefail
 
@@ -46,9 +47,9 @@ sys.stdout.write(found[0])
 PY
 }
 
-# Checks the consumer project references the packed Extensions package and nothing in-repo.
-# Args: csproj path, expected package version. Returns non-zero when a ProjectReference,
-# a version mismatch, a missing package, or an NU1901-NU1904 suppression is present.
+# Checks the consumer can build from the solution and from the local feed.
+# Args: csproj path, expected package version. Returns non-zero when the smoke
+# switch, the project reference, the package version, or an NU1901-NU1904 suppression is wrong.
 assert_consumer_project() {
   local path="$1"
   local expected="$2"
@@ -56,14 +57,18 @@ assert_consumer_project() {
 import sys
 import xml.etree.ElementTree as ET
 path, expected = sys.argv[1], sys.argv[2]
+raw = open(path, encoding="utf-8").read()
+if "'$(ALogSmokeFromFeed)' == 'true'" not in raw or "'$(ALogSmokeFromFeed)' != 'true'" not in raw:
+    sys.stderr.write("consumer is missing the ALogSmokeFromFeed switch\n")
+    sys.exit(1)
 root = ET.parse(path).getroot()
-found = False
+found_package = False
+found_project = False
 for element in root.iter():
     if element.tag.endswith("ProjectReference"):
-        sys.stderr.write("consumer has a ProjectReference\n")
-        sys.exit(1)
+        found_project = True
     if element.tag.endswith("PackageReference") and element.attrib.get("Include") == "ALog.Extensions.Logging":
-        found = True
+        found_package = True
         version = element.attrib.get("Version", "")
         if version != expected:
             sys.stderr.write(f"consumer version {version} != {expected}\n")
@@ -73,8 +78,8 @@ for code in ("NU1901", "NU1902", "NU1903", "NU1904"):
     if code in text:
         sys.stderr.write(f"consumer mentions {code}\n")
         sys.exit(1)
-if not found:
-    sys.stderr.write("consumer is missing ALog.Extensions.Logging\n")
+if not found_package or not found_project:
+    sys.stderr.write("consumer needs both a package reference and a project reference\n")
     sys.exit(1)
 PY
 }
@@ -87,7 +92,6 @@ prepare_work_dir() {
   local work
   work=$(mktemp -d "${base}/alog-smoke.XXXXXX")
   mkdir -p "$work/feed" "$work/packages"
-  export NUGET_PACKAGES="$work/packages"
   printf '%s\n' "$work"
 }
 
@@ -141,12 +145,61 @@ pack_packages() {
   write_nuget_config "$work/nuget.config" "$work/feed"
 }
 
-# Restores and builds the consumer from the local feed.
-# Args: work directory. Returns the dotnet status.
+# Restores the consumer from the local feed with the package reference selected.
+# Args: work directory. Removes the previous obj directory so a project-reference
+# assets file cannot be reused. Returns the dotnet restore status.
+restore_consumer_from_feed() {
+  local work="$1"
+  rm -rf eng/consumer-smoke/console/obj
+  dotnet restore "$CONSUMER_PROJECT" -p:ALogSmokeFromFeed=true --configfile "$work/nuget.config" --nologo
+}
+
+# Builds the already restored feed-based consumer.
+# Args: work directory. The property stays on so the build cannot switch back
+# to the project reference. Returns the dotnet build status.
 build_consumer() {
   local work="$1"
-  dotnet restore "$CONSUMER_PROJECT" --configfile "$work/nuget.config" --nologo
-  dotnet build "$CONSUMER_PROJECT" -c Release --no-restore --nologo
+  dotnet build "$CONSUMER_PROJECT" -c Release -p:ALogSmokeFromFeed=true --no-restore --nologo
+}
+
+# Proves project.assets.json resolved ALog as the packed package from the feed.
+# Args: assets path, package version, feed directory. Prints the SMOKE-PACKAGE line.
+# Returns 1 when ALog is missing, a project reference, or not from that feed.
+prove_feed_package() {
+  python3 eng/smoke-assets-check.py "$1" "$2" "$3"
+}
+
+# Accepts the two smoke jobs. Args: file or console. Returns 1 for anything else.
+require_smoke_mode() {
+  case "$1" in
+    file|console) return 0 ;;
+  esac
+  echo "Usage: eng/consumer-smoke.sh file|console" >&2
+  return 1
+}
+
+# File job gate: one distinct token in the ALog file and consumer exit 0.
+# Args: file count, distinct file count, consumer exit status.
+evaluate_file_gate() {
+  local file_count="$1"
+  local file_distinct="$2"
+  local app_status="$3"
+  if [ "$app_status" -eq 0 ] && [ "$file_count" -eq 1 ] && [ "$file_distinct" -eq 1 ]; then
+    return 0
+  fi
+  return 1
+}
+
+# Prints SMOKE-CONSOLE count=<n> and copies that exact line into the job summary.
+# Args: count, summary path (empty skips the file).
+report_console_count() {
+  local count="$1"
+  local summary_path="${2:-}"
+  local line="SMOKE-CONSOLE count=${count}"
+  printf '%s\n' "$line"
+  if [ -n "$summary_path" ]; then
+    printf '%s\n' "$line" >> "$summary_path"
+  fi
 }
 
 # Drops inherited ALog__ variables so the consumer sees only the file sink.
@@ -291,7 +344,8 @@ write_smoke_summary() {
 - distinct tokens (stdout+stderr / file): ${stdout_distinct} / ${file_distinct}
 - same token in both: ${same_guid}
 - consumer exit code: ${app_status}
-- green requires stdout+stderr 1, file 1, one shared token, and exit 0
+- file gate: file count 1, one distinct file token, exit 0
+- console gate: SMOKE-CONSOLE count=1 and exit 0
 EOF
 )
   printf '%s\n' "$text"
@@ -310,13 +364,17 @@ run_consumer() {
   export ALog__File__Path="$work/alog.log"
   : > "$work/combined.log"
   local status=0
-  dotnet run --project "$CONSUMER_PROJECT" -c Release --no-build >"$work/combined.log" 2>&1 || status=$?
+  dotnet run --project "$CONSUMER_PROJECT" -c Release --no-build -p:ALogSmokeFromFeed=true >"$work/combined.log" 2>&1 || status=$?
   return "$status"
 }
 
-# Packs, runs, writes the counts, and returns the green/red status.
-# A pack or build failure still writes a zero count so the job summary exists.
+# Packs, proves the feed package, runs, and returns the status for one smoke mode.
+# Args: file or console. A pack or restore failure still writes counts.
+# file is green only for one ALog-file token and exit 0.
+# console prints SMOKE-CONSOLE count=<n> and is green only when that count is 1.
 main() {
+  local mode="${1:-}"
+  require_smoke_mode "$mode" || return 1
   require_repo_root
   export DOTNET_CLI_TELEMETRY_OPTOUT=1
   local version ext
@@ -329,17 +387,37 @@ main() {
   assert_consumer_project "$CONSUMER_PROJECT" "$version"
   local work
   work=$(prepare_work_dir)
+  # prepare_work_dir runs in a subshell, so the package cache is exported here.
+  export NUGET_PACKAGES="$work/packages"
   local app_status=1
-  if pack_packages "$work" "$version" && build_consumer "$work"; then
-    app_status=0
-    run_consumer "$work" || app_status=$?
+  local proved=0
+  if pack_packages "$work" "$version" && restore_consumer_from_feed "$work"; then
+    if prove_feed_package "eng/consumer-smoke/console/obj/project.assets.json" "$version" "$work/feed"; then
+      proved=1
+      if build_consumer "$work"; then
+        app_status=0
+        run_consumer "$work" || app_status=$?
+      fi
+    fi
   fi
   local packed
   if ! packed=$(pack_stats "$work/combined.log" "$work/alog.log" "$app_status"); then
     packed="0 0 0 0 0 ${app_status}"
   fi
+  local stdout_count file_count file_distinct
+  read -r stdout_count _ file_count file_distinct _ _ <<< "$packed"
   write_smoke_summary "$packed" "${GITHUB_STEP_SUMMARY:-}"
-  evaluate_smoke "$packed"
+  if [ "$mode" = "console" ]; then
+    report_console_count "$stdout_count" "${GITHUB_STEP_SUMMARY:-}"
+    if [ "$proved" -ne 1 ] || [ "$app_status" -ne 0 ] || [ "$stdout_count" -ne 1 ]; then
+      return 1
+    fi
+    return 0
+  fi
+  if [ "$proved" -ne 1 ]; then
+    return 1
+  fi
+  evaluate_file_gate "$file_count" "$file_distinct" "$app_status"
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

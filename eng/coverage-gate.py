@@ -773,6 +773,51 @@ def coverage_rows(
     return rows, machine
 
 
+def target_gap_warnings(
+    coverage: dict[str, PackageRates],
+    ratchet: Ratchet,
+    enforce: bool,
+) -> list[str]:
+    """Describe how far each package sits from the 90/80 targets.
+
+    Args:
+        coverage: Measurements. A missing package is skipped.
+        ratchet: Targets. The line target is strict greater-than.
+        enforce: When true the caller already fails, so no warning is added.
+
+    Returns:
+        Warning lines. Empty when the target gate is on or every package clears it.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if enforce:
+        return []
+    warnings: list[str] = []
+    for name in REQUIRED_PACKAGES:
+        measured = coverage.get(name)
+        if measured is None:
+            continue
+        if measured.lines <= ratchet.lines_target:
+            gap = ratchet.lines_target - measured.lines
+            warnings.append(
+                f"Warning: {name} lines {format_percent(measured.lines)} are short of "
+                f"> {format_percent(ratchet.lines_target)} by {format_percent(gap)}. "
+                "COVERAGE_ENFORCE is false, so this is not a failure."
+            )
+        if measured.branches < ratchet.branches_target:
+            gap = ratchet.branches_target - measured.branches
+            warnings.append(
+                f"Warning: {name} branches {format_percent(measured.branches)} are short of "
+                f">= {format_percent(ratchet.branches_target)} by {format_percent(gap)}. "
+                "COVERAGE_ENFORCE is false, so this is not a failure."
+            )
+    return warnings
+
+
 def format_summary(
     coverage: dict[str, PackageRates],
     ratchet: Ratchet,
@@ -813,6 +858,10 @@ def format_summary(
         f"Branch target >= {format_percent(ratchet.branches_target)}. "
         f"COVERAGE_ENFORCE={switch}."
     )
+    warnings = target_gap_warnings(coverage, ratchet, enforce)
+    if warnings:
+        lines.append("")
+        lines.extend(warnings)
     if problems:
         lines.append("")
         lines.append("Coverage gate failed:")

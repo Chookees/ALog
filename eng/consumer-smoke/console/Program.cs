@@ -4,8 +4,8 @@ using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 // Console consumer for the S4 smoke (arc_spec 4.1 point 7).
-// The smoke script packs ALog and restores this project from that feed.
-// This file stays out of ALog.sln so the solution build cannot skip the pack.
+// ALog.sln builds this project through its project reference.
+// The smoke script sets ALogSmokeFromFeed and restores the packed package instead.
 
 /// <summary>
 /// Hosts one information line so CI can count where that line is written.

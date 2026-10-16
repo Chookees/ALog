@@ -3,7 +3,9 @@
 version: 2
 updates:
   - package-ecosystem: nuget
-    directory: "/"
+    directories:
+      - "/"
+      - "/eng/consumer-smoke/console"
     schedule:
       interval: weekly
     groups:

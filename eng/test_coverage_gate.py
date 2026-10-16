@@ -400,6 +400,11 @@ class CoverageGateTests(unittest.TestCase):
         self.assertEqual(GATE.target_problems(ratchet), [])
         self.assertIn("ALog", ratchet.packages)
         self.assertIn("ALog.Extensions.Logging", ratchet.packages)
+        for name, floor in ratchet.packages.items():
+            if floor.lines != floor.lines.to_integral_value():
+                raise AssertionError(f"{name} line floor is not a whole percent")
+            if floor.branches != floor.branches.to_integral_value():
+                raise AssertionError(f"{name} branch floor is not a whole percent")
 
     def test_more_than_20_packages_is_rejected(self) -> None:
         """The package cap is 20. The 21st package fails before comparison.
