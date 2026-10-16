@@ -153,6 +153,8 @@ _TeamCity*
 coverage*.json
 coverage*.xml
 coverage*.info
+# The ratchet is source. The pattern above would hide it.
+!eng/coverage-ratchet.json
 
 # Visual Studio code coverage results
 *.coverage

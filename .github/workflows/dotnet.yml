@@ -1,4 +1,6 @@
 # Library CI for ALog (.NET 10)
+# SQL Server is started in a step so the password can be generated and masked.
+# The image pin is the single digest in ALOG_SQL_IMAGE.
 
 name: .NET
 
@@ -11,18 +13,71 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
-
-    services:
-      sqlserver:
-        image: mcr.microsoft.com/mssql/server:2022-latest
-        env:
-          ACCEPT_EULA: Y
-          MSSQL_SA_PASSWORD: "Your_strong_Password123"
-        ports:
-          - 1433:1433
-
+    timeout-minutes: 30
     env:
-      ALOG_SQL_TEST_CONNECTION: "Server=127.0.0.1,1433;User Id=sa;Password=Your_strong_Password123;TrustServerCertificate=True;Encrypt=False;"
+      COVERAGE_ENFORCE: "false"
+      ALOG_SQL_IMAGE: mcr.microsoft.com/mssql/server@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Script tests
+      run: |
+        bash eng/test_vuln_check.sh
+        bash eng/test_start_sql.sh
+        bash eng/test_consumer_smoke.sh
+        bash eng/test_s4_grep.sh
+        python3 eng/test_coverage_gate.py
+
+    - name: Start SQL Server
+      run: bash eng/start-sql.sh "$ALOG_SQL_IMAGE"
+
+    - name: Restore
+      run: dotnet restore ALog.sln
+
+    - name: Build
+      run: dotnet build ALog.sln -c Release --no-restore
+
+    - name: Test
+      id: test
+      run: dotnet test ALog.sln -c Release --no-build --verbosity normal --results-directory TestResults --logger trx --collect "XPlat Code Coverage" --settings coverage.runsettings --blame-hang-timeout 5m --blame-hang-dump-type mini
+
+    - name: Fetch master ratchet
+      run: |
+        git fetch --no-tags --depth=1 origin master
+        if git cat-file -e origin/master:eng/coverage-ratchet.json; then
+          git show origin/master:eng/coverage-ratchet.json > "$RUNNER_TEMP/coverage-ratchet-baseline.json"
+          echo "COVERAGE_BASELINE=$RUNNER_TEMP/coverage-ratchet-baseline.json" >> "$GITHUB_ENV"
+        else
+          echo "COVERAGE_BASELINE=" >> "$GITHUB_ENV"
+        fi
+
+    - name: Coverage gate
+      run: |
+        args=(--cobertura-dir TestResults --ratchet eng/coverage-ratchet.json --summary "$GITHUB_STEP_SUMMARY")
+        if [ -n "${COVERAGE_BASELINE}" ]; then
+          args+=(--baseline "$COVERAGE_BASELINE")
+        fi
+        python3 eng/coverage-gate.py "${args[@]}"
+
+    - name: Upload test results
+      if: failure() && steps.test.outcome != 'skipped'
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: test-results
+        path: TestResults
+        retention-days: 7
+        if-no-files-found: error
+
+  vuln-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
 
     steps:
     - name: Checkout
@@ -36,8 +91,22 @@ jobs:
     - name: Restore
       run: dotnet restore ALog.sln
 
-    - name: Build
-      run: dotnet build ALog.sln -c Release --no-restore
+    - name: Vulnerable package check
+      run: bash eng/vuln-check.sh
 
-    - name: Test
-      run: dotnet test ALog.sln -c Release --no-build --verbosity normal
+  consumer-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    continue-on-error: true # bis 2a-2 (DC-AB2) gemergt
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4.3.1
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Consumer smoke
+      run: bash eng/consumer-smoke.sh

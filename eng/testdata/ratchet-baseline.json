@@ -1,0 +1,8 @@
+{
+  "linesTarget": 90,
+  "branchesTarget": 80,
+  "packages": {
+    "ALog": { "lines": 50.0, "branches": 40.0 },
+    "ALog.Extensions.Logging": { "lines": 60.0, "branches": 50.0 }
+  }
+}

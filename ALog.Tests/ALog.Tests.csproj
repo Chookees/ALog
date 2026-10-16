@@ -13,6 +13,14 @@
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="Testcontainers.MsSql" Version="4.6.0" />
+    <!--
+      Testcontainers 4.6.0 brings SSH.NET 2024.2.0, which the vulnerability
+      scan reports as high severity (GHSA-q939-rpr3-3284 and GHSA-mggc-4xg6-vcxf).
+      2026.0.0 is the patched release.
+      This direct reference is test-only so the solution vulnerability scan can go clean.
+      Remove it when Testcontainers itself depends on SSH.NET 2026.0.0 or newer.
+    -->
+    <PackageReference Include="SSH.NET" Version="2026.0.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
   </ItemGroup>

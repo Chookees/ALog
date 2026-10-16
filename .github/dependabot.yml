@@ -1,0 +1,40 @@
+# Weekly grouped updates. The SQL image digest is not a package Dependabot can see.
+# AWS major bumps stay ignored until the AWS V4 step removes this ignore.
+version: 2
+updates:
+  - package-ecosystem: nuget
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      microsoft-extensions:
+        patterns:
+          - "Microsoft.Extensions.*"
+      aws:
+        patterns:
+          - "AWSSDK.*"
+      sql:
+        patterns:
+          - "Microsoft.Data.SqlClient"
+          - "System.Security.Cryptography.Pkcs"
+      test:
+        patterns:
+          - "xunit*"
+          - "coverlet*"
+          - "Microsoft.NET.Test.Sdk"
+          - "Testcontainers*"
+          - "Microsoft.CodeAnalysis.*"
+          - "SSH.NET"
+    ignore:
+      - dependency-name: "AWSSDK.*"
+        update-types:
+          - "version-update:semver-major"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"
