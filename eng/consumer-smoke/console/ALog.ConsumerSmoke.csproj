@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+    <!--
+      In ALog.sln so the vulnerability scan and Dependabot see this consumer.
+      The normal solution build uses the project reference, so restore does not
+      need the local feed. eng/consumer-smoke.sh sets ALogSmokeFromFeed and then
+      this project takes the packed ALog.Extensions.Logging package instead.
+      The assembly is outside the coverage Include in coverage.runsettings.
+    -->
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(ALogSmokeFromFeed)' == 'true'">
+    <PackageReference Include="ALog.Extensions.Logging" Version="0.2.1" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(ALogSmokeFromFeed)' != 'true'">
+    <ProjectReference Include="..\..\..\ALog.Extensions.Logging\ALog.Extensions.Logging.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>

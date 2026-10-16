@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<coverage line-rate="0" branch-rate="0" version="1.9">
+  <packages>
+    <package name="ALog" line-rate="0.602" branch-rate="0.558" />
+    <package name="ALog.Extensions.Logging" line-rate="0.737" branch-rate="0.621" />
+  </packages>
+</coverage>
