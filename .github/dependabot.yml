@@ -31,6 +31,10 @@ updates:
       - dependency-name: "AWSSDK.*"
         update-types:
           - "version-update:semver-major"
+      # bis v3/MTP
+      - dependency-name: "coverlet.*"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: github-actions
     directory: "/"
