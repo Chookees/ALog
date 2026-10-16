@@ -90,11 +90,12 @@ def git(repo: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def commit_tree(files: dict[str, str | None]) -> tuple[Path, str]:
+def commit_tree(files: dict[str, str | None], base_ratchet: str = RATCHET) -> tuple[Path, str]:
     """Build a two-commit repo and return it plus the base commit.
 
     Args:
         files: Head-commit paths. ``None`` deletes a path that existed in the base.
+        base_ratchet: Ratchet JSON stored in the base commit.
 
     Returns:
         Repository path and the base commit SHA. The caller owns the temp dir
@@ -109,7 +110,7 @@ def commit_tree(files: dict[str, str | None]) -> tuple[Path, str]:
     root = Path(tempfile.mkdtemp(prefix="coverage-exception-"))
     git(root, "init", "-b", "master")
     base_files = {
-        "eng/coverage-ratchet.json": RATCHET,
+        "eng/coverage-ratchet.json": base_ratchet,
         "ALog/Clean.cs": "namespace ALog;\npublic class Clean {}\n",
         "ALog.Extensions.Logging/Clean.cs": "namespace ALog.Extensions.Logging;\npublic class Clean {}\n",
     }
@@ -133,7 +134,13 @@ def commit_tree(files: dict[str, str | None]) -> tuple[Path, str]:
     return root, base
 
 
-def expect(label: str, files: dict[str, str | None], body: str, blocked: bool) -> None:
+def expect(
+    label: str,
+    files: dict[str, str | None],
+    body: str,
+    blocked: bool,
+    base_ratchet: str = RATCHET,
+) -> None:
     """Fail the process when a fixture does not match the expected gate.
 
     Args:
@@ -141,6 +148,7 @@ def expect(label: str, files: dict[str, str | None], body: str, blocked: bool) -
         files: Head commit contents.
         body: Pull-request body.
         blocked: True when the check must return trigger names.
+        base_ratchet: Ratchet JSON stored in the base commit.
 
     Returns:
         None.
@@ -151,7 +159,7 @@ def expect(label: str, files: dict[str, str | None], body: str, blocked: bool) -
     Side effects:
         Writes a temporary git repository.
     """
-    repo, base = commit_tree(files)
+    repo, base = commit_tree(files, base_ratchet)
     missing = module.decide(repo, base, body)
     if blocked and not missing:
         raise SystemExit(f"{label} was allowed without a reason")
@@ -244,6 +252,10 @@ def expect_bypasses() -> None:
         ("props alias", "Directory.Build.props", "<Project>\n  <ItemGroup>\n    <Using Include=\"System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute\" Alias=\"Hidden\" />\n  </ItemGroup>\n</Project>\n"),
         ("block comment on the same line", "ALog/Marked.cs", "namespace ALog;\n/* kept */ [ExcludeFromCodeCoverage] public class Marked {}\n"),
         ("compiler generated", "ALog/Made.cs", "namespace ALog;\n[CompilerGenerated]\npublic class Made {}\n"),
+        ("unicode escape", "ALog/Escaped.cs", "namespace ALog;\n[System.Diagnostics.CodeAnalysis.ExcludeFromCode\\u0043overage]\npublic class Escaped {}\n"),
+        ("unicode escape U", "ALog/EscapedU.cs", "namespace ALog;\n[System.Diagnostics.CodeAnalysis.ExcludeFromCode\\U00000043overage]\npublic class EscapedU {}\n"),
+        ("csproj using alias", "ALog/ALog.csproj", "<Project>\n  <ItemGroup>\n    <Using Include=\"System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute\" Alias=\"Skip\"/>\n  </ItemGroup>\n</Project>\n"),
+        ("proj using alias", "ALog/Extra.proj", "<Project>\n  <ItemGroup>\n    <Using Include=\"System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute\" Alias=\"Skip\"/>\n  </ItemGroup>\n</Project>\n"),
     )
     index = 0
     while index < len(cases) and index < 20:
@@ -284,7 +296,48 @@ def expect_reason_shapes() -> None:
     expect("reason of 10 characters", trigger, "coverage-exception: 1234567890\n", False)
     bracketed = "coverage-exception: this reason has a < bracket in it\n"
     expect("angle bracket in a long reason", trigger, bracketed, True)
+    expect_tester_reasons()
     test_fetch_uses_pulls_endpoint()
+
+
+def expect_tester_reasons() -> None:
+    """Reject the short and placeholder reasons from the re-review.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: One of those bodies authorizes a policy change, or a drop
+        from 68 to 0 is allowed when the body is ``coverage-exception: x``.
+
+    Side effects:
+        Writes temporary git repositories.
+    """
+    trigger = {"coverage.runsettings": "<RunSettings></RunSettings>\n"}
+    bodies = (
+        "coverage-exception: x",
+        "coverage-exception: TODO",
+        "coverage-exception: .",
+        "coverage-exception: <Grund> weil",
+        "coverage-exception: Grund: <Grund>",
+    )
+    index = 0
+    while index < len(bodies) and index < 10:
+        body = bodies[index]
+        expect(f"tester reason {body}", trigger, body + "\n", True)
+        index += 1
+    base_68 = RATCHET.replace('"lines": 50', '"lines": 68', 1)
+    zero = base_68.replace('"lines": 68', '"lines": 0', 1)
+    expect(
+        "drop 68 to 0 with coverage-exception: x",
+        {"eng/coverage-ratchet.json": zero},
+        "coverage-exception: x\n",
+        True,
+        base_68,
+    )
 
 
 def expect_floor_policy() -> None:

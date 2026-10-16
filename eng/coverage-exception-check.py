@@ -6,9 +6,10 @@ Raising ratchet floors needs no reason. Each lowered metric needs its own
 line, and the drop may be at most one percentage point. Any other ratchet edit,
 and any change to ``coverage.runsettings`` or ``coverage.config``, needs a
 general reason of at least 10 characters with no ``<`` or ``>``. Added or
-changed lines in ``*.cs``, ``*.props``, and ``*.targets`` that contain the
-tokens ``ExcludeFromCodeCoverage``, ``GeneratedCode``, or ``CompilerGenerated``
-need that general reason too, including comments, aliases, and qualifiers.
+changed lines in ``*.cs``, ``*.csproj``, ``*.props``, ``*.targets``, and
+``*.proj`` that contain the tokens ``ExcludeFromCodeCoverage``,
+``GeneratedCode``, or ``CompilerGenerated`` need that general reason too,
+including comments, aliases, qualifiers, and C# ``\\u`` / ``\\U`` escapes.
 In CI the body is read from the pulls API, not from the event payload.
 """
 
@@ -27,10 +28,11 @@ from typing import Mapping
 RATCHET = "eng/coverage-ratchet.json"
 POLICY_FILES = ("coverage.runsettings", "coverage.config")
 EXCLUSION_TOKENS = ("ExcludeFromCodeCoverage", "GeneratedCode", "CompilerGenerated")
-SOURCE_SUFFIXES = (".cs", ".props", ".targets")
+SOURCE_SUFFIXES = (".cs", ".csproj", ".props", ".targets", ".proj")
 TOKEN_RE = re.compile(
     "(?<![A-Za-z0-9_])(?:" + "|".join(EXCLUSION_TOKENS) + ")(?:Attribute)?(?![A-Za-z0-9_])"
 )
+CS_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
 HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 FLOOR_LINE = re.compile(
     r"^coverage-exception:\s*floor\s+(\S+)\s+(lines|branches)\s+"
@@ -265,15 +267,51 @@ def changed_paths(repo: Path, base: str) -> list[str]:
     return paths
 
 
+def decode_csharp_escapes(text: str) -> str:
+    """Replace C# ``\\uXXXX`` and ``\\UXXXXXXXX`` escapes with characters.
+
+    Args:
+        text: One added diff line, without the leading plus.
+
+    Returns:
+        The line with those escapes decoded. A code point above U+10FFFF is
+        left as the escape text. More than 1000 escapes fails closed.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    parts: list[str] = []
+    cursor = 0
+    seen = 0
+    for match in CS_ESCAPE.finditer(text):
+        seen += 1
+        if seen > 1000:
+            parts.append(EXCLUSION_TOKENS[0])
+            return "".join(parts)
+        parts.append(text[cursor:match.start()])
+        code = int(match.group(1) or match.group(2) or "0", 16)
+        if code > 0x10FFFF:
+            parts.append(match.group(0))
+        else:
+            parts.append(chr(code))
+        cursor = match.end()
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
 def exclusion_token_added(diff_text: str) -> bool:
     """Return whether an added or changed line contains an exclusion token.
 
     Args:
-        diff_text: Unified diff of ``*.cs``, ``*.props``, and ``*.targets``.
-        Comments, aliases, and qualifiers count. A huge diff fails closed.
+        diff_text: Unified diff of C# and MSBuild files. Comments, aliases,
+        qualifiers, and C# unicode escapes count. A huge diff fails closed.
 
     Returns:
-        True when a ``+`` line contains one of ``EXCLUSION_TOKENS`` as a token.
+        True when a ``+`` line contains one of ``EXCLUSION_TOKENS`` as a token
+        after ``\\u`` and ``\\U`` escapes are decoded.
 
     Raises:
         None.
@@ -290,7 +328,7 @@ def exclusion_token_added(diff_text: str) -> bool:
             return True
         if not line.startswith("+") or line.startswith("+++"):
             continue
-        if TOKEN_RE.search(line[1:]):
+        if TOKEN_RE.search(decode_csharp_escapes(line[1:])):
             return True
     return False
 
@@ -301,7 +339,8 @@ def source_diff(repo: Path, base: str, paths: list[str]) -> str:
     Args:
         repo: Repository root.
         base: Git ref to diff against.
-        paths: Changed paths. Only ``.cs``, ``.props``, and ``.targets`` are kept.
+        paths: Changed paths. Only ``.cs``, ``.csproj``, ``.props``, ``.targets``,
+        and ``.proj`` are kept.
 
     Returns:
         The diff text. Empty when none of those files changed. More than 500
