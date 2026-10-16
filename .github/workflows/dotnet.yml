@@ -17,6 +17,7 @@ jobs:
     timeout-minutes: 30
     env:
       COVERAGE_ENFORCE: "false"
+      # Only the value 1 enables the SQL live tests. Any other value skips them.
       ALOG_REQUIRE_SQL: "1"
       ALOG_SQL_IMAGE: mcr.microsoft.com/mssql/server@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
 
@@ -27,7 +28,13 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
       with:
-        dotnet-version: 10.0.x
+        global-json-file: global.json
+
+    - name: Assert SDK version
+      run: |
+        version=$(dotnet --version)
+        echo "dotnet --version ${version}"
+        test "$version" = "10.0.402"
 
     - name: Script tests
       run: |
@@ -37,12 +44,19 @@ jobs:
         bash eng/test_s4_grep.sh
         python3 eng/test_coverage_gate.py
         python3 eng/test_coverage_exception_check.py
+        python3 eng/test_analyzer_ratchet_check.py
+        bash eng/test_bb_grep.sh
+        bash eng/test_build_base_assemblies.sh
+        python3 eng/test_coverage_metadata.py
 
     - name: Start SQL Server
       run: bash eng/start-sql.sh "$ALOG_SQL_IMAGE"
 
     - name: Restore
       run: dotnet restore ALog.sln
+
+    - name: Build property proof
+      run: bash eng/build-property-proof.sh
 
     - name: Build
       run: dotnet build ALog.sln -c Release --no-restore
@@ -80,12 +94,21 @@ jobs:
           echo "COVERAGE_BASELINE=" >> "$GITHUB_ENV"
         fi
 
+    - name: Analyzer ratchet
+      run: python3 eng/analyzer-ratchet-check.py --base "$COVERAGE_BASE_REF"
+
+    - name: Build coverage metadata tool
+      run: dotnet build eng/coverage-metadata/CoverageMetadata.csproj -c Release --nologo
+
+    - name: Build base assemblies
+      run: bash eng/build-base-assemblies.sh "$COVERAGE_BASE_REF" "$RUNNER_TEMP/base-bin"
+
     - name: Coverage exception check
       if: github.event_name == 'pull_request'
       env:
         GITHUB_TOKEN: ${{ github.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
-      run: python3 eng/coverage-exception-check.py --base "$COVERAGE_BASE_REF"
+      run: python3 eng/coverage-exception-check.py --base "$COVERAGE_BASE_REF" --base-bin "$RUNNER_TEMP/base-bin"
 
     - name: Coverage gate
       env:
@@ -119,7 +142,13 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
       with:
-        dotnet-version: 10.0.x
+        global-json-file: global.json
+
+    - name: Assert SDK version
+      run: |
+        version=$(dotnet --version)
+        echo "dotnet --version ${version}"
+        test "$version" = "10.0.402"
 
     - name: Restore
       run: dotnet restore ALog.sln
@@ -140,7 +169,13 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
       with:
-        dotnet-version: 10.0.x
+        global-json-file: global.json
+
+    - name: Assert SDK version
+      run: |
+        version=$(dotnet --version)
+        echo "dotnet --version ${version}"
+        test "$version" = "10.0.402"
 
     - name: Consumer smoke file
       run: bash eng/consumer-smoke.sh file
@@ -157,7 +192,13 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
       with:
-        dotnet-version: 10.0.x
+        global-json-file: global.json
+
+    - name: Assert SDK version
+      run: |
+        version=$(dotnet --version)
+        echo "dotnet --version ${version}"
+        test "$version" = "10.0.402"
 
     - name: Consumer smoke console
       run: bash eng/consumer-smoke.sh console

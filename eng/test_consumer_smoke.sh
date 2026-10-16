@@ -127,6 +127,25 @@ if ! grep -F -q "stdout+stderr count: 2" "$work/summary.md"; then
 else
   pass "summary appended"
 fi
+if printf '%s\n' "$summary" | grep -F -q 'SMOKE-CONSOLE count='; then
+  echo "FAIL summary printed the console count token" >&2
+  failures=$((failures + 1))
+else
+  pass "summary omits the console count token"
+fi
+count_line=$(report_console_count 2 "$work/count.md")
+if [ "$count_line" != "SMOKE-CONSOLE count=2" ]; then
+  echo "FAIL console count line: ${count_line}" >&2
+  failures=$((failures + 1))
+else
+  pass "one console count line"
+fi
+if [ "$(grep -F -c 'SMOKE-CONSOLE count=2' "$work/count.md")" -ne 1 ]; then
+  echo "FAIL console count was not written once" >&2
+  failures=$((failures + 1))
+else
+  pass "console count written once"
+fi
 
 export ALog__MinimumLevel=Debug
 clear_inherited_alog_keys
@@ -186,21 +205,32 @@ assets="$work/assets.json"
 feed="$work/feed"
 mkdir -p "$feed"
 printf 'packed-bytes' > "$feed/ALog.${version}.nupkg"
+printf 'packed-ext' > "$feed/ALog.Extensions.Logging.${version}.nupkg"
 sha=$(python3 - "$feed/ALog.${version}.nupkg" << 'PY'
 import base64, hashlib, sys
 print(base64.b64encode(hashlib.sha512(open(sys.argv[1], "rb").read()).digest()).decode("ascii"))
 PY
 )
+extsha=$(python3 - "$feed/ALog.Extensions.Logging.${version}.nupkg" << 'PY'
+import base64, hashlib, sys
+print(base64.b64encode(hashlib.sha512(open(sys.argv[1], "rb").read()).digest()).decode("ascii"))
+PY
+)
 cat > "$assets" << EOF
-{"libraries":{"ALog/${version}":{"type":"package","sha512":"${sha}"},"ALog.Extensions.Logging/${version}":{"type":"package"}},"sources":{"${feed}":{}}}
+{"libraries":{"ALog/${version}":{"type":"package","sha512":"${sha}"},"ALog.Extensions.Logging/${version}":{"type":"package","sha512":"${extsha}"}},"sources":{"${feed}":{}}}
 EOF
 proof=$(python3 eng/smoke-assets-check.py "$assets" "$version" "$feed")
-if [ "$proof" != "SMOKE-PACKAGE ALog ${version} from-feed" ]; then
+expected=$(printf 'SMOKE-PACKAGE ALog %s from-feed\nSMOKE-PACKAGE ALog.Extensions.Logging %s from-feed' "$version" "$version")
+if [ "$proof" != "$expected" ]; then
   echo "FAIL package proof: ${proof}" >&2
   failures=$((failures + 1))
 else
-  pass "package proof line"
+  pass "package proof lines"
 fi
+cat > "$assets" << EOF
+{"libraries":{"ALog/${version}":{"type":"package","sha512":"${sha}"},"ALog.Extensions.Logging/${version}":{"type":"package","sha512":"wrong"}},"sources":{"${feed}":{}}}
+EOF
+expect_fail "extensions sha512" python3 eng/smoke-assets-check.py "$assets" "$version" "$feed"
 cat > "$assets" << EOF
 {"libraries":{"ALog/1.0.0":{"type":"project","path":"ALog/ALog.csproj"}},"sources":{"${feed}":{}}}
 EOF

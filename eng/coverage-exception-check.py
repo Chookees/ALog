@@ -877,6 +877,180 @@ def load_body(env: Mapping[str, str] | None = None) -> str:
     return source.get("PR_BODY", "")
 
 
+# BB-09. The tool resolves attribute types from metadata. These two names are
+# the only ones that make a new head entry need a coverage-exception line.
+METADATA_TOOL = Path("eng/coverage-metadata/bin/Release/net10.0/CoverageMetadata.dll")
+HEAD_ASSEMBLIES = (
+    Path("ALog/bin/Release/net10.0/ALog.dll"),
+    Path("ALog.Extensions.Logging/bin/Release/net10.0/ALog.Extensions.Logging.dll"),
+)
+BASE_ASSEMBLY_NAMES = ("ALog.dll", "ALog.Extensions.Logging.dll")
+MAX_ASSEMBLIES = 8
+MAX_METADATA_LINES = 100_000
+MAX_METADATA_LINE_CHARS = 4_000
+
+
+def metadata_requires_reason(new_lines: list[str], body: str) -> bool:
+    """Return whether new metadata entries still need a coverage-exception line.
+
+    Args:
+        new_lines: Attribute lines present in head and absent in base. Empty
+            means nothing was added, including a removed attribute.
+        body: Pull-request text. A floor line does not authorize an attribute.
+
+    Returns:
+        True when ``new_lines`` is non-empty and the body has no general
+        reason of at least 10 characters without angle brackets.
+
+    Raises:
+        ValueError: The body is larger than 1000000 characters.
+
+    Side effects:
+        None.
+    """
+    if not new_lines:
+        return False
+    return not valid_reason(body)
+
+
+def entries_new_in_head(base_lines: list[str], head_lines: list[str]) -> list[str]:
+    """Return attribute lines that head has and base does not.
+
+    Args:
+        base_lines: Lines from the base assemblies. At most 100000.
+        head_lines: Lines from the head assemblies. At most 100000.
+
+    Returns:
+        Head lines missing from base, in head order. A line that only exists
+        on base is not returned, so removing an attribute stays empty.
+
+    Raises:
+        ValueError: Either list is longer than 100000 lines.
+
+    Side effects:
+        None.
+    """
+    if len(base_lines) > MAX_METADATA_LINES or len(head_lines) > MAX_METADATA_LINES:
+        raise ValueError("metadata list is longer than 100000 lines.")
+    base = set(base_lines)
+    found: list[str] = []
+    for line in head_lines:
+        if line in base:
+            continue
+        found.append(line)
+    return found
+
+
+def read_metadata_lines(repo: Path, assemblies: list[Path]) -> list[str]:
+    """Run the BB-09 tool and return the lines it prints.
+
+    Args:
+        repo: Repository root. The Release build of the tool must already exist.
+        assemblies: One to eight assembly paths. Each must be a readable file.
+
+    Returns:
+        The tool's stdout lines. Empty when the assemblies have no tracked
+        attributes. Each line has four tab-separated fields.
+
+    Raises:
+        ValueError: The tool is missing, an assembly cannot be read, the tool
+            exits non-zero, or a printed line is not four fields. A missing
+            assembly is a failure, not an empty result.
+
+    Side effects:
+        Reads the assemblies and starts ``dotnet exec``.
+    """
+    if not assemblies or len(assemblies) > MAX_ASSEMBLIES:
+        raise ValueError("assembly list must contain 1 to 8 paths.")
+    tool = repo / METADATA_TOOL
+    if not tool.is_file():
+        raise ValueError(f"coverage metadata tool is missing: {tool}")
+    args = ["dotnet", "exec", str(tool)]
+    for path in assemblies:
+        if not path.is_file():
+            raise ValueError(f"assembly missing or unreadable: {path}")
+        try:
+            with path.open("rb") as handle:
+                if handle.read(1) == b"":
+                    raise ValueError(f"assembly missing or unreadable: {path}")
+        except OSError as exc:
+            raise ValueError(f"assembly missing or unreadable: {path}") from exc
+        args.append(str(path))
+    completed = subprocess.run(args, check=False, capture_output=True, text=True)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "metadata tool failed"
+        raise ValueError(detail)
+    lines: list[str] = []
+    for line in completed.stdout.splitlines():
+        if not line:
+            continue
+        if len(line) > MAX_METADATA_LINE_CHARS or line.count("\t") != 3:
+            raise ValueError("metadata tool printed a line that is not four fields.")
+        lines.append(line)
+        if len(lines) > MAX_METADATA_LINES:
+            raise ValueError("metadata tool printed more than 100000 lines.")
+    return lines
+
+
+def head_assembly_paths(repo: Path) -> list[Path]:
+    """Return the Release assemblies of the two shipped libraries.
+
+    Args:
+        repo: Repository root.
+
+    Returns:
+        ``ALog.dll`` then ``ALog.Extensions.Logging.dll`` under ``bin/Release``.
+        The files are not opened here.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return [repo / relative for relative in HEAD_ASSEMBLIES]
+
+
+def base_assembly_paths(base_bin: Path) -> list[Path]:
+    """Return the two library assemblies copied from a base build.
+
+    Args:
+        base_bin: Directory that holds ``ALog.dll`` and
+            ``ALog.Extensions.Logging.dll``.
+
+    Returns:
+        Those two paths, in that order.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return [base_bin / name for name in BASE_ASSEMBLY_NAMES]
+
+
+def new_metadata_entries(repo: Path, base_bin: Path) -> list[str]:
+    """Diff the tracked attributes of the two libraries, base against head.
+
+    Args:
+        repo: Repository root with a built tool and built head assemblies.
+        base_bin: Directory with the base assemblies. A missing file fails.
+
+    Returns:
+        Attribute lines that are new in head.
+
+    Raises:
+        ValueError: An assembly or the tool cannot be read.
+
+    Side effects:
+        Reads four assemblies and runs the metadata tool twice.
+    """
+    base_lines = read_metadata_lines(repo, base_assembly_paths(base_bin))
+    head_lines = read_metadata_lines(repo, head_assembly_paths(repo))
+    return entries_new_in_head(base_lines, head_lines)
+
+
 def format_failure(missing: list[str]) -> str:
     """Describe which exception lines are still missing.
 
@@ -909,28 +1083,27 @@ def format_failure(missing: list[str]) -> str:
     return "".join(lines)
 
 
-def main(argv: list[str]) -> int:
-    """Diff the repo against a base ref and require a reason when needed.
+def parse_check_args(argv: list[str]) -> tuple[str, Path, str] | None:
+    """Read ``--base``, ``--repo``, and ``--base-bin`` from the command line.
 
     Args:
-        argv: ``--base <ref>`` and optional ``--repo <path>``. The body comes
-        from the pulls API when ``GITHUB_TOKEN`` is set, otherwise ``PR_BODY``.
+        argv: Arguments after the program name.
 
     Returns:
-        ``0`` when no reason is required or one is present, ``1`` when a reason
-        is missing, ``2`` when the arguments are wrong.
+        ``(base ref, repo, base bin)``. The base bin is empty when omitted.
+        None when an argument is not recognized. The caller prints usage.
 
     Raises:
-        None. Git and JSON errors exit ``1``.
+        None.
 
     Side effects:
-        Reads git and the working tree. May GET the pull-request body. Writes
-        to stdout and stderr.
+        None.
     """
     base = ""
     repo = Path.cwd()
+    base_bin = ""
     index = 0
-    while index < len(argv):
+    while index < len(argv) and index < 20:
         token = argv[index]
         if token == "--base" and index + 1 < len(argv):
             base = argv[index + 1]
@@ -940,13 +1113,51 @@ def main(argv: list[str]) -> int:
             repo = Path(argv[index + 1])
             index += 2
             continue
-        sys.stderr.write("usage: coverage-exception-check.py --base <ref> [--repo <path>]\n")
+        if token == "--base-bin" and index + 1 < len(argv):
+            base_bin = argv[index + 1]
+            index += 2
+            continue
+        return None
+    if index != len(argv):
+        return None
+    return base, repo, base_bin
+
+
+def main(argv: list[str]) -> int:
+    """Diff the repo against a base ref and require a reason when needed.
+
+    Args:
+        argv: ``--base <ref>``, optional ``--repo <path>``, and ``--base-bin``
+        pointing at the base Release assemblies. The body comes from the pulls
+        API when ``GITHUB_TOKEN`` is set, otherwise ``PR_BODY``.
+
+    Returns:
+        ``0`` when no reason is required or one is present, ``1`` when a reason
+        is missing or an assembly cannot be read, ``2`` when the arguments are wrong.
+
+    Raises:
+        None. Git, JSON, and metadata errors exit ``1``.
+
+    Side effects:
+        Reads git, the working tree, and four assemblies. May GET the
+        pull-request body. Writes to stdout and stderr.
+    """
+    parsed = parse_check_args(argv)
+    if parsed is None:
+        sys.stderr.write(
+            "usage: coverage-exception-check.py --base <ref> --base-bin <dir> [--repo <path>]\n"
+        )
         return 2
-    if not base:
-        sys.stderr.write("coverage-exception-check.py requires --base.\n")
+    base, repo, base_bin = parsed
+    if not base or not base_bin:
+        sys.stderr.write("coverage-exception-check.py requires --base and --base-bin.\n")
         return 2
     try:
-        missing = decide(repo, base, load_body())
+        body = load_body()
+        missing = decide(repo, base, body)
+        new_lines = new_metadata_entries(repo, Path(base_bin))
+        if metadata_requires_reason(new_lines, body):
+            missing.append("metadata-exclusion")
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError, KeyError) as exc:
         sys.stderr.write(f"coverage exception check failed: {exc}\n")
         return 1

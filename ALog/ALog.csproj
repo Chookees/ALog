@@ -2,8 +2,6 @@
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
     <PackageId>ALog</PackageId>
     <Version>0.2.1</Version>
     <PackageReleaseNotes>0.2.1: throwing filters drop the event; non-KVP scopes are kept; level gate before work; factory activity scopes are captured at emit; SelfLog.Enable/Disable and LogContext.Push/PushScope.</PackageReleaseNotes>
