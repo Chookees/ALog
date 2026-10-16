@@ -102,6 +102,15 @@ internal sealed class CapturingHttpHandler : HttpMessageHandler
 {
     public List<CapturedHttpRequest> Requests { get; } = new();
 
+    /// <summary>
+    /// Sync <see cref="HttpClient.Send"/> calls this. It finishes the async handler inline.
+    /// </summary>
+    /// <param name="request">Request whose body is captured.</param>
+    /// <param name="cancellationToken">Passed through to <see cref="SendAsync"/>.</param>
+    /// <returns>The same response <see cref="SendAsync"/> would return.</returns>
+    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+        => SendAsync(request, cancellationToken).GetAwaiter().GetResult();
+
     protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request,
         CancellationToken cancellationToken)
