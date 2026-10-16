@@ -33,6 +33,9 @@ main() {
   fi
   local report
   local status=0
+  # The vulnerable-package sentence is English. Force that language so a runner
+  # whose default is German cannot hide the finding.
+  export DOTNET_CLI_UI_LANGUAGE=en
   set +e
   report=$(dotnet list ALog.sln package --vulnerable --include-transitive 2>&1)
   status=$?

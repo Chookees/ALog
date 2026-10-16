@@ -1,52 +1,89 @@
 #!/usr/bin/env python3
 """Require ``coverage-exception: <reason>`` when a PR changes coverage policy.
 
-arc_spec 4.1 point 4 and S4-12. The pull-request body is read from the
-environment variable ``PR_BODY`` (not the command line). Raising every ratchet
-floor, without removing a package or changing the 90/80 targets, is not an
-exception. Any other change to the ratchet, plus edits to ``coverage.runsettings``
-or ``coverage.config``, plus a new ``ExcludeFromCodeCoverage`` or
-``GeneratedCode`` attribute under the two libraries, needs the reason line.
+Raising ratchet floors needs no reason. Lowering a floor, any other ratchet
+edit, and any change to ``coverage.runsettings`` or ``coverage.config`` need a
+real reason. Added or changed lines in ``*.cs``, ``*.props``, and ``*.targets``
+that contain the tokens ``ExcludeFromCodeCoverage``, ``GeneratedCode``, or
+``CompilerGenerated`` need one too, including comments, aliases, and qualifiers.
+In CI the body is read from the pulls API, not from the event payload.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
+import urllib.request
 from decimal import Decimal
 from pathlib import Path
+from typing import Mapping
 
 RATCHET = "eng/coverage-ratchet.json"
-POLICY_FILES = (RATCHET, "coverage.runsettings", "coverage.config")
-LIBRARY_ROOTS = ("ALog", "ALog.Extensions.Logging")
-ATTRIBUTES = ("[ExcludeFromCodeCoverage", "[GeneratedCode")
+POLICY_FILES = ("coverage.runsettings", "coverage.config")
+EXCLUSION_TOKENS = ("ExcludeFromCodeCoverage", "GeneratedCode", "CompilerGenerated")
+SOURCE_SUFFIXES = (".cs", ".props", ".targets")
+TOKEN_RE = re.compile(
+    "(?<![A-Za-z0-9_])(?:" + "|".join(EXCLUSION_TOKENS) + ")(?:Attribute)?(?![A-Za-z0-9_])"
+)
+HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+PLACEHOLDER = re.compile(r"<[^>\n]*>")
 MAX_DIFF_CHARS = 2_000_000
 MAX_DIFF_LINES = 20_000
+MAX_SOURCE_FILES = 500
+MAX_BODY_CHARS = 1_000_000
 
 
-def reason_present(body: str) -> bool:
-    """Return whether the body has a non-empty coverage-exception reason.
+def strip_html_comments(body: str) -> str:
+    """Remove HTML comments so a reason hidden in one does not count.
 
     Args:
-        body: Pull-request text. An empty string has no reason.
+        body: Pull-request text. Comments may span lines.
 
     Returns:
-        True when a line starts with ``coverage-exception:`` and has text after it.
+        The text with each ``<!-- ... -->`` region removed.
 
     Raises:
-        None.
+        ValueError: The body is larger than 1000000 characters.
 
     Side effects:
         None.
     """
-    for line in body.splitlines():
+    if len(body) > MAX_BODY_CHARS:
+        raise ValueError("pull request body is larger than 1000000 characters.")
+    return HTML_COMMENT.sub("", body)
+
+
+def valid_reason(body: str) -> bool:
+    """Return whether the body has a usable coverage-exception reason.
+
+    Args:
+        body: Pull-request text, including any HTML comments.
+
+    Returns:
+        True when a line starts with ``coverage-exception:`` and the text after
+        it is non-empty and not a single placeholder such as ``<reason>``.
+
+    Raises:
+        ValueError: The body is larger than 1000000 characters.
+
+    Side effects:
+        None.
+    """
+    text = strip_html_comments(body)
+    seen = 0
+    for line in text.splitlines():
+        seen += 1
+        if seen > 5000:
+            return False
         if not line.startswith("coverage-exception:"):
             continue
         reason = line.split(":", 1)[1].strip()
-        if reason:
-            return True
+        if not reason or PLACEHOLDER.fullmatch(reason):
+            continue
+        return True
     return False
 
 
@@ -141,38 +178,38 @@ def git_output(repo: Path, args: list[str]) -> str:
     return completed.stdout
 
 
-def changed_policy_paths(repo: Path, base: str) -> list[str]:
-    """List policy and library paths that differ from the base ref.
+def changed_paths(repo: Path, base: str) -> list[str]:
+    """List every path that differs from the base ref.
 
     Args:
         repo: Repository root.
         base: Git ref such as ``origin/master``.
 
     Returns:
-        Repo-relative paths, at most a few hundred.
+        Repo-relative paths. At most 5000.
 
     Raises:
-        ValueError: Git cannot diff the ref.
+        ValueError: Git cannot diff the ref, or the diff is too wide.
 
     Side effects:
         Reads git.
     """
-    text = git_output(repo, ["diff", "--name-only", base, "--", *POLICY_FILES, *LIBRARY_ROOTS])
+    text = git_output(repo, ["diff", "--name-only", base])
     paths = [line.strip() for line in text.splitlines() if line.strip()]
     if len(paths) > 5000:
         raise ValueError("diff lists more than 5000 paths.")
     return paths
 
 
-def attribute_was_added(diff_text: str) -> bool:
-    """Return whether the diff adds an exclusion attribute.
+def exclusion_token_added(diff_text: str) -> bool:
+    """Return whether an added or changed line contains an exclusion token.
 
     Args:
-        diff_text: Unified diff. A huge diff is treated as an addition so the
-        check fails closed.
+        diff_text: Unified diff of ``*.cs``, ``*.props``, and ``*.targets``.
+        Comments, aliases, and qualifiers count. A huge diff fails closed.
 
     Returns:
-        True when an added line contains an exclusion attribute and is not a comment.
+        True when a ``+`` line contains one of ``EXCLUSION_TOKENS`` as a token.
 
     Raises:
         None.
@@ -189,12 +226,39 @@ def attribute_was_added(diff_text: str) -> bool:
             return True
         if not line.startswith("+") or line.startswith("+++"):
             continue
-        code = line[1:].strip()
-        if code.startswith("//") or code.startswith("*") or code.startswith("/*"):
-            continue
-        if any(attribute in code for attribute in ATTRIBUTES):
+        if TOKEN_RE.search(line[1:]):
             return True
     return False
+
+
+def source_diff(repo: Path, base: str, paths: list[str]) -> str:
+    """Return the unified diff of source files that can carry the tokens.
+
+    Args:
+        repo: Repository root.
+        base: Git ref to diff against.
+        paths: Changed paths. Only ``.cs``, ``.props``, and ``.targets`` are kept.
+
+    Returns:
+        The diff text. Empty when none of those files changed. More than 500
+        matching files returns a marker that the caller treats as a hit.
+
+    Raises:
+        ValueError: Git cannot diff the selected files.
+
+    Side effects:
+        Reads git.
+    """
+    selected: list[str] = []
+    for path in paths:
+        if not path.lower().endswith(SOURCE_SUFFIXES):
+            continue
+        selected.append(path)
+        if len(selected) > MAX_SOURCE_FILES:
+            return "+" + EXCLUSION_TOKENS[0]
+    if not selected:
+        return ""
+    return git_output(repo, ["diff", "-U0", base, "--", *selected])
 
 
 def ratchet_needs_reason(repo: Path, base: str) -> bool:
@@ -242,14 +306,13 @@ def triggers(repo: Path, base: str) -> list[str]:
     Side effects:
         Reads git and the working tree.
     """
-    paths = changed_policy_paths(repo, base)
+    paths = changed_paths(repo, base)
     found: list[str] = []
     if RATCHET in paths and ratchet_needs_reason(repo, base):
         found.append("coverage-ratchet")
-    if any(path in paths for path in ("coverage.runsettings", "coverage.config")):
+    if any(path in paths for path in POLICY_FILES):
         found.append("coverage-settings")
-    library_diff = git_output(repo, ["diff", "-U0", base, "--", *LIBRARY_ROOTS])
-    if attribute_was_added(library_diff):
+    if exclusion_token_added(source_diff(repo, base, paths)):
         found.append("exclusion-attribute")
     return found
 
@@ -273,9 +336,80 @@ def decide(repo: Path, base: str, body: str) -> list[str]:
         Reads git and the working tree.
     """
     found = triggers(repo, base)
-    if not found or reason_present(body):
+    if not found or valid_reason(body):
         return []
     return found
+
+
+def fetch_pull_request_body(env: Mapping[str, str] | None = None) -> str:
+    """Read the current pull-request body from the GitHub pulls API.
+
+    Args:
+        env: Environment with ``GITHUB_TOKEN``, ``GITHUB_REPOSITORY``, and
+        ``PR_NUMBER``. ``None`` uses ``os.environ``.
+
+    Returns:
+        The body text. A null body becomes an empty string.
+
+    Raises:
+        ValueError: The environment or the payload is not usable.
+        OSError: The API request fails.
+
+    Side effects:
+        Sends one HTTPS GET to ``/repos/{owner}/{repo}/pulls/{number}``.
+    """
+    source = os.environ if env is None else env
+    token = source.get("GITHUB_TOKEN", "")
+    repo = source.get("GITHUB_REPOSITORY", "")
+    number = source.get("PR_NUMBER", "")
+    if not token:
+        raise ValueError("GITHUB_TOKEN is missing.")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise ValueError("GITHUB_REPOSITORY is missing.")
+    if not number.isdigit() or len(number) > 10:
+        raise ValueError("PR_NUMBER is missing.")
+    url = f"https://api.github.com/repos/{repo}/pulls/{number}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "alog-coverage-exception-check",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        raw = response.read(MAX_BODY_CHARS + 1)
+    if len(raw) > MAX_BODY_CHARS:
+        raise ValueError("pull request payload is too large.")
+    payload = json.loads(raw.decode("utf-8"))
+    body = payload.get("body") or ""
+    if not isinstance(body, str):
+        raise ValueError("pull request body is not text.")
+    return body
+
+
+def load_body(env: Mapping[str, str] | None = None) -> str:
+    """Choose the pull-request body from the API or from ``PR_BODY``.
+
+    Args:
+        env: Environment. ``None`` uses ``os.environ``. When the GitHub token
+        and pull-request number are set, the API wins over ``PR_BODY``.
+
+    Returns:
+        The body text to validate.
+
+    Raises:
+        ValueError: The API environment or payload is not usable.
+        OSError: The API request fails.
+
+    Side effects:
+        May send one HTTPS GET.
+    """
+    source = os.environ if env is None else env
+    if source.get("GITHUB_TOKEN") and source.get("PR_NUMBER") and source.get("GITHUB_REPOSITORY"):
+        return fetch_pull_request_body(source)
+    return source.get("PR_BODY", "")
 
 
 def main(argv: list[str]) -> int:
@@ -283,7 +417,7 @@ def main(argv: list[str]) -> int:
 
     Args:
         argv: ``--base <ref>`` and optional ``--repo <path>``. The body comes
-        from the ``PR_BODY`` environment variable.
+        from the pulls API when ``GITHUB_TOKEN`` is set, otherwise ``PR_BODY``.
 
     Returns:
         ``0`` when no reason is required or one is present, ``1`` when a reason
@@ -293,7 +427,8 @@ def main(argv: list[str]) -> int:
         None. Git and JSON errors exit ``1``.
 
     Side effects:
-        Reads git, the working tree, and ``PR_BODY``. Writes to stdout and stderr.
+        Reads git and the working tree. May GET the pull-request body. Writes
+        to stdout and stderr.
     """
     base = ""
     repo = Path.cwd()
@@ -314,7 +449,7 @@ def main(argv: list[str]) -> int:
         sys.stderr.write("coverage-exception-check.py requires --base.\n")
         return 2
     try:
-        missing = decide(repo, base, os.environ.get("PR_BODY", ""))
+        missing = decide(repo, base, load_body())
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError, KeyError) as exc:
         sys.stderr.write(f"coverage exception check failed: {exc}\n")
         return 1

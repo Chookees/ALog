@@ -388,6 +388,43 @@ class CoverageGateTests(unittest.TestCase):
             )
             self.assertEqual(code, 1)
 
+    def test_lowered_floor_passes_only_with_a_real_reason(self) -> None:
+        """A lower floor is allowed when the body has a real exception reason.
+
+        A placeholder reason does not waive the lower. Raising stays allowed
+        with no reason, which the fixture test above already covers.
+
+        Side effects:
+            Reads the ratchet and Cobertura fixtures.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            source = Path(raw) / "src"
+            source.mkdir()
+            write_cs(source / "Clean.cs", "class Clean {}\n")
+            args = [
+                "--cobertura",
+                str(DATA / "cobertura-assembly-name.xml"),
+                "--ratchet",
+                str(DATA / "ratchet-lowered.json"),
+                "--baseline",
+                str(DATA / "ratchet-baseline.json"),
+                "--source-root",
+                str(source),
+            ]
+            allowed = GATE.main(
+                args,
+                {
+                    "COVERAGE_ENFORCE": "false",
+                    "PR_BODY": "coverage-exception: SQL branches fell after the filter change.\n",
+                },
+            )
+            self.assertEqual(allowed, 0)
+            blocked = GATE.main(
+                args,
+                {"COVERAGE_ENFORCE": "false", "PR_BODY": "coverage-exception: <reason>\n"},
+            )
+            self.assertEqual(blocked, 1)
+
     def test_real_ratchet_file_has_both_packages_and_targets(self) -> None:
         """The committed ratchet parses and names the two shipped packages.
 

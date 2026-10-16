@@ -45,6 +45,37 @@ expect_fail "vulnerable sentence" report_is_clean "$dirty_report"
 expect_fail "empty report" report_is_clean ""
 expect_fail "whitespace report" report_is_clean $' \n\t'
 
+# A runner whose default UI language is German must still fail on a vulnerable
+# report. The fixture dotnet prints the English sentence only when the check
+# forces DOTNET_CLI_UI_LANGUAGE=en.
+fake=$(mktemp -d)
+cat > "$fake/dotnet" << 'EOF'
+#!/bin/bash
+if [ "${DOTNET_CLI_UI_LANGUAGE:-}" = "en" ]; then
+  printf '%s\n' 'Project `ALog` has the following vulnerable packages'
+  printf '%s\n' '   > System.Security.Cryptography.Pkcs  9.0.4  High'
+  exit 0
+fi
+printf '%s\n' 'Projekt `ALog` hat die folgenden anfälligen Pakete'
+exit 0
+EOF
+chmod +x "$fake/dotnet"
+root=$(cd "$here/.." && pwd)
+start=$(pwd)
+cd "$root"
+saved_path="$PATH"
+saved_lang="${DOTNET_CLI_UI_LANGUAGE-}"
+export DOTNET_CLI_UI_LANGUAGE=de
+export PATH="$fake:${PATH}"
+expect_fail "german default still fails" main
+export PATH="$saved_path"
+if [ -n "$saved_lang" ]; then
+  export DOTNET_CLI_UI_LANGUAGE="$saved_lang"
+else
+  unset DOTNET_CLI_UI_LANGUAGE
+fi
+cd "$start"
+
 if [ "$failures" -ne 0 ]; then
   echo "${failures} vuln-check tests failed" >&2
   exit 1

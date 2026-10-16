@@ -199,10 +199,193 @@ def main() -> None:
         True,
     )
     comment = "namespace ALog;\n// [ExcludeFromCodeCoverage] mentioned only\npublic class Note {}\n"
-    expect("commented attribute", {"ALog/Note.cs": comment}, "", False)
+    expect("commented attribute without reason", {"ALog/Note.cs": comment}, "", True)
+    expect("commented attribute with reason", {"ALog/Note.cs": comment}, REASON, False)
     empty = "coverage-exception:\n"
     expect("empty reason", {"coverage.runsettings": "<RunSettings></RunSettings>\n"}, empty, True)
+    expect_bypasses()
+    expect_reason_shapes()
     print("coverage exception tests passed")
+
+
+def expect_bypasses() -> None:
+    """Each attribute spelling must need a reason, including comments and aliases.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: A spelling is accepted without a reason, or rejected with one.
+
+    Side effects:
+        Writes one temporary git repository per spelling.
+    """
+    cases = (
+        ("qualified name", "ALog/Qualified.cs", "namespace ALog;\n[System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]\npublic class Qualified {}\n"),
+        ("global qualifier", "ALog/Global.cs", "namespace ALog;\n[global::System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverage]\npublic class Global {}\n"),
+        ("two-line qualified name", "ALog/Split.cs", "namespace ALog;\n[global::System.Diagnostics.CodeAnalysis.\n    ExcludeFromCodeCoverageAttribute]\npublic class Split {}\n"),
+        ("attribute list", "ALog/List.cs", "namespace ALog;\n[Serializable, ExcludeFromCodeCoverage]\npublic class List {}\n"),
+        ("spaced attribute", "ALog/Spaced.cs", "namespace ALog;\n[ ExcludeFromCodeCoverage ]\npublic class Spaced {}\n"),
+        ("attribute on two lines", "ALog/Broken.cs", "namespace ALog;\n[\nExcludeFromCodeCoverage\n]\npublic class Broken {}\n"),
+        ("using alias", "ALog/Alias.cs", "using Hidden = System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute;\npublic class AliasUser {}\n"),
+        ("props alias", "Directory.Build.props", "<Project>\n  <ItemGroup>\n    <Using Include=\"System.Diagnostics.CodeAnalysis.ExcludeFromCodeCoverageAttribute\" Alias=\"Hidden\" />\n  </ItemGroup>\n</Project>\n"),
+        ("block comment on the same line", "ALog/Marked.cs", "namespace ALog;\n/* kept */ [ExcludeFromCodeCoverage] public class Marked {}\n"),
+        ("compiler generated", "ALog/Made.cs", "namespace ALog;\n[CompilerGenerated]\npublic class Made {}\n"),
+    )
+    index = 0
+    while index < len(cases) and index < 20:
+        label, path, text = cases[index]
+        expect(f"{label} without reason", {path: text}, "", True)
+        expect(f"{label} with reason", {path: text}, REASON, False)
+        index += 1
+
+
+def expect_reason_shapes() -> None:
+    """Placeholders and HTML comments are not a coverage-exception reason.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: A placeholder is accepted or a real reason is rejected.
+
+    Side effects:
+        Writes temporary git repositories.
+    """
+    trigger = {"coverage.runsettings": "<RunSettings></RunSettings>\n"}
+    for placeholder in ("<Grund>", "<reason>", "<...>"):
+        expect(
+            f"placeholder {placeholder}",
+            trigger,
+            f"coverage-exception: {placeholder}\n",
+            True,
+        )
+    hidden = "<!--\ncoverage-exception: this reason is inside a comment.\n-->\ncoverage-exception: <reason>\n"
+    expect("reason hidden in html comment", trigger, hidden, True)
+    visible = "<!-- coverage-exception: <reason> -->\ncoverage-exception: SQL coverage dropped with the new filter.\n"
+    expect("reason outside html comment", trigger, visible, False)
+    test_fetch_uses_pulls_endpoint()
+
+
+def test_fetch_uses_pulls_endpoint() -> None:
+    """The body fetch hits the pulls API and returns that body.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: The URL or the parsed body is wrong.
+
+    Side effects:
+        Patches ``urlopen`` for one call. No network.
+    """
+
+    class Response:
+        """Minimal context manager for a fake pulls payload."""
+
+        def read(self, limit: int) -> bytes:
+            """Return a small JSON body.
+
+            Args:
+                limit: Maximum bytes the caller is willing to read.
+
+            Returns:
+                The fake payload.
+
+            Raises:
+                None.
+
+            Side effects:
+                None.
+            """
+            if limit < 10:
+                raise SystemExit("read limit is too small")
+            return b'{"body": "coverage-exception: from the api\\n"}'
+
+        def __enter__(self) -> "Response":
+            """Enter the context.
+
+            Args:
+                None.
+
+            Returns:
+                This response.
+
+            Raises:
+                None.
+
+            Side effects:
+                None.
+            """
+            return self
+
+        def __exit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            """Leave the context.
+
+            Args:
+                exc_type: Exception class, if any.
+                exc: Exception value, if any.
+                tb: Traceback, if any.
+
+            Returns:
+                False so exceptions propagate.
+
+            Raises:
+                None.
+
+            Side effects:
+                None.
+            """
+            return False
+
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request: object, timeout: int) -> Response:
+        """Record the request and return the fake response.
+
+        Args:
+            request: urllib request.
+            timeout: Socket timeout.
+
+        Returns:
+            The fake response.
+
+        Raises:
+            None.
+
+        Side effects:
+            Stores the URL and timeout in ``captured``.
+        """
+        captured["url"] = getattr(request, "full_url", "")
+        captured["timeout"] = timeout
+        return Response()
+
+    original = module.urllib.request.urlopen
+    module.urllib.request.urlopen = fake_urlopen
+    try:
+        body = module.fetch_pull_request_body(
+            {
+                "GITHUB_TOKEN": "token",
+                "GITHUB_REPOSITORY": "Chookees/ALog",
+                "PR_NUMBER": "8",
+            }
+        )
+    finally:
+        module.urllib.request.urlopen = original
+    if captured.get("url") != "https://api.github.com/repos/Chookees/ALog/pulls/8":
+        raise SystemExit(f"pulls URL was {captured.get('url')}")
+    if body != "coverage-exception: from the api\n":
+        raise SystemExit(f"body was {body}")
+    print("ok pulls endpoint")
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ on:
   push:
     branches: [ "master" ]
   pull_request:
+    types: [opened, synchronize, reopened, edited]
     branches: [ "master" ]
 
 jobs:
@@ -82,10 +83,14 @@ jobs:
     - name: Coverage exception check
       if: github.event_name == 'pull_request'
       env:
-        PR_BODY: ${{ github.event.pull_request.body }}
+        GITHUB_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
       run: python3 eng/coverage-exception-check.py --base "$COVERAGE_BASE_REF"
 
     - name: Coverage gate
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
       run: |
         args=(--cobertura-dir TestResults --ratchet eng/coverage-ratchet.json --summary "$GITHUB_STEP_SUMMARY")
         if [ -n "${COVERAGE_BASELINE}" ]; then
@@ -119,6 +124,8 @@ jobs:
       run: dotnet restore ALog.sln
 
     - name: Vulnerable package check
+      env:
+        DOTNET_CLI_UI_LANGUAGE: en
       run: bash eng/vuln-check.sh
 
   smoke-file:

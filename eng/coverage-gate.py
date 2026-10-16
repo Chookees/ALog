@@ -924,7 +924,6 @@ def evaluate_gate(
         problems.extend(target_problems(baseline))
     problems.extend(floor_problems(coverage, ratchet))
     problems.extend(enforce_problems(coverage, ratchet, enforce))
-    problems.extend(lowering_problems(baseline, ratchet))
     problems.extend(scan_exemptions(source_roots))
     summary = format_summary(coverage, ratchet, enforce, problems)
     return GateResult(summary=summary, problems=problems)
@@ -988,6 +987,86 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def load_exception_check():
+    """Load the coverage-exception script so the reason rule stays in one place.
+
+    Args:
+        None.
+
+    Returns:
+        The loaded module. Later calls return the cached module.
+
+    Raises:
+        RuntimeError: The script cannot be loaded.
+
+    Side effects:
+        Executes ``eng/coverage-exception-check.py`` once.
+    """
+    cached = getattr(load_exception_check, "module", None)
+    if cached is not None:
+        return cached
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "coverage-exception-check.py"
+    spec = importlib.util.spec_from_file_location("coverage_exception_check", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load {path}.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    setattr(load_exception_check, "module", module)
+    return module
+
+
+def floor_lower_is_allowed(env: Mapping[str, str]) -> bool:
+    """Return whether a valid coverage-exception reason waives a lowered floor.
+
+    Args:
+        env: Environment. A GitHub token and pull-request number select the API.
+        Otherwise ``PR_BODY`` is used. A fetch error does not waive the lower.
+
+    Returns:
+        True only for a non-empty, non-placeholder reason.
+
+    Raises:
+        None.
+
+    Side effects:
+        May send one HTTPS GET when the API environment is set.
+    """
+    try:
+        module = load_exception_check()
+        if env.get("GITHUB_TOKEN") and env.get("PR_NUMBER") and env.get("GITHUB_REPOSITORY"):
+            body = module.fetch_pull_request_body(env)
+        else:
+            body = env.get("PR_BODY", "")
+        return bool(module.valid_reason(body))
+    except (OSError, ValueError, RuntimeError, json.JSONDecodeError):
+        return False
+
+
+def merge_lowering(problems: list[str], extra: list[str], allowed: bool) -> list[str]:
+    """Append lowering problems unless a valid exception reason waives them.
+
+    Args:
+        problems: Failures already found by the other checks.
+        extra: Problems from ``lowering_problems``. Empty leaves the list as it is.
+        allowed: True when the pull-request body has a real reason.
+
+    Returns:
+        The combined problem list. Raising produces an empty ``extra``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if not extra or allowed:
+        return problems
+    return [*problems, *extra]
+
+
 def run_gate(args: argparse.Namespace, env: Mapping[str, str]) -> GateResult:
     """Load inputs and evaluate the gate.
 
@@ -1010,12 +1089,24 @@ def run_gate(args: argparse.Namespace, env: Mapping[str, str]) -> GateResult:
     baseline = None
     if args.baseline:
         baseline = load_ratchet(Path(args.baseline))
-    return evaluate_gate(
+    enforce = enforce_from_env(env)
+    result = evaluate_gate(
         coverage,
         ratchet,
         baseline,
-        enforce_from_env(env),
+        enforce,
         resolve_source_roots(args.source_root),
+    )
+    problems = merge_lowering(
+        result.problems,
+        lowering_problems(baseline, ratchet),
+        floor_lower_is_allowed(env),
+    )
+    if problems == result.problems:
+        return result
+    return GateResult(
+        summary=format_summary(coverage, ratchet, enforce, problems),
+        problems=problems,
     )
 
 
