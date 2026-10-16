@@ -3,7 +3,8 @@
 # Usage: eng/consumer-smoke.sh file|console
 #
 # Both modes restore with -p:ALogSmokeFromFeed=true and print
-# SMOKE-PACKAGE ALog <version> from-feed after checking project.assets.json.
+# SMOKE-PACKAGE ALog <version> from-feed and the same line for
+# ALog.Extensions.Logging after checking project.assets.json and both SHA-512s.
 # file is green when SMOKE-<guid> appears once in the ALog file and the process
 # exits 0. console prints SMOKE-CONSOLE count=<n> and is green only when n is 1.
 # On the S4 tree the console count is 2. The normal solution build uses the
@@ -345,7 +346,7 @@ write_smoke_summary() {
 - same token in both: ${same_guid}
 - consumer exit code: ${app_status}
 - file gate: file count 1, one distinct file token, exit 0
-- console gate: SMOKE-CONSOLE count=1 and exit 0
+- console gate: one stdout token and exit 0
 EOF
 )
   printf '%s\n' "$text"

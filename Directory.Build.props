@@ -1,0 +1,29 @@
+<Project>
+  <!--
+    Build-Basis shared settings. Every project under this repo imports this file.
+    TreatWarningsAsErrors is true only when CI=true, which GitHub Actions sets.
+    A local build leaves warnings as warnings. NU1901-NU1904 stay errors in CI
+    because they are not listed in WarningsNotAsErrors.
+  -->
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Deterministic>true</Deterministic>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest-recommended</AnalysisLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+    <TreatWarningsAsErrors Condition="'$(CI)' != 'true'">false</TreatWarningsAsErrors>
+    <TreatWarningsAsErrors Condition="'$(CI)' == 'true'">true</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <!--
+    AD-O14. Trim, AOT, and single-file analyzers run on the two shipped libraries.
+    The libraries are not marked compatible with trimming or AOT. The analyzers do not promise either.
+  -->
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'ALog' Or '$(MSBuildProjectName)' == 'ALog.Extensions.Logging'">
+    <EnableTrimAnalyzer>true</EnableTrimAnalyzer>
+    <EnableAotAnalyzer>true</EnableAotAnalyzer>
+    <EnableSingleFileAnalyzer>true</EnableSingleFileAnalyzer>
+  </PropertyGroup>
+</Project>

@@ -1,0 +1,60 @@
+root = true
+
+[*.cs]
+# NASA naming: public and internal surface is PascalCase. Private fields, properties, and events are camelCase.
+dotnet_naming_rule.public_members_should_be_pascal_case.severity = warning
+dotnet_naming_rule.public_members_should_be_pascal_case.symbols = public_symbols
+dotnet_naming_rule.public_members_should_be_pascal_case.style = pascal_case_style
+dotnet_naming_symbols.public_symbols.applicable_kinds = class,struct,interface,enum,delegate,method,property,event,field
+dotnet_naming_symbols.public_symbols.applicable_accessibilities = public,protected,protected_internal,internal
+dotnet_naming_style.pascal_case_style.capitalization = pascal_case
+
+dotnet_naming_rule.private_members_should_be_camel_case.severity = warning
+dotnet_naming_rule.private_members_should_be_camel_case.symbols = private_symbols
+dotnet_naming_rule.private_members_should_be_camel_case.style = camel_case_style
+dotnet_naming_symbols.private_symbols.applicable_kinds = field,property,event
+dotnet_naming_symbols.private_symbols.applicable_accessibilities = private
+dotnet_naming_style.camel_case_style.capitalization = camel_case
+
+dotnet_diagnostic.IDE0130.severity = warning
+dotnet_diagnostic.CA2007.severity = warning
+
+# analyzer-ratchet (BB): bestehende Befunde, nur schrumpfen
+dotnet_diagnostic.CA1001.severity = suggestion # 1
+dotnet_diagnostic.CA1050.severity = suggestion # 2
+dotnet_diagnostic.CA1305.severity = suggestion # 3
+dotnet_diagnostic.CA1510.severity = suggestion # 2
+dotnet_diagnostic.CA1513.severity = suggestion # 1
+dotnet_diagnostic.CA1707.severity = suggestion # 60
+dotnet_diagnostic.CA1711.severity = suggestion # 1
+dotnet_diagnostic.CA1716.severity = suggestion # 1
+dotnet_diagnostic.CA1805.severity = suggestion # 1
+dotnet_diagnostic.CA1816.severity = suggestion # 10
+dotnet_diagnostic.CA1822.severity = suggestion # 7
+dotnet_diagnostic.CA1848.severity = suggestion # 19
+dotnet_diagnostic.CA1852.severity = suggestion # 1
+dotnet_diagnostic.CA1859.severity = suggestion # 3
+dotnet_diagnostic.CA1861.severity = suggestion # 5
+dotnet_diagnostic.CA1869.severity = suggestion # 1
+dotnet_diagnostic.CA1873.severity = suggestion # 3
+dotnet_diagnostic.CA2007.severity = suggestion # 23
+dotnet_diagnostic.CA2201.severity = suggestion # 2
+dotnet_diagnostic.CA2249.severity = suggestion # 1
+dotnet_diagnostic.IDE0130.severity = suggestion # 7
+dotnet_diagnostic.IL2026.severity = suggestion # 6
+dotnet_diagnostic.IL3050.severity = suggestion # 6
+
+[ALog.Tests/**.cs]
+dotnet_diagnostic.CA2007.severity = none
+
+[DemoApp/**.cs]
+dotnet_diagnostic.CA2007.severity = none
+
+[samples/**.cs]
+dotnet_diagnostic.CA2007.severity = none
+
+[ALog.Benchmarks/**.cs]
+dotnet_diagnostic.CA2007.severity = none
+
+[eng/**.cs]
+dotnet_diagnostic.CA2007.severity = none
