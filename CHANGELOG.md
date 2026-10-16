@@ -13,6 +13,7 @@
 - Fixed: `ALogLoggerProvider` implements `ISupportExternalScope` again, so the patch does not drop that interface. Factory scopes, including Activity TraceId, SpanId, and ParentId, are copied onto the event at emit time, after the level gate. `LogContext` scopes come first; external scopes follow
 - Changed: Scopes from `ILogger.BeginScope` apply to MEL events; for `Log.*` use `LogContext.Push`
 - Changed: `GetContext()` returns one shared empty dictionary when there is no scope. Each scope node stores its depth so the depth limit is a single comparison
+- Fixed: ALog references `System.Security.Cryptography.Pkcs` 10.0.13 directly, so apps no longer get the vulnerable 9.0.4 transitively through `Microsoft.Data.SqlClient` (NU1902/NU1903 with `TreatWarningsAsErrors`).
 
 ## 0.2.0
 
