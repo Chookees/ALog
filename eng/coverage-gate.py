@@ -1100,25 +1100,33 @@ def lowered_metrics(
 
 
 def baseline_drop_problems(
-    baseline: Ratchet | None, candidate: Ratchet, env: Mapping[str, str]
+    baseline: Ratchet | None,
+    candidate: Ratchet,
+    env: Mapping[str, str],
+    coverage: Mapping[str, PackageRates] | None = None,
 ) -> list[str]:
     """Return removals and drops the pull-request body does not authorize.
 
     Args:
         baseline: Base ratchet. ``None`` means there is nothing to lower.
         candidate: This commit's ratchet.
-        env: Body source. A general ``coverage-exception:`` line does not
-        authorize a drop; each metric needs its own floor line.
+        env: Body source. ``COVERAGE_BASE_REF`` is the git ref used to see
+        whether this diff removes ``CompilerGenerated`` from ``ExcludeByAttribute``.
+        Without that variable the one-point rule always applies.
+        coverage: Measured percents for the head. A large baseline drop must not
+        sit below these values rounded down to a whole percent.
 
     Returns:
         Problem strings. A drop of at most one percentage point with a matching
-        floor line is omitted. Removing a package is always listed.
+        floor line is omitted. A larger drop is omitted only when the exception
+        check's one-time Lücken-Baseline rule accepts it. Removing a package is
+        always listed.
 
     Raises:
         None.
 
     Side effects:
-        May send one HTTPS GET.
+        May send one HTTPS GET. May read ``coverage.runsettings`` from git.
     """
     if baseline is None:
         return []
@@ -1126,7 +1134,24 @@ def baseline_drop_problems(
     problems = [item for item in removed if "removed the floor" in item]
     module = load_exception_check()
     body = load_pull_request_body(env)
-    problems.extend(module.unauthorized_drops(lowered_metrics(baseline, candidate), body))
+    measured = None
+    if coverage is not None:
+        measured = {name: (rate.lines, rate.branches) for name, rate in coverage.items()}
+    removed_flag = False
+    base_ref = env.get("COVERAGE_BASE_REF", "")
+    if base_ref:
+        try:
+            removed_flag = bool(module.compiler_generated_removed(Path.cwd(), base_ref))
+        except (OSError, ValueError):
+            removed_flag = False
+    problems.extend(
+        module.unauthorized_drops(
+            lowered_metrics(baseline, candidate),
+            body,
+            compiler_generated_removed=removed_flag,
+            measured=measured,
+        )
+    )
     return problems
 
 
@@ -1154,7 +1179,7 @@ def collect_ratchet_comparison(
         May send one HTTPS GET.
     """
     problems = floor_problems(coverage, ratchet)
-    problems.extend(baseline_drop_problems(baseline, ratchet, env))
+    problems.extend(baseline_drop_problems(baseline, ratchet, env, coverage))
     return problems
 
 

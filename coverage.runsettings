@@ -1,9 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Coverlet settings for the S4 coverage gate.
-  Include only the two shipped assemblies. Generated code and explicit
-  exclusions are omitted here; the comment above each exclusion is checked
-  separately by eng/coverage-gate.py.
+  Coverlet settings for the coverage gate.
+  Include only the two shipped assemblies. Explicit exclusions and
+  GeneratedCode are omitted. CompilerGenerated stays included from C1 so
+  async and iterator state machines are measured (C1-07). The comment above
+  each exclusion is checked separately by eng/coverage-gate.py.
 -->
 <RunSettings>
   <DataCollectionRunSettings>
@@ -12,7 +13,7 @@
         <Configuration>
           <Format>cobertura</Format>
           <Include>[ALog]*,[ALog.Extensions.Logging]*</Include>
-          <ExcludeByAttribute>ExcludeFromCodeCoverage,GeneratedCode,CompilerGenerated</ExcludeByAttribute>
+          <ExcludeByAttribute>ExcludeFromCodeCoverage,GeneratedCode</ExcludeByAttribute>
           <ExcludeByFile>**/obj/**</ExcludeByFile>
         </Configuration>
       </DataCollector>

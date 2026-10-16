@@ -3,22 +3,30 @@
 
 Raising ratchet floors needs no reason. Each lowered metric needs its own
 ``coverage-exception: floor <package> <lines|branches> <old> -> <new>: <reason>``
-line, and the drop may be at most one percentage point. Any other ratchet edit,
-and any change to ``coverage.runsettings`` or ``coverage.config``, needs a
-general reason of at least 10 characters with no ``<`` or ``>``. Added or
-changed lines in ``*.cs``, ``*.csproj``, ``*.props``, ``*.targets``, and
-``*.proj`` that contain the tokens ``ExcludeFromCodeCoverage``,
-``GeneratedCode``, or ``CompilerGenerated`` need that general reason too,
-including comments, aliases, and qualifiers. Before that search each added
-line is normalized: C# ``\\uXXXX`` and ``\\UXXXXXXXX`` escapes are decoded,
-then every Unicode format character (category Cf, which C# ignores inside
-identifiers) is removed. MSBuild files (``.csproj``, ``.proj``, ``.props``,
-``.targets``) also decode decimal ``&#NN;``, hex ``&#xHH;``, and the named
-XML entities once, before the format characters are removed. An added MSBuild
-line that contains ``<Using`` and either ``Alias=`` or ``$(`` is a hit even
-when the token is not written out, because a Using alias or a property can
-assemble the attribute name. In CI the body is read from the pulls API, not
-from the event payload.
+line, and the drop may be at most one percentage point. A larger drop is
+accepted only for the one-time C1-07 baseline: the base ``coverage.runsettings``
+still lists ``CompilerGenerated`` in ``ExcludeByAttribute``, the head file does
+not, every lowered metric has a floor line whose reason contains
+``Lücken-Baseline``, and the new floor is not below the measured percent
+rounded down to a whole number. After that removal the base file no longer
+lists the name, so the larger drop cannot fire again. Adding any
+``ExcludeByAttribute`` name (case-insensitive, with or without an ``Attribute``
+suffix) is red even with a valid reason. Any other ratchet edit, and any
+change to ``coverage.runsettings`` or ``coverage.config``, needs a general
+reason of at least 10 characters with no ``<`` or ``>``. Added or changed
+lines in ``*.cs``, ``*.csproj``, ``*.props``, ``*.targets``, and ``*.proj``
+that contain the tokens ``ExcludeFromCodeCoverage``, ``GeneratedCode``, or
+``CompilerGenerated`` need that general reason too, including comments,
+aliases, and qualifiers. Before that search each added line is normalized:
+C# ``\\uXXXX`` and ``\\UXXXXXXXX`` escapes are decoded, then every Unicode
+format character (category Cf, which C# ignores inside identifiers) is
+removed. MSBuild files (``.csproj``, ``.proj``, ``.props``, ``.targets``)
+also decode decimal ``&#NN;``, hex ``&#xHH;``, and the named XML entities
+once, before the format characters are removed. An added MSBuild line that
+contains ``<Using`` and either ``Alias=`` or ``$(`` is a hit even when the
+token is not written out, because a Using alias or a property can assemble
+the attribute name. In CI the body is read from the pulls API, not from the
+event payload.
 """
 
 from __future__ import annotations
@@ -30,12 +38,20 @@ import subprocess
 import sys
 import unicodedata
 import urllib.request
-from decimal import Decimal
+import xml.etree.ElementTree as ElementTree
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Mapping
 
 RATCHET = "eng/coverage-ratchet.json"
+RUNSETTINGS = "coverage.runsettings"
 POLICY_FILES = ("coverage.runsettings", "coverage.config")
+# Normalized ExcludeByAttribute name. The one-time large-drop exception keys off this.
+COMPILER_GENERATED = "compilergenerated"
+ATTRIBUTE_SUFFIX = "attribute"
+LUCKEN_MARKER = "Lücken-Baseline"
+MAX_EXCLUDE_NAMES = 100
+MAX_XML_ELEMENTS = 5000
 EXCLUSION_TOKENS = ("ExcludeFromCodeCoverage", "GeneratedCode", "CompilerGenerated")
 SOURCE_SUFFIXES = (".cs", ".csproj", ".props", ".targets", ".proj")
 TOKEN_RE = re.compile(
@@ -136,15 +152,16 @@ def valid_reason(body: str) -> bool:
     return False
 
 
-def parse_floor_lines(body: str) -> list[tuple[str, str, Decimal, Decimal]]:
+def parse_floor_lines(body: str) -> list[tuple[str, str, Decimal, Decimal, str]]:
     """Read floor lines whose reason is usable.
 
     Args:
         body: Pull-request text. HTML comments are removed first.
 
     Returns:
-        ``(package, metric, old, new)`` for each matching line. At most 40.
-        A short reason or a reason that contains ``<`` or ``>`` drops the line.
+        ``(package, metric, old, new, reason)`` for each matching line. At most
+        40. A short reason or a reason that contains ``<`` or ``>`` drops the line.
+        The reason is kept so a large drop can require the Lücken-Baseline marker.
 
     Raises:
         ValueError: The body is larger than 1000000 characters.
@@ -153,7 +170,7 @@ def parse_floor_lines(body: str) -> list[tuple[str, str, Decimal, Decimal]]:
         None.
     """
     text = strip_html_comments(body)
-    found: list[tuple[str, str, Decimal, Decimal]] = []
+    found: list[tuple[str, str, Decimal, Decimal, str]] = []
     seen = 0
     for line in text.splitlines():
         seen += 1
@@ -163,7 +180,13 @@ def parse_floor_lines(body: str) -> list[tuple[str, str, Decimal, Decimal]]:
         if match is None or not usable_reason(match.group(5).strip()):
             continue
         found.append(
-            (match.group(1), match.group(2), Decimal(match.group(3)), Decimal(match.group(4)))
+            (
+                match.group(1),
+                match.group(2),
+                Decimal(match.group(3)),
+                Decimal(match.group(4)),
+                match.group(5).strip(),
+            )
         )
     return found
 
@@ -602,6 +625,34 @@ def source_diff(repo: Path, base: str, paths: list[str]) -> str:
     return git_output(repo, ["diff", "-U0", base, "--", *selected])
 
 
+def show_git_text(repo: Path, base: str, path: str) -> str | None:
+    """Return one file at a git ref, or None when that path is absent.
+
+    Args:
+        repo: Repository root.
+        base: Git ref such as ``origin/master``.
+        path: Repo-relative path. A missing path is not an error.
+
+    Returns:
+        File text. None when git cannot show that path.
+
+    Raises:
+        None.
+
+    Side effects:
+        Reads git. Does not write it.
+    """
+    show = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{base}:{path}"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if show.returncode != 0:
+        return None
+    return show.stdout
+
+
 def show_base_ratchet(repo: Path, base: str) -> str | None:
     """Return the ratchet file at the base ref, or None when it is absent.
 
@@ -618,15 +669,167 @@ def show_base_ratchet(repo: Path, base: str) -> str | None:
     Side effects:
         Reads git.
     """
-    show = subprocess.run(
-        ["git", "-C", str(repo), "show", f"{base}:{RATCHET}"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if show.returncode != 0:
-        return None
-    return show.stdout
+    return show_git_text(repo, base, RATCHET)
+
+
+def normalize_exclusion_entry(token: str) -> str:
+    """Return one ExcludeByAttribute name in comparable form.
+
+    Args:
+        token: One comma-separated entry. Whitespace is ignored. An ``Attribute``
+        suffix is optional. Empty input stays empty.
+
+    Returns:
+        The name folded to lower case. A trailing ``Attribute`` suffix is removed
+        when characters remain, so ``CompilerGenerated`` and
+        ``CompilerGeneratedAttribute`` compare equal.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    cleaned = token.strip().casefold()
+    if cleaned.endswith(ATTRIBUTE_SUFFIX) and len(cleaned) > len(ATTRIBUTE_SUFFIX):
+        return cleaned[: -len(ATTRIBUTE_SUFFIX)]
+    return cleaned
+
+
+def local_xml_name(tag: str) -> str:
+    """Return an XML tag without its namespace.
+
+    Args:
+        tag: Element tag, possibly ``{namespace}name``.
+
+    Returns:
+        The local name. A tag without a namespace is returned unchanged.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
+
+
+def parse_exclude_by_attribute(text: str | None) -> set[str]:
+    """Read the normalized ExcludeByAttribute set from runsettings text.
+
+    Args:
+        text: ``coverage.runsettings`` contents. ``None`` means the file is
+        absent and the set is empty.
+
+    Returns:
+        Names compared case-insensitively, without an ``Attribute`` suffix.
+        Duplicate names collapse. At most 100 names are accepted.
+
+    Raises:
+        ValueError: The text is not XML, the document is larger than 2000000
+        characters, or it has more than 5000 elements or 100 names.
+
+    Side effects:
+        None.
+    """
+    if text is None:
+        return set()
+    if len(text) > MAX_DIFF_CHARS:
+        raise ValueError("coverage.runsettings is larger than 2000000 characters.")
+    root = ElementTree.fromstring(text)
+    names: set[str] = set()
+    seen = 0
+    for element in root.iter():
+        seen += 1
+        if seen > MAX_XML_ELEMENTS:
+            raise ValueError("coverage.runsettings has more than 5000 elements.")
+        if local_xml_name(element.tag).casefold() != "excludebyattribute":
+            continue
+        parts = (element.text or "").split(",")
+        if len(parts) > MAX_EXCLUDE_NAMES:
+            raise ValueError("ExcludeByAttribute lists more than 100 names.")
+        index = 0
+        while index < len(parts) and index < MAX_EXCLUDE_NAMES:
+            name = normalize_exclusion_entry(parts[index])
+            if name:
+                names.add(name)
+                if len(names) > MAX_EXCLUDE_NAMES:
+                    raise ValueError("ExcludeByAttribute lists more than 100 names.")
+            index += 1
+    return names
+
+
+def read_worktree_exclude(repo: Path) -> set[str]:
+    """Return ExcludeByAttribute names from the working tree runsettings.
+
+    Args:
+        repo: Repository root. The head file is ``coverage.runsettings``.
+
+    Returns:
+        Normalized names. An absent file is an empty set.
+
+    Raises:
+        ValueError: The file is present but not usable XML.
+        OSError: The file cannot be read.
+
+    Side effects:
+        Reads the working tree.
+    """
+    path = repo / RUNSETTINGS
+    if not path.is_file():
+        return set()
+    return parse_exclude_by_attribute(path.read_text(encoding="utf-8"))
+
+
+def compiler_generated_removed(repo: Path, base: str) -> bool:
+    """Return whether this diff drops CompilerGenerated from ExcludeByAttribute.
+
+    Args:
+        repo: Repository root. The working tree is the head file.
+        base: Git ref of the base branch.
+
+    Returns:
+        True only when the base file lists ``CompilerGenerated`` and the head
+        file does not. A missing file, a parse error, or any other edit is
+        False, so a large floor drop stays on the one-point rule.
+
+    Raises:
+        None. XML and IO errors return False.
+
+    Side effects:
+        Reads git and the working tree.
+    """
+    try:
+        before = parse_exclude_by_attribute(show_git_text(repo, base, RUNSETTINGS))
+        after = read_worktree_exclude(repo)
+    except (OSError, ValueError, ElementTree.ParseError):
+        return False
+    return COMPILER_GENERATED in before and COMPILER_GENERATED not in after
+
+
+def exclude_names_added(repo: Path, base: str) -> bool:
+    """Return whether head's ExcludeByAttribute set gained a name.
+
+    Args:
+        repo: Repository root. The working tree is the head file.
+        base: Git ref of the base branch.
+
+    Returns:
+        True when head has a normalized name that base does not. Reordering,
+        case, and an ``Attribute`` suffix do not count. Removing a name is False.
+
+    Raises:
+        ValueError: A present file is not usable XML.
+        OSError: The head file cannot be read.
+
+    Side effects:
+        Reads git and the working tree.
+    """
+    before = parse_exclude_by_attribute(show_git_text(repo, base, RUNSETTINGS))
+    after = read_worktree_exclude(repo)
+    return bool(after - before)
 
 
 def lowered_metrics(
@@ -699,7 +902,7 @@ def ratchet_parts(
 
 def drop_is_listed(
     drop: tuple[str, str, Decimal, Decimal],
-    lines: list[tuple[str, str, Decimal, Decimal]],
+    lines: list[tuple[str, str, Decimal, Decimal, str]],
 ) -> bool:
     """Return whether one drop has a floor line with the same package and numbers.
 
@@ -727,19 +930,147 @@ def drop_is_listed(
     return False
 
 
+def whole_percent(percent: Decimal) -> Decimal:
+    """Round a measured percent down to a whole number.
+
+    Args:
+        percent: A percent already on the coverage gate's scale, one decimal
+        place, from 0 to 100. This is not the raw 0..1 Cobertura rate.
+
+    Returns:
+        The greatest whole percent that is not above ``percent``. ``59.2``
+        becomes ``59``. ``60.0`` stays ``60``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return percent.to_integral_value(rounding=ROUND_DOWN)
+
+
+def luecken_line_matches(
+    drop: tuple[str, str, Decimal, Decimal],
+    lines: list[tuple[str, str, Decimal, Decimal, str]],
+) -> bool:
+    """Return whether a drop has a floor line marked Lücken-Baseline.
+
+    Args:
+        drop: ``(package, metric, old, new)`` from the ratchet diff.
+        lines: Parsed floor lines, including the reason. At most 40 are read.
+
+    Returns:
+        True when package, metric, old, and new match a line whose reason
+        contains ``Lücken-Baseline``. A normal floor reason does not match.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    seen = 0
+    for line in lines:
+        seen += 1
+        if seen > MAX_LISTED:
+            return False
+        if line[0] != drop[0] or line[1] != drop[1]:
+            continue
+        if line[2] != drop[2] or line[3] != drop[3]:
+            continue
+        if LUCKEN_MARKER in line[4]:
+            return True
+    return False
+
+
+def measurement_allows(
+    drop: tuple[str, str, Decimal, Decimal],
+    measured: Mapping[str, tuple[Decimal, Decimal]] | None,
+) -> bool:
+    """Return whether a new floor is at least the measured percent rounded down.
+
+    Args:
+        drop: ``(package, metric, old, new)``. ``new`` is the proposed floor.
+        measured: Package name to ``(lines, branches)`` in percent. ``None``
+        means this run has no Cobertura report.
+
+    Returns:
+        True when the package was measured and ``new`` is greater than or equal
+        to that percent rounded down. Missing data is False, so a large drop
+        cannot skip the measurement.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if measured is None:
+        return False
+    package, metric, _old, new = drop
+    pair = measured.get(package)
+    if pair is None:
+        return False
+    percent = pair[0] if metric == "lines" else pair[1]
+    return new >= whole_percent(percent)
+
+
+def below_measurement_problem(
+    drop: tuple[str, str, Decimal, Decimal],
+    measured: Mapping[str, tuple[Decimal, Decimal]] | None,
+) -> str:
+    """Describe a floor that sits below the measured coverage.
+
+    Args:
+        drop: ``(package, metric, old, new)``. ``new`` is the proposed floor.
+        measured: Package percents, or ``None`` when no report was collected.
+
+    Returns:
+        One problem sentence. The rounded-down percent is ``missing`` when that
+        package was not measured, so the log shows why the drop was rejected.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    package, metric, _old, new = drop
+    shown = "missing"
+    if measured is not None and package in measured:
+        pair = measured[package]
+        percent = pair[0] if metric == "lines" else pair[1]
+        shown = format(whole_percent(percent), "f")
+    return (
+        f"{package} {metric} floor {new} is below the measured coverage "
+        f"rounded down to {shown}."
+    )
+
+
 def unauthorized_drops(
     lowered: list[tuple[str, str, Decimal, Decimal]],
     body: str,
+    *,
+    compiler_generated_removed: bool = False,
+    measured: Mapping[str, tuple[Decimal, Decimal]] | None = None,
 ) -> list[str]:
-    """Return drops that are larger than one point or lack a matching floor line.
+    """Return drops that this body does not authorize.
 
     Args:
         lowered: Metrics that went down. Each entry is package, metric, old, new.
         body: Pull-request text.
+        compiler_generated_removed: True only when this diff is the one-time
+        removal of ``CompilerGenerated`` from ``ExcludeByAttribute``. The caller
+        decides that from the runsettings files. The reason text alone is not
+        enough, and the default keeps the one-point rule.
+        measured: Head coverage in percent, or ``None`` when it was not collected.
+        A large drop must be at least the measured value rounded down.
 
     Returns:
         One problem per drop that this body does not authorize. Empty when
-        every drop is at most one percentage point and named exactly.
+        every drop is at most one percentage point and named exactly, or when
+        a larger drop meets every Lücken-Baseline condition.
 
     Raises:
         ValueError: The body is larger than 1000000 characters.
@@ -756,30 +1087,46 @@ def unauthorized_drops(
             problems.append("More than 40 lowered floors.")
             break
         package, metric, old, new = drop
-        if old - new > MAX_FLOOR_DROP:
-            problems.append(
-                f"{package} {metric} drop {old} -> {new} exceeds 1 percentage point."
-            )
+        if old - new <= MAX_FLOOR_DROP:
+            if not drop_is_listed(drop, lines):
+                problems.append(
+                    f"{package} {metric} {old} -> {new} has no matching coverage-exception floor line."
+                )
             continue
-        if not drop_is_listed(drop, lines):
-            problems.append(
-                f"{package} {metric} {old} -> {new} has no matching coverage-exception floor line."
-            )
+        if compiler_generated_removed and luecken_line_matches(drop, lines):
+            if measurement_allows(drop, measured):
+                continue
+            problems.append(below_measurement_problem(drop, measured))
+            continue
+        problems.append(
+            f"{package} {metric} drop {old} -> {new} exceeds 1 percentage point."
+        )
     return problems
 
 
-def decide(repo: Path, base: str, body: str) -> list[str]:
+def decide(
+    repo: Path,
+    base: str,
+    body: str,
+    measured: Mapping[str, tuple[Decimal, Decimal]] | None = None,
+) -> list[str]:
     """Return policy changes that are still missing their exception line.
 
     Args:
         repo: Repository root.
         base: Git ref to diff against.
         body: Pull-request body.
+        measured: Head line and branch percents by package. ``None`` means no
+        Cobertura report was collected. A large Lücken-Baseline drop then fails
+        closed, because the floor cannot be checked against the measurement.
 
     Returns:
-        Trigger names. ``floor-lower`` means a drop is missing its floor line
-        or is larger than one percentage point. A general reason does not
-        clear ``floor-lower``. Empty when the diff is clean or authorized.
+        Trigger names. ``floor-lower`` means a drop is missing its floor line,
+        is larger than one percentage point without the one-time baseline
+        exception, or sits below the measured coverage. ``exclude-attribute-added``
+        means ``ExcludeByAttribute`` gained a name; a reason does not clear it.
+        A general reason does not clear ``floor-lower``. Empty when the diff is
+        clean or authorized.
 
     Raises:
         ValueError: Git or JSON cannot be read.
@@ -801,9 +1148,41 @@ def decide(repo: Path, base: str, body: str) -> list[str]:
     missing: list[str] = []
     if found and not valid_reason(body):
         missing.extend(found)
-    if unauthorized_drops(lowered, body):
+    removed = compiler_generated_removed(repo, base) if RUNSETTINGS in paths else False
+    if unauthorized_drops(
+        lowered,
+        body,
+        compiler_generated_removed=removed,
+        measured=measured,
+    ):
         missing.append("floor-lower")
+    if RUNSETTINGS in paths and runsettings_added_name(repo, base):
+        missing.append("exclude-attribute-added")
     return missing
+
+
+def runsettings_added_name(repo: Path, base: str) -> bool:
+    """Return whether the runsettings diff added an exclusion name.
+
+    Args:
+        repo: Repository root.
+        base: Git ref to diff against.
+
+    Returns:
+        True when head gained a normalized ``ExcludeByAttribute`` name, or when
+        the file cannot be parsed. A parse error is treated as an addition so
+        broken XML cannot hide a new name.
+
+    Raises:
+        None.
+
+    Side effects:
+        Reads git and the working tree.
+    """
+    try:
+        return exclude_names_added(repo, base)
+    except (OSError, ValueError, ElementTree.ParseError):
+        return True
 
 
 def fetch_pull_request_body(env: Mapping[str, str] | None = None) -> str:
@@ -1071,9 +1450,20 @@ def format_failure(missing: list[str]) -> str:
         lines.append(
             "Each lowered floor needs `coverage-exception: floor <package> "
             "<lines|branches> <old> -> <new>: <reason>`, and the drop must be "
-            "at most 1 percentage point.\n"
+            "at most 1 percentage point. A larger drop is accepted only when "
+            "this diff removes CompilerGenerated from ExcludeByAttribute, each "
+            "lowered metric's reason contains Lücken-Baseline, and the new floor "
+            "is not below the measured coverage rounded down to a whole percent.\n"
         )
-    others = [item for item in missing if item != "floor-lower"]
+    if "exclude-attribute-added" in missing:
+        lines.append(
+            "coverage.runsettings added an ExcludeByAttribute entry. A new "
+            "exclusion name is rejected even when the pull request has a "
+            "coverage-exception line.\n"
+        )
+    others = [
+        item for item in missing if item not in ("floor-lower", "exclude-attribute-added")
+    ]
     if others:
         lines.append(
             "PR changes coverage policy (" + ", ".join(others) + ") without a "
@@ -1081,6 +1471,76 @@ def format_failure(missing: list[str]) -> str:
             "angle brackets.\n"
         )
     return "".join(lines)
+
+
+def load_coverage_gate():
+    """Load the coverage gate so measured percents use its rounding.
+
+    Args:
+        None.
+
+    Returns:
+        The loaded gate module. Package rates are one-decimal percents.
+
+    Raises:
+        ValueError: The gate script cannot be loaded.
+
+    Side effects:
+        Executes ``eng/coverage-gate.py`` once per call. The gate does not run.
+    """
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "coverage-gate.py"
+    spec = importlib.util.spec_from_file_location("coverage_gate_for_exception", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"coverage gate script is missing: {path}")
+    loaded = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = loaded
+    if spec.loader is None:
+        raise ValueError(f"coverage gate script is missing: {path}")
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+def load_measured_coverage(repo: Path) -> dict[str, tuple[Decimal, Decimal]] | None:
+    """Read package percents from Cobertura files under TestResults.
+
+    Args:
+        repo: Repository root. CI writes ``TestResults/**/coverage.cobertura.xml``
+        before this check runs. A checkout without that directory has no
+        measurement yet.
+
+    Returns:
+        Package name to ``(lines, branches)`` in percent, using the coverage
+        gate's one-decimal rounding. ``None`` when TestResults is missing or
+        empty. A large floor drop is then rejected.
+
+    Raises:
+        ValueError: A Cobertura file is present but cannot be read, or the gate
+        script cannot be loaded.
+
+    Side effects:
+        Reads TestResults and loads the coverage gate module.
+    """
+    directory = repo / "TestResults"
+    if not directory.is_dir():
+        return None
+    gate = load_coverage_gate()
+    try:
+        paths = gate.collect_cobertura([], [str(directory)])
+    except ValueError as exc:
+        if str(exc) == "No Cobertura files were found.":
+            return None
+        raise
+    rates = gate.load_cobertura(paths)
+    measured: dict[str, tuple[Decimal, Decimal]] = {}
+    count = 0
+    for name, rate in rates.items():
+        count += 1
+        if count > MAX_LISTED:
+            raise ValueError("Cobertura lists more than 40 packages.")
+        measured[str(name)] = (rate.lines, rate.branches)
+    return measured
 
 
 def parse_check_args(argv: list[str]) -> tuple[str, Path, str] | None:
@@ -1154,7 +1614,7 @@ def main(argv: list[str]) -> int:
         return 2
     try:
         body = load_body()
-        missing = decide(repo, base, body)
+        missing = decide(repo, base, body, load_measured_coverage(repo))
         new_lines = new_metadata_entries(repo, Path(base_bin))
         if metadata_requires_reason(new_lines, body):
             missing.append("metadata-exclusion")

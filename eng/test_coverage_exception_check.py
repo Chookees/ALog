@@ -11,6 +11,8 @@ import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -90,12 +92,17 @@ def git(repo: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
-def commit_tree(files: dict[str, str | None], base_ratchet: str = RATCHET) -> tuple[Path, str]:
+def commit_tree(
+    files: dict[str, str | None],
+    base_ratchet: str = RATCHET,
+    base_extra: dict[str, str] | None = None,
+) -> tuple[Path, str]:
     """Build a two-commit repo and return it plus the base commit.
 
     Args:
         files: Head-commit paths. ``None`` deletes a path that existed in the base.
         base_ratchet: Ratchet JSON stored in the base commit.
+        base_extra: Extra files stored in the base commit before the head change.
 
     Returns:
         Repository path and the base commit SHA. The caller owns the temp dir
@@ -114,6 +121,9 @@ def commit_tree(files: dict[str, str | None], base_ratchet: str = RATCHET) -> tu
         "ALog/Clean.cs": "namespace ALog;\npublic class Clean {}\n",
         "ALog.Extensions.Logging/Clean.cs": "namespace ALog.Extensions.Logging;\npublic class Clean {}\n",
     }
+    if base_extra:
+        for path, text in base_extra.items():
+            base_files[path] = text
     for path, text in base_files.items():
         target = root / path
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -224,6 +234,8 @@ def main() -> None:
     expect_reason_shapes()
     expect_floor_policy()
     expect_format_and_msbuild()
+    expect_luecken_baseline()
+    expect_exclude_attribute_additions()
     print("coverage exception tests passed")
 
 
@@ -522,6 +534,231 @@ def test_fetch_uses_pulls_endpoint() -> None:
     if body != "coverage-exception: from the api\n":
         raise SystemExit(f"body was {body}")
     print("ok pulls endpoint")
+
+
+@dataclass(frozen=True)
+class GateCase:
+    """One exception-check fixture.
+
+    ``measured`` is the head coverage in percent. ``None`` means the fixture
+    does not supply a Cobertura report.
+    """
+
+    label: str
+    files: dict[str, str | None]
+    body: str
+    blocked: bool
+    base_ratchet: str = RATCHET
+    base_extra: dict[str, str] | None = None
+    measured: dict[str, tuple[Decimal, Decimal]] | None = None
+
+
+def expect_case(case: GateCase) -> None:
+    """Fail when a fixture does not match the expected gate result.
+
+    Args:
+        case: Label, files, body, and whether the check must return triggers.
+        Measured percents and extra base files are optional.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: The fixture result is wrong.
+
+    Side effects:
+        Writes a temporary git repository.
+    """
+    repo, base = commit_tree(case.files, case.base_ratchet, case.base_extra)
+    missing = module.decide(repo, base, case.body, case.measured)
+    if case.blocked and not missing:
+        raise SystemExit(f"{case.label} was allowed: {missing}")
+    if not case.blocked and missing:
+        raise SystemExit(f"{case.label} was blocked: {missing}")
+    print(f"ok {case.label}")
+
+
+def runsettings_xml(names: str) -> str:
+    """Build a minimal runsettings file with one ExcludeByAttribute list.
+
+    Args:
+        names: Comma-separated attribute names. They are not normalized here.
+
+    Returns:
+        XML text the exclusion parser accepts.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+        "<RunSettings><DataCollectionRunSettings><DataCollectors><DataCollector>"
+        "<Configuration><ExcludeByAttribute>"
+        + names
+        + "</ExcludeByAttribute></Configuration></DataCollector></DataCollectors>"
+        "</DataCollectionRunSettings></RunSettings>\n"
+    )
+
+
+def expect_luecken_baseline() -> None:
+    """A drop above one point is allowed only for the CompilerGenerated removal.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: A required red or green fixture has the wrong result.
+
+    Side effects:
+        Writes temporary git repositories.
+    """
+    with_generated = runsettings_xml(
+        "ExcludeFromCodeCoverage,GeneratedCode,CompilerGenerated"
+    )
+    without_generated = runsettings_xml("ExcludeFromCodeCoverage,GeneratedCode")
+    luecken = (
+        "coverage-exception: floor ALog lines 50 -> 48: "
+        "Lücken-Baseline (C1-07, CompilerGenerated no longer excluded)\n"
+    )
+    measured_ok = {"ALog": (Decimal("48.4"), Decimal("40"))}
+    measured_high = {"ALog": (Decimal("59.2"), Decimal("40"))}
+    removal = {
+        "coverage.runsettings": without_generated,
+        "eng/coverage-ratchet.json": LOWERED_TWO,
+    }
+    base_with = {"coverage.runsettings": with_generated}
+    expect_case(
+        GateCase(
+            "luecken reason without runsettings change",
+            {"eng/coverage-ratchet.json": LOWERED_TWO},
+            REASON + luecken,
+            True,
+            measured=measured_ok,
+        )
+    )
+    expect_case(
+        GateCase(
+            "runsettings removal with luecken reason",
+            removal,
+            REASON + luecken,
+            False,
+            base_extra=base_with,
+            measured=measured_ok,
+        )
+    )
+    later = without_generated.replace("<Configuration>", "<Configuration><!-- later -->", 1)
+    second = {"eng/coverage-ratchet.json": LOWERED_TWO, "coverage.runsettings": later}
+    expect_case(
+        GateCase(
+            "second pr after baseline still rejects a large drop",
+            second,
+            REASON + luecken,
+            True,
+            base_extra={"coverage.runsettings": without_generated},
+            measured=measured_ok,
+        )
+    )
+    expect_case(
+        GateCase(
+            "drop below rounded-down measurement",
+            removal,
+            REASON + luecken,
+            True,
+            base_extra=base_with,
+            measured=measured_high,
+        )
+    )
+    expect_case(
+        GateCase(
+            "large drop with runsettings change but no luecken line",
+            removal,
+            REASON + FLOOR_TWO,
+            True,
+            base_extra=base_with,
+            measured=measured_ok,
+        )
+    )
+    one_point = {
+        "coverage.runsettings": without_generated,
+        "eng/coverage-ratchet.json": LOWERED,
+    }
+    expect_case(
+        GateCase(
+            "one point drop during removal still uses the normal floor line",
+            one_point,
+            REASON + FLOOR_ONE,
+            False,
+            base_extra=base_with,
+            measured=measured_ok,
+        )
+    )
+
+
+def expect_exclude_attribute_additions() -> None:
+    """A new ExcludeByAttribute name is red even when a reason is present.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: An addition is allowed, or a removal with a reason is blocked.
+
+    Side effects:
+        Writes temporary git repositories.
+    """
+    with_generated = runsettings_xml(
+        "ExcludeFromCodeCoverage,GeneratedCode,CompilerGenerated"
+    )
+    without_generated = runsettings_xml("ExcludeFromCodeCoverage,GeneratedCode")
+    expect_case(
+        GateCase(
+            "re-adding CompilerGenerated",
+            {"coverage.runsettings": with_generated},
+            REASON,
+            True,
+            base_extra={"coverage.runsettings": without_generated},
+        )
+    )
+    expect_case(
+        GateCase(
+            "adding another ExcludeByAttribute entry",
+            {"coverage.runsettings": runsettings_xml(
+                "ExcludeFromCodeCoverage,GeneratedCode,CompilerGenerated,CustomSkip"
+            )},
+            REASON,
+            True,
+            base_extra={"coverage.runsettings": with_generated},
+        )
+    )
+    expect_case(
+        GateCase(
+            "removing CompilerGenerated with a reason",
+            {"coverage.runsettings": without_generated},
+            REASON,
+            False,
+            base_extra={"coverage.runsettings": with_generated},
+        )
+    )
+    expect_case(
+        GateCase(
+            "Attribute suffix is the same entry",
+            {"coverage.runsettings": runsettings_xml(
+                "ExcludeFromCodeCoverage,GeneratedCode,CompilerGeneratedAttribute"
+            )},
+            REASON,
+            False,
+            base_extra={"coverage.runsettings": with_generated},
+        )
+    )
 
 
 if __name__ == "__main__":

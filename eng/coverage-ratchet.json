@@ -1,9 +1,9 @@
 {
-  "note": "Floors are the S4 CI measurement rounded down to a whole percent. That rounding is the only tolerance. A pull request may raise a floor freely. Lowering one metric by at most 1 percentage point needs a coverage-exception floor line naming package, metric, old, and new. linesTarget is strict greater-than and branchesTarget is greater-than-or-equal, and only when COVERAGE_ENFORCE=true. S4 leaves that switch false. On push to master the floor comparison is a warning.",
+  "note": "Floors are whole percents. A pull request may raise a floor freely. Lowering one metric by at most 1 percentage point needs a coverage-exception floor line naming package, metric, old, and new. A larger drop is accepted only while base coverage.runsettings still lists CompilerGenerated, the head removes it, each lowered metric's reason contains Lücken-Baseline, and the new floor is not below the measured percent rounded down. linesTarget is strict greater-than and branchesTarget is greater-than-or-equal, and only when COVERAGE_ENFORCE=true. C1 leaves that switch false. On push to master the floor comparison is a warning.",
   "linesTarget": 90,
   "branchesTarget": 80,
   "packages": {
-    "ALog": { "lines": 68, "branches": 56 },
+    "ALog": { "lines": 60, "branches": 55 },
     "ALog.Extensions.Logging": { "lines": 73, "branches": 62 }
   }
 }
