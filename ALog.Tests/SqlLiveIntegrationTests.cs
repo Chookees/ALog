@@ -103,8 +103,7 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
 
         try
         {
-            _container = new MsSqlBuilder()
-                .WithImage(SqlServerImage)
+            _container = new MsSqlBuilder(SqlServerImage)
                 .WithPassword(CreateSqlPassword())
                 .Build();
 
