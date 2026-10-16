@@ -9,8 +9,16 @@ general reason of at least 10 characters with no ``<`` or ``>``. Added or
 changed lines in ``*.cs``, ``*.csproj``, ``*.props``, ``*.targets``, and
 ``*.proj`` that contain the tokens ``ExcludeFromCodeCoverage``,
 ``GeneratedCode``, or ``CompilerGenerated`` need that general reason too,
-including comments, aliases, qualifiers, and C# ``\\u`` / ``\\U`` escapes.
-In CI the body is read from the pulls API, not from the event payload.
+including comments, aliases, and qualifiers. Before that search each added
+line is normalized: C# ``\\uXXXX`` and ``\\UXXXXXXXX`` escapes are decoded,
+then every Unicode format character (category Cf, which C# ignores inside
+identifiers) is removed. MSBuild files (``.csproj``, ``.proj``, ``.props``,
+``.targets``) also decode decimal ``&#NN;``, hex ``&#xHH;``, and the named
+XML entities once, before the format characters are removed. An added MSBuild
+line that contains ``<Using`` and either ``Alias=`` or ``$(`` is a hit even
+when the token is not written out, because a Using alias or a property can
+assemble the attribute name. In CI the body is read from the pulls API, not
+from the event payload.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 import urllib.request
 from decimal import Decimal
 from pathlib import Path
@@ -33,6 +42,10 @@ TOKEN_RE = re.compile(
     "(?<![A-Za-z0-9_])(?:" + "|".join(EXCLUSION_TOKENS) + ")(?:Attribute)?(?![A-Za-z0-9_])"
 )
 CS_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
+# One pass only. A reference produced by decoding another reference is not expanded again.
+XML_REF = re.compile(r"&#([0-9]{1,7});|&#x([0-9A-Fa-f]{1,6});|&(amp|lt|gt|quot|apos);")
+XML_NAMED = {"amp": "&", "lt": "<", "gt": ">", "quot": '"', "apos": "'"}
+MSBUILD_SUFFIXES = (".csproj", ".proj", ".props", ".targets")
 HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 FLOOR_LINE = re.compile(
     r"^coverage-exception:\s*floor\s+(\S+)\s+(lines|branches)\s+"
@@ -45,6 +58,8 @@ MAX_DIFF_CHARS = 2_000_000
 MAX_DIFF_LINES = 20_000
 MAX_SOURCE_FILES = 500
 MAX_BODY_CHARS = 1_000_000
+MAX_ESCAPES = 1000
+MAX_LINE_CHARS = 10_000
 
 
 def strip_html_comments(body: str) -> str:
@@ -275,7 +290,9 @@ def decode_csharp_escapes(text: str) -> str:
 
     Returns:
         The line with those escapes decoded. A code point above U+10FFFF is
-        left as the escape text. More than 1000 escapes fails closed.
+        left as the escape text. More than 1000 escapes fails closed by
+        appending an exclusion token. The caller still has to strip format
+        characters, and MSBuild lines still have to decode XML references.
 
     Raises:
         None.
@@ -288,7 +305,7 @@ def decode_csharp_escapes(text: str) -> str:
     seen = 0
     for match in CS_ESCAPE.finditer(text):
         seen += 1
-        if seen > 1000:
+        if seen > MAX_ESCAPES:
             parts.append(EXCLUSION_TOKENS[0])
             return "".join(parts)
         parts.append(text[cursor:match.start()])
@@ -302,16 +319,230 @@ def decode_csharp_escapes(text: str) -> str:
     return "".join(parts)
 
 
+def xml_reference_text(match: re.Match[str]) -> str:
+    """Turn one XML reference match into the character it names.
+
+    Args:
+        match: A match of ``XML_REF``. Group 1 is decimal, group 2 is hex,
+        and group 3 is a named entity (``amp``, ``lt``, ``gt``, ``quot``,
+        ``apos``).
+
+    Returns:
+        The decoded character. A code point above U+10FFFF is returned as the
+        original reference text so ``chr`` is never called on it.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    named = match.group(3)
+    if named:
+        return XML_NAMED[named]
+    digits = match.group(1) or match.group(2) or "0"
+    code = int(digits, 10 if match.group(1) else 16)
+    if code > 0x10FFFF:
+        return match.group(0)
+    return chr(code)
+
+
+def decode_xml_references(text: str) -> str:
+    """Replace XML character references on one MSBuild line.
+
+    Args:
+        text: One added line after C# ``\\u`` / ``\\U`` decoding.
+
+    Returns:
+        Decimal ``&#NN;``, hex ``&#xHH;``, and the five named entities replaced
+        once. ``&#38;#69;`` becomes the text ``&#69;`` and is not expanded
+        again. More than 1000 references fails closed.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    parts: list[str] = []
+    cursor = 0
+    seen = 0
+    for match in XML_REF.finditer(text):
+        seen += 1
+        if seen > MAX_ESCAPES:
+            parts.append(EXCLUSION_TOKENS[0])
+            return "".join(parts)
+        parts.append(text[cursor:match.start()])
+        parts.append(xml_reference_text(match))
+        cursor = match.end()
+    parts.append(text[cursor:])
+    return "".join(parts)
+
+
+def strip_format_characters(text: str) -> str:
+    """Drop Unicode format characters before the token search.
+
+    Args:
+        text: One added line after escapes and, for MSBuild, XML references.
+
+    Returns:
+        The line with every character whose Unicode category is Cf removed.
+        C# ignores those characters inside identifiers, including the soft
+        hyphen U+00AD, the zero-width space U+200B, and the word joiner
+        U+2060. A line longer than 10000 characters fails closed.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if len(text) > MAX_LINE_CHARS:
+        return EXCLUSION_TOKENS[0]
+    kept: list[str] = []
+    seen = 0
+    for char in text:
+        seen += 1
+        if seen > MAX_LINE_CHARS:
+            return EXCLUSION_TOKENS[0]
+        if unicodedata.category(char) == "Cf":
+            continue
+        kept.append(char)
+    return "".join(kept)
+
+
+def is_msbuild_path(path: str) -> bool:
+    """Return whether a diff path is an MSBuild file.
+
+    Args:
+        path: Repo-relative path from a ``+++ b/`` header. Empty when the diff
+        has no header, which is how an over-cap marker is scanned.
+
+    Returns:
+        True for ``.csproj``, ``.proj``, ``.props``, and ``.targets``. The
+        match is case-insensitive. A ``.cs`` file is false.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if not path:
+        return False
+    return path.lower().endswith(MSBUILD_SUFFIXES)
+
+
+def prepare_scanned_line(text: str, msbuild: bool) -> str:
+    """Normalize one added line the way the compiler or MSBuild would read it.
+
+    Args:
+        text: One added diff line, without the leading plus.
+        msbuild: True when the current file is ``.csproj``, ``.proj``,
+        ``.props``, or ``.targets``.
+
+    Returns:
+        C# unicode escapes decoded, then XML references when ``msbuild`` is
+        true, then format characters removed. XML decoding is one pass.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    decoded = decode_csharp_escapes(text)
+    if msbuild:
+        decoded = decode_xml_references(decoded)
+    return strip_format_characters(decoded)
+
+
+def using_line_triggers(text: str) -> bool:
+    """Return whether an MSBuild Using line can hide an exclusion attribute.
+
+    Args:
+        text: One prepared MSBuild line. The strings are matched exactly.
+
+    Returns:
+        True when the line contains ``<Using`` and either ``Alias=`` or
+        ``$(``. A plain ``<Using Include="System.Linq"/>`` is false.
+        ``<UsingTask`` contains ``<Using`` and is a hit only when an alias or
+        a property is also present.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if "<Using" not in text:
+        return False
+    return "Alias=" in text or "$(" in text
+
+
+def added_line_triggers(text: str, msbuild: bool) -> bool:
+    """Return whether one added line is an exclusion hit.
+
+    Args:
+        text: One added diff line, without the leading plus.
+        msbuild: True for an MSBuild file. XML references and the Using rule
+        apply only then.
+
+    Returns:
+        True when the prepared line contains an exclusion token, or when an
+        MSBuild line contains ``<Using`` plus ``Alias=`` or ``$(``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    prepared = prepare_scanned_line(text, msbuild)
+    if prepared and TOKEN_RE.search(prepared):
+        return True
+    if not msbuild:
+        return False
+    return using_line_triggers(prepared)
+
+
+def diff_path(header: str) -> str:
+    """Read the repo path from a unified-diff ``+++`` header.
+
+    Args:
+        header: A line that starts with ``+++ ``, including the space Git
+        writes before ``b/``.
+
+    Returns:
+        The path after the ``b/`` prefix. ``/dev/null`` stays unchanged so it
+        does not look like a source file.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    raw = header[4:].strip()
+    if raw.startswith("b/"):
+        return raw[2:]
+    return raw
+
+
 def exclusion_token_added(diff_text: str) -> bool:
     """Return whether an added or changed line contains an exclusion token.
 
     Args:
-        diff_text: Unified diff of C# and MSBuild files. Comments, aliases,
-        qualifiers, and C# unicode escapes count. A huge diff fails closed.
+        diff_text: Unified diff of C# and MSBuild files. The current file comes
+        from each ``+++ b/`` header. Comments, aliases, qualifiers, C# unicode
+        escapes, Unicode format characters, and MSBuild character references
+        count. A huge diff fails closed.
 
     Returns:
-        True when a ``+`` line contains one of ``EXCLUSION_TOKENS`` as a token
-        after ``\\u`` and ``\\U`` escapes are decoded.
+        True when a ``+`` line contains one of ``EXCLUSION_TOKENS`` after that
+        normalization, or an MSBuild line contains ``<Using`` and either
+        ``Alias=`` or ``$(``. A line that itself starts with ``+++`` is a
+        header or an added ``++`` line and is not searched.
 
     Raises:
         None.
@@ -322,13 +553,18 @@ def exclusion_token_added(diff_text: str) -> bool:
     if len(diff_text) > MAX_DIFF_CHARS:
         return True
     seen = 0
+    path = ""
     for line in diff_text.splitlines():
         seen += 1
         if seen > MAX_DIFF_LINES:
             return True
-        if not line.startswith("+") or line.startswith("+++"):
+        if line.startswith("+++"):
+            if line.startswith("+++ "):
+                path = diff_path(line)
             continue
-        if TOKEN_RE.search(decode_csharp_escapes(line[1:])):
+        if not line.startswith("+"):
+            continue
+        if added_line_triggers(line[1:], is_msbuild_path(path)):
             return True
     return False
 
@@ -340,11 +576,13 @@ def source_diff(repo: Path, base: str, paths: list[str]) -> str:
         repo: Repository root.
         base: Git ref to diff against.
         paths: Changed paths. Only ``.cs``, ``.csproj``, ``.props``, ``.targets``,
-        and ``.proj`` are kept.
+        and ``.proj`` are kept. The MSBuild suffixes are the files whose XML
+        references and ``<Using`` lines are interpreted.
 
     Returns:
         The diff text. Empty when none of those files changed. More than 500
-        matching files returns a marker that the caller treats as a hit.
+        matching files returns a marker that the caller treats as a hit. The
+        marker has no ``+++`` header, so it is scanned as a non-MSBuild line.
 
     Raises:
         ValueError: Git cannot diff the selected files.

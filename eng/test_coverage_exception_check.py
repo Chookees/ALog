@@ -223,6 +223,7 @@ def main() -> None:
     expect_bypasses()
     expect_reason_shapes()
     expect_floor_policy()
+    expect_format_and_msbuild()
     print("coverage exception tests passed")
 
 
@@ -369,6 +370,43 @@ def expect_floor_policy() -> None:
     expect("each lowered metric named", both, FLOOR_LINES + FLOOR_BRANCHES, False)
     settings = {"coverage.runsettings": "<RunSettings></RunSettings>\n"}
     expect("runsettings with only a floor line", settings, FLOOR_ONE, True)
+
+
+def expect_format_and_msbuild() -> None:
+    """Format characters, XML references, and hidden Using lines need a reason.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: A hidden token is accepted, or a plain System.Linq Using is
+        rejected.
+
+    Side effects:
+        Writes temporary git repositories.
+    """
+    cases = (
+        ("soft hyphen raw", "ALog/Soft.cs", "namespace ALog;\n[Exclude\u00adFromCodeCoverage]\npublic class Soft {}\n"),
+        ("soft hyphen escaped", "ALog/SoftEsc.cs", "namespace ALog;\n[Exclude\\u00ADFromCodeCoverage]\npublic class SoftEsc {}\n"),
+        ("format characters", "ALog/Format.cs", "namespace ALog;\n[Ex\u200bclude\u2060FromCodeCoverage]\npublic class Format {}\n"),
+        ("xml decimal reference", "ALog/Decimal.csproj", "<Project>\n  <Item Include=\"System.Diagnostics.CodeAnalysis.&#69;xcludeFromCodeCoverageAttribute\" />\n</Project>\n"),
+        ("xml hex reference", "ALog/Hex.csproj", "<Project>\n  <Item Include=\"System.Diagnostics.CodeAnalysis.&#x45;xcludeFromCodeCoverageAttribute\" />\n</Project>\n"),
+        ("xml decimal in using", "ALog/Ent.csproj", "<Project>\n  <Using Include=\"System.Diagnostics.CodeAnalysis.&#69;xcludeFromCodeCoverageAttribute\" Alias=\"Ent\"/>\n</Project>\n"),
+        ("using alias without token", "ALog/Linq.csproj", "<Project>\n  <Using Include=\"System.Linq\" Alias=\"Linq\"/>\n</Project>\n"),
+        ("using property", "ALog/Mid.csproj", "<Project>\n  <Mid>FromCode</Mid>\n  <Using Include=\"System.Diagnostics.CodeAnalysis.Exclude$(Mid)CoverageAttribute\" />\n</Project>\n"),
+        ("named xml entities", "ALog/Named.props", "<Project>\n  &lt;Using Include=\"System.Linq\" Alias=\"Linq\"/&gt;\n</Project>\n"),
+    )
+    index = 0
+    while index < len(cases) and index < 20:
+        label, path, text = cases[index]
+        expect(f"{label} without reason", {path: text}, "", True)
+        expect(f"{label} with reason", {path: text}, REASON, False)
+        index += 1
+    plain = "<Project>\n  <Using Include=\"System.Linq\"/>\n</Project>\n"
+    expect("plain using does not trigger", {"ALog/Plain.csproj": plain}, "", False)
 
 
 def test_fetch_uses_pulls_endpoint() -> None:
