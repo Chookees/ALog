@@ -1,9 +1,9 @@
 {
-  "note": "Package floors are the minimum line and branch percents. A pull request may only raise them. linesTarget uses a strict greater-than comparison and branchesTarget uses greater-than-or-equal, and only when COVERAGE_ENFORCE=true. S4 leaves that switch false. The floors below are the S4 CI measurement once that run is recorded.",
+  "note": "Package floors are the line and branch percents measured by the S4 CI run. A pull request may only raise them. linesTarget uses a strict greater-than comparison and branchesTarget uses greater-than-or-equal, and only when COVERAGE_ENFORCE=true. S4 leaves that switch false.",
   "linesTarget": 90,
   "branchesTarget": 80,
   "packages": {
-    "ALog": { "lines": 0.0, "branches": 0.0 },
-    "ALog.Extensions.Logging": { "lines": 0.0, "branches": 0.0 }
+    "ALog": { "lines": 68.3, "branches": 56.9 },
+    "ALog.Extensions.Logging": { "lines": 73.3, "branches": 62.1 }
   }
 }
