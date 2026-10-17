@@ -123,15 +123,16 @@ if ! grep -F -q -- '--blame-hang-dump-type mini' "$workflow"; then
 else
   pass "hang dump type"
 fi
-if ! grep -F -q 'COVERAGE_ENFORCE: "false"' "$workflow"; then
-  fail "coverage enforce is not false"
+# Z1 turns the line gate on. Extensions lines are above 90 with SQL and without it.
+if ! grep -F -q 'COVERAGE_ENFORCE: "true"' "$workflow"; then
+  fail "coverage enforce is not true"
 else
-  pass "coverage enforce false"
+  pass "coverage enforce true"
 fi
-if grep -E -q 'COVERAGE_ENFORCE[=:][[:space:]]*"?true' "$workflow"; then
-  fail "coverage enforce true is present"
+if grep -E -q 'COVERAGE_ENFORCE[=:][[:space:]]*"?false' "$workflow"; then
+  fail "coverage enforce false is present"
 else
-  pass "coverage enforce true absent"
+  pass "coverage enforce false absent"
 fi
 
 continue_count=$(grep -c -F 'continue-on-error:' "$workflow" || true)
