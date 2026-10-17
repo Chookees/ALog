@@ -36,40 +36,78 @@ public class AzureLogWriter : ILogWriter, IFormattableLogWriter
         _httpClient = httpClient ?? new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
     }
 
+    /// <summary>
+    /// Sends one event with <see cref="HttpClient.Send"/> and does not wait on a task.
+    /// </summary>
+    /// <param name="logEvent">Event to send. Null is reported and dropped.</param>
+    /// <remarks>
+    /// A handler without synchronous <c>Send</c> throws <see cref="NotSupportedException"/>.
+    /// That exception stays on this writer's error path. Callers do not see it.
+    /// The call blocks the caller for the HTTP round trip. Safe on a thread that owns a
+    /// <see cref="SynchronizationContext"/> because no continuation is posted back to it.
+    /// </remarks>
     public void Write(LogEvent logEvent)
-    {
-        WriteInternal(logEvent, asyncMode: false).GetAwaiter().GetResult();
-    }
-
-    public Task WriteAsync(LogEvent logEvent) => WriteInternal(logEvent, asyncMode: true);
-
-    private async Task WriteInternal(LogEvent logEvent, bool asyncMode)
     {
         try
         {
-            var payload = BuildTrackPayload(logEvent);
-            using var content = new StringContent(payload, Encoding.UTF8, "application/json");
-            using var request = new HttpRequestMessage(HttpMethod.Post, _endpoint) { Content = content };
+            if (logEvent is null)
+                throw new ArgumentNullException(nameof(logEvent));
 
-            HttpResponseMessage response;
-            if (asyncMode)
-            {
-                response = await _httpClient.SendAsync(request).ConfigureAwait(false);
-            }
-            else
-            {
-                response = _httpClient.SendAsync(request).GetAwaiter().GetResult();
-            }
-
-            using (response)
-            {
-                response.EnsureSuccessStatusCode();
-            }
+            using var request = CreateRequest(logEvent);
+            using var response = _httpClient.Send(request, CancellationToken.None);
+            response.EnsureSuccessStatusCode();
         }
         catch (Exception ex)
         {
-            System.Console.Error.WriteLine($"[AzureLogWriter] Application Insights write failed: {ex}");
+            Report(ex);
         }
+    }
+
+    /// <summary>
+    /// Sends one event with <see cref="HttpClient.SendAsync"/> and does not resume on the caller context.
+    /// </summary>
+    /// <param name="logEvent">Event to send. Null is reported and the task still completes.</param>
+    /// <returns>A task that completes after the post, including when the post fails.</returns>
+    /// <remarks>
+    /// Failures are written to the error stream. The task does not fault.
+    /// The await uses <c>ConfigureAwait(false)</c>.
+    /// </remarks>
+    public async Task WriteAsync(LogEvent logEvent)
+    {
+        try
+        {
+            if (logEvent is null)
+                throw new ArgumentNullException(nameof(logEvent));
+
+            using var request = CreateRequest(logEvent);
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+        }
+        catch (Exception ex)
+        {
+            Report(ex);
+        }
+    }
+
+    /// <summary>
+    /// Builds the track POST for one event.
+    /// </summary>
+    /// <param name="logEvent">Event whose payload is the body. Must not be null.</param>
+    /// <returns>The request. The caller disposes it, which disposes the body.</returns>
+    private HttpRequestMessage CreateRequest(LogEvent logEvent)
+    {
+        var payload = BuildTrackPayload(logEvent);
+        var content = new StringContent(payload, Encoding.UTF8, "application/json");
+        return new HttpRequestMessage(HttpMethod.Post, _endpoint) { Content = content };
+    }
+
+    /// <summary>
+    /// Writes one Azure failure to the error stream. The event is dropped.
+    /// </summary>
+    /// <param name="ex">Failure from payload building or the HTTP call. Must not be null.</param>
+    private static void Report(Exception ex)
+    {
+        System.Console.Error.WriteLine($"[AzureLogWriter] Application Insights write failed: {ex}");
     }
 
     internal string BuildTrackPayload(LogEvent logEvent)

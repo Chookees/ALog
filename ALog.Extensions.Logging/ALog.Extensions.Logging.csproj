@@ -29,6 +29,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="ALog.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!--
       Packed dependency is a minimum version (nuspec version="0.2.1" means >= 0.2.1).
       Do not switch this to an exact pin such as [0.2.1].

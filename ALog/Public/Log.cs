@@ -37,7 +37,7 @@ public static class Log
     public static async Task WriteAsync(string message, LogLevel level = LogLevel.Info)
     {
         EnsureInitialized();
-        await _logger!.LogAsync(message, level);
+        await _logger!.LogAsync(message, level).ConfigureAwait(false);
     }
 
     public static void Invoke(Exception exception, string message, LogLevel level = LogLevel.Error)
@@ -49,7 +49,7 @@ public static class Log
     public static async Task WriteAsync(Exception exception, string message, LogLevel level = LogLevel.Error)
     {
         EnsureInitialized();
-        await _logger!.LogAsync(exception, message, level);
+        await _logger!.LogAsync(exception, message, level).ConfigureAwait(false);
     }
 
     public static void Write(string message, LogLevel level = LogLevel.Info) => Invoke(message, level);
@@ -65,7 +65,7 @@ public static class Log
     public static async Task WriteAsync(LogLevel level, string messageTemplate, params object?[] propertyValues)
     {
         EnsureInitialized();
-        await _logger!.LogAsync(messageTemplate, level, propertyValues);
+        await _logger!.LogAsync(messageTemplate, level, propertyValues).ConfigureAwait(false);
     }
 
     public static void Write(Exception? exception, LogLevel level, string messageTemplate, params object?[] propertyValues)
@@ -100,7 +100,7 @@ public static class Log
         EnsureInitialized();
         if (_logger is LoggerEngine engine)
         {
-            await engine.FlushAsync();
+            await engine.FlushAsync().ConfigureAwait(false);
         }
     }
 

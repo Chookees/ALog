@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      COVERAGE_ENFORCE: "false"
+      COVERAGE_ENFORCE: "true"
       # Only the value 1 enables the SQL live tests. Any other value skips them.
       ALOG_REQUIRE_SQL: "1"
       ALOG_SQL_IMAGE: mcr.microsoft.com/mssql/server@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
@@ -48,6 +48,8 @@ jobs:
         bash eng/test_bb_grep.sh
         bash eng/test_build_base_assemblies.sh
         python3 eng/test_coverage_metadata.py
+        python3 eng/test_sync_wait_check.py
+        python3 eng/sync-wait-check.py
 
     - name: Start SQL Server
       run: bash eng/start-sql.sh "$ALOG_SQL_IMAGE"

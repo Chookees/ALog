@@ -1,9 +1,9 @@
 {
-  "note": "Floors are whole percents. A pull request may raise a floor freely. Lowering one metric by at most 1 percentage point needs a coverage-exception floor line naming package, metric, old, and new. A larger drop is accepted only while base coverage.runsettings still lists CompilerGenerated, the head removes it, each lowered metric's reason contains Lücken-Baseline, and the new floor is not below the measured percent rounded down. linesTarget is strict greater-than and branchesTarget is greater-than-or-equal, and only when COVERAGE_ENFORCE=true. C1 leaves that switch false. On push to master the floor comparison is a warning.",
+  "note": "Floors are whole percents. A pull request may raise a floor freely. Lowering one metric by at most 1 percentage point needs a coverage-exception floor line naming package, metric, old, and new. A larger drop is accepted only while base coverage.runsettings still lists CompilerGenerated, the head removes it, each lowered metric's reason contains Lücken-Baseline, and the new floor is not below the measured percent rounded down. linesTarget is strict greater-than and branchesTarget is greater-than-or-equal, and only when COVERAGE_ENFORCE=true. Z1 sets that switch true. On push to master the floor comparison is a warning.",
   "linesTarget": 90,
   "branchesTarget": 80,
   "packages": {
-    "ALog": { "lines": 94, "branches": 90 },
+    "ALog": { "lines": 95, "branches": 91 },
     "ALog.Extensions.Logging": { "lines": 90, "branches": 83 }
   }
 }
