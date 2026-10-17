@@ -90,6 +90,19 @@ class SyncWaitCheckTests(unittest.TestCase):
             problems = CHECK.evaluate(root)
         self.assertTrue(any("not allowlisted" in item for item in problems))
 
+    def test_declaration_allowlist_does_not_cover_a_call(self) -> None:
+        """Listing the awaiter method does not permit a GetResult call."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "ALog/Core/Sample.cs:void GetResult\\( # Awaiter method returns immediately. Timeout: not applicable.\n",
+                "public void GetResult() { }\nx.GetResult();\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("x.GetResult" in item for item in problems))
+        self.assertFalse(any("void GetResult" in item for item in problems))
+
     def test_reason_without_timeout_fails(self) -> None:
         """An allowlist reason that does not name a timeout is a failure."""
         with tempfile.TemporaryDirectory() as tmp:
