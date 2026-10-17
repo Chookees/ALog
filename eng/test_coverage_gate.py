@@ -452,6 +452,32 @@ class CoverageGateTests(unittest.TestCase):
             self.assertEqual(soft, 0)
             self.assertIn("::warning::ALog lines 60.2 are below floor 90.0.", soft_text)
 
+    def test_luecken_text_alone_does_not_allow_a_two_point_drop(self) -> None:
+        """A Lücken-Baseline line does not authorize a two-point drop by itself.
+
+        This call does not set ``COVERAGE_BASE_REF`` and does not remove
+        ``CompilerGenerated`` from runsettings. The one-point rule stays in
+        force, so the gate exits 1.
+
+        Side effects:
+            Writes temporary ratchet files and reads one Cobertura fixture.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "src"
+            source.mkdir()
+            write_cs(source / "Clean.cs", "class Clean {}\n")
+            baseline = root / "baseline.json"
+            two = root / "two.json"
+            baseline.write_text(ratchet_text(50, 40), encoding="utf-8")
+            two.write_text(ratchet_text(48, 40), encoding="utf-8")
+            summary = root / "summary.md"
+            body = (
+                "coverage-exception: floor ALog lines 50 -> 48: "
+                "Lücken-Baseline (C1-07, CompilerGenerated no longer excluded)\n"
+            )
+            self.assertEqual(run_gate(gate_args(two, baseline, source, summary), body), 1)
+
     def test_real_ratchet_file_has_both_packages_and_targets(self) -> None:
         """The committed ratchet parses and names the two shipped packages.
 

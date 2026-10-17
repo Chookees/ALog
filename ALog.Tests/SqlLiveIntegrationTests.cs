@@ -1,5 +1,8 @@
 using System.Security.Cryptography;
+using ALog;
+using ALog.Config;
 using ALog.Core;
+using ALog.Formatters;
 using ALog.Writers.Sql;
 using Microsoft.Data.SqlClient;
 using Testcontainers.MsSql;
@@ -178,6 +181,95 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
         Assert.Equal("live-sql-message", message);
         await WriteSqlIntegrationProofOnceAsync();
     }
+
+    /// <summary>
+    /// SQL keeps the rendered message and the context JSON. The template property
+    /// bag has no column. A <see cref="JsonFormatter"/> on the config is not applied,
+    /// because this writer is not <see cref="ALog.Public.Interfaces.IFormattableLogWriter"/>.
+    /// </summary>
+    /// <remarks>
+    /// Uses the live server when one is available. Does not print a second
+    /// <c>ALOG-SQL-INTEGRATION</c> line. Locally, with no SQL server, the test
+    /// returns without failing, matching the other live SQL tests.
+    /// </remarks>
+    [Fact(Timeout = 60000)]
+    public async Task Sql_DefaultAndJsonConfig_OmitTemplateProperties()
+    {
+        if (_unavailableReason is not null)
+        {
+            if (RequiresSql)
+                throw new InvalidOperationException(_unavailableReason);
+            Console.WriteLine($"[SqlLiveIntegrationTests] skipped: {_unavailableReason}");
+            return;
+        }
+
+        var table = "C1Prop" + Guid.NewGuid().ToString("N");
+        var writer = new SqlLogWriter(_connectionString!, table, autoCreateTable: true);
+        writer.Write(SqlSample("direct alpha"));
+        Log.Init(new LoggerConfig()
+            .AddWriter(writer)
+            .SetMinimumLevel(LogLevel.Trace)
+            .SetFormatter(new JsonFormatter()));
+        try
+        {
+            using (LogContext.Push(new KeyValuePair<string, object?>[] { new("User", "ada") }))
+                Log.Write(LogLevel.Info, "hello {A}", "alpha");
+        }
+        finally
+        {
+            Log.Shutdown();
+        }
+
+        await AssertSqlRowsOmitTemplateBagAsync(table);
+    }
+
+    /// <summary>
+    /// Reads the two characterization rows and checks that each context has User
+    /// and neither row stores the template property A.
+    /// </summary>
+    /// <param name="table">Alphanumeric table created for this test.</param>
+    /// <returns>A completed task after both rows have been checked.</returns>
+    /// <exception cref="InvalidOperationException">Thrown when the table does not contain two rows.</exception>
+    private async Task AssertSqlRowsOmitTemplateBagAsync(string table)
+    {
+        await using var connection = new SqlConnection(_connectionString);
+        await connection.OpenAsync();
+        await using var command = new SqlCommand(
+            $"SELECT Message, Context FROM [{table}] ORDER BY Message",
+            connection);
+        await using var reader = await command.ExecuteReaderAsync();
+        var seen = 0;
+        while (await reader.ReadAsync())
+        {
+            seen++;
+            var message = reader.GetString(0);
+            var context = reader.IsDBNull(1) ? string.Empty : reader.GetString(1);
+            Assert.Contains("alpha", message, StringComparison.Ordinal);
+            Assert.Contains("User", context, StringComparison.Ordinal);
+            Assert.Contains("ada", context, StringComparison.Ordinal);
+            // Ist-Verhalten 3a113bf, Befund an DC gemeldet
+            Assert.DoesNotContain("\"A\"", context, StringComparison.Ordinal);
+            Assert.DoesNotContain("\"A\"", message, StringComparison.Ordinal);
+        }
+
+        if (seen != 2)
+            throw new InvalidOperationException($"Expected 2 SQL rows, found {seen}.");
+    }
+
+    /// <summary>
+    /// Builds a direct SQL event. Properties hold A and context holds User.
+    /// </summary>
+    /// <param name="message">Rendered message stored in the Message column.</param>
+    /// <returns>An info event at the fixed coverage clock.</returns>
+    private static LogEvent SqlSample(string message)
+        => new(
+            CoverageClock.UtcNow,
+            LogLevel.Info,
+            message,
+            null,
+            new Dictionary<string, object> { ["User"] = "ada" },
+            new Dictionary<string, object> { ["A"] = "alpha" },
+            "hello {A}");
 
     /// <summary>
     /// Builds the single SQL proof line from <c>@@VERSION</c>.
