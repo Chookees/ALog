@@ -22,7 +22,8 @@ public sealed partial class C4QueueFixTests
 
     /// <summary>
     /// Capacity 100 and 1000 writes drop 900 immediately, then one ALOG0070 line carries 900.
-    /// After the first call, the median warm call and at least 990 of the 999 warm calls are under 10 ms.
+    /// Write returns while the blocked writer has finished nothing.
+    /// After the first call, the median warm call and at least 990 of the 999 warm calls are under 10 ms, and no call takes a second.
     /// Flush is completed by releasing the blocked writer, and it writes no ALOG0071.
     /// </summary>
     /// <returns>A task that finishes after flush and dispose.</returns>
@@ -50,21 +51,26 @@ public sealed partial class C4QueueFixTests
             clock);
         try
         {
-            // C4-01 excludes the first call in the process, which may pay for JIT.
+            // C4-01 excludes the first call from the 10 ms sample, because that call may pay for JIT.
+            // The one-second hang guard still applies to it. Write has returned for every call
+            // while the writer remains inside its first blocked call.
             var warm = new TimeSpan[999];
             var warmCount = 0;
             for (var i = 0; i < 1000; i++)
             {
                 var started = Stopwatch.GetTimestamp();
                 queue.TryEnqueue(Event("n-" + i.ToString(CultureInfo.InvariantCulture)));
+                var elapsed = Stopwatch.GetElapsedTime(started);
+                AssertShorterThanOneSecond(elapsed);
                 if (i == 0)
                     continue;
 
-                warm[warmCount] = Stopwatch.GetElapsedTime(started);
+                warm[warmCount] = elapsed;
                 warmCount++;
             }
 
             Assert.Equal(999, warmCount);
+            Assert.Empty(writer.Events);
             AssertWarmEnqueueSamplesStayUnderTenMilliseconds(warm);
             Assert.Equal(100, queue.AcceptedCount);
             Assert.Equal(900, queue.FullDropCount);
@@ -90,10 +96,14 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// Each WriteAsync on a full queue is already complete when the call returns.
-    /// The 10 ms bound starts at the second call.
+    /// Each of the 999 warm WriteAsync calls on a full queue returns a task that is already successful.
+    /// The median and at least 990 of those calls are under 10 ms, and no call takes a second.
     /// </summary>
     /// <returns>A task that finishes after the overflow calls.</returns>
+    /// <remarks>
+    /// Completion is the state of the returned task, not a clock. A task that is still running fails the test.
+    /// The finally block releases the writer and disposes the queue. Only the test thread calls it.
+    /// </remarks>
     [Fact(Timeout = 15000)]
     public async Task WriteAsync_FullQueue_CompletesWithin10ms()
     {
@@ -106,17 +116,26 @@ public sealed partial class C4QueueFixTests
             asyncEnabled: false);
         try
         {
+            // The first call is left out of the 10 ms sample. It still has the hang guard.
+            // Each of the other 999 tasks must already be successful when EnqueueAsync returns.
+            var warm = new TimeSpan[999];
+            var warmCount = 0;
             for (var i = 0; i < 1000; i++)
             {
                 var started = Stopwatch.GetTimestamp();
                 var pending = queue.EnqueueAsync(Event("a-" + i.ToString(CultureInfo.InvariantCulture)));
-                // C4-01: the 10 ms limit is warm. The first call in the process may pay for JIT.
-                if (i > 0)
-                    Assert.True(Stopwatch.GetElapsedTime(started) < TimeSpan.FromMilliseconds(10));
+                var elapsed = Stopwatch.GetElapsedTime(started);
+                AssertShorterThanOneSecond(elapsed);
+                if (i == 0)
+                    continue;
 
-                Assert.True(pending.IsCompletedSuccessfully);
+                Assert.True(pending.IsCompletedSuccessfully, "still running");
+                warm[warmCount] = elapsed;
+                warmCount++;
             }
 
+            Assert.Equal(999, warmCount);
+            AssertWarmEnqueueSamplesStayUnderTenMilliseconds(warm);
             Assert.Equal(100, queue.AcceptedCount);
             Assert.Equal(900, queue.FullDropCount);
         }
@@ -711,17 +730,17 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// Checks the C4-01 10 ms bound on the warm calls: the median is under 10 ms, and at least 990 of 999 calls are too.
+    /// Checks the C4-01 plausibility bound: the median is under 10 ms, at least 990 of 999 warm calls are too, and none took a second.
     /// </summary>
     /// <param name="samples">
-    /// One duration per warm <c>TryEnqueue</c>, in any order. Exactly 999 values. Not null.
+    /// One duration per warm call, in any order. Exactly 999 values. Not null.
     /// This method sorts the array and does not restore the original order.
     /// </param>
     /// <remarks>
-    /// A null array throws <see cref="ArgumentNullException"/>. A wrong length or a slow sample fails the test.
+    /// A null array throws <see cref="ArgumentNullException"/>. A wrong length, a slow median, or a one-second sample fails the test.
     /// Not thread-safe. Only the test thread calls it.
-    /// Nine samples may exceed 10 ms so one scheduler stall does not fail the run.
-    /// The old full-queue wait still fails: about 900 of these calls would sit on the shutdown deadline.
+    /// Nine samples may exceed 10 ms so one scheduler stall does not fail the run. A sample of one second or more is a hang, not a stall.
+    /// There is no strict maximum under 10 ms. Whether the call blocked is decided by the caller, from the task or from the writer still being inside its first write.
     /// </remarks>
     private static void AssertWarmEnqueueSamplesStayUnderTenMilliseconds(TimeSpan[] samples)
     {
@@ -747,6 +766,20 @@ public sealed partial class C4QueueFixTests
         Assert.True(
             under >= minimumUnderLimit,
             "under10ms " + under.ToString(CultureInfo.InvariantCulture) + " of " + requiredSamples.ToString(CultureInfo.InvariantCulture));
+        AssertShorterThanOneSecond(samples[requiredSamples - 1]);
+    }
+
+    /// <summary>
+    /// Fails when one call lasted a second or longer. That is the hang guard, not the 10 ms plausibility check.
+    /// </summary>
+    /// <param name="elapsed">Duration of one call. A negative value still passes, because it is not a hang.</param>
+    /// <remarks>
+    /// Does not throw except through the assertion. Not thread-safe. Only the test thread calls it.
+    /// A blocked pre-C4 enqueue sits on the five-second wait and fails here.
+    /// </remarks>
+    private static void AssertShorterThanOneSecond(TimeSpan elapsed)
+    {
+        Assert.True(elapsed < TimeSpan.FromSeconds(1), "hang " + elapsed.ToString());
     }
 
     /// <summary>
