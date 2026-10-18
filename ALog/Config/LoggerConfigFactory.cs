@@ -8,9 +8,22 @@ using ALog.Writers.File;
 
 /// <summary>
 /// Builds a <see cref="LoggerConfig"/> from <see cref="ALogOptions"/> (JSON/env-friendly).
+/// A console writer is added only when <see cref="ConsoleWriterOptions.Enabled"/> is true (A2a-61).
 /// </summary>
 public static class LoggerConfigFactory
 {
+    /// <summary>
+    /// Builds writers, enrichers, and the minimum level from bound options.
+    /// A missing console section does not add a console writer. File is added only when enabled.
+    /// </summary>
+    /// <param name="options">Bound options. Null is rejected. <see cref="ALogOptions.Console"/> may be null.</param>
+    /// <returns>A configuration the caller owns. It has no console writer unless console options are enabled.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="options"/> is null.</exception>
+    /// <exception cref="ArgumentException">Thrown when the level name or an enricher name is unknown.</exception>
+    /// <remarks>
+    /// Does not write a log line and does not touch an explicit <c>AddWriter</c> call.
+    /// Allocates the configuration and any writers it adds. Safe to call from any thread; the result is not shared.
+    /// </remarks>
     public static LoggerConfig FromOptions(ALogOptions options)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -32,9 +45,11 @@ public static class LoggerConfigFactory
         else if (string.Equals(options.Formatter, "plain", StringComparison.OrdinalIgnoreCase))
             config.SetFormatter(new PlainTextFormatter());
 
-        if (options.Console is null || options.Console.Enabled)
+        // DC-AB2: null (section missing) and Enabled false both skip the console writer.
+        var console = options.Console;
+        if (console is not null && console.Enabled)
         {
-            config.AddWriter(new ConsoleLogWriter(useColors: options.Console?.UseColors ?? true));
+            config.AddWriter(new ConsoleLogWriter(useColors: console.UseColors));
         }
 
         if (options.File is { Enabled: true })

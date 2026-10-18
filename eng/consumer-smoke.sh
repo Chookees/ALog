@@ -7,7 +7,8 @@
 # ALog.Extensions.Logging after checking project.assets.json and both SHA-512s.
 # file is green when SMOKE-<guid> appears once in the ALog file and the process
 # exits 0. console prints SMOKE-CONSOLE count=<n> and is green only when n is 1.
-# On the S4 tree the console count is 2. The normal solution build uses the
+# ALog does not add a console writer unless ALog:Console:Enabled is true, so the
+# Microsoft console provider writes the line once. The normal solution build uses the
 # project reference; only this script selects the packed package.
 
 set -euo pipefail

@@ -185,7 +185,6 @@ jobs:
   smoke-console:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
-    continue-on-error: true # bis A2a-65 (2a-2)
 
     steps:
     - name: Checkout

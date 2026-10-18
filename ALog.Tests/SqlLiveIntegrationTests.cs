@@ -13,7 +13,7 @@ namespace ALog.Tests;
 /// Live SQL Server integration for LIM-003.
 /// Prefers <c>ALOG_SQL_TEST_CONNECTION</c> (CI generates that string and masks the password).
 /// Otherwise Testcontainers starts <see cref="SqlServerImage"/> with a random password.
-/// When ALOG_REQUIRE_SQL=1, missing SQL fails the test. Locally without that variable a missing server is a no-op pass with a console note.
+/// When ALOG_REQUIRE_SQL=1, a missing server fails the test. When that variable is not 1, Skip.If skips it.
 /// The image digest is the single reference in this file; the workflow holds the other one.
 /// </summary>
 public sealed class SqlLiveIntegrationTests : IAsyncLifetime
@@ -32,9 +32,66 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
     private static bool RequiresSql =>
         string.Equals(Environment.GetEnvironmentVariable("ALOG_REQUIRE_SQL"), "1", StringComparison.Ordinal);
 
+    /// <summary>
+    /// Skip text xUnit shows when this machine has no SQL Server.
+    /// The variable is the one CI writes after it starts SQL Server.
+    /// </summary>
+    internal const string SqlUnavailableSkipReason =
+        "SQL Server not available: set ALOG_SQL_TEST_CONNECTION";
+
+
     private MsSqlContainer? _container;
     private string? _connectionString;
     private string? _unavailableReason;
+
+    /// <summary>
+    /// Decides whether a live SQL test runs or is skipped.
+    /// CI passes <paramref name="requireSql"/> true, so the test runs and fails if SQL stays down.
+    /// A connection string that does not open is a skip, even when Docker is present, because the fixture does not fall through to a container.
+    /// </summary>
+    /// <param name="requireSql">True when <c>ALOG_REQUIRE_SQL</c> is <c>1</c>.</param>
+    /// <param name="hasConnectionString">True when <c>ALOG_SQL_TEST_CONNECTION</c> is set.</param>
+    /// <param name="connectionReachable">True when that connection string opened.</param>
+    /// <param name="dockerAvailable">True when the Docker endpoint Testcontainers would use is present.</param>
+    /// <returns><see cref="SqlUnavailableSkipReason"/>, or null when the test must run.</returns>
+    /// <remarks>
+    /// No I/O. Callers probe SQL and Docker before they pass the flags. Safe to call from any thread.
+    /// </remarks>
+    internal static string? SkipReason(
+        bool requireSql,
+        bool hasConnectionString,
+        bool connectionReachable,
+        bool dockerAvailable)
+    {
+        if (requireSql)
+            return null;
+        if (hasConnectionString)
+            return connectionReachable ? null : SqlUnavailableSkipReason;
+        if (dockerAvailable)
+            return null;
+        return SqlUnavailableSkipReason;
+    }
+
+    /// <summary>
+    /// Builds the failure text used when <c>ALOG_REQUIRE_SQL</c> is <c>1</c> and SQL Server is down.
+    /// CI sets that variable on the job that starts SQL Server, so a dead server fails the build.
+    /// </summary>
+    /// <param name="detail">What the connection attempt reported. Empty is rejected.</param>
+    /// <returns>One line that names <c>ALOG_REQUIRE_SQL=1</c> and then the detail.</returns>
+    /// <exception cref="ArgumentException">Thrown when <paramref name="detail"/> is empty.</exception>
+    /// <remarks>
+    /// No I/O. The detail is capped at 400 characters. Safe to call from any thread.
+    /// </remarks>
+    internal static string RequiredSqlFailure(string detail)
+    {
+        if (string.IsNullOrWhiteSpace(detail))
+            throw new ArgumentException("SQL failure detail is empty.", nameof(detail));
+
+        const int maxDetail = 400;
+        if (detail.Length > maxDetail)
+            detail = detail.Substring(0, maxDetail);
+        return "SQL Server is not reachable and ALOG_REQUIRE_SQL=1. " + detail;
+    }
 
     /// <summary>
     /// Builds a SQL Server password for the Testcontainers path.
@@ -74,15 +131,13 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
 
     /// <summary>
     /// Connects to the SQL Server this fixture will write to.
-    /// <c>ALOG_REQUIRE_SQL=1</c> fails the test when SQL stays unreachable. CI sets that variable.
-    /// Without the variable, Testcontainers starts the pinned image with <see cref="CreateSqlPassword"/>.
+    /// <c>ALOG_REQUIRE_SQL=1</c> does not change this method. The test method fails when the server stays down.
+    /// Without that value, Testcontainers starts the pinned image with <see cref="CreateSqlPassword"/>.
+    /// A failed attempt is stored so the test can skip or fail.
     /// </summary>
-    /// <returns>A completed task after the connection string is stored, or after a local skip is recorded.</returns>
-    /// <exception cref="InvalidOperationException">
-    /// Thrown when <c>ALOG_REQUIRE_SQL=1</c> and SQL does not become reachable. Otherwise the reason is stored.
-    /// </exception>
+    /// <returns>A completed task after the connection string is stored, or after a failure is recorded.</returns>
     /// <remarks>
-    /// May start a Docker container and open a TCP connection. xUnit builds one instance per test.
+    /// May start a Docker container and open a TCP connection. Does not throw when SQL is missing.
     /// </remarks>
     public async Task InitializeAsync()
     {
@@ -98,8 +153,6 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
             catch (Exception ex)
             {
                 _unavailableReason = $"ALOG_SQL_TEST_CONNECTION set but SQL not reachable: {ex.Message}";
-                if (RequiresSql)
-                    throw new InvalidOperationException(_unavailableReason, ex);
                 return;
             }
         }
@@ -122,10 +175,27 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
                 await _container.DisposeAsync();
                 _container = null;
             }
-
-            if (RequiresSql)
-                throw new InvalidOperationException(_unavailableReason, ex);
         }
+    }
+
+    /// <summary>
+    /// Skips this test when SQL Server is down and <c>ALOG_REQUIRE_SQL</c> is not <c>1</c>.
+    /// When that variable is <c>1</c>, a missing server fails the test instead of skipping it.
+    /// CI sets <c>ALOG_REQUIRE_SQL</c> to <c>1</c> on the job that starts SQL Server.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <c>ALOG_REQUIRE_SQL</c> is <c>1</c> and no server was reached.
+    /// </exception>
+    /// <remarks>
+    /// Calls <c>Skip.If</c> from Xunit.SkippableFact. That call does not return when it skips.
+    /// xUnit 2.9 reports <c>Assert.Skip</c> as a failure, so this method does not call it.
+    /// </remarks>
+    private void SkipIfSqlIsUnavailable()
+    {
+        if (_unavailableReason is null)
+            return;
+        Skip.If(!RequiresSql, SqlUnavailableSkipReason);
+        throw new InvalidOperationException(RequiredSqlFailure(_unavailableReason));
     }
 
     public async Task DisposeAsync()
@@ -134,16 +204,10 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
             await _container.DisposeAsync();
     }
 
-    [Fact]
+    [SkippableFact]
     public async Task LIM003_SqlLogWriter_CreatesTable_And_InsertsRow()
     {
-        if (_unavailableReason is not null)
-        {
-            if (RequiresSql)
-                throw new InvalidOperationException(_unavailableReason);
-            Console.WriteLine($"[SqlLiveIntegrationTests] skipped: {_unavailableReason}");
-            return;
-        }
+        SkipIfSqlIsUnavailable();
 
         Assert.False(string.IsNullOrWhiteSpace(_connectionString));
         var tableName = "ALogLiveLogs";
@@ -189,19 +253,13 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
     /// </summary>
     /// <remarks>
     /// Uses the live server when one is available. Does not print a second
-    /// <c>ALOG-SQL-INTEGRATION</c> line. Locally, with no SQL server, the test
-    /// returns without failing, matching the other live SQL tests.
+    /// <c>ALOG-SQL-INTEGRATION</c> line. With no SQL server, and without
+    /// <c>ALOG_REQUIRE_SQL=1</c>, <c>Skip.If</c> skips the test.
     /// </remarks>
-    [Fact(Timeout = 60000)]
+    [SkippableFact(Timeout = 60000)]
     public async Task Sql_DefaultAndJsonConfig_OmitTemplateProperties()
     {
-        if (_unavailableReason is not null)
-        {
-            if (RequiresSql)
-                throw new InvalidOperationException(_unavailableReason);
-            Console.WriteLine($"[SqlLiveIntegrationTests] skipped: {_unavailableReason}");
-            return;
-        }
+        SkipIfSqlIsUnavailable();
 
         var table = "C1Prop" + Guid.NewGuid().ToString("N");
         var writer = new SqlLogWriter(_connectionString!, table, autoCreateTable: true);

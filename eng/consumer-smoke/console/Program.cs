@@ -9,8 +9,8 @@ using Microsoft.Extensions.Logging;
 
 /// <summary>
 /// Hosts one information line so CI can count where that line is written.
-/// MEL keeps its default console provider. ALog is added beside it and, until
-/// the console writer becomes opt-in, also writes the line to the console.
+/// MEL keeps its default console provider. ALog is added beside it and does not
+/// add a console writer, because this host sets no <c>ALog:Console:Enabled</c> key.
 /// </summary>
 public sealed class Program
 {
@@ -18,8 +18,8 @@ public sealed class Program
     /// Builds the generic host, writes one <c>SMOKE-{Guid}</c> line, and stops.
     /// The file sink is configured only by the smoke script's environment
     /// (<c>ALog__File__Enabled</c> and <c>ALog__File__Path</c>). No other ALog
-    /// key is set here, and the MEL providers are not cleared, so the current
-    /// tree prints the line twice on the console and once in the file.
+    /// key is set here, and the MEL providers are not cleared, so the line is
+    /// printed once on the console (by MEL) and once in the file (by ALog).
     /// </summary>
     /// <param name="args">Arguments forwarded to the generic host. Null is rejected. Empty is valid.</param>
     /// <returns>A task that completes after the host has stopped and its writers are disposed.</returns>
@@ -35,8 +35,8 @@ public sealed class Program
         ArgumentNullException.ThrowIfNull(args);
 
         var builder = Host.CreateApplicationBuilder(args);
-        // Leave MEL's console provider in place. Clearing it would hide the
-        // double console line that this smoke exists to show until 2a-2.
+        // Leave MEL's console provider in place. ALog's console writer stays off
+        // because no ALog:Console:Enabled key is set, so the line is not doubled.
         builder.Logging.AddALog(builder.Configuration);
 
         using var host = builder.Build();
