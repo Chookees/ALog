@@ -33,6 +33,11 @@ SVG_NAMES = (
     "coverage-ALog.svg",
     "coverage-ALog.Extensions.Logging.svg",
 )
+PUSH_RED_PREFIX = "coverage badges were not published: git push failed: "
+PUSH_RED_SUFFIX = (
+    ". Check that the badge job has contents: write "
+    "and that no ruleset blocks the badges branch."
+)
 
 
 def load_module(filename: str, module_name: str):
@@ -435,6 +440,20 @@ class CoverageBadgeTests(unittest.TestCase):
             self.assertEqual(len(notices), 4)
             self.assertIn("committed", results[4][1])
 
+    def test_five_parallel_runs_with_the_same_sha_stay_green(self) -> None:
+        """Five publishers of one master SHA all exit 0, three times.
+
+        Each round uses a fresh bare origin. A red exit, including a flaky
+        one, fails the suite. The winning SVG is not asserted because the
+        writers race.
+
+        Side effects:
+            Creates three temporary bare origins and fifteen clones.
+        """
+        for round_index in range(1, 4):
+            with self.subTest(round=round_index):
+                self._assert_same_sha_race()
+
     def test_push_conflict_warns_after_three_retries(self) -> None:
         """A badges push that stays a real conflict warns after three retries.
 
@@ -531,6 +550,7 @@ class CoverageBadgeTests(unittest.TestCase):
             code, out, err = self._publish(root, "not-a-sha", "nope")
             self.assertEqual(code, 2)
             self.assertIn("coverage badges were not published", err)
+            self.assertNotIn("git push failed", err)
             self.assertNotIn("::notice::", out)
             self.assertNotIn("::warning::", out)
             empty = root / "empty"
@@ -538,6 +558,7 @@ class CoverageBadgeTests(unittest.TestCase):
             code, out, err = self._publish_dir(root, empty, "a" * 40)
             self.assertEqual(code, 2, err)
             self.assertIn("coverage badges were not published", err)
+            self.assertNotIn("git push failed", err)
             self.assertNotIn("::warning::", out)
 
     def test_unreachable_pushurl_exits_red(self) -> None:
@@ -592,6 +613,48 @@ class CoverageBadgeTests(unittest.TestCase):
             code, out, err = self._publish(work, sha, "hook-words")
             self._assert_real_push_error(code, out, err, "non-fast-forward")
             self.assertEqual((origin / "push-attempts").read_text().strip(), "1")
+
+    def test_push_failure_keeps_a_percent_sign_in_the_red_line(self) -> None:
+        """A real push failure shows 100% unescaped and does not retry.
+
+        The hook text also starts a fake workflow command on the next line.
+        The publisher still prints exactly one red line.
+
+        Side effects:
+            Creates a temporary bare origin with a rejecting pre-receive hook.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, work, sha = self._one_master_commit(root)
+            self._reject_with_message(origin, "rejected 100%\n::error::injected")
+            code, out, err = self._publish(work, sha, "percent")
+            self._assert_real_push_error(code, out, err, "100%")
+            self.assertNotIn("%25", err)
+            self.assertNotIn("::warning::", out)
+            self.assertFalse(err.strip().startswith("::"))
+            self.assertEqual((origin / "push-attempts").read_text().strip(), "1")
+
+    def test_percent_is_escaped_once_inside_workflow_commands(self) -> None:
+        """A 100% git reason is escaped once in notice and warning text.
+
+        The red path keeps the percent sign. These commands are the only
+        place it becomes ``100%25``. A second escape would show ``100%2525``.
+
+        Side effects:
+            None.
+        """
+        reason = self.publish._push_error_text("note 100%\n::error::hidden", "")
+        self.assertIn("100%", reason)
+        self.assertNotIn("%25", reason)
+        self.assertNotIn("\n", reason)
+        self.assertFalse(reason.startswith("::"))
+        warning_out = io.StringIO()
+        with redirect_stdout(warning_out):
+            code = self.publish._report_outcome("conflict", reason, "b" * 40)
+        self.assertEqual(code, 0)
+        self._assert_percent_escaped_once(warning_out.getvalue().strip(), "::warning::")
+        notice = self.publish._workflow_command("notice", reason)
+        self._assert_percent_escaped_once(notice, "::notice::")
 
     def test_real_non_fast_forward_is_retried(self) -> None:
         """A real non-fast-forward waits one second and then publishes.
@@ -685,7 +748,56 @@ class CoverageBadgeTests(unittest.TestCase):
         locked = "error: cannot lock ref 'refs/heads/badges': is at abc but expected def\n"
         self.assertEqual(self.publish._classify_push("", locked, 1), "conflict")
         remote_lock = "!\trefs/heads/badges:refs/heads/badges\t[remote rejected] (cannot lock ref)\n"
-        self.assertEqual(self.publish._classify_push(remote_lock, "cannot lock ref", 1), "error")
+        self.assertEqual(self.publish._classify_push(remote_lock, "cannot lock ref", 1), "conflict")
+
+    def test_failed_to_update_ref_with_the_lock_line_is_a_conflict(self) -> None:
+        """GitHub's failed-to-update-ref pair is a badges lock conflict.
+
+        Side effects:
+            None.
+        """
+        stdout = "!\trefs/heads/badges:refs/heads/badges\t[remote rejected] (failed to update ref)\n"
+        stderr = "remote: error: cannot lock ref 'refs/heads/badges': is at X but expected Y\n"
+        self.assertEqual(self.publish._classify_push(stdout, stderr, 1), "conflict")
+
+    def test_remote_rejected_cannot_lock_ref_prefix_is_a_conflict(self) -> None:
+        """A remote rejection whose reason starts with cannot lock ref is a conflict.
+
+        Side effects:
+            None.
+        """
+        for reason in (
+            "cannot lock ref",
+            "cannot lock ref 'refs/heads/badges'",
+        ):
+            stdout = f"!\trefs/heads/badges:refs/heads/badges\t[remote rejected] ({reason})\n"
+            self.assertEqual(self.publish._classify_push(stdout, "", 1), "conflict", reason)
+
+    def test_failed_to_update_ref_without_the_lock_line_is_red(self) -> None:
+        """failed to update ref is an error unless stderr has the badges lock line.
+
+        Side effects:
+            None.
+        """
+        stdout = "!\trefs/heads/badges:refs/heads/badges\t[remote rejected] (failed to update ref)\n"
+        self.assertEqual(self.publish._classify_push(stdout, "", 1), "error")
+        other_ref = "remote: error: cannot lock ref 'refs/heads/other': is at X but expected Y\n"
+        self.assertEqual(self.publish._classify_push(stdout, other_ref, 1), "error")
+        loose = "remote: cannot lock ref 'refs/heads/badges'\n"
+        self.assertEqual(self.publish._classify_push(stdout, loose, 1), "error")
+
+    def test_hook_reason_with_cannot_lock_ref_in_the_middle_is_red(self) -> None:
+        """A hook reason that only contains cannot lock ref in the middle is an error.
+
+        Side effects:
+            None.
+        """
+        stdout = (
+            "!\trefs/heads/badges:refs/heads/badges\t"
+            "[remote rejected] (pre-receive hook declined: cannot lock ref is not a conflict)\n"
+        )
+        stderr = "remote: pre-receive hook declined: cannot lock ref is not a conflict\n"
+        self.assertEqual(self.publish._classify_push(stdout, stderr, 1), "error")
 
     def _publish_subprocess(self, repo: Path, sha: str, marker: str) -> tuple[int, str, str]:
         """Publish from a separate process so parallel runs do not share stdout.
@@ -968,9 +1080,13 @@ class CoverageBadgeTests(unittest.TestCase):
         self.assertNotIn("::warning::", out)
         self.assertNotIn("::notice::", out)
         self.assertNotIn("Traceback", err)
-        self.assertEqual(len(err.strip().splitlines()), 1)
-        self.assertIn("coverage badges were not published", err)
-        self.assertIn(needle, err)
+        line = err.strip()
+        self.assertEqual(len(line.splitlines()), 1, err)
+        self.assertTrue(line.startswith(PUSH_RED_PREFIX), line)
+        self.assertTrue(line.endswith(PUSH_RED_SUFFIX), line)
+        reason = line[len(PUSH_RED_PREFIX) : -len(PUSH_RED_SUFFIX)]
+        self.assertIn(needle, reason)
+        self.assertFalse(line.startswith("::"))
 
     def _reject_with_message(self, origin: Path, message: str) -> None:
         """Install a pre-receive hook that rejects every push with one message.
@@ -1086,6 +1202,60 @@ class CoverageBadgeTests(unittest.TestCase):
             'exec "$real" "$@"',
         ]
         return "\n".join(lines) + "\n"
+
+    def _assert_same_sha_race(self) -> None:
+        """Run five publishers of one SHA and require every exit code to be 0.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: A publisher exits red or does not finish.
+
+        Side effects:
+            Creates a temporary bare origin and five clones.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, shas = self._origin_with_commits(root, 1)
+            sha = shas[0]
+            clones = []
+            for index in range(5):
+                clone = root / f"clone-{index}"
+                self._git(root, ["clone", str(origin), str(clone)])
+                clones.append(clone)
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                futures = [
+                    pool.submit(self._publish_subprocess, clone, sha, f"same-{index}")
+                    for index, clone in enumerate(clones)
+                ]
+                results = [future.result(timeout=90) for future in futures]
+            for code, _out, err in results:
+                self.assertEqual(code, 0, err)
+            self.assertTrue(self._badge_text(origin).startswith("<svg>same-"))
+
+    def _assert_percent_escaped_once(self, line: str, prefix: str) -> None:
+        """Require one workflow command that contains 100%25 a single time.
+
+        Args:
+            line: The command, without a trailing newline.
+            prefix: ``::notice::`` or ``::warning::``.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: The line is not one command, or the percent sign
+                was escaped twice or not at all.
+
+        Side effects:
+            None.
+        """
+        self.assertEqual(len(line.splitlines()), 1, line)
+        self.assertTrue(line.startswith(prefix), line)
+        self.assertEqual(line.count("100%25"), 1, line)
+        self.assertNotIn("%2525", line)
+        self.assertNotIn("100%2525", line)
 
     def _restore_path(self) -> None:
         """Put ``PATH`` back after a git wrapper test.

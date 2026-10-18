@@ -9,9 +9,12 @@ newest commit's build fails and never reaches this script. A rejected badges
 push is retried at most three times, each time with a new fetch and a new
 head check, waiting 1, 2, and 4 seconds before those retries. Only a real
 concurrency rejection is retried: porcelain ``[rejected] (non-fast-forward)``,
-``[rejected] (fetch first)``, ``[rejected] (stale info)``, or ``cannot lock
-ref``. A hook, a ruleset, a permission failure, or a transport error exits 2
-with one line and is not retried. If a real conflict is still failing after
+``[rejected] (fetch first)``, ``[rejected] (stale info)``, a ``cannot lock
+ref`` that is not a remote rejection, or ``[remote rejected]`` only when its
+reason starts with ``cannot lock ref`` or is exactly ``failed to update ref``
+and stderr contains the badges lock line. Every other remote rejection exits
+2 with one line and is not retried. Percent signs are escaped once, and only
+inside ``::notice::`` and ``::warning::``. If a real conflict is still failing after
 the retries, the process exits 0 with a warning that states the reason. A
 script error, invalid input, or a missing SVG stays red. Nothing in this
 file force-pushes, and the push refspec never names master. Next file:
@@ -498,25 +501,26 @@ def _run_push(repo: Path) -> None:
             env=_git_child_env(),
         )
     except subprocess.TimeoutExpired as error:
-        raise RuntimeError("git push timed out") from error
+        raise RuntimeError(_real_push_failure("git push timed out")) from error
     if result.returncode == 0:
         return
     reason = _push_error_text(result.stdout, result.stderr)
     if _classify_push(result.stdout, result.stderr, result.returncode) == "conflict":
         raise PushRejected(reason)
-    raise RuntimeError(reason)
+    raise RuntimeError(_real_push_failure(reason))
 
 
 def _push_error_text(stdout: str, stderr: str) -> str:
-    """Return one escaped line describing a failed badges push.
+    """Return one unescaped line describing a failed badges push.
 
     Args:
         stdout: Git standard output. Used when stderr is empty.
         stderr: Git standard error. Preferred when it has text.
 
     Returns:
-        A single line of at most 500 characters. Whitespace is collapsed and
-        ``%`` is written as ``%25``. Token-shaped text is hidden.
+        A single line of at most 500 characters. Whitespace is collapsed.
+        ``%`` stays ``%`` so the red line can show ``100%``. Token-shaped
+        text is hidden. Workflow commands escape this text later.
 
     Raises:
         None.
@@ -525,7 +529,34 @@ def _push_error_text(stdout: str, stderr: str) -> str:
         None.
     """
     text = stderr if stderr.strip() else stdout
-    return _safe_git_error(text).replace("%", "%25")
+    return _safe_git_error(text)
+
+
+def _real_push_failure(reason: str) -> str:
+    """Build the red message for a badges push that is not a conflict.
+
+    Args:
+        reason: One-line git reason. Empty text is replaced so the sentence
+            still names a failure. Percent signs are not escaped.
+
+    Returns:
+        ``git push failed: <reason>. Check that the badge job has contents:
+        write and that no ruleset blocks the badges branch.``
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if reason.strip() == "":
+        reason = "git failed"
+    return (
+        "git push failed: "
+        + reason
+        + ". Check that the badge job has contents: write "
+        + "and that no ruleset blocks the badges branch."
+    )
 
 
 def _classify_push(stdout: str, stderr: str, returncode: int) -> str:
@@ -539,11 +570,13 @@ def _classify_push(stdout: str, stderr: str, returncode: int) -> str:
     Returns:
         ``ok`` when git exited 0. ``conflict`` when the badges line is
         ``[rejected] (non-fast-forward)``, ``[rejected] (fetch first)``, or
-        ``[rejected] (stale info)``, or git reports ``cannot lock ref``
-        without a ``[remote rejected]`` badges line. ``error`` for a hook,
-        ruleset, permission failure, transport failure, or anything else.
-        ``[remote rejected]`` is an error even if its text says
-        ``non-fast-forward`` or ``cannot lock ref``.
+        ``[rejected] (stale info)``, when git reports ``cannot lock ref``
+        without a ``[remote rejected]`` badges line, or when that remote
+        rejection's reason starts with ``cannot lock ref`` or is exactly
+        ``failed to update ref`` and stderr contains
+        ``remote: error: cannot lock ref 'refs/heads/badges'``. ``error``
+        for every other remote rejection, including a hook whose text merely
+        contains ``cannot lock ref``.
 
     Raises:
         None.
@@ -554,8 +587,9 @@ def _classify_push(stdout: str, stderr: str, returncode: int) -> str:
     if returncode == 0:
         return "ok"
     lines = _badges_status_lines(stdout)
-    if _has_remote_rejected(lines):
-        return "error"
+    remote = _remote_rejected_outcome(lines, stderr)
+    if remote is not None:
+        return remote
     if _has_conflict_summary(lines):
         return "conflict"
     if "cannot lock ref" in f"{stdout}\n{stderr}":
@@ -624,14 +658,19 @@ def _status_fields(raw: str) -> tuple[str, str, str] | None:
     return flag, refspec, summary
 
 
-def _has_remote_rejected(lines: list[tuple[str, str]]) -> bool:
-    """Return whether a badges line was rejected by the remote itself.
+def _remote_rejected_outcome(lines: list[tuple[str, str]], stderr: str) -> str | None:
+    """Classify ``[remote rejected]`` badges lines, if any exist.
 
     Args:
         lines: Flag and summary pairs. At most 20 are inspected.
+        stderr: Git standard error. Used only for the exact badges lock line.
 
     Returns:
-        True when a summary starts with ``[remote rejected]``.
+        ``conflict`` when every remote rejection is a lock conflict.
+        ``error`` when any remote rejection is a hook, ruleset, permission
+        failure, or anything else. ``None`` when no badges line is
+        ``[remote rejected]``, so the caller can still see a local
+        non-fast-forward.
 
     Raises:
         None.
@@ -640,12 +679,70 @@ def _has_remote_rejected(lines: list[tuple[str, str]]) -> bool:
         None.
     """
     seen = 0
+    found = False
+    conflict = True
     for _flag, summary in lines:
         seen += 1
         if seen > 20:
             break
-        if summary.startswith("[remote rejected]"):
-            return True
+        if not summary.startswith("[remote rejected]"):
+            continue
+        found = True
+        if not _remote_reason_is_lock(_parenthetical_reason(summary), stderr):
+            conflict = False
+    if not found:
+        return None
+    if conflict:
+        return "conflict"
+    return "error"
+
+
+def _parenthetical_reason(summary: str) -> str:
+    """Return the text inside a ``[remote rejected] (reason)`` summary.
+
+    Args:
+        summary: The porcelain summary field. A missing parenthesis means
+            there is no lock reason.
+
+    Returns:
+        The reason, or an empty string when the summary has no ``(reason)``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    prefix = "[remote rejected] ("
+    if summary.startswith(prefix) and summary.endswith(")") and len(summary) > len(prefix):
+        return summary[len(prefix) : -1]
+    return ""
+
+
+def _remote_reason_is_lock(reason: str, stderr: str) -> bool:
+    """Return whether one remote-rejection reason is a badges ref lock.
+
+    Args:
+        reason: Text inside the porcelain parentheses. Matching is exact for
+            ``failed to update ref`` and a prefix match for ``cannot lock ref``.
+            A hook sentence that only contains those words later is not a lock.
+        stderr: Git standard error. The failed-to-update reason is a lock
+            only when this contains the badges ``cannot lock ref`` line.
+
+    Returns:
+        True for the two lock shapes from arc_spec v5.21b. False otherwise.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if reason.startswith("cannot lock ref"):
+        return True
+    lock_line = "remote: error: cannot lock ref 'refs/heads/badges'"
+    if reason == "failed to update ref" and lock_line in stderr:
+        return True
     return False
 
 
@@ -830,11 +927,13 @@ def _workflow_command(kind: str, message: str) -> str:
     Args:
         kind: ``notice`` or ``warning``.
         message: Reason shown in the log. Empty text is rejected so a skip
-            cannot exit 0 without saying why. Percent signs are escaped
-            because the workflow command grammar uses them.
+            cannot exit 0 without saying why. ``%``, CR, and LF are escaped
+            once here and nowhere else. A colon in the message stays a colon
+            so ``after 3 retries:`` remains readable.
 
     Returns:
         A single line such as ``::notice::...`` of at most 520 characters.
+        ``100%`` appears as ``100%25``. A second escape is not applied.
 
     Raises:
         ValueError: The kind is unknown or the message is empty.
@@ -844,13 +943,14 @@ def _workflow_command(kind: str, message: str) -> str:
     """
     if kind not in {"notice", "warning"}:
         raise ValueError("workflow command must be notice or warning")
-    cleaned = " ".join(message.split())
+    # Percent first so the %0D and %0A inserted below are not escaped again.
+    escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    cleaned = " ".join(escaped.split())
     if cleaned == "":
         raise ValueError("workflow command message is empty")
-    escaped = cleaned.replace("%", "%25")
-    if len(escaped) > 500:
-        escaped = escaped[:500]
-    return f"::{kind}::{escaped}"
+    if len(cleaned) > 500:
+        cleaned = cleaned[:500]
+    return f"::{kind}::{cleaned}"
 
 
 def _fetch_origin_master(repo: Path) -> str:

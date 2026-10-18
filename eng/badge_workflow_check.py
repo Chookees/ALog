@@ -48,10 +48,11 @@ def load_workflow(path: Path) -> dict:
 
     Raises:
         ValueError: The path is not a file, the file is too large, the YAML
-            cannot be parsed, a mapping key is duplicated, or the document is
-            not a mapping.
+            cannot be parsed, a mapping key is duplicated or unhashable, or
+            the document is not a mapping.
         OSError: The file cannot be read.
-        ImportError: PyYAML is not installed.
+        SystemExit: PyYAML is not installed. Exit status 2. stderr is the
+            install line and there is no traceback.
 
     Side effects:
         Reads the file and imports PyYAML.
@@ -68,20 +69,26 @@ def load_workflow(path: Path) -> dict:
 
 
 def _import_yaml():
-    """Import PyYAML.
+    """Import PyYAML or stop with the install line.
 
     Returns:
-        The yaml module.
+        The yaml module when it is installed.
 
     Raises:
-        ImportError: PyYAML is not installed. The caller prints one install
-            line and does not show this exception's traceback.
+        SystemExit: PyYAML is not installed. Exit status 2. stderr is exactly
+            ``PyYAML is required for the badge workflow check: python3 -m pip
+            install -r eng/requirements-ci.txt`` and Python prints no
+            traceback. Every entry point reaches this function before it can
+            report a missing import as an uncaught exception.
 
     Side effects:
-        Imports the module.
+        Imports the module, or writes one line to stderr and exits.
     """
-    import yaml
-
+    try:
+        import yaml
+    except ImportError:
+        print(_PYYAML_REQUIRED, file=sys.stderr)
+        raise SystemExit(2)
     return yaml
 
 
@@ -95,8 +102,9 @@ def _parse_yaml(text: str) -> object:
         The parsed document.
 
     Raises:
-        ImportError: PyYAML is not installed.
-        ValueError: The YAML cannot be parsed, including a duplicate key.
+        SystemExit: PyYAML is not installed.
+        ValueError: The YAML cannot be parsed, including a duplicate key or
+            an unhashable key.
 
     Side effects:
         Imports PyYAML.
@@ -105,10 +113,34 @@ def _parse_yaml(text: str) -> object:
     try:
         return yaml.load(text, Loader=_unique_loader(yaml))
     except yaml.YAMLError as error:
-        message = " ".join(str(error).split())
-        if len(message) > _MAX_ERROR_CHARS:
-            message = message[:_MAX_ERROR_CHARS]
-        raise ValueError(f"workflow YAML cannot be parsed: {message}") from error
+        raise ValueError(_yaml_failure(error)) from error
+    except TypeError as error:
+        raise ValueError(_yaml_failure(error)) from error
+
+
+def _yaml_failure(error: BaseException) -> str:
+    """Turn a parser failure into one bounded sentence.
+
+    Args:
+        error: The parser exception. Its text is collapsed to one line and
+            cut at 200 characters so a huge document cannot flood stderr.
+
+    Returns:
+        ``workflow YAML cannot be parsed: ...``. An empty exception becomes
+        a fixed sentence.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    message = " ".join(str(error).split())
+    if message == "":
+        message = "the document is not valid YAML"
+    if len(message) > _MAX_ERROR_CHARS:
+        message = message[:_MAX_ERROR_CHARS]
+    return f"workflow YAML cannot be parsed: {message}"
 
 
 def _unique_loader(yaml_module):
@@ -169,8 +201,9 @@ def _mapping_without_duplicates(loader, node, yaml_module) -> dict:
         The constructed mapping. At most 200 keys are accepted.
 
     Raises:
-        ConstructorError: A key is repeated, the node has no pair list, or it
-            has more than 200 pairs.
+        ConstructorError: A key is repeated, a key cannot be stored because
+            it is unhashable, the node has no pair list, or it has more than
+            200 pairs.
 
     Side effects:
         None.
@@ -184,17 +217,78 @@ def _mapping_without_duplicates(loader, node, yaml_module) -> dict:
             None,
         )
     mapping: dict = {}
+    seen = 0
     for key_node, value_node in pairs:
+        seen += 1
+        if seen > 200:
+            break
         key = loader.construct_object(key_node, deep=False)
-        if key in mapping:
-            raise yaml_module.constructor.ConstructorError(
-                f"found duplicate key {key!r}",
-                getattr(key_node, "start_mark", None),
-                f"found duplicate key {key!r}",
-                getattr(key_node, "start_mark", None),
-            )
+        _reject_duplicate_or_unhashable(mapping, key, key_node, yaml_module)
         mapping[key] = loader.construct_object(value_node, deep=False)
     return mapping
+
+
+def _reject_duplicate_or_unhashable(mapping: dict, key: object, key_node: object, yaml_module) -> None:
+    """Reject a repeated key and a key that cannot be stored.
+
+    Args:
+        mapping: Keys already accepted. At most 200 entries.
+        key: The candidate key. A list or another unhashable value is a
+            parse error, not a traceback.
+        key_node: The YAML node, used only for the error mark.
+        yaml_module: The yaml module, used for ``ConstructorError``.
+
+    Returns:
+        None when the key can be added.
+
+    Raises:
+        ConstructorError: The key is already present, or using it as a
+            dictionary key raises ``TypeError``.
+
+    Side effects:
+        None. The caller stores the value after this returns.
+    """
+    try:
+        duplicated = key in mapping
+    except TypeError as error:
+        raise _unhashable_key(key_node, error, yaml_module) from error
+    if not duplicated:
+        return
+    raise yaml_module.constructor.ConstructorError(
+        f"found duplicate key {key!r}",
+        getattr(key_node, "start_mark", None),
+        f"found duplicate key {key!r}",
+        getattr(key_node, "start_mark", None),
+    )
+
+
+def _unhashable_key(key_node: object, error: TypeError, yaml_module):
+    """Build the parser error for a mapping key that cannot be hashed.
+
+    Args:
+        key_node: The YAML node. Its start mark is attached when present.
+        error: The ``TypeError`` raised by the dictionary.
+        yaml_module: The yaml module, used for ``ConstructorError``.
+
+    Returns:
+        A ``ConstructorError``. PyYAML treats that as a YAML error, so the
+            caller prints one line and exits 2.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    detail = " ".join(str(error).split())
+    if detail == "":
+        detail = "unhashable key"
+    return yaml_module.constructor.ConstructorError(
+        None,
+        None,
+        f"mapping key cannot be used: {detail}",
+        getattr(key_node, "start_mark", None),
+    )
 
 
 def check_badge_workflow(document: object) -> list[str]:

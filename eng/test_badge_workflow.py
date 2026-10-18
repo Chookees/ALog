@@ -15,6 +15,8 @@ from __future__ import annotations
 import copy
 import importlib.util
 import io
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -337,28 +339,17 @@ class BadgeWorkflowTests(unittest.TestCase):
                 self.assertNotIn("Traceback", err)
                 self.assertEqual(len(err.strip().splitlines()), 1)
 
-    def test_missing_pyyaml_exits_with_the_install_line(self) -> None:
-        """A missing PyYAML import prints one install line and no traceback.
+    def test_unhashable_yaml_key_is_one_line(self) -> None:
+        """An unhashable mapping key exits 2 with one line and no traceback.
 
         Side effects:
-            Hides the ``yaml`` module for the duration of the call.
+            Writes a temporary workflow file.
         """
-        message = (
-            "PyYAML is required for the badge workflow check: "
-            "python3 -m pip install -r eng/requirements-ci.txt"
-        )
-        saved = sys.modules.get("yaml")
-        sys.modules["yaml"] = None
-        try:
-            code, err = self._check_text(WORKFLOW.read_text(encoding="utf-8"))
-        finally:
-            if saved is None:
-                sys.modules.pop("yaml", None)
-            else:
-                sys.modules["yaml"] = saved
-        self.assertEqual(code, 2)
-        self.assertEqual(err, message + "\n")
+        code, err = self._check_text("? [a, b]\n: 1\n")
+        self.assertEqual(code, 2, err)
         self.assertNotIn("Traceback", err)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertTrue(err.startswith("badge workflow check failed:"), err)
 
     def test_ci_pins_pyyaml_before_script_tests(self) -> None:
         """CI installs the hashed requirements file before the script tests.
@@ -368,7 +359,8 @@ class BadgeWorkflowTests(unittest.TestCase):
         """
         workflow = WORKFLOW.read_text(encoding="utf-8")
         install = workflow.find(
-            "python3 -m pip install --require-hashes -r eng/requirements-ci.txt"
+            "python3 -m pip install --require-hashes --only-binary=:all: "
+            "-r eng/requirements-ci.txt"
         )
         scripts = workflow.find("- name: Script tests")
         self.assertGreater(install, 0)
@@ -405,5 +397,93 @@ class BadgeWorkflowTests(unittest.TestCase):
         return code, stderr.getvalue()
 
 
+class MissingPyYamlTests(unittest.TestCase):
+    """Entry points when the process cannot import PyYAML.
+
+    This class has no ``setUp``. A setup that parsed the workflow would load
+    PyYAML before the missing-import assertion ran.
+    """
+
+    def test_every_entry_point_prints_the_install_line(self) -> None:
+        """The checker, this file, and the S4 script exit 2 with one line.
+
+        Side effects:
+            Creates a virtual environment without PyYAML and runs the three
+            entry points with that interpreter.
+        """
+        message = (
+            "PyYAML is required for the badge workflow check: "
+            "python3 -m pip install -r eng/requirements-ci.txt"
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            venv = Path(raw) / "venv"
+            created = subprocess.run(
+                [sys.executable, "-m", "venv", str(venv)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(created.returncode, 0, created.stderr)
+            python = venv / "bin" / "python3"
+            checker = subprocess.run(
+                [str(python), str(ROOT / "badge_workflow_check.py"), str(WORKFLOW)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self._assert_install_line(checker, message, stdout_empty=True)
+            suite = subprocess.run(
+                [str(python), str(ROOT / "test_badge_workflow.py")],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self._assert_install_line(suite, message, stdout_empty=True)
+            env = os.environ.copy()
+            env["PATH"] = str(venv / "bin") + os.pathsep + env.get("PATH", "")
+            script = subprocess.run(
+                ["bash", str(ROOT / "test_s4_grep.sh")],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=env,
+                cwd=str(ROOT.parent),
+            )
+            self._assert_install_line(script, message, stdout_empty=False)
+
+    def _assert_install_line(self, result: subprocess.CompletedProcess[str], message: str, *, stdout_empty: bool) -> None:
+        """Require exit 2, the install line, and no traceback.
+
+        Args:
+            result: Completed entry point.
+            message: The exact install sentence.
+            stdout_empty: When true, stdout must be empty. The S4 script
+                prints earlier passing checks, so its stdout is not empty.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: The process did not stop with that one line.
+
+        Side effects:
+            None.
+        """
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 2, combined)
+        self.assertNotIn("Traceback", combined)
+        err_lines = [line for line in result.stderr.splitlines() if line.strip()]
+        self.assertEqual(err_lines, [message], result.stderr)
+        if stdout_empty:
+            self.assertEqual(result.stdout, "")
+
+
 if __name__ == "__main__":
+    # Stop before unittest. A missing import raised from setUp becomes an
+    # error with a traceback and exit 1, which hides the install line.
+    load_checker()._import_yaml()
     raise SystemExit(unittest.main())
