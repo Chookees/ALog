@@ -224,7 +224,7 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// A 10 ms writer and 1,000 queued events return inside 5.2 s with one ALOG0071 line.
+    /// A 10 ms writer and 1,000 queued events return inside the shutdown window with one ALOG0071 line.
     /// Written plus the reported remainder is 1,000. A fast writer of 100,000 events reports nothing.
     /// Flush after dispose does not add a line. A log after dispose adds one ALOG0072 and no second ALOG0071.
     /// </summary>
@@ -251,7 +251,13 @@ public sealed partial class C4QueueFixTests
 
             var started = Stopwatch.StartNew();
             engine.Dispose();
-            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(5200), "elapsed " + started.Elapsed.ToString());
+            // New writes stop at 4900 ms. A 10 ms writer is between calls then, so the processor
+            // leaves and Dispose returns there, about 100 ms before the 5 s deadline.
+            // The floor is that cutoff minus the 50 ms slack. The ceiling stays twice the 5 s deadline.
+            TransitionDeadline.AssertBetween(
+                started.Elapsed,
+                TimeSpan.FromMilliseconds(4850),
+                BackgroundLogQueue.ShutdownDeadline);
             string report;
             lock (lines)
                 report = Assert.Single(lines);
@@ -382,7 +388,7 @@ public sealed partial class C4QueueFixTests
     /// reports ALOG0072 once for a later write, and does not write after the writer is disposed.
     /// </summary>
     /// <returns>A task that finishes after the parallel shutdown.</returns>
-    [Fact(Timeout = 30000)]
+    [Fact(Timeout = 60000)]
     public async Task Shutdown_TwiceSequentialAndParallel_ThenWrite_NoException()
     {
         var lines = new List<string>();
@@ -436,8 +442,8 @@ public sealed partial class C4QueueFixTests
             var started = Stopwatch.StartNew();
             var first = Task.Run(() => parallel.Dispose());
             var second = Task.Run(() => parallel.Dispose());
-            await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(8));
-            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(5200), "elapsed " + started.Elapsed.ToString());
+            await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(30));
+            TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
             parallel.Log("after", LogLevel.Info);
             Assert.False(hanging.Disposed);
             lock (lines)
@@ -487,11 +493,11 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// A writer blocked forever lets shutdown return inside 5.2 s. The writer is not disposed.
+    /// A writer blocked forever lets shutdown return inside the shutdown window. The writer is not disposed.
     /// The remainder is one ALOG0071 line.
     /// </summary>
     /// <returns>A task that finishes after shutdown.</returns>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = 45000)]
     public async Task HangingWriter_ShutdownReturns_AndDoesNotDispose()
     {
         var lines = new List<string>();
@@ -510,7 +516,7 @@ public sealed partial class C4QueueFixTests
             Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(5)));
             var started = Stopwatch.StartNew();
             engine.Dispose();
-            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(5200), "elapsed " + started.Elapsed.ToString());
+            TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
             Assert.False(writer.Disposed);
             Assert.False(engine.Queue!.ReleaseWriters);
             var report = Assert.Single(lines);

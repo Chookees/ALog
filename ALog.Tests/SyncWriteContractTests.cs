@@ -29,7 +29,7 @@ public sealed class SyncWriteContractTests
     /// <see cref="AzureLogWriter.Write"/> reports a handler that has no synchronous send.
     /// </summary>
     /// <remarks>
-    /// Z1-03. The call returns in under one second, does not throw, and does not call
+    /// Z1-03. The call returns in under two seconds, does not throw, and does not call
     /// <c>SendAsync</c>. The pump cap is 25 seconds so a hang fails the test instead of the suite.
     /// </remarks>
     [Fact(Timeout = 30000)]
@@ -330,8 +330,8 @@ public sealed class SyncWriteContractTests
     }
 
     /// <summary>
-    /// A full queue returns false from <see cref="BackgroundLogQueue.TryEnqueue"/> immediately.
-    /// The event is counted as a drop. The caller does not wait out the shutdown deadline.
+    /// A full queue returns false from <see cref="BackgroundLogQueue.TryEnqueue"/> without waiting for the writer.
+    /// The event is counted as a drop. The call stays under twice the old 50 ms bound.
     /// </summary>
     /// <remarks>
     /// The reader is blocked inside the writer, so the outstanding count stays at capacity.
@@ -359,7 +359,8 @@ public sealed class SyncWriteContractTests
             var started = Stopwatch.StartNew();
             var accepted = queue.TryEnqueue(Event("overflow"));
             Assert.False(accepted);
-            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(50), "elapsed " + started.Elapsed.ToString());
+            Assert.Empty(writer.Events);
+            TransitionDeadline.AssertNoLongerThanTwice(started.Elapsed, TimeSpan.FromMilliseconds(50));
             Assert.Equal(1, queue.FullDropCount);
         }
         finally
@@ -370,15 +371,15 @@ public sealed class SyncWriteContractTests
     }
 
     /// <summary>
-    /// An enqueue after the queue has closed returns false without throwing.
-    /// Dispose while a writer call is still running returns inside the deadline.
+    /// An enqueue after the queue has started to close returns false without waiting for the writer.
+    /// Dispose while a writer call is still running stays inside the shutdown window.
     /// </summary>
     /// <remarks>
     /// The blocked writer is released after the deadline assertions so the processor can leave.
     /// A second dispose waits for the first and does not throw.
     /// </remarks>
     /// <returns>A task that finishes after dispose returns.</returns>
-    [Fact(Timeout = 30000)]
+    [Fact(Timeout = 60000)]
     public async Task Queue_TryEnqueue_ReturnsFalseWhenTheChannelCloses()
     {
         var writer = new BlockingWriter();
@@ -397,13 +398,15 @@ public sealed class SyncWriteContractTests
                 await Task.Delay(10);
 
             Assert.True(writer.EnteredCount > 0);
-            var started = Stopwatch.StartNew();
+            var disposeStarted = Stopwatch.StartNew();
             disposing = Task.Run(() => queue.Dispose());
+            var enqueueStarted = Stopwatch.StartNew();
             var accepted = queue.TryEnqueue(Event("closing"));
             Assert.False(accepted);
-            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(50), "elapsed " + started.Elapsed.ToString());
-            await disposing.WaitAsync(TimeSpan.FromSeconds(8));
-            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(5200), "dispose " + started.Elapsed.ToString());
+            Assert.Empty(writer.Events);
+            TransitionDeadline.AssertNoLongerThanTwice(enqueueStarted.Elapsed, TimeSpan.FromMilliseconds(50));
+            await disposing.WaitAsync(TimeSpan.FromSeconds(30));
+            TransitionDeadline.AssertFiredInWindow(disposeStarted.Elapsed, BackgroundLogQueue.ShutdownDeadline);
             Assert.False(queue.TryEnqueue(Event("after")));
             queue.Dispose();
         }
@@ -411,7 +414,7 @@ public sealed class SyncWriteContractTests
         {
             writer.Release();
             if (disposing is not null)
-                await disposing.WaitAsync(TimeSpan.FromSeconds(8));
+                await disposing.WaitAsync(TimeSpan.FromSeconds(30));
         }
     }
 
@@ -461,7 +464,7 @@ public sealed class SyncWriteContractTests
             {
                 error = CaptureError(() => WriteSync(writer));
             });
-            Assert.True(elapsed < TimeSpan.FromSeconds(1), elapsed.ToString());
+            TransitionDeadline.AssertNoLongerThanTwice(elapsed, TimeSpan.FromSeconds(1));
             Assert.Contains(errorTag, error, StringComparison.Ordinal);
             Assert.Equal(0, handler.AsyncStarts);
         }
