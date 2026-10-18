@@ -289,6 +289,43 @@ class CoverageGateTests(unittest.TestCase):
             self.assertTrue(combined.startswith("earlier\n"))
             self.assertIn("COVERAGE package=ALog.Extensions.Logging lines=73.7", combined)
 
+    def test_measurement_flag_writes_the_compared_line_percents(self) -> None:
+        """``--measurement`` stores the line percents this run compared.
+
+        The badge job reads the file. It does not start another test run.
+        The fixture rates are 60.2 and 73.7.
+
+        Side effects:
+            Writes a temporary ratchet, a clean source file, and the JSON file.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            source = root / "src"
+            source.mkdir()
+            write_cs(source / "Clean.cs", "class Clean {}\n")
+            ratchet = root / "ratchet.json"
+            ratchet.write_text(ratchet_text(0, 0), encoding="utf-8")
+            measurement = root / "lines.json"
+            code = GATE.main(
+                [
+                    "--cobertura",
+                    str(DATA / "cobertura-assembly-name.xml"),
+                    "--ratchet",
+                    str(ratchet),
+                    "--source-root",
+                    str(source),
+                    "--measurement",
+                    str(measurement),
+                ],
+                {"COVERAGE_ENFORCE": "false", "GITHUB_EVENT_NAME": "push"},
+            )
+            self.assertEqual(code, 0)
+            document = measurement.read_text(encoding="utf-8")
+            self.assertIn('"lines": "60.2"', document)
+            self.assertIn('"lines": "73.7"', document)
+            self.assertTrue(document.endswith("\n"))
+            self.assertFalse((root / "lines.json.tmp").exists())
+
     def test_main_enforce_false_passes_and_true_fails(self) -> None:
         """The command exits 0 for S4 and 1 when the target gate is on.
 

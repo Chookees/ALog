@@ -548,6 +548,319 @@ check_readmes()
 PY
 pass "coverage gate stays in CI and README AddALog blocks import ALog"
 
+python3 - << 'PY'
+"""B1-01 and the README badge line.
+
+The badge job's condition, needs, and permissions are checked from parsed
+YAML, not by counting lines. The workflow default stays exactly contents
+read, and no other job grants write. Both READMEs carry CI, Coverage,
+License, and .NET 10 in that order directly under the H1. The repository
+README also keeps GitHub downloads.
+"""
+
+import importlib.util
+import sys
+from pathlib import Path
+
+WORKFLOW = ".github/workflows/dotnet.yml"
+ACTIONS = "https://github.com/Chookees/ALog/actions/workflows/dotnet.yml"
+LICENSE = "https://github.com/Chookees/ALog/blob/master/LICENSE"
+CI_IMAGE = "https://img.shields.io/github/actions/workflow/status/Chookees/ALog/dotnet.yml?branch=master&label=CI"
+NET_IMAGE = "https://img.shields.io/badge/.NET-10-512BD4"
+DOWNLOADS = "https://img.shields.io/github/downloads/chookees/alog/total"
+RELEASES = "https://github.com/Chookees/ALog/releases"
+SOURCEFORGE = (
+    "[![Download ALog](https://a.fsdn.com/con/app/sf-download-button)]"
+    "(https://sourceforge.net/projects/alog/files/latest/download)"
+)
+ROOT_HEADING = "# ALog – A Modern, Modular, Cross-Platform Logger for .NET 10+"
+EXT_HEADING = "# ALog.Extensions.Logging"
+
+
+def fail(message):
+    """Print one failure and stop.
+
+    Args:
+        message: What was wrong.
+
+    Side effects: writes stderr and exits 1. Does not return.
+    """
+    sys.stderr.write(message + "\n")
+    sys.exit(1)
+
+
+def read_text(path):
+    """Read a UTF-8 file with a line cap.
+
+    Args:
+        path: File to read.
+
+    Returns:
+        The file text.
+
+    Raises:
+        SystemExit: The file has more than 20000 lines.
+    """
+    with open(path, encoding="utf-8") as handle:
+        lines = []
+        for index, line in enumerate(handle, start=1):
+            if index > 20000:
+                fail(f"{path} is too long")
+            lines.append(line)
+    return "".join(lines)
+
+
+def is_job_header(line):
+    """Return whether a line starts a workflow job.
+
+    Args:
+        line: One workflow line, without the trailing newline.
+
+    Returns:
+        True for a two-space key such as ``  build:``.
+    """
+    if not line.startswith("  ") or line.startswith("   "):
+        return False
+    name = line.strip()
+    if not name.endswith(":"):
+        return False
+    key = name[:-1]
+    return key != "" and " " not in key
+
+
+def split_jobs(text):
+    """Split a workflow into the preamble and one body per job.
+
+    Args:
+        text: Full workflow YAML.
+
+    Returns:
+        The text before ``jobs:``, then a map of job name to body text.
+
+    Raises:
+        SystemExit: The jobs section is missing or a job is malformed.
+    """
+    lines = text.splitlines()
+    jobs_at = None
+    for index, line in enumerate(lines):
+        if line == "jobs:":
+            jobs_at = index
+            break
+    if jobs_at is None:
+        fail("jobs section is missing")
+    preamble = "\n".join(lines[:jobs_at])
+    jobs = {}
+    current = None
+    body = []
+    for line in lines[jobs_at + 1:]:
+        if is_job_header(line):
+            if current is not None:
+                jobs[current] = "\n".join(body)
+            current = line.strip()[:-1]
+            body = []
+            continue
+        if current is None:
+            fail(f"unexpected line before the first job: {line}")
+        if line and not line.startswith(" ") and not line.startswith("#"):
+            fail(f"job {current} ended at {line}")
+        body.append(line)
+        if len(body) > 2000:
+            fail(f"job {current} is too long")
+    if current is None:
+        fail("workflow has no jobs")
+    jobs[current] = "\n".join(body)
+    if len(jobs) > 20:
+        fail("workflow has more than 20 jobs")
+    return preamble, jobs
+
+
+def assert_order(line, markers, label):
+    """Require each marker to appear, left to right.
+
+    Args:
+        line: One README line.
+        markers: Substrings in the required order. At most 10.
+        label: Name used in the failure.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: A marker is missing or out of order.
+    """
+    if len(markers) > 10:
+        fail("too many badge markers")
+    position = -1
+    for marker in markers:
+        found = line.find(marker)
+        if found < 0:
+            fail(f"{label} is missing {marker}")
+        if found <= position:
+            fail(f"{label} has {marker} out of order")
+        position = found
+
+
+def line_under(text, heading):
+    """Return the line immediately under a heading.
+
+    Args:
+        text: Markdown source.
+        heading: Full heading line.
+
+    Returns:
+        The following line.
+
+    Raises:
+        SystemExit: The heading is missing or is the last line.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line == heading:
+            if index + 1 >= len(lines):
+                fail(f"no line under {heading}")
+            return lines[index + 1]
+    fail(f"missing heading {heading}")
+    return ""
+
+
+def next_nonempty(text, heading):
+    """Return the first non-empty line after the line under a heading.
+
+    Args:
+        text: Markdown source.
+        heading: Full heading line.
+
+    Returns:
+        That line.
+
+    Raises:
+        SystemExit: No such line exists.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line != heading:
+            continue
+        for follower in lines[index + 2:]:
+            if follower.strip() != "":
+                return follower
+        fail(f"no paragraph under {heading}")
+    fail(f"missing heading {heading}")
+    return ""
+
+
+def load_badge_checker():
+    """Load the structural B1-01 checker.
+
+    Returns:
+        The badge_workflow_check module.
+
+    Raises:
+        SystemExit: The checker cannot be loaded.
+    """
+    path = "eng/badge_workflow_check.py"
+    spec = importlib.util.spec_from_file_location("badge_workflow_check", path)
+    if spec is None or spec.loader is None:
+        fail("badge workflow checker is missing")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def check_workflow():
+    """Lock B1-01 from parsed YAML, plus the trigger text.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: The badge job, its permissions, or the trigger is wrong.
+    """
+    checker = load_badge_checker()
+    try:
+        document = checker.load_workflow(Path(WORKFLOW))
+    except (OSError, ValueError) as error:
+        fail(f"workflow cannot be parsed: {error}")
+    for problem in checker.check_badge_workflow(document):
+        fail(problem)
+    text = read_text(WORKFLOW)
+    preamble, _jobs = split_jobs(text)
+    if "badges" in preamble:
+        fail("workflow triggers mention badges")
+    if preamble.count('branches: [ "master" ]') != 2:
+        fail("push and pull_request must both target only master")
+    if "--force" in text or "push -f" in text:
+        fail("workflow contains a force push")
+
+
+def badge_markers(coverage_file):
+    """Return the shared badge markers plus one coverage file.
+
+    Args:
+        coverage_file: SVG file name on the badges branch.
+
+    Returns:
+        Markers in README order, without the GitHub downloads badge.
+    """
+    coverage = (
+        "[![Coverage](https://raw.githubusercontent.com/Chookees/ALog/badges/"
+        + coverage_file
+        + ")]("
+        + ACTIONS
+        + ")"
+    )
+    return [
+        "[![CI](" + CI_IMAGE + ")](" + ACTIONS + ")",
+        coverage,
+        "[![License: MIT](https://img.shields.io/badge/License-MIT-blue)](" + LICENSE + ")",
+        "![.NET 10](" + NET_IMAGE + ")",
+    ]
+
+
+def check_readmes():
+    """Lock the badge line on both READMEs.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: Order, alt text, link, or a forbidden badge is wrong.
+    """
+    root = read_text("README.md")
+    extensions = read_text("ALog.Extensions.Logging/README.md")
+    root_badges = line_under(root, ROOT_HEADING)
+    ext_badges = line_under(extensions, EXT_HEADING)
+    root_markers = badge_markers("coverage-ALog.svg")
+    root_markers.append("[![GitHub downloads](" + DOWNLOADS + ")](" + RELEASES + ")")
+    assert_order(root_badges, root_markers, "root README")
+    assert_order(ext_badges, badge_markers("coverage-ALog.Extensions.Logging.svg"), "extensions README")
+    if "[![.NET 10]" in root_badges or "[![.NET 10]" in ext_badges:
+        fail(".NET 10 badge must not be a link")
+    if "GitHub downloads" in ext_badges or "sourceforge" in extensions.lower():
+        fail("extensions README has a repository-only badge")
+    if "coverage-ALog.Extensions.Logging.svg" in root_badges:
+        fail("root README points at the extensions coverage badge")
+    if "coverage-ALog.svg)" in ext_badges:
+        fail("extensions README points at the ALog coverage badge")
+    if next_nonempty(root, ROOT_HEADING) != SOURCEFORGE:
+        fail("SourceForge button is not under the badge line")
+    if "GitHub Downloads (all assets, all releases)" in root:
+        fail("old GitHub downloads alt text remains")
+    for label, text in (("root", root), ("extensions", extensions)):
+        if "img.shields.io/nuget" in text or "codecov.io" in text or "gist.github" in text:
+            fail(f"{label} README links a service that is not in the badge set")
+        if "[![NuGet" in text or "NuGet downloads" in text:
+            fail(f"{label} README has a NuGet badge")
+    changelog = read_text("CHANGELOG.md")
+    if "coverage-ALog.svg" in changelog or "img.shields.io" in changelog:
+        fail("CHANGELOG mentions badges")
+
+
+check_workflow()
+check_readmes()
+PY
+python3 eng/test_badge_workflow.py
+pass "B1 badge job and README badges"
+
 if [ "$failures" -ne 0 ]; then
   echo "${failures} s4 grep tests failed" >&2
   exit 1
