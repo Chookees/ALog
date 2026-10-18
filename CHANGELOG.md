@@ -21,6 +21,8 @@
 - Breaking (behavior): synchronous writes through `AzureLogWriter` and `HttpLogWriter` use `HttpClient.Send`. If you pass an `HttpClient` whose handler does not support synchronous `Send`, those writes fail like any writer error; enable the background queue for such handlers.
 - Breaking (behavior): ALog writes to the console only when `ALog:Console:Enabled` is `true`. Before, `AddALog` added its own console output next to the Microsoft console provider, so every line appeared twice.
 - Fixed: `AddALog` matches message-template values by name, not by position, so ASP.NET Core and EF Core messages render correctly and keep the right property names.
+- Fixed: `AddALog` no longer throws into the application when a log message cannot be formatted. ALog writes the event with its message template and reports ALOG0022.
+- Fixed: `AddALog` stores `{@Order}` and `{$Order}` as the property `Order`, and keeps the property values when a message has no `{OriginalFormat}`.
 
 ## 0.2.0
 

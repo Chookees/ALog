@@ -1,6 +1,7 @@
 // Message templates for ALog's own Log.Write path.
 // Hole names are letters, digits, and underscores. A leading '@' is not an operator.
-// The MEL bridge uses ReadPropertyName so {@Order} stays @Order. Next: LoggerEngine.cs.
+// ReadPropertyName only strips braces and a format suffix. The MEL bridge strips one '@' or '$' after that.
+// Next: LoggerEngine.cs.
 namespace ALog.Core;
 
 using System.Globalization;
