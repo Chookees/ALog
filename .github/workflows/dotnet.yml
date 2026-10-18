@@ -17,7 +17,8 @@ jobs:
     timeout-minutes: 30
     env:
       COVERAGE_ENFORCE: "true"
-      # Only the value 1 enables the SQL live tests. Any other value skips them.
+      # Only the value 1 enables the SQL live tests. true (any case) does too.
+      # Any other non-empty value fails the SQL tests. Empty or unset skips them.
       ALOG_REQUIRE_SQL: "1"
       ALOG_SQL_IMAGE: mcr.microsoft.com/mssql/server@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
 

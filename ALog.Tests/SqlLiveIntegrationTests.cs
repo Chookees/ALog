@@ -10,10 +10,28 @@ using Testcontainers.MsSql;
 namespace ALog.Tests;
 
 /// <summary>
+/// How <c>ALOG_REQUIRE_SQL</c> changes the live SQL tests.
+/// Optional skips when no server is reachable. Required fails instead.
+/// Invalid fails even when a server is up, because the value is not a known switch.
+/// </summary>
+internal enum SqlRequirement
+{
+    /// <summary>Unset or empty. A missing server skips the test.</summary>
+    Optional = 0,
+
+    /// <summary>The value is <c>1</c> or <c>true</c>. A missing server fails the test.</summary>
+    Required = 1,
+
+    /// <summary>Any other non-empty value. The test fails before it looks at the server.</summary>
+    Invalid = 2
+}
+
+/// <summary>
 /// Live SQL Server integration for LIM-003.
 /// Prefers <c>ALOG_SQL_TEST_CONNECTION</c> (CI generates that string and masks the password).
 /// Otherwise Testcontainers starts <see cref="SqlServerImage"/> with a random password.
-/// When ALOG_REQUIRE_SQL=1, a missing server fails the test. When that variable is not 1, Skip.If skips it.
+/// When ALOG_REQUIRE_SQL is 1 or true, a missing server fails the test. Unset or empty skips it.
+/// Any other non-empty value fails the test even when a server is up.
 /// The image digest is the single reference in this file; the workflow holds the other one.
 /// </summary>
 public sealed class SqlLiveIntegrationTests : IAsyncLifetime
@@ -28,9 +46,6 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
         ';', '=', ' ', '\'', '"', '{', '}', '$', '`', '\\', '\r', '\n'
     };
     private static int _integrationProofWritten;
-
-    private static bool RequiresSql =>
-        string.Equals(Environment.GetEnvironmentVariable("ALOG_REQUIRE_SQL"), "1", StringComparison.Ordinal);
 
     /// <summary>
     /// Skip text xUnit shows when this machine has no SQL Server.
@@ -49,7 +64,7 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
     /// CI passes <paramref name="requireSql"/> true, so the test runs and fails if SQL stays down.
     /// A connection string that does not open is a skip, even when Docker is present, because the fixture does not fall through to a container.
     /// </summary>
-    /// <param name="requireSql">True when <c>ALOG_REQUIRE_SQL</c> is <c>1</c>.</param>
+    /// <param name="requireSql">True when <c>ALOG_REQUIRE_SQL</c> is <c>1</c> or <c>true</c>.</param>
     /// <param name="hasConnectionString">True when <c>ALOG_SQL_TEST_CONNECTION</c> is set.</param>
     /// <param name="connectionReachable">True when that connection string opened.</param>
     /// <param name="dockerAvailable">True when the Docker endpoint Testcontainers would use is present.</param>
@@ -73,11 +88,11 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// Builds the failure text used when <c>ALOG_REQUIRE_SQL</c> is <c>1</c> and SQL Server is down.
-    /// CI sets that variable on the job that starts SQL Server, so a dead server fails the build.
+    /// Builds the failure text used when SQL is required and SQL Server is down.
+    /// CI sets <c>ALOG_REQUIRE_SQL</c> on the job that starts SQL Server, so a dead server fails the build.
     /// </summary>
-    /// <param name="detail">What the connection attempt reported. Empty is rejected.</param>
-    /// <returns>One line that names <c>ALOG_REQUIRE_SQL=1</c> and then the detail.</returns>
+    /// <param name="detail">What the connection attempt reported. Empty is rejected. Longer than 400 characters is cut.</param>
+    /// <returns>The sentence <c>ALOG_REQUIRE_SQL requires SQL, but no server was reachable: </c> plus the detail.</returns>
     /// <exception cref="ArgumentException">Thrown when <paramref name="detail"/> is empty.</exception>
     /// <remarks>
     /// No I/O. The detail is capped at 400 characters. Safe to call from any thread.
@@ -90,7 +105,80 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
         const int maxDetail = 400;
         if (detail.Length > maxDetail)
             detail = detail.Substring(0, maxDetail);
-        return "SQL Server is not reachable and ALOG_REQUIRE_SQL=1. " + detail;
+        return "ALOG_REQUIRE_SQL requires SQL, but no server was reachable: " + detail;
+    }
+
+    /// <summary>
+    /// Reads <c>ALOG_REQUIRE_SQL</c>. Empty and unset skip when no server is reachable.
+    /// <c>1</c> and <c>true</c> (any case) require a server. Every other non-empty value is invalid.
+    /// </summary>
+    /// <param name="value">The environment variable as read. Null and empty are optional. Not trimmed.</param>
+    /// <returns><see cref="SqlRequirement.Optional"/>, <see cref="SqlRequirement.Required"/>, or <see cref="SqlRequirement.Invalid"/>.</returns>
+    /// <remarks>
+    /// No I/O. Does not throw. Safe to call from any thread.
+    /// </remarks>
+    internal static SqlRequirement ClassifyRequireSql(string? value)
+    {
+        if (string.IsNullOrEmpty(value))
+            return SqlRequirement.Optional;
+
+        if (string.Equals(value, "1", StringComparison.Ordinal))
+            return SqlRequirement.Required;
+
+        if (string.Equals(value, "true", StringComparison.OrdinalIgnoreCase))
+            return SqlRequirement.Required;
+
+        return SqlRequirement.Invalid;
+    }
+
+    /// <summary>
+    /// Builds the failure text for a non-empty <c>ALOG_REQUIRE_SQL</c> that is not <c>1</c> or <c>true</c>.
+    /// The value is copied as given so the message shows what was set.
+    /// </summary>
+    /// <param name="value">The variable's text. Empty is rejected. Not trimmed.</param>
+    /// <returns>The exact invalid-value sentence, with <paramref name="value"/> between the quotes.</returns>
+    /// <exception cref="ArgumentException">Thrown when <paramref name="value"/> is empty.</exception>
+    /// <remarks>
+    /// No I/O. Does not cap the value. Safe to call from any thread.
+    /// </remarks>
+    internal static string InvalidRequireSqlMessage(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+            throw new ArgumentException("ALOG_REQUIRE_SQL value is empty.", nameof(value));
+
+        return "ALOG_REQUIRE_SQL is set to '" + value
+            + "'. Use 1 or true to require SQL, or unset it to skip the SQL tests.";
+    }
+
+    /// <summary>
+    /// Decides whether a live SQL test runs, skips, or fails.
+    /// An invalid variable fails even when <paramref name="unavailableReason"/> is null, because a server does not make a bad switch valid.
+    /// </summary>
+    /// <param name="requireSql">Value of <c>ALOG_REQUIRE_SQL</c>. Null and empty are optional.</param>
+    /// <param name="unavailableReason">Why no server was reached. Null means a server is up. Empty is treated as up.</param>
+    /// <returns>
+    /// Failure text, or null when the test may run or skip.
+    /// Skip text, or null when the test runs or fails. At most one of the two is set.
+    /// </returns>
+    /// <remarks>
+    /// No I/O. A whitespace reason still throws from <see cref="RequiredSqlFailure"/>. Null and empty mean the server is up.
+    /// Safe to call from any thread.
+    /// </remarks>
+    internal static (string? Failure, string? SkipReason) DecideSqlAvailability(
+        string? requireSql,
+        string? unavailableReason)
+    {
+        var kind = ClassifyRequireSql(requireSql);
+        if (kind == SqlRequirement.Invalid)
+            return (InvalidRequireSqlMessage(requireSql ?? string.Empty), null);
+
+        if (string.IsNullOrEmpty(unavailableReason))
+            return (null, null);
+
+        if (kind == SqlRequirement.Required)
+            return (RequiredSqlFailure(unavailableReason), null);
+
+        return (null, SqlUnavailableSkipReason);
     }
 
     /// <summary>
@@ -131,7 +219,7 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
 
     /// <summary>
     /// Connects to the SQL Server this fixture will write to.
-    /// <c>ALOG_REQUIRE_SQL=1</c> does not change this method. The test method fails when the server stays down.
+    /// <c>ALOG_REQUIRE_SQL</c> does not change this method. The test method fails when the server stays down and SQL is required.
     /// Without that value, Testcontainers starts the pinned image with <see cref="CreateSqlPassword"/>.
     /// A failed attempt is stored so the test can skip or fail.
     /// </summary>
@@ -179,12 +267,12 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// Skips this test when SQL Server is down and <c>ALOG_REQUIRE_SQL</c> is not <c>1</c>.
-    /// When that variable is <c>1</c>, a missing server fails the test instead of skipping it.
+    /// Skips this test when SQL Server is down and <c>ALOG_REQUIRE_SQL</c> is unset or empty.
+    /// <c>1</c> and <c>true</c> fail instead of skipping. Any other non-empty value fails even when a server is up.
     /// CI sets <c>ALOG_REQUIRE_SQL</c> to <c>1</c> on the job that starts SQL Server.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when <c>ALOG_REQUIRE_SQL</c> is <c>1</c> and no server was reached.
+    /// Thrown when SQL is required and no server was reached, or when the variable is not a known switch.
     /// </exception>
     /// <remarks>
     /// Calls <c>Skip.If</c> from Xunit.SkippableFact. That call does not return when it skips.
@@ -192,10 +280,14 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
     /// </remarks>
     private void SkipIfSqlIsUnavailable()
     {
-        if (_unavailableReason is null)
-            return;
-        Skip.If(!RequiresSql, SqlUnavailableSkipReason);
-        throw new InvalidOperationException(RequiredSqlFailure(_unavailableReason));
+        var decision = DecideSqlAvailability(
+            Environment.GetEnvironmentVariable("ALOG_REQUIRE_SQL"),
+            _unavailableReason);
+        if (decision.Failure is not null)
+            throw new InvalidOperationException(decision.Failure);
+
+        if (decision.SkipReason is not null)
+            Skip.If(true, decision.SkipReason);
     }
 
     public async Task DisposeAsync()
@@ -254,7 +346,7 @@ public sealed class SqlLiveIntegrationTests : IAsyncLifetime
     /// <remarks>
     /// Uses the live server when one is available. Does not print a second
     /// <c>ALOG-SQL-INTEGRATION</c> line. With no SQL server, and without
-    /// <c>ALOG_REQUIRE_SQL=1</c>, <c>Skip.If</c> skips the test.
+    /// <c>ALOG_REQUIRE_SQL</c> unset, <c>Skip.If</c> skips the test.
     /// </remarks>
     [SkippableFact(Timeout = 60000)]
     public async Task Sql_DefaultAndJsonConfig_OmitTemplateProperties()

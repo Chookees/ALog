@@ -26,6 +26,7 @@ It is designed to be simple to use, highly configurable, and ready for modern de
 
   <ItemGroup>
     <InternalsVisibleTo Include="ALog.Tests" />
+    <InternalsVisibleTo Include="ALog.Extensions.Logging" />
   </ItemGroup>
 
   <ItemGroup>

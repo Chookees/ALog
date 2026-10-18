@@ -8,11 +8,9 @@
   <ItemGroup>
     <PackageReference Include="AWSSDK.CloudWatchLogs" Version="3.7.509.3" />
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.13" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.13" />
     <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" Version="10.11.0" />
-    <PackageReference Include="Microsoft.Extensions.Configuration.Json" Version="10.0.13" />
-    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.13" />
-    <PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.13" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="10.0.13" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
     <PackageReference Include="Testcontainers.MsSql" Version="4.16.0" />
     <!-- SSH.NET 2026.0.0: GHSA-q939-rpr3-3284 (CVE-2026-48798), GHSA-mggc-4xg6-vcxf (CVE-2026-85756) (High), transitiv über Testcontainers. Entfernen, sobald Testcontainers eine Version mit SSH.NET >= 2026.0.0 mitbringt. -->
@@ -20,6 +18,10 @@
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" />
     <PackageReference Include="Xunit.SkippableFact" Version="1.5.85" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
 
   <ItemGroup>
