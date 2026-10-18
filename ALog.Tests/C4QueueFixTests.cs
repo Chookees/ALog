@@ -21,6 +21,16 @@ public sealed partial class C4QueueFixTests
     private const string DeadlineSuffix = " queued events were not written. A writer is too slow to drain the queue in time; check the target or reduce the log volume before shutdown.";
 
     /// <summary>
+    /// Mirrors the product's new-writer-call cutoff, in milliseconds.
+    /// The slow-writer shutdown returns at this cutoff, so its floor is <c>CutoffMs - 50</c>.
+    /// The 5 second deadline minus 50 ms does not apply to that test.
+    /// </summary>
+    /// <remarks>
+    /// shortcut: 4900 ms is the private field <c>BackgroundLogQueue.NewWriteBudget</c> in ALog/Core/BackgroundLogQueue.cs, initialized as <c>TimeSpan.FromMilliseconds(4900)</c>. The follow-up clock-entry-point PR will publish that as an internal constant and this test will derive the floor from it.
+    /// </remarks>
+    private const int CutoffMs = 4900;
+
+    /// <summary>
     /// Capacity 100 and 1000 writes drop 900 immediately, then one ALOG0070 line carries 900.
     /// Write returns while the blocked writer has finished nothing.
     /// After the first call, the median warm call and at least 990 of the 999 warm calls are under 10 ms, and no call takes a second.
@@ -251,12 +261,11 @@ public sealed partial class C4QueueFixTests
 
             var started = Stopwatch.StartNew();
             engine.Dispose();
-            // New writes stop at 4900 ms. A 10 ms writer is between calls then, so the processor
-            // leaves and Dispose returns there, about 100 ms before the 5 s deadline.
-            // The floor is that cutoff minus the 50 ms slack. The ceiling stays twice the 5 s deadline.
+            // A 10 ms writer is between calls when new writes stop, so Dispose returns at the cutoff.
+            // The 4950 ms floor does not apply here. The ceiling stays twice the 5 s deadline.
             TransitionDeadline.AssertBetween(
                 started.Elapsed,
-                TimeSpan.FromMilliseconds(4850),
+                TimeSpan.FromMilliseconds(CutoffMs - 50),
                 BackgroundLogQueue.ShutdownDeadline);
             string report;
             lock (lines)

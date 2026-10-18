@@ -34,7 +34,7 @@ internal static class TransitionDeadline
     /// Fails when <paramref name="elapsed"/> is before <paramref name="earliest"/> or later than twice <paramref name="deadline"/>.
     /// </summary>
     /// <param name="elapsed">Measured wait.</param>
-    /// <param name="earliest">Soonest acceptable return. The 5 s deadline uses deadline minus 50 ms. The slow-writer path uses the 4900 ms cutoff minus 50 ms.</param>
+    /// <param name="earliest">Soonest acceptable return. The 5 s deadline uses deadline minus 50 ms. The slow-writer path passes the new-writer-call cutoff minus 50 ms.</param>
     /// <param name="deadline">Promised deadline. Twice this value is the failure line. Must be positive.</param>
     /// <remarks>
     /// A deadline of zero or less throws <see cref="ArgumentOutOfRangeException"/>.
