@@ -273,7 +273,7 @@ CONSOLE_TEXT = (
     "ALog writes to the console only when `ALog:Console:Enabled` is `true`. "
     "With `AddALog`, choose one console: keep the Microsoft console provider and "
     "leave ALog's console off, or call `builder.Logging.ClearProviders()` and set "
-    "`ALog:Console:Enabled` to `true` (as in the Quickstart). With both, every line appears twice."
+    "`ALog:Console:Enabled` to `true` (as in `samples/ALog.AspNetSample`). With both, every line appears twice."
 )
 CHANGELOG_LINE = (
     "- Breaking (behavior): ALog writes to the console only when `ALog:Console:Enabled` is `true`. "
