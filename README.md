@@ -39,6 +39,11 @@ builder.Logging.ClearProviders();
 builder.Logging.AddALog(builder.Configuration); // binds "ALog" section
 ```
 
+Turn on ALog's console in `appsettings.json`:
+```json
+{ "ALog": { "Console": { "Enabled": true } } }
+```
+
 See `samples/ALog.AspNetSample`.
 
 ---

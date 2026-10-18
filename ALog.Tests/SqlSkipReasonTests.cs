@@ -101,15 +101,14 @@ public sealed class SqlSkipReasonTests
     }
 
     /// <summary>
-    /// Both live SQL methods wear <see cref="SqlServerFactAttribute"/>.
-    /// A plain <see cref="FactAttribute"/> would report a missing server as a pass.
+    /// Both live SQL methods wear <see cref="SkippableFactAttribute"/> so <c>Skip.If</c> can skip them.
+    /// A plain fact cannot report a runtime skip on xUnit 2.
     /// </summary>
     /// <remarks>
     /// Reads attributes only. Does not open a connection or start Docker.
-    /// Constructing the attribute reads the process environment once and caches it.
     /// </remarks>
     [Fact]
-    public void LiveSqlTests_UseTheSkipAttribute()
+    public void LiveSqlTests_UseSkippableFact()
     {
         var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.DeclaredOnly;
         var methods = typeof(SqlLiveIntegrationTests).GetMethods(flags);
@@ -120,9 +119,24 @@ public sealed class SqlSkipReasonTests
             if (fact is null)
                 continue;
             facts++;
-            Assert.IsType<SqlServerFactAttribute>(fact);
+            Assert.IsType<SkippableFactAttribute>(fact);
         }
 
         Assert.Equal(2, facts);
+    }
+
+    /// <summary>
+    /// A missing server with <c>ALOG_REQUIRE_SQL=1</c> fails, and the message names that variable.
+    /// </summary>
+    /// <remarks>
+    /// No I/O. Safe to run next to the other unit tests.
+    /// </remarks>
+    [Fact]
+    public void RequiredSqlFailure_NamesTheExistingVariable()
+    {
+        var message = SqlLiveIntegrationTests.RequiredSqlFailure("Docker is not running.");
+
+        Assert.Contains("ALOG_REQUIRE_SQL=1", message, StringComparison.Ordinal);
+        Assert.Contains("Docker is not running.", message, StringComparison.Ordinal);
     }
 }
