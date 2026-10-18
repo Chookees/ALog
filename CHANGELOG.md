@@ -19,6 +19,7 @@
 - Fixed: ALog no longer resumes on the caller's `SynchronizationContext`, and `SqlLogWriter` has a truly synchronous path, so no synchronous write blocks on a task.
 - Breaking (behavior): without the background queue, `FileLogWriter` writes synchronously on the calling thread (no `Task.Run`); `WriteAsync` completes inline.
 - Breaking (behavior): synchronous writes through `AzureLogWriter` and `HttpLogWriter` use `HttpClient.Send`. If you pass an `HttpClient` whose handler does not support synchronous `Send`, those writes fail like any writer error; enable the background queue for such handlers.
+- Breaking (behavior): ALog writes to the console only when `ALog:Console:Enabled` is `true`. Before, `AddALog` added its own console output next to the Microsoft console provider, so every line appeared twice.
 
 ## 0.2.0
 

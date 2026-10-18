@@ -33,11 +33,19 @@ Source: https://github.com/Chookees/ALog · Optional future sink split: [`docs/P
 ### ASP.NET Core
 
 ```csharp
+using ALog.Extensions.Logging;
+
 builder.Logging.ClearProviders();
 builder.Logging.AddALog(builder.Configuration); // binds "ALog" section
 ```
 
 See `samples/ALog.AspNetSample`.
+
+---
+
+## Console output
+
+ALog writes to the console only when `ALog:Console:Enabled` is `true`. With `AddALog`, choose one console: keep the Microsoft console provider and leave ALog's console off, or call `builder.Logging.ClearProviders()` and set `ALog:Console:Enabled` to `true` (as in the Quickstart). With both, every line appears twice.
 
 ---
 
@@ -239,6 +247,14 @@ using (Log.BeginScope("sessionId", "abc123"))
 - [x] Benchmarks project
 - [ ] Modular sink packages (see `docs/PACKAGE_SPLIT.md`)
 - [ ] NuGet logo / package icon
+
+---
+
+## Migrating from 0.2.0
+
+### C2-Console
+
+- Breaking (behavior): ALog writes to the console only when `ALog:Console:Enabled` is `true`. Before, `AddALog` added its own console output next to the Microsoft console provider, so every line appeared twice.
 
 ---
 

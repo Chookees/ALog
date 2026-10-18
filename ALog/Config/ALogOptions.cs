@@ -24,9 +24,23 @@ public sealed class ALogOptions
     public bool JsonPretty { get; set; }
 }
 
+/// <summary>
+/// Options for the console writer created by <see cref="LoggerConfigFactory.FromOptions"/>.
+/// An explicit <c>AddWriter(new ConsoleLogWriter(...))</c> does not read this type.
+/// </summary>
 public sealed class ConsoleWriterOptions
 {
-    public bool Enabled { get; set; } = true;
+    /// <summary>
+    /// When true, <see cref="LoggerConfigFactory.FromOptions"/> adds one console writer.
+    /// The default is false, so a missing <c>ALog:Console</c> section does not print.
+    /// Set <c>ALog:Console:Enabled</c> to true to opt in (DC-AB2, A2a-61).
+    /// </summary>
+    public bool Enabled { get; set; } = false;
+
+    /// <summary>
+    /// When true, the console writer colors the line by level.
+    /// The default is true. It is used only when <see cref="Enabled"/> is true.
+    /// </summary>
     public bool UseColors { get; set; } = true;
 }
 
