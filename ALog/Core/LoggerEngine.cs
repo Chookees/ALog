@@ -118,6 +118,62 @@ public class LoggerEngine : ILogger, IDisposable
         WriteSync(Enrich(CreateFromTemplate(messageTemplate, exception, level, propertyValues, category)));
     }
 
+    /// <summary>
+    /// Writes one event whose text is already final.
+    /// The MEL bridge uses this so ASP.NET and EF templates are stored, not rendered again.
+    /// </summary>
+    /// <param name="captured">
+    /// Category, level, exception, formatter text, template, and named properties.
+    /// A null message is stored as empty. A null property bag means no template properties.
+    /// </param>
+    /// <remarks>
+    /// Drops the event when the level is below the configured minimum. Does not throw for that case.
+    /// Allocates the event. Safe to call from the logging thread; the engine is the same one <see cref="LogStructured"/> uses.
+    /// </remarks>
+    internal void LogCaptured(in CapturedLog captured)
+    {
+        if (!_levels.Allows(captured.Level))
+            return;
+
+        var message = captured.Message ?? string.Empty;
+        WriteSync(Enrich(CreatePlain(new Seed
+        {
+            Message = message,
+            Exception = captured.Exception,
+            Level = captured.Level,
+            Properties = captured.Properties,
+            MessageTemplate = captured.MessageTemplate,
+            Category = captured.Category
+        })));
+    }
+
+    /// <summary>
+    /// One MEL event whose text and names are already decided.
+    /// Passed as one value so <see cref="LogCaptured"/> stays within the parameter limit.
+    /// </summary>
+    internal readonly struct CapturedLog
+    {
+        /// <summary>Logger category. Null is stored as null.</summary>
+        public string? Category { get; init; }
+
+        /// <summary>ALog level. Compared with the configured minimum.</summary>
+        public LogLevel Level { get; init; }
+
+        /// <summary>Exception attached to the event. Null when the caller had none.</summary>
+        public Exception? Exception { get; init; }
+
+        /// <summary>Text the MEL formatter returned. Null is stored as empty.</summary>
+        public string? Message { get; init; }
+
+        /// <summary>The <c>{OriginalFormat}</c> template, unchanged. Null when the caller has none.</summary>
+        public string? MessageTemplate { get; init; }
+
+        /// <summary>
+        /// Properties keyed by name. Null means none. A null entry is a present value.
+        /// </summary>
+        public IReadOnlyDictionary<string, object>? Properties { get; init; }
+    }
+
     private LogEvent CreateFromTemplate(
         string messageTemplate,
         Exception? exception,

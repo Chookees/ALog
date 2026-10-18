@@ -1,3 +1,6 @@
+// Message templates for ALog's own Log.Write path.
+// Hole names are letters, digits, and underscores. A leading '@' is not an operator.
+// The MEL bridge uses ReadPropertyName so {@Order} stays @Order. Next: LoggerEngine.cs.
 namespace ALog.Core;
 
 using System.Globalization;
@@ -65,4 +68,38 @@ public static class MessageTemplate
 
     public static bool HasHoles(string template) =>
         !string.IsNullOrEmpty(template) && HolePattern.IsMatch(template);
+
+    /// <summary>
+    /// Reads the property name stored for one MEL state key.
+    /// Braces and a <c>:format</c> suffix are removed. <c>@</c> stays, because <see cref="HolePattern"/>
+    /// does not treat it as an operator: <c>{@Order}</c> is not a hole, so the name is <c>@Order</c>.
+    /// </summary>
+    /// <param name="key">State key, for example <c>Method</c>, <c>{Elapsed:0.00}</c>, or <c>{0}</c>. Null and empty return null.</param>
+    /// <returns>The name, or null when the key is empty or only a format suffix.</returns>
+    /// <remarks>
+    /// No allocation beyond the returned string. Does not throw. Safe to call from any thread.
+    /// </remarks>
+    internal static string? ReadPropertyName(string? key)
+    {
+        if (string.IsNullOrEmpty(key))
+            return null;
+
+        var start = 0;
+        var end = key.Length;
+        if (end >= 2 && key[0] == '{' && key[end - 1] == '}')
+        {
+            start = 1;
+            end -= 1;
+        }
+
+        // The hole regex's format group is ":...". The first colon ends the name.
+        var colon = key.IndexOf(':', start, end - start);
+        if (colon >= 0)
+            end = colon;
+
+        if (end <= start)
+            return null;
+
+        return key.Substring(start, end - start);
+    }
 }

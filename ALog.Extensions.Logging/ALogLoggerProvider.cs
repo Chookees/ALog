@@ -1,3 +1,6 @@
+// MEL bridge. The message text is the formatter's. Property names come from state keys.
+// {OriginalFormat} is the template and is not a property. The scan stops at MelScopeAdapter.MaxProperties.
+// Next: MelScopeAdapter.cs for scopes, LoggerEngine.LogCaptured for the write.
 namespace ALog.Extensions.Logging;
 
 using System.Collections.Concurrent;
@@ -104,6 +107,9 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
     private volatile int _categoryMin = LevelTable.UseGlobal;
     private volatile int _seen = -1;
 
+    // Same spelling MEL uses. Compared ordinally so a similar key stays a property.
+    private const string OriginalFormat = "{OriginalFormat}";
+
     public ALogLogger(
         string category,
         LoggerEngine engine,
@@ -185,41 +191,102 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
         _seen = table.Generation;
     }
 
+    /// <summary>
+    /// Writes one MEL call. Named state goes to <see cref="LoggerEngine.LogCaptured"/> with the formatter text.
+    /// Anything else is logged as the formatter text alone, because there is no template to keep.
+    /// </summary>
+    /// <typeparam name="TState">State type MEL passed. A key/value list is read; other types are not.</typeparam>
+    /// <param name="state">MEL state. Null is logged as plain text.</param>
+    /// <param name="exception">Exception from MEL. Null when the call had none.</param>
+    /// <param name="message">Text the formatter returned. This is the event text when a template is present.</param>
+    /// <param name="alogLevel">ALog level already mapped from MEL. The engine drops it when it is below the minimum.</param>
+    /// <remarks>
+    /// Allocates the property bag only when a non-empty <c>{OriginalFormat}</c> is inside the scan window.
+    /// Does not render the template. Safe to call from the logging thread; the engine is the same one <c>LogStructured</c> uses.
+    /// </remarks>
     private void Write<TState>(TState state, Exception? exception, string message, ALogLevel alogLevel)
     {
-        if (state is IReadOnlyList<KeyValuePair<string, object?>> values
-            && TryOriginalFormat(values, out var original, out var props)
-            && MessageTemplate.HasHoles(original))
+        if (state is IReadOnlyList<KeyValuePair<string, object?>> values)
         {
-            _engine.LogStructured(_category, alogLevel, exception, original, props);
-            return;
+            var captured = TryBind(values, message, alogLevel, exception);
+            if (captured.HasValue)
+            {
+                _engine.LogCaptured(captured.Value);
+                return;
+            }
         }
 
         _engine.LogStructured(_category, alogLevel, exception, message);
     }
 
-    private static bool TryOriginalFormat(
+    /// <summary>
+    /// Binds MEL pairs by key for one event. The first <c>{OriginalFormat}</c> is the template.
+    /// Every other pair becomes a property named by <see cref="MessageTemplate.ReadPropertyName"/>.
+    /// </summary>
+    /// <param name="values">State pairs in MEL's order. The list is not reordered. Null is rejected by the caller.</param>
+    /// <param name="message">Formatter text stored as the event message, including null at runtime.</param>
+    /// <param name="level">ALog level copied onto the captured event.</param>
+    /// <param name="exception">Exception copied onto the captured event. Null is allowed.</param>
+    /// <returns>
+    /// The captured event, or null when the first template is missing or empty.
+    /// A null return tells <see cref="Write{TState}"/> to keep the formatter text without named properties.
+    /// </returns>
+    /// <remarks>
+    /// Reads at most <see cref="MelScopeAdapter.MaxProperties"/> pairs so a huge state cannot grow without a bound.
+    /// The first of two equal names wins (ordinal). A null value is stored. Does not throw for a bad key.
+    /// Allocates the bag. Not safe to share the returned bag across threads before the engine copies it.
+    /// </remarks>
+    private LoggerEngine.CapturedLog? TryBind(
         IReadOnlyList<KeyValuePair<string, object?>> values,
-        out string original,
-        out object?[] props)
+        string message,
+        ALogLevel level,
+        Exception? exception)
     {
-        original = string.Empty;
-        var found = false;
-        var buffer = new List<object?>(values.Count);
-        for (var i = 0; i < values.Count; i++)
+        var limit = values.Count;
+        if (limit > MelScopeAdapter.MaxProperties)
+            limit = MelScopeAdapter.MaxProperties;
+
+        var sawFormat = false;
+        string? template = null;
+        Dictionary<string, object>? props = null;
+        for (var i = 0; i < limit; i++)
         {
             var pair = values[i];
-            if (pair.Key == "{OriginalFormat}")
+            if (string.Equals(pair.Key, OriginalFormat, StringComparison.Ordinal))
             {
-                original = pair.Value?.ToString() ?? string.Empty;
-                found = true;
+                // The first template wins. A later one must not replace it or become a property.
+                if (!sawFormat)
+                {
+                    sawFormat = true;
+                    template = pair.Value?.ToString();
+                }
+
                 continue;
             }
 
-            buffer.Add(pair.Value);
+            var name = MessageTemplate.ReadPropertyName(pair.Key);
+            if (name is null)
+                continue;
+
+            props ??= new Dictionary<string, object>(StringComparer.Ordinal);
+            if (props.ContainsKey(name))
+                continue;
+
+            // Dictionary<string, object> stores a null value. The annotation is the only lie.
+            props.Add(name, pair.Value!);
         }
 
-        props = buffer.ToArray();
-        return found && original.Length > 0;
+        if (!sawFormat || string.IsNullOrEmpty(template))
+            return null;
+
+        return new LoggerEngine.CapturedLog
+        {
+            Category = _category,
+            Level = level,
+            Exception = exception,
+            Message = message,
+            MessageTemplate = template,
+            Properties = props
+        };
     }
 }

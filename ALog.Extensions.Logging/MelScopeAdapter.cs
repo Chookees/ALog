@@ -14,7 +14,12 @@ using Microsoft.Extensions.Logging;
 internal static class MelScopeAdapter
 {
     private const string OriginalFormat = "{OriginalFormat}";
-    private const int MaxProperties = 128;
+
+    /// <summary>
+    /// Most entries read from one MEL scope or one MEL log state.
+    /// The log bridge uses the same window so a large state cannot grow without a bound.
+    /// </summary>
+    internal const int MaxProperties = 128;
     private const int MaxTexts = 64;
 
     // Static so the log path does not allocate a closure per call.
