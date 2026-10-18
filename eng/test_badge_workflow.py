@@ -6,15 +6,19 @@ line-counting guard was supposed to reject. arc_spec v5.20 requires every
 one of them to fail this checker, including the eight shapes that guard
 still accepted: the master condition moved onto the publish step, extra
 write scopes on badge or the default, ``packages: write`` on another job,
-and a concurrency group. Next file: ``eng/badge_workflow_check.py``.
+and a concurrency group. v5.21 also rejects concurrency on a job and a
+duplicated YAML key. Next file: ``eng/badge_workflow_check.py``.
 """
 
 from __future__ import annotations
 
 import copy
 import importlib.util
+import io
 import sys
+import tempfile
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -45,6 +49,13 @@ MUTATION_NAMES = (
     "build_contents_write",
     "smoke_file_packages_write",
     "concurrency_group",
+    "badge_job_concurrency",
+    "build_job_concurrency",
+)
+TEXT_MUTATIONS = (
+    "badge_duplicate_if",
+    "badge_duplicate_permissions",
+    "default_duplicate_permissions",
 )
 
 
@@ -166,6 +177,10 @@ def _mutate_condition(document: dict, name: str) -> bool:
         badge["needs"] = ["build", "vuln-check"]
     elif name == "concurrency_group":
         document["concurrency"] = {"group": "ci", "cancel-in-progress": True}
+    elif name == "badge_job_concurrency":
+        badge["concurrency"] = {"group": "badges", "cancel-in-progress": False}
+    elif name == "build_job_concurrency":
+        document["jobs"]["build"]["concurrency"] = "ci-${{ github.ref }}"
     else:
         return False
     return True
@@ -213,6 +228,42 @@ def _mutate_permissions(document: dict, name: str) -> bool:
     else:
         return False
     return True
+
+
+def duplicate_key_text(name: str) -> str:
+    """Return the workflow text with one YAML key repeated.
+
+    Args:
+        name: ``badge_duplicate_if`` inserts ``if: always()`` above the real
+            badge condition. ``badge_duplicate_permissions`` repeats the badge
+            permissions block. ``default_duplicate_permissions`` repeats the
+            top-level permissions block. The second copy is still valid, so a
+            parser that keeps the last key accepts the file.
+
+    Returns:
+        The modified workflow text.
+
+    Raises:
+        ValueError: ``name`` is unknown, or the anchor text is not unique.
+
+    Side effects:
+        Reads the workflow file.
+    """
+    text = WORKFLOW.read_text(encoding="utf-8")
+    if name == "badge_duplicate_if":
+        anchor = "    if: github.event_name == 'push' && github.ref == 'refs/heads/master'\n"
+        replacement = "    if: always()\n" + anchor
+    elif name == "badge_duplicate_permissions":
+        anchor = "    permissions:\n      contents: write\n"
+        replacement = anchor + anchor
+    elif name == "default_duplicate_permissions":
+        anchor = "permissions:\n  contents: read\n"
+        replacement = anchor + anchor
+    else:
+        raise ValueError(f"unknown text mutation {name}")
+    if text.count(anchor) != 1:
+        raise ValueError(f"{name} anchor is not unique")
+    return text.replace(anchor, replacement, 1)
 
 
 def apply_mutation(document: dict, name: str) -> dict:
@@ -271,6 +322,87 @@ class BadgeWorkflowTests(unittest.TestCase):
                 mutated = apply_mutation(self.document, name)
                 problems = self.checker.check_badge_workflow(mutated)
                 self.assertTrue(problems, name)
+
+    def test_duplicate_yaml_keys_are_rejected(self) -> None:
+        """A repeated mapping key fails the check, including a first ``if: always()``.
+
+        Side effects:
+            Writes a temporary workflow file.
+        """
+        for name in TEXT_MUTATIONS:
+            with self.subTest(name=name):
+                code, err = self._check_text(duplicate_key_text(name))
+                self.assertEqual(code, 2, err)
+                self.assertIn("duplicate", err.lower())
+                self.assertNotIn("Traceback", err)
+                self.assertEqual(len(err.strip().splitlines()), 1)
+
+    def test_missing_pyyaml_exits_with_the_install_line(self) -> None:
+        """A missing PyYAML import prints one install line and no traceback.
+
+        Side effects:
+            Hides the ``yaml`` module for the duration of the call.
+        """
+        message = (
+            "PyYAML is required for the badge workflow check: "
+            "python3 -m pip install -r eng/requirements-ci.txt"
+        )
+        saved = sys.modules.get("yaml")
+        sys.modules["yaml"] = None
+        try:
+            code, err = self._check_text(WORKFLOW.read_text(encoding="utf-8"))
+        finally:
+            if saved is None:
+                sys.modules.pop("yaml", None)
+            else:
+                sys.modules["yaml"] = saved
+        self.assertEqual(code, 2)
+        self.assertEqual(err, message + "\n")
+        self.assertNotIn("Traceback", err)
+
+    def test_ci_pins_pyyaml_before_script_tests(self) -> None:
+        """CI installs the hashed requirements file before the script tests.
+
+        Side effects:
+            Reads the workflow, the requirements file, and Dependabot config.
+        """
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        install = workflow.find(
+            "python3 -m pip install --require-hashes -r eng/requirements-ci.txt"
+        )
+        scripts = workflow.find("- name: Script tests")
+        self.assertGreater(install, 0)
+        self.assertLess(install, scripts)
+        self.assertIn("python3 -m venv", workflow[:install])
+        requirements = (ROOT / "requirements-ci.txt").read_text(encoding="utf-8")
+        self.assertIn("PyYAML==6.0.3", requirements)
+        self.assertGreaterEqual(requirements.count("--hash=sha256:"), 2)
+        dependabot = (ROOT.parent / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+        self.assertIn("package-ecosystem: pip", dependabot)
+        self.assertIn('directory: "/eng"', dependabot)
+
+    def _check_text(self, text: str) -> tuple[int, str]:
+        """Run the checker CLI on one workflow document.
+
+        Args:
+            text: Workflow YAML.
+
+        Returns:
+            The exit code and stderr.
+
+        Raises:
+            OSError: The temporary file cannot be written.
+
+        Side effects:
+            Writes a temporary file and runs the checker.
+        """
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as raw:
+            path = Path(raw) / "dotnet.yml"
+            path.write_text(text, encoding="utf-8")
+            with redirect_stderr(stderr):
+                code = self.checker.main([str(path)])
+        return code, stderr.getvalue()
 
 
 if __name__ == "__main__":

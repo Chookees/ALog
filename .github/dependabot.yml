@@ -49,3 +49,8 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+
+  - package-ecosystem: pip
+    directory: "/eng"
+    schedule:
+      interval: weekly

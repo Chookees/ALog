@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -263,7 +264,13 @@ class CoverageBadgeTests(unittest.TestCase):
         command = self.publish.push_command()
         self.assertEqual(
             command,
-            ["git", "push", "origin", "refs/heads/badges:refs/heads/badges"],
+            [
+                "git",
+                "push",
+                "--porcelain",
+                "origin",
+                "refs/heads/badges:refs/heads/badges",
+            ],
         )
         self.assertNotIn("--force", command)
         self.assertNotIn("-f", command)
@@ -429,44 +436,66 @@ class CoverageBadgeTests(unittest.TestCase):
             self.assertIn("committed", results[4][1])
 
     def test_push_conflict_warns_after_three_retries(self) -> None:
-        """A badges push that keeps failing exits 0 and states the reason.
+        """A badges push that stays a real conflict warns after three retries.
 
-        The hook rejects every badges push. The publisher tries once and
-        retries three times, then warns. The badges branch is not created.
+        Each push is moved to a commit the client does not have, so git
+        reports fetch first. The publisher waits 1, 2, and 4 seconds and
+        then warns. The previous SVG stays.
 
         Side effects:
-            Creates a temporary bare origin whose pre-receive hook rejects
-            pushes.
+            Creates a temporary bare origin and a git wrapper on ``PATH``.
         """
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             origin, work, sha = self._one_master_commit(root)
-            self._reject_pushes(origin)
-            code, out, err = self._publish(work, sha, "never")
+            self._publish_ok(work, sha, "kept")
+            pauses = self._record_pauses()
+            self._divert_badges_pushes(root, origin, "always-side")
+            try:
+                code, out, err = self._publish(work, sha, "lost")
+            finally:
+                self._restore_path()
             self.assertEqual(code, 0, err)
             self.assertIn("::warning::", out)
             self.assertIn("after 3 retries", out)
-            self.assertIn("badge push rejected by test hook", out)
             self.assertNotIn("::notice::", out)
+            self.assertNotIn("lost", out)
+            self.assertEqual(pauses, [1, 2, 4])
             self.assertEqual((origin / "push-attempts").read_text().strip(), "4")
-            missing = self._git(origin, ["rev-parse", "--verify", "refs/heads/badges"], check=False)
-            self.assertNotEqual(missing.returncode, 0)
+            self.assertEqual(self._badge_text(origin), "<svg>kept</svg>")
 
     def test_retry_stops_when_a_newer_commit_appears(self) -> None:
-        """A conflict retry fetches master again and does not write when it moved.
+        """A non-fast-forward retry fetches master again and skips when it moved.
 
         Side effects:
-            Creates a temporary bare origin and rejects the first badges push.
+            Creates a temporary bare origin and a git wrapper on ``PATH``.
         """
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             origin, work, first, second = self._two_master_commits(root)
             self._git(origin, ["update-ref", "refs/heads/master", first])
-            self._reject_pushes(origin)
+            self._publish_ok(work, first, "seed")
+            pauses = self._record_pauses()
+            self._divert_badges_pushes(root, origin, "once-master")
             calls = {"count": 0}
             real_head = self.publish._master_head
 
             def move_on_retry(repo: Path, *, fetch: bool) -> str:
+                """Move origin master on the second head check.
+
+                Args:
+                    repo: Repository the publisher is updating.
+                    fetch: Forwarded to the real head lookup.
+
+                Returns:
+                    The master SHA after the optional move.
+
+                Raises:
+                    AssertionError: Git cannot read or move the ref.
+
+                Side effects:
+                    May move ``refs/heads/master`` on the bare origin.
+                """
                 calls["count"] += 1
                 if calls["count"] == 2:
                     self._git(origin, ["update-ref", "refs/heads/master", second])
@@ -477,13 +506,19 @@ class CoverageBadgeTests(unittest.TestCase):
                 code, out, err = self._publish(work, first, "stale")
             finally:
                 self.publish._master_head = real_head
+                self._restore_path()
             self.assertEqual(code, 0, err)
             self.assertIn("::notice::", out)
             self.assertNotIn("::warning::", out)
             self.assertEqual(calls["count"], 2)
+            self.assertEqual(pauses, [1])
             self.assertEqual((origin / "push-attempts").read_text().strip(), "1")
-            missing = self._git(origin, ["rev-parse", "--verify", "refs/heads/badges"], check=False)
-            self.assertNotEqual(missing.returncode, 0)
+            shown = self._git(
+                origin,
+                ["show", f"refs/heads/badges:{SVG_NAMES[0]}"],
+                check=False,
+            )
+            self.assertNotIn("stale", shown.stdout)
 
     def test_invalid_input_and_a_missing_svg_stay_red(self) -> None:
         """A bad commit id or a missing SVG file fails the process.
@@ -504,6 +539,153 @@ class CoverageBadgeTests(unittest.TestCase):
             self.assertEqual(code, 2, err)
             self.assertIn("coverage badges were not published", err)
             self.assertNotIn("::warning::", out)
+
+    def test_unreachable_pushurl_exits_red(self) -> None:
+        """An unreachable push URL is a real error, not a conflict warning.
+
+        Side effects:
+            Creates a temporary bare origin and points its push URL at a
+            closed local port. Fetch still uses the local bare repository.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, work, sha = self._one_master_commit(root)
+            self._git(
+                work,
+                ["remote", "set-url", "--push", "origin", "http://127.0.0.1:1/missing.git"],
+            )
+            code, out, err = self._publish(work, sha, "nowhere")
+            self._assert_real_push_error(code, out, err, "Failed to connect")
+            self.assertFalse((origin / "push-attempts").exists())
+
+    def test_permission_denied_hook_exits_red(self) -> None:
+        """A hook that says permission denied is a real error and is not retried.
+
+        Side effects:
+            Creates a temporary bare origin with a rejecting pre-receive hook.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, work, sha = self._one_master_commit(root)
+            self._reject_with_message(
+                origin,
+                "Permission to Chookees/ALog.git denied to github-actions[bot]",
+            )
+            code, out, err = self._publish(work, sha, "denied")
+            self._assert_real_push_error(code, out, err, "Permission")
+            self.assertIn("denied", err)
+            self.assertEqual((origin / "push-attempts").read_text().strip(), "1")
+
+    def test_hook_non_fast_forward_wording_exits_red(self) -> None:
+        """Hook text that merely says non-fast-forward is not a conflict.
+
+        Side effects:
+            Creates a temporary bare origin with a rejecting pre-receive hook.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, work, sha = self._one_master_commit(root)
+            self._reject_with_message(
+                origin,
+                "rejected: non-fast-forward is not allowed by this hook",
+            )
+            code, out, err = self._publish(work, sha, "hook-words")
+            self._assert_real_push_error(code, out, err, "non-fast-forward")
+            self.assertEqual((origin / "push-attempts").read_text().strip(), "1")
+
+    def test_real_non_fast_forward_is_retried(self) -> None:
+        """A real non-fast-forward waits one second and then publishes.
+
+        Side effects:
+            Creates a temporary bare origin and a git wrapper on ``PATH``.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, work, sha = self._one_master_commit(root)
+            self._publish_ok(work, sha, "old")
+            pauses = self._record_pauses()
+            self._divert_badges_pushes(root, origin, "once-master")
+            try:
+                code, out, err = self._publish(work, sha, "new")
+            finally:
+                self._restore_path()
+            self.assertEqual(code, 0, err)
+            self.assertEqual(out.strip(), "committed")
+            self.assertNotIn("::warning::", out)
+            self.assertEqual(pauses, [1])
+            self.assertEqual((origin / "push-attempts").read_text().strip(), "2")
+            self.assertEqual(self._badge_text(origin), "<svg>new</svg>")
+
+    def test_german_locale_still_detects_non_fast_forward(self) -> None:
+        """A German parent locale still treats a real non-fast-forward as a conflict.
+
+        The parent sets ``LANG`` and leaves ``LC_ALL`` unset. Git itself is
+        run with ``LC_ALL=C``.
+
+        Side effects:
+            Creates a temporary bare origin, changes the process locale for
+            the call, and prepends a git wrapper to ``PATH``.
+        """
+        saved = {key: os.environ.get(key) for key in ("LANG", "LC_ALL", "LANGUAGE")}
+        os.environ["LANG"] = "de_DE.UTF-8"
+        os.environ.pop("LC_ALL", None)
+        os.environ.pop("LANGUAGE", None)
+        try:
+            self.assertNotIn("LC_ALL", os.environ)
+            with tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                origin, work, sha = self._one_master_commit(root)
+                self._publish_ok(work, sha, "alt")
+                pauses = self._record_pauses()
+                self._divert_badges_pushes(root, origin, "once-master")
+                try:
+                    code, out, err = self._publish(work, sha, "neu")
+                finally:
+                    self._restore_path()
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out.strip(), "committed")
+                self.assertEqual(pauses, [1])
+                self.assertEqual((origin / "push-locale").read_text(encoding="utf-8"), "LC_ALL=C\nLANGUAGE=C\n")
+                self.assertEqual(self._badge_text(origin), "<svg>neu</svg>")
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_porcelain_remote_rejected_is_not_a_conflict(self) -> None:
+        """A remote rejection stays an error when the hook text says non-fast-forward.
+
+        Side effects:
+            None.
+        """
+        stdout = (
+            "To /tmp/origin.git\n"
+            "!\trefs/heads/badges:refs/heads/badges\t"
+            "[remote rejected] (non-fast-forward)\n"
+            "Done\n"
+        )
+        stderr = "remote: non-fast-forward cannot lock ref refs/heads/badges\n"
+        self.assertEqual(self.publish._classify_push(stdout, stderr, 1), "error")
+
+    def test_porcelain_conflict_reasons_are_conflicts(self) -> None:
+        """Porcelain conflict reasons and a cannot-lock failure are conflicts.
+
+        Side effects:
+            None.
+        """
+        for summary in (
+            "[rejected] (non-fast-forward)",
+            "[rejected] (fetch first)",
+            "[rejected] (stale info)",
+        ):
+            stdout = f"!\trefs/heads/badges:refs/heads/badges\t{summary}\n"
+            self.assertEqual(self.publish._classify_push(stdout, "", 1), "conflict", summary)
+        locked = "error: cannot lock ref 'refs/heads/badges': is at abc but expected def\n"
+        self.assertEqual(self.publish._classify_push("", locked, 1), "conflict")
+        remote_lock = "!\trefs/heads/badges:refs/heads/badges\t[remote rejected] (cannot lock ref)\n"
+        self.assertEqual(self.publish._classify_push(remote_lock, "cannot lock ref", 1), "error")
 
     def _publish_subprocess(self, repo: Path, sha: str, marker: str) -> tuple[int, str, str]:
         """Publish from a separate process so parallel runs do not share stdout.
@@ -709,12 +891,94 @@ class CoverageBadgeTests(unittest.TestCase):
         self._git(work, ["push", "origin", "HEAD:refs/heads/master"])
         return origin, work, shas
 
-    def _reject_pushes(self, origin: Path) -> None:
-        """Install a hook that rejects every push and counts the attempts.
+    def _publish_ok(self, work: Path, sha: str, marker: str) -> None:
+        """Publish one SVG pair and require a new badges commit.
 
         Args:
-            origin: Bare repository. Its ``hooks`` directory must exist, which
-                ``git init --bare`` creates.
+            work: Repository to publish from.
+            sha: Master commit id.
+            marker: Text stored in the ALog SVG.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: The publisher does not commit.
+
+        Side effects:
+            May fetch, commit, and push badges.
+        """
+        code, out, err = self._publish(work, sha, marker)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.strip(), "committed")
+
+    def _record_pauses(self) -> list[int]:
+        """Replace the publisher sleep with a list of requested delays.
+
+        Returns:
+            The list the publisher appends to. It is empty until a retry.
+
+        Raises:
+            None.
+
+        Side effects:
+            Replaces ``_pause`` on the publisher module for this test.
+        """
+        recorded: list[int] = []
+
+        def pause(seconds: int) -> None:
+            """Record one retry delay.
+
+            Args:
+                seconds: The delay the publisher asked for.
+
+            Returns:
+                None.
+
+            Raises:
+                None.
+
+            Side effects:
+                Appends ``seconds`` to ``recorded``.
+            """
+            recorded.append(seconds)
+
+        self.publish._pause = pause
+        return recorded
+
+    def _assert_real_push_error(self, code: int, out: str, err: str, needle: str) -> None:
+        """Require one red line and no conflict warning.
+
+        Args:
+            code: Publisher exit code.
+            out: Publisher stdout.
+            err: Publisher stderr.
+            needle: Text the error line must contain.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: The failure was not a single red line.
+
+        Side effects:
+            None.
+        """
+        self.assertEqual(code, 2)
+        self.assertNotIn("::warning::", out)
+        self.assertNotIn("::notice::", out)
+        self.assertNotIn("Traceback", err)
+        self.assertEqual(len(err.strip().splitlines()), 1)
+        self.assertIn("coverage badges were not published", err)
+        self.assertIn(needle, err)
+
+    def _reject_with_message(self, origin: Path, message: str) -> None:
+        """Install a pre-receive hook that rejects every push with one message.
+
+        Args:
+            origin: Bare repository. ``git init --bare`` creates ``hooks``.
+            message: Text written to the hook's stderr. It is quoted for the
+                shell.
 
         Returns:
             None.
@@ -723,8 +987,8 @@ class CoverageBadgeTests(unittest.TestCase):
             OSError: The hook file cannot be written.
 
         Side effects:
-            Writes ``hooks/pre-receive``. Later pushes append to
-            ``push-attempts`` inside the bare repository.
+            Writes ``hooks/pre-receive``. Each push increments
+            ``push-attempts`` in the bare repository.
         """
         hook = origin / "hooks" / "pre-receive"
         hook.write_text(
@@ -736,11 +1000,108 @@ class CoverageBadgeTests(unittest.TestCase):
             "fi\n"
             "n=$((n + 1))\n"
             "printf '%s\\n' \"$n\" > \"$count_file\"\n"
-            "echo \"badge push rejected by test hook\" >&2\n"
+            f"printf '%s\\n' {shlex.quote(message)} >&2\n"
             "exit 1\n",
             encoding="utf-8",
         )
         hook.chmod(0o755)
+
+    def _divert_badges_pushes(self, root: Path, origin: Path, mode: str) -> None:
+        """Prepend a git wrapper that turns a badges push into a conflict.
+
+        Args:
+            root: Temporary directory that will hold the wrapper.
+            origin: Bare origin whose badges ref the wrapper moves.
+            mode: ``once-master`` points badges at master before the first
+                push, which is a non-fast-forward. ``always-side`` points
+                badges at a new commit of the same tree before every push,
+                which is fetch first.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: ``mode`` is unknown or git cannot read master.
+
+        Side effects:
+            Prepends ``root/bin`` to ``PATH``. The caller restores it with
+            ``_restore_path``. Writes ``push-attempts`` and ``push-locale``
+            into the bare origin when a push runs.
+        """
+        if mode not in {"once-master", "always-side"}:
+            raise AssertionError("unknown divert mode")
+        master = self._git(origin, ["rev-parse", "refs/heads/master"]).stdout.strip()
+        bindir = root / "bin"
+        bindir.mkdir()
+        script = bindir / "git"
+        script.write_text(self._diverter_script(origin, master, mode), encoding="utf-8")
+        script.chmod(0o755)
+        self._saved_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(bindir) + os.pathsep + self._saved_path
+
+    def _diverter_script(self, origin: Path, master: str, mode: str) -> str:
+        """Return the shell script that fronts git for one divert mode.
+
+        Args:
+            origin: Bare origin path baked into the script.
+            master: Master commit id baked into the script.
+            mode: ``once-master`` or ``always-side``.
+
+        Returns:
+            A complete shell script.
+
+        Raises:
+            None.
+
+        Side effects:
+            None.
+        """
+        origin_q = shlex.quote(str(origin))
+        master_q = shlex.quote(master)
+        mode_q = shlex.quote(mode)
+        lines = [
+            "#!/bin/sh",
+            "real=/usr/bin/git",
+            f"origin={origin_q}",
+            f"master={master_q}",
+            f"mode={mode_q}",
+            'is_push=0; for arg in "$@"; do [ "$arg" = push ] && is_push=1; done',
+            '[ "$is_push" = 1 ] || exec "$real" "$@"',
+            'printf "%s\\n" "LC_ALL=${LC_ALL-unset}" > "$origin/push-locale"',
+            'printf "%s\\n" "LANGUAGE=${LANGUAGE-unset}" >> "$origin/push-locale"',
+            'n=0; [ -f "$origin/push-attempts" ] && n=$(cat "$origin/push-attempts")',
+            'n=$((n + 1)); printf "%s\\n" "$n" > "$origin/push-attempts"',
+            'divert=0; [ "$mode" = always-side ] && divert=1; [ "$n" = 1 ] && divert=1',
+            '[ "$divert" = 1 ] || exec "$real" "$@"',
+            'if [ "$mode" = always-side ]; then',
+            '  tip=$("$real" --git-dir="$origin" rev-parse refs/heads/badges) || exit 1',
+            '  tree=$("$real" --git-dir="$origin" rev-parse "$tip^{tree}") || exit 1',
+            "  side=$(GIT_AUTHOR_NAME=Badge GIT_AUTHOR_EMAIL=badge@example.com "
+            "GIT_COMMITTER_NAME=Badge GIT_COMMITTER_EMAIL=badge@example.com "
+            '"$real" --git-dir="$origin" commit-tree "$tree" -m "side-$n") || exit 1',
+            '  "$real" --git-dir="$origin" update-ref refs/heads/badges "$side" || exit 1',
+            "else",
+            '  "$real" --git-dir="$origin" update-ref refs/heads/badges "$master" || exit 1',
+            "fi",
+            'exec "$real" "$@"',
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _restore_path(self) -> None:
+        """Put ``PATH`` back after a git wrapper test.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side effects:
+            Restores the process ``PATH`` saved by ``_divert_badges_pushes``.
+        """
+        saved = getattr(self, "_saved_path", None)
+        if isinstance(saved, str):
+            os.environ["PATH"] = saved
 
     def _git(self, repo: Path, args: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
         """Run git in a temporary repository.

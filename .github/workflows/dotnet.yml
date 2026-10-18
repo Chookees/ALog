@@ -44,6 +44,13 @@ jobs:
         echo "dotnet --version ${version}"
         test "$version" = "10.0.402"
 
+    - name: Install CI Python tools
+      run: |
+        python3 -m venv "$RUNNER_TEMP/ci-venv"
+        echo "$RUNNER_TEMP/ci-venv/bin" >> "$GITHUB_PATH"
+        export PATH="$RUNNER_TEMP/ci-venv/bin:$PATH"
+        python3 -m pip install --require-hashes -r eng/requirements-ci.txt
+
     - name: Script tests
       run: |
         bash eng/test_vuln_check.sh

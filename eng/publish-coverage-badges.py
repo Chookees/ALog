@@ -7,10 +7,15 @@ is still the head of ``origin/master``. An older run exits 0 with a notice
 and leaves the previous SVG in place, which is also what happens when the
 newest commit's build fails and never reaches this script. A rejected badges
 push is retried at most three times, each time with a new fetch and a new
-head check. If it still fails, the process exits 0 with a warning that
-states the reason. A script error, invalid input, or a missing SVG stays
-red. Nothing in this file force-pushes, and the push refspec never names
-master. Next file: ``eng/coverage-badge.py``.
+head check, waiting 1, 2, and 4 seconds before those retries. Only a real
+concurrency rejection is retried: porcelain ``[rejected] (non-fast-forward)``,
+``[rejected] (fetch first)``, ``[rejected] (stale info)``, or ``cannot lock
+ref``. A hook, a ruleset, a permission failure, or a transport error exits 2
+with one line and is not retried. If a real conflict is still failing after
+the retries, the process exits 0 with a warning that states the reason. A
+script error, invalid input, or a missing SVG stays red. Nothing in this
+file force-pushes, and the push refspec never names master. Next file:
+``eng/coverage-badge.py``.
 """
 
 from __future__ import annotations
@@ -19,6 +24,7 @@ import argparse
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Mapping
 
@@ -29,7 +35,22 @@ _SVG_NAMES = (
 )
 _MAX_SVG_BYTES = 20000
 _MAX_DIRECTORY_ENTRIES = 20
-_PUSH = ["git", "push", "origin", "refs/heads/badges:refs/heads/badges"]
+_PUSH = [
+    "git",
+    "push",
+    "--porcelain",
+    "origin",
+    "refs/heads/badges:refs/heads/badges",
+]
+_BADGES_REF = "refs/heads/badges"
+_CONFLICT_SUMMARIES = frozenset(
+    {
+        "[rejected] (non-fast-forward)",
+        "[rejected] (fetch first)",
+        "[rejected] (stale info)",
+    }
+)
+_MAX_STATUS_LINES = 40
 # github-actions[bot]. The token that pushes is GITHUB_TOKEN, so the commit
 # identity has to be the bot. This is not a person.
 _BOT_NAME = "github-actions[bot]"
@@ -40,11 +61,14 @@ _SHA_CHARS = "0123456789abcdef"
 
 
 class PushRejected(RuntimeError):
-    """A non-forced push of badges was rejected.
+    """A non-forced badges push lost a concurrency race.
 
-    The caller may retry at most three times, fetching master again before
-    each retry. This is not a signal to force-push, and exhausting the
-    retries is a warning rather than a failed workflow.
+    The porcelain status was a non-fast-forward, fetch-first, or stale-info
+    rejection, or git reported ``cannot lock ref``. The caller may retry at
+    most three times, fetching master again before each retry. A hook,
+    ruleset, permission, or transport failure is a ``RuntimeError`` instead,
+    and this is not a signal to force-push. Exhausting the retries is a
+    warning rather than a failed workflow.
     """
 
 
@@ -52,8 +76,9 @@ def push_command() -> list[str]:
     """Return the only git push this job is allowed to run.
 
     Returns:
-        ``git push origin refs/heads/badges:refs/heads/badges``. There is no
-        force flag, and the command does not name master.
+        ``git push --porcelain origin refs/heads/badges:refs/heads/badges``.
+        There is no force flag, and the command does not name master.
+        ``--porcelain`` makes the status line machine-readable.
 
     Raises:
         RuntimeError: The command was edited into an unsafe push.
@@ -62,7 +87,14 @@ def push_command() -> list[str]:
         None.
     """
     command = list(_PUSH)
-    if command != ["git", "push", "origin", "refs/heads/badges:refs/heads/badges"]:
+    expected = [
+        "git",
+        "push",
+        "--porcelain",
+        "origin",
+        "refs/heads/badges:refs/heads/badges",
+    ]
+    if command != expected:
         raise RuntimeError("refusing a push that is not a normal badges update")
     if "--force" in command or "-f" in command or "master" in command:
         raise RuntimeError("refusing a forced push or a push of master")
@@ -110,7 +142,8 @@ def _run_git(
         repo: Working tree. Git receives this as ``-C``.
         args: Arguments after the repository path. One to 12 items. A push is
             rejected here so every push goes through ``push_command``.
-        env: Extra environment variables. ``None`` uses the process environment.
+        env: Extra environment variables. ``None`` adds none. Git still runs
+            with ``LC_ALL=C`` and ``LANGUAGE=C``.
         check: When true, a non-zero status raises.
         timeout: Seconds before the process is killed. 1 to 60.
 
@@ -130,10 +163,7 @@ def _run_git(
         raise ValueError("pushes and force flags are not run from this helper")
     if timeout < 1 or timeout > 60:
         raise ValueError("git timeout must be from 1 to 60 seconds")
-    merged = os.environ.copy()
-    merged["GIT_TERMINAL_PROMPT"] = "0"
-    if env is not None:
-        merged.update(env)
+    merged = _git_child_env(env)
     try:
         result = subprocess.run(
             ["git", "-C", str(repo), *args],
@@ -148,6 +178,32 @@ def _run_git(
     if check and result.returncode != 0:
         raise RuntimeError(_safe_git_error(result.stderr or result.stdout))
     return result
+
+
+def _git_child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Build the environment for a git subprocess.
+
+    Args:
+        extra: Variables copied in after the process environment. ``None``
+            adds none. ``LC_ALL`` and ``LANGUAGE`` are forced to ``C`` after
+            ``extra``, so a German parent locale cannot change git's text.
+
+    Returns:
+        The environment mapping.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    merged = os.environ.copy()
+    merged["GIT_TERMINAL_PROMPT"] = "0"
+    if extra is not None:
+        merged.update(extra)
+    merged["LC_ALL"] = "C"
+    merged["LANGUAGE"] = "C"
+    return merged
 
 
 def _assert_git_repo(repo: Path) -> None:
@@ -413,17 +469,19 @@ def _commit_if_changed(repo: Path) -> bool:
 
 
 def _run_push(repo: Path) -> None:
-    """Push badges with the fixed refspec.
+    """Push badges with the fixed porcelain refspec.
 
     Args:
-        repo: Repository root. HEAD must be badges.
+        repo: Repository root. HEAD must be badges. Git runs with
+            ``LC_ALL=C`` and ``LANGUAGE=C``.
 
     Returns:
         None.
 
     Raises:
-        PushRejected: The remote rejected the update.
-        RuntimeError: HEAD is not badges, or the command is not the fixed one.
+        PushRejected: The badges status is a real concurrency conflict.
+        RuntimeError: HEAD is not badges, the command is not the fixed one,
+            the push timed out, or git failed for any other reason.
 
     Side effects:
         Pushes ``refs/heads/badges``. Does not force and does not push master.
@@ -436,13 +494,229 @@ def _run_push(repo: Path) -> None:
             check=False,
             capture_output=True,
             text=True,
-        timeout=60,
-        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-    )
+            timeout=60,
+            env=_git_child_env(),
+        )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError("git push timed out") from error
-    if result.returncode != 0:
-        raise PushRejected(_safe_git_error(result.stderr or result.stdout))
+    if result.returncode == 0:
+        return
+    reason = _push_error_text(result.stdout, result.stderr)
+    if _classify_push(result.stdout, result.stderr, result.returncode) == "conflict":
+        raise PushRejected(reason)
+    raise RuntimeError(reason)
+
+
+def _push_error_text(stdout: str, stderr: str) -> str:
+    """Return one escaped line describing a failed badges push.
+
+    Args:
+        stdout: Git standard output. Used when stderr is empty.
+        stderr: Git standard error. Preferred when it has text.
+
+    Returns:
+        A single line of at most 500 characters. Whitespace is collapsed and
+        ``%`` is written as ``%25``. Token-shaped text is hidden.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    text = stderr if stderr.strip() else stdout
+    return _safe_git_error(text).replace("%", "%25")
+
+
+def _classify_push(stdout: str, stderr: str, returncode: int) -> str:
+    """Classify one badges push as ok, conflict, or error.
+
+    Args:
+        stdout: Standard output. Porcelain status lines are tab-separated.
+        stderr: Standard error. A ``cannot lock ref`` line can be a conflict.
+        returncode: The git exit code. Zero is ok.
+
+    Returns:
+        ``ok`` when git exited 0. ``conflict`` when the badges line is
+        ``[rejected] (non-fast-forward)``, ``[rejected] (fetch first)``, or
+        ``[rejected] (stale info)``, or git reports ``cannot lock ref``
+        without a ``[remote rejected]`` badges line. ``error`` for a hook,
+        ruleset, permission failure, transport failure, or anything else.
+        ``[remote rejected]`` is an error even if its text says
+        ``non-fast-forward`` or ``cannot lock ref``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if returncode == 0:
+        return "ok"
+    lines = _badges_status_lines(stdout)
+    if _has_remote_rejected(lines):
+        return "error"
+    if _has_conflict_summary(lines):
+        return "conflict"
+    if "cannot lock ref" in f"{stdout}\n{stderr}":
+        return "conflict"
+    return "error"
+
+
+def _badges_status_lines(stdout: str) -> list[tuple[str, str]]:
+    """Return porcelain flag and summary pairs for refs/heads/badges.
+
+    Args:
+        stdout: Git porcelain output. At most 40 lines are read, and at most
+            20 badges lines are returned.
+
+    Returns:
+        Pairs of the status flag and the summary. Lines that are not a
+        badges status are skipped.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    found: list[tuple[str, str]] = []
+    seen = 0
+    for raw in stdout.splitlines():
+        seen += 1
+        if seen > _MAX_STATUS_LINES:
+            break
+        parsed = _status_fields(raw)
+        if parsed is None:
+            continue
+        flag, refspec, summary = parsed
+        if refspec.split(":")[-1] != _BADGES_REF:
+            continue
+        found.append((flag, summary))
+        if len(found) >= 20:
+            break
+    return found
+
+
+def _status_fields(raw: str) -> tuple[str, str, str] | None:
+    """Split one porcelain line into flag, refspec, and summary.
+
+    Args:
+        raw: One line. A status line has two tab characters.
+
+    Returns:
+        The three fields, or ``None`` when the line is not a status line.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    parts = raw.split("\t")
+    if len(parts) < 3:
+        return None
+    flag = parts[0]
+    refspec = parts[1].strip()
+    summary = "\t".join(parts[2:]).strip()
+    if flag == "" or refspec == "" or summary == "":
+        return None
+    return flag, refspec, summary
+
+
+def _has_remote_rejected(lines: list[tuple[str, str]]) -> bool:
+    """Return whether a badges line was rejected by the remote itself.
+
+    Args:
+        lines: Flag and summary pairs. At most 20 are inspected.
+
+    Returns:
+        True when a summary starts with ``[remote rejected]``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    seen = 0
+    for _flag, summary in lines:
+        seen += 1
+        if seen > 20:
+            break
+        if summary.startswith("[remote rejected]"):
+            return True
+    return False
+
+
+def _has_conflict_summary(lines: list[tuple[str, str]]) -> bool:
+    """Return whether a badges line is a concurrency rejection.
+
+    Args:
+        lines: Flag and summary pairs. At most 20 are inspected. The flag
+            must be ``!`` and the summary must be one of the three exact
+            conflict reasons.
+
+    Returns:
+        True when a line is a non-fast-forward, fetch-first, or stale-info
+        rejection.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    seen = 0
+    for flag, summary in lines:
+        seen += 1
+        if seen > 20:
+            break
+        if flag == "!" and summary in _CONFLICT_SUMMARIES:
+            return True
+    return False
+
+
+def _pause(seconds: int) -> None:
+    """Wait before a conflict retry.
+
+    Args:
+        seconds: 1, 2, or 4. Tests replace this function so they do not wait.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: ``seconds`` is not 1, 2, or 4.
+
+    Side effects:
+        Sleeps for ``seconds`` seconds.
+    """
+    if seconds not in (1, 2, 4):
+        raise ValueError("retry pause must be 1, 2, or 4 seconds")
+    time.sleep(seconds)
+
+
+def _pause_before_retry(attempt: int) -> None:
+    """Sleep 1, 2, or 4 seconds before retry 1, 2, or 3.
+
+    Args:
+        attempt: The attempt that just failed. 1 waits 1 second, 2 waits 2
+            seconds, and 3 waits 4 seconds.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: ``attempt`` is not 1, 2, or 3.
+
+    Side effects:
+        Sleeps, unless a test replaced ``_pause``.
+    """
+    pauses = (1, 2, 4)
+    if attempt < 1 or attempt > 3:
+        raise ValueError("retry pause is only used after attempts 1 to 3")
+    _pause(pauses[attempt - 1])
 
 
 def sync_badges(
@@ -659,7 +933,8 @@ def publish_with_retry(
         fetch: When true, each attempt fetches origin master and, inside
             ``sync_badges``, the badges branch. When false, the local master
             ref is the head.
-        push: When true, push after a new commit. A conflict is retried.
+        push: When true, push after a new commit. A concurrency conflict is
+            retried. Any other push failure propagates.
 
     Returns:
         ``("committed", "")`` or ``("unchanged", "")`` when this SHA is still
@@ -676,7 +951,8 @@ def publish_with_retry(
 
     Side effects:
         May fetch, commit, and push badges. At most four attempts. Each
-        attempt checks the master head again. A retry does not force-push.
+        attempt checks the master head again. Before retries 1, 2, and 3 the
+        caller waits 1, 2, and 4 seconds. A retry does not force-push.
     """
     _assert_git_repo(repo)
     _require_svgs(generated)
@@ -696,6 +972,7 @@ def publish_with_retry(
             last_error = str(error) or last_error
             if not push or attempt == _MAX_PUSH_ATTEMPTS:
                 break
+            _pause_before_retry(attempt)
     return ("conflict", last_error)
 
 

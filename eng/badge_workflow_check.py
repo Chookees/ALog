@@ -4,9 +4,11 @@
 arc_spec v5.20 reads the badge job from parsed YAML. Counting the condition
 text stays green when that condition moves onto a step, and it stays green
 when an extra write scope is added beside ``contents: write``. This module
-rejects those shapes. It also rejects a concurrency group: a cancelled
-queued run would fail the workflow and the CI badge. The badge job instead
-skips when its commit is no longer the head of master. Next file:
+rejects those shapes. It also rejects a concurrency group on the workflow
+and on every job: a cancelled queued run would fail the workflow and the CI
+badge. Duplicate YAML keys are rejected too, because a parser that keeps the
+last key would hide an earlier ``if: always()``. The badge job instead skips
+when its commit is no longer the head of master. Next file:
 ``eng/test_badge_workflow.py``.
 """
 
@@ -15,7 +17,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import yaml
+# Printed alone when PyYAML is not installed. CI installs the pinned file.
+_PYYAML_REQUIRED = (
+    "PyYAML is required for the badge workflow check: "
+    "python3 -m pip install -r eng/requirements-ci.txt"
+)
 
 # Job-level expression required by arc_spec B1-01. A copy on a step does not count.
 BADGE_IF = "github.event_name == 'push' && github.ref == 'refs/heads/master'"
@@ -42,27 +48,153 @@ def load_workflow(path: Path) -> dict:
 
     Raises:
         ValueError: The path is not a file, the file is too large, the YAML
-            cannot be parsed, or the document is not a mapping.
+            cannot be parsed, a mapping key is duplicated, or the document is
+            not a mapping.
         OSError: The file cannot be read.
+        ImportError: PyYAML is not installed.
 
     Side effects:
-        Reads the file.
+        Reads the file and imports PyYAML.
     """
     if not path.is_file():
         raise ValueError(f"{path} is not a file")
     text = path.read_text(encoding="utf-8")
     if len(text) > _MAX_WORKFLOW_CHARS:
         raise ValueError("workflow is larger than 200000 characters")
+    parsed = _parse_yaml(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("workflow is not a mapping")
+    return parsed
+
+
+def _import_yaml():
+    """Import PyYAML.
+
+    Returns:
+        The yaml module.
+
+    Raises:
+        ImportError: PyYAML is not installed. The caller prints one install
+            line and does not show this exception's traceback.
+
+    Side effects:
+        Imports the module.
+    """
+    import yaml
+
+    return yaml
+
+
+def _parse_yaml(text: str) -> object:
+    """Parse workflow YAML and reject a duplicated mapping key.
+
+    Args:
+        text: Workflow source. Already bounded by the caller.
+
+    Returns:
+        The parsed document.
+
+    Raises:
+        ImportError: PyYAML is not installed.
+        ValueError: The YAML cannot be parsed, including a duplicate key.
+
+    Side effects:
+        Imports PyYAML.
+    """
+    yaml = _import_yaml()
     try:
-        parsed = yaml.safe_load(text)
+        return yaml.load(text, Loader=_unique_loader(yaml))
     except yaml.YAMLError as error:
         message = " ".join(str(error).split())
         if len(message) > _MAX_ERROR_CHARS:
             message = message[:_MAX_ERROR_CHARS]
         raise ValueError(f"workflow YAML cannot be parsed: {message}") from error
-    if not isinstance(parsed, dict):
-        raise ValueError("workflow is not a mapping")
-    return parsed
+
+
+def _unique_loader(yaml_module):
+    """Return a SafeLoader subclass that rejects duplicate mapping keys.
+
+    Args:
+        yaml_module: The imported yaml module. The subclass is built from its
+            SafeLoader, so the process-wide loader is not changed.
+
+    Returns:
+        A loader class for ``yaml.load``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+
+    class UniqueKeyLoader(yaml_module.SafeLoader):
+        """SafeLoader that rejects a repeated mapping key."""
+
+    def construct(loader, node):
+        """Build one mapping and reject a key that already appeared.
+
+        Args:
+            loader: The active loader.
+            node: A YAML mapping node.
+
+        Returns:
+            The constructed mapping.
+
+        Raises:
+            ConstructorError: A key is repeated, or the node is not a mapping
+                of at most 200 pairs.
+
+        Side effects:
+            None.
+        """
+        return _mapping_without_duplicates(loader, node, yaml_module)
+
+    UniqueKeyLoader.add_constructor(
+        yaml_module.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        construct,
+    )
+    return UniqueKeyLoader
+
+
+def _mapping_without_duplicates(loader, node, yaml_module) -> dict:
+    """Construct a mapping unless one of its keys is repeated.
+
+    Args:
+        loader: The active PyYAML loader.
+        node: A mapping node. ``value`` is a list of key and value pairs.
+        yaml_module: The yaml module, used for ``ConstructorError``.
+
+    Returns:
+        The constructed mapping. At most 200 keys are accepted.
+
+    Raises:
+        ConstructorError: A key is repeated, the node has no pair list, or it
+            has more than 200 pairs.
+
+    Side effects:
+        None.
+    """
+    pairs = getattr(node, "value", None)
+    if not isinstance(pairs, list) or len(pairs) > 200:
+        raise yaml_module.constructor.ConstructorError(
+            None,
+            None,
+            "mapping is missing or has more than 200 keys",
+            None,
+        )
+    mapping: dict = {}
+    for key_node, value_node in pairs:
+        key = loader.construct_object(key_node, deep=False)
+        if key in mapping:
+            raise yaml_module.constructor.ConstructorError(
+                f"found duplicate key {key!r}",
+                getattr(key_node, "start_mark", None),
+                f"found duplicate key {key!r}",
+                getattr(key_node, "start_mark", None),
+            )
+        mapping[key] = loader.construct_object(value_node, deep=False)
+    return mapping
 
 
 def check_badge_workflow(document: object) -> list[str]:
@@ -78,8 +210,8 @@ def check_badge_workflow(document: object) -> list[str]:
         ``contents: read``, the badge job's ``if`` is the master push
         expression and is not repeated on a step, badge needs only build,
         badge permissions are exactly ``contents: write``, no other job
-        grants a write scope, and the document has no concurrency group.
-        At most 20 problems are returned.
+        grants a write scope, and neither the document nor any job declares
+        a concurrency group. At most 20 problems are returned.
 
     Raises:
         None.
@@ -100,6 +232,7 @@ def check_badge_workflow(document: object) -> list[str]:
     if len(jobs) > _MAX_JOBS:
         problems.append("workflow has more than 20 jobs")
         return _cap(problems)
+    problems.extend(_job_concurrency_problems(jobs))
     badge = jobs.get("badge")
     if not isinstance(badge, dict):
         problems.append("badge job is missing")
@@ -109,6 +242,34 @@ def check_badge_workflow(document: object) -> list[str]:
     problems.extend(_badge_permission_problems(badge.get("permissions")))
     problems.extend(_other_job_write_problems(jobs))
     return _cap(problems)
+
+
+def _job_concurrency_problems(jobs: dict) -> list[str]:
+    """Return one problem for each job that declares concurrency.
+
+    Args:
+        jobs: The workflow ``jobs`` mapping. At most 20 entries are inspected.
+            A concurrency key on any job is rejected, including badge and
+            build. A job that is not a mapping is left to the write check.
+
+    Returns:
+        Problem sentences. Empty when no inspected job has ``concurrency``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    found: list[str] = []
+    seen = 0
+    for name, body in jobs.items():
+        seen += 1
+        if seen > _MAX_JOBS:
+            break
+        if isinstance(body, dict) and "concurrency" in body:
+            found.append(f"{name} declares a concurrency group")
+    return found
 
 
 def _default_permission_problems(permissions: object) -> list[str]:
@@ -307,7 +468,8 @@ def main(argv: list[str]) -> int:
 
     Returns:
         0 when the workflow matches B1-01. 1 when it has problems. 2 when
-        the file cannot be read or parsed, or the usage is wrong.
+        the file cannot be read or parsed, PyYAML is missing, or the usage
+        is wrong. A missing PyYAML prints only the install line.
 
     Raises:
         None.
@@ -320,6 +482,9 @@ def main(argv: list[str]) -> int:
         return 2
     try:
         document = load_workflow(Path(argv[0]))
+    except ImportError:
+        print(_PYYAML_REQUIRED, file=sys.stderr)
+        return 2
     except (OSError, ValueError) as error:
         print(f"badge workflow check failed: {error}", file=sys.stderr)
         return 2
