@@ -1,0 +1,8 @@
+# Sync waits that stay in ALog. Each line is path:regex # reason.
+# The reason names the timeout and why the caller SynchronizationContext is not captured.
+# eng/sync-wait-check.py fails when a library hit is missing here, or a line here matches nothing.
+
+ALog/Core/BackgroundLogQueue.cs:void GetResult\( # Awaiter method required by ICriticalNotifyCompletion. It returns immediately and waits on nothing. Timeout: not applicable, because this declaration is not a wait; a call to GetResult is still rejected.
+ALog/Core/BackgroundLogQueue.cs:pending\.Wait\( # Channel capacity wait. Completions run on the reader thread, so the caller SynchronizationContext is not captured. Timeout: 5 seconds.
+ALog/Core/BackgroundLogQueue.cs:_backgroundTask\.Wait\( # Dispose waits for the background processor. That processor awaits with ConfigureAwait(false), so it does not capture the disposer SynchronizationContext. Timeout: 5 seconds.
+ALog/Writers/Cloud/AwsCloudWatchWriter.cs:pending\.Wait\( # The AWS SDK has no synchronous API. The put starts on the thread pool, so the caller SynchronizationContext is not captured. Timeout: 100 seconds, the default HTTP client timeout used when the SDK client timeout is unset.

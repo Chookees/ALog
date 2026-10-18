@@ -22,6 +22,9 @@ public class HttpLogWriter : ILogWriter, IFormattableLogWriter
     private readonly HttpMethod _method;
     private readonly TimeSpan _timeout;
 
+    // A request with more headers than this is truncated. The body still sends.
+    private const int MaxRequestHeaders = 64;
+
     public ILogFormatter? Formatter { get; set; }
 
     public HttpLogWriter(
@@ -44,56 +47,117 @@ public class HttpLogWriter : ILogWriter, IFormattableLogWriter
         if (_ownsHttpClient)
         {
             _httpClient.Timeout = _timeout;
-
-            foreach (var header in _headers)
-            {
-                _httpClient.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
-            }
+            ApplyHeaders(request: null);
         }
     }
 
+    /// <summary>
+    /// Sends one event with <see cref="HttpClient.Send"/> and does not wait on a task.
+    /// </summary>
+    /// <param name="logEvent">Event to send. Null is reported and dropped.</param>
+    /// <remarks>
+    /// A handler without synchronous <c>Send</c> throws <see cref="NotSupportedException"/>.
+    /// That stays on this writer's error path. The caller does not see it and the call does not hang.
+    /// The caller blocks for the HTTP round trip. No continuation is posted to a
+    /// <see cref="SynchronizationContext"/>.
+    /// </remarks>
     public void Write(LogEvent logEvent)
-    {
-        WriteInternal(logEvent, asyncMode: false).GetAwaiter().GetResult();
-    }
-
-    public async Task WriteAsync(LogEvent logEvent)
-    {
-        await WriteInternal(logEvent, asyncMode: true);
-    }
-
-    private async Task WriteInternal(LogEvent logEvent, bool asyncMode)
     {
         try
         {
-            var content = PrepareContent(logEvent);
-            var httpContent = new StringContent(content, Encoding.UTF8, GetContentType());
+            if (logEvent is null)
+                throw new ArgumentNullException(nameof(logEvent));
 
-            using var request = new HttpRequestMessage(_method, _endpoint)
-            {
-                Content = httpContent
-            };
-
-            foreach (var header in _headers)
-            {
-                request.Headers.TryAddWithoutValidation(header.Key, header.Value);
-            }
-
-            if (asyncMode)
-            {
-                using var response = await _httpClient.SendAsync(request);
-                response.EnsureSuccessStatusCode();
-            }
-            else
-            {
-                using var response = _httpClient.Send(request);
-                response.EnsureSuccessStatusCode();
-            }
+            using var request = CreateRequest(logEvent);
+            using var response = _httpClient.Send(request, CancellationToken.None);
+            response.EnsureSuccessStatusCode();
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[HttpLogWriter] HTTP write failed: {ex}");
+            Report(ex);
         }
+    }
+
+    /// <summary>
+    /// Sends one event with <see cref="HttpClient.SendAsync"/> and does not resume on the caller context.
+    /// </summary>
+    /// <param name="logEvent">Event to send. Null is reported and the task still completes.</param>
+    /// <returns>A task that completes after the post, including when the post fails.</returns>
+    /// <remarks>
+    /// Failures are written to the error stream. The task does not fault.
+    /// The await uses <c>ConfigureAwait(false)</c>.
+    /// </remarks>
+    public async Task WriteAsync(LogEvent logEvent)
+    {
+        try
+        {
+            if (logEvent is null)
+                throw new ArgumentNullException(nameof(logEvent));
+
+            using var request = CreateRequest(logEvent);
+            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+        }
+        catch (Exception ex)
+        {
+            Report(ex);
+        }
+    }
+
+    /// <summary>
+    /// Builds the outbound request, including per-request headers.
+    /// </summary>
+    /// <param name="logEvent">Event to format. Must not be null.</param>
+    /// <returns>The request. The caller disposes it, which disposes the body.</returns>
+    private HttpRequestMessage CreateRequest(LogEvent logEvent)
+    {
+        var content = PrepareContent(logEvent);
+        var httpContent = new StringContent(content, Encoding.UTF8, GetContentType());
+        var request = new HttpRequestMessage(_method, _endpoint)
+        {
+            Content = httpContent
+        };
+
+        ApplyHeaders(request);
+        return request;
+    }
+
+    /// <summary>
+    /// Copies at most <see cref="MaxRequestHeaders"/> headers onto the owned client or one request.
+    /// </summary>
+    /// <param name="request">Request that receives the headers. Null updates the owned client's defaults.</param>
+    /// <remarks>
+    /// The cap is 64 so a huge header map cannot grow the send path without a bound.
+    /// A rejected header name is skipped. The event body is still sent.
+    /// </remarks>
+    private void ApplyHeaders(HttpRequestMessage? request)
+    {
+        var scanned = 0;
+        foreach (var header in _headers)
+        {
+            if (scanned == MaxRequestHeaders)
+                break;
+
+            scanned++;
+            if (request is null)
+            {
+                // Default headers are best-effort. A rejected name does not fail construction.
+                _ = _httpClient.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
+                continue;
+            }
+
+            // A rejected header is skipped. The event body is still sent.
+            _ = request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+        }
+    }
+
+    /// <summary>
+    /// Writes one HTTP failure to the error stream. The event is dropped.
+    /// </summary>
+    /// <param name="ex">Failure from formatting or the HTTP call. Must not be null.</param>
+    private static void Report(Exception ex)
+    {
+        Console.Error.WriteLine($"[HttpLogWriter] HTTP write failed: {ex}");
     }
 
     private string PrepareContent(LogEvent logEvent)

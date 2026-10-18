@@ -182,7 +182,7 @@ public class LoggerEngine : ILogger, IDisposable
 
         if (_backgroundQueue != null)
         {
-            await _backgroundQueue.EnqueueAsync(logEvent);
+            await _backgroundQueue.EnqueueAsync(logEvent).ConfigureAwait(false);
         }
         else if (!_config.AsyncEnabled)
         {
@@ -190,7 +190,7 @@ public class LoggerEngine : ILogger, IDisposable
         }
         else
         {
-            await _dispatcher.DispatchAsync(logEvent);
+            await _dispatcher.DispatchAsync(logEvent).ConfigureAwait(false);
         }
     }
 
@@ -272,7 +272,7 @@ public class LoggerEngine : ILogger, IDisposable
     {
         if (_backgroundQueue != null)
         {
-            await _backgroundQueue.FlushAsync();
+            await _backgroundQueue.FlushAsync().ConfigureAwait(false);
         }
     }
 

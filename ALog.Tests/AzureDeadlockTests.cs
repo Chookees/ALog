@@ -7,66 +7,98 @@ using ALog.Writers.Cloud;
 namespace ALog.Tests;
 
 /// <summary>
-/// Proves the Azure sync write blocks on a single-thread context.
-/// Z1 removes the blocking wait. These tests only record the current behavior.
+/// Sync writes on a one-thread <see cref="SynchronizationContext"/> must return
+/// without waiting for that context. Z1-01 and Z1-02. The async Azure path stays covered here.
 /// </summary>
 public sealed class AzureDeadlockTests
 {
     private static readonly DateTime Stamp = new(2020, 1, 2, 3, 4, 5, DateTimeKind.Utc);
 
     /// <summary>
-    /// Runs <see cref="AzureLogWriter.Write"/> on a one-thread context whose handler
-    /// yields without <c>ConfigureAwait(false)</c>. The call is still blocked after
-    /// the 2 second client timeout, and the handler has not finished the request.
-    /// Z1 reverses this deadlock.
+    /// <see cref="AzureLogWriter.Write"/> on a one-thread context returns in under one second
+    /// and the handler's synchronous <c>Send</c> receives the request.
     /// </summary>
     /// <remarks>
-    /// <see cref="HttpClient.Timeout"/> cancels the token passed to the handler.
-    /// This handler does not observe that token, and the yield continuation is
-    /// queued on the blocked pump, so the timeout does not complete <c>GetResult</c>.
-    /// The test therefore treats a call that is still running after 2 seconds as
-    /// the deadlock. <see cref="SingleThreadContext.Send"/> throws after 25 seconds
-    /// on a background thread so the suite does not wait for it. The fact timeout
-    /// is 30 seconds. The client, writer, and pump are left alive because disposing
-    /// them does not release the blocked wait.
+    /// The handler also yields from <c>SendAsync</c> without <c>ConfigureAwait(false)</c>.
+    /// A sync-over-async wait on that method never resumes, because the pump thread is blocked.
+    /// <see cref="SingleThreadContext.Send"/> throws after 25 seconds so a failed run cannot
+    /// hang the suite. This fact's own limit is 30 seconds. On a failure the client, writer,
+    /// and pump are left undisposed: disposing them does not release a blocked wait.
     /// </remarks>
     [Fact(Timeout = 30000)]
-    [Trait("Category", "KnownBug")]
-    public async Task Write_OnSingleThreadContext_BlocksUntilClientTimeout()
+    public async Task Write_OnSingleThreadContext_ReturnsWithinOneSecondAndHandlerReceivedTheRequest()
     {
-        // Z1 reverses this deadlock.
-        var handler = new YieldHandler();
+        await AssertReturnsWithinOneSecond(writerFactory: client =>
+            new AzureLogWriter(InstrumentationKey, httpClient: client));
+    }
+
+    /// <summary>
+    /// <see cref="ALog.Writers.Http.HttpLogWriter.Write"/> on a one-thread context returns
+    /// in under one second and the handler's synchronous <c>Send</c> receives the request.
+    /// </summary>
+    /// <remarks>
+    /// Same pump, handler, and one-second limit as the Azure test (Z1-02). The 25 second
+    /// pump cap is the backstop. A failure leaves the client and pump undisposed.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task HttpWrite_OnSingleThreadContext_ReturnsWithinOneSecondAndHandlerReceivedTheRequest()
+    {
+        await AssertReturnsWithinOneSecond(writerFactory: client =>
+            new ALog.Writers.Http.HttpLogWriter("https://example.test/logs", httpClient: client));
+    }
+
+    /// <summary>
+    /// Runs one synchronous writer on the pump and requires a completed send within one second.
+    /// </summary>
+    /// <param name="writerFactory">Builds the writer around the probe client. The test disposes it only after success.</param>
+    /// <returns>A task that finishes when the assertion is done. A blocked write fails this task after one second.</returns>
+    /// <remarks>
+    /// The runner is a thread-pool task so the assertion thread is not the pump.
+    /// A writer that blocks is still inside <see cref="SingleThreadContext.Send"/> when this returns.
+    /// The method is async so xUnit's fact timeout applies. It does not resume on a caller context:
+    /// the one-second wait is <see cref="Task.Delay"/>, which this helper does not capture.
+    /// </remarks>
+    private static async Task AssertReturnsWithinOneSecond(Func<HttpClient, IDisposable> writerFactory)
+    {
+        var handler = new SyncSendYieldHandler();
         var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(2) };
-        var writer = new AzureLogWriter(InstrumentationKey, httpClient: client);
+        var writer = writerFactory(client);
         var pump = new SingleThreadContext();
-        var watch = Stopwatch.StartNew();
-        var send = Task.Run(() =>
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        // The runner stays blocked when Write deadlocks. The one-second wait below does not join it.
+        _ = Task.Run(() =>
         {
             try
             {
-                pump.Send(() => writer.Write(Event()));
+                pump.Send(() =>
+                {
+                    if (writer is AzureLogWriter azure)
+                        azure.Write(Event());
+                    else if (writer is ALog.Writers.Http.HttpLogWriter http)
+                        http.Write(Event());
+                    else
+                        throw new InvalidOperationException("Unexpected writer.");
+                });
+                completed.TrySetResult();
             }
-            catch (TimeoutException)
+            catch (Exception ex)
             {
-                // The 25 second cap fired. Write is still blocked on the pump.
+                completed.TrySetException(ex);
             }
         });
 
-        while (handler.Started == 0)
+        var finished = await Task.WhenAny(completed.Task, Task.Delay(TimeSpan.FromSeconds(1))).ConfigureAwait(false);
+        if (finished != completed.Task)
         {
-            if (watch.Elapsed > TimeSpan.FromSeconds(5))
-                throw new TimeoutException("The Azure handler did not start.");
-
-            await Task.Delay(10);
+            Assert.Fail(
+                $"Write did not return within 1 second. syncSends={handler.SyncSends} asyncStarts={handler.AsyncStarts}");
         }
 
-        var remaining = TimeSpan.FromMilliseconds(2000) - watch.Elapsed;
-        if (remaining > TimeSpan.Zero)
-            await Task.Delay(remaining);
-
-        Assert.False(send.IsCompleted);
-        Assert.False(handler.Finished.IsCompleted);
-        Assert.True(watch.Elapsed >= TimeSpan.FromMilliseconds(1900), $"elapsed {watch.Elapsed}");
+        await completed.Task.ConfigureAwait(false);
+        Assert.Equal(1, handler.SyncSends);
+        client.Dispose();
+        writer.Dispose();
+        pump.Dispose();
     }
 
     /// <summary>
@@ -260,6 +292,52 @@ internal sealed class SingleThreadContext : IDisposable
         /// <exception cref="TimeoutException">Thrown when the pump does not finish within 25 seconds.</exception>
         public override void Send(SendOrPostCallback d, object? state)
             => owner.Send(() => d(state));
+    }
+}
+
+/// <summary>
+/// Handler with a real synchronous <c>Send</c> and a <c>SendAsync</c> that yields
+/// onto the caller context. The sync path must use <c>Send</c>. The yield is the deadlock trap.
+/// </summary>
+internal sealed class SyncSendYieldHandler : HttpMessageHandler
+{
+    private int syncSends;
+    private int asyncStarts;
+
+    /// <summary>How many times <see cref="Send"/> ran.</summary>
+    public int SyncSends => syncSends;
+
+    /// <summary>How many times <see cref="SendAsync"/> was entered.</summary>
+    public int AsyncStarts => asyncStarts;
+
+    /// <summary>
+    /// Records one synchronous send and returns HTTP 200 without posting to a context.
+    /// </summary>
+    /// <param name="request">Ignored. The probe has no body the test reads back.</param>
+    /// <param name="cancellationToken">Ignored. The response is already complete.</param>
+    /// <returns>HTTP 200.</returns>
+    protected override HttpResponseMessage Send(HttpRequestMessage request, CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref syncSends);
+        return new HttpResponseMessage(HttpStatusCode.OK);
+    }
+
+    /// <summary>
+    /// Yields onto the caller <see cref="SynchronizationContext"/> and then returns HTTP 200.
+    /// </summary>
+    /// <param name="request">Ignored. The probe does not read the body.</param>
+    /// <param name="cancellationToken">Not observed. A blocked pump never reaches the continuation.</param>
+    /// <returns>HTTP 200 after the continuation runs.</returns>
+    /// <remarks>
+    /// There is no <c>ConfigureAwait(false)</c>. A caller blocked on this task never resumes it.
+    /// </remarks>
+    protected override async Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        Interlocked.Increment(ref asyncStarts);
+        await Task.Yield();
+        return new HttpResponseMessage(HttpStatusCode.OK);
     }
 }
 

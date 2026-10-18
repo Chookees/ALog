@@ -44,7 +44,7 @@ public class LogDispatcher
         {
             try
             {
-                await writer.WriteAsync(logEvent);
+                await writer.WriteAsync(logEvent).ConfigureAwait(false);
             }
             catch (Exception ex)
             {
@@ -71,7 +71,7 @@ public class LogDispatcher
             tasks.Add(ProcessBatchForWriterAsync(writer, logEvents));
         }
 
-        await Task.WhenAll(tasks);
+        await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 
     private async Task ProcessBatchForWriterAsync(ILogWriter writer, IEnumerable<LogEvent> logEvents)
@@ -80,7 +80,7 @@ public class LogDispatcher
         {
             foreach (var logEvent in logEvents)
             {
-                await writer.WriteAsync(logEvent);
+                await writer.WriteAsync(logEvent).ConfigureAwait(false);
             }
         }
         catch (Exception ex)

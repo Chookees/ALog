@@ -24,38 +24,54 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
         EnsureDirectoryExists(_filePath);
     }
 
-    public void Write(LogEvent logEvent) =>
-        WriteInternal(logEvent, asyncMode: false).GetAwaiter().GetResult();
+    /// <summary>
+    /// Appends one line on the calling thread. Does not queue work and does not wait on a task.
+    /// </summary>
+    /// <param name="logEvent">Event to append. Null is reported and dropped.</param>
+    /// <remarks>
+    /// Without the background queue the caller blocks for the file I/O.
+    /// Failures are written to the error stream and are not thrown to the caller.
+    /// </remarks>
+    public void Write(LogEvent logEvent) => WriteCore(logEvent);
 
-    public Task WriteAsync(LogEvent logEvent) =>
-        WriteInternal(logEvent, asyncMode: true);
+    /// <summary>
+    /// Appends one line on the calling thread and returns an already completed task.
+    /// </summary>
+    /// <param name="logEvent">Event to append. Null is reported and the task still completes.</param>
+    /// <returns>
+    /// <see cref="Task.CompletedTask"/> after the line is written, or after the error is reported.
+    /// <see cref="Task.IsCompleted"/> is true before the caller awaits it.
+    /// </returns>
+    /// <remarks>
+    /// There is no thread-pool hop. Asynchrony for file I/O comes only from the background queue.
+    /// </remarks>
+    public Task WriteAsync(LogEvent logEvent)
+    {
+        WriteCore(logEvent);
+        return Task.CompletedTask;
+    }
 
-    private async Task WriteInternal(LogEvent logEvent, bool asyncMode)
+    /// <summary>
+    /// Formats one event and appends it under the writer lock.
+    /// </summary>
+    /// <param name="logEvent">Event to append. Null is reported and dropped.</param>
+    /// <remarks>
+    /// The lock covers rotation and append so two callers cannot split a line.
+    /// A formatting or I/O failure is reported and does not leave the lock held.
+    /// </remarks>
+    private void WriteCore(LogEvent logEvent)
     {
         try
         {
+            if (logEvent is null)
+                throw new ArgumentNullException(nameof(logEvent));
+
             var line = Formatter?.Format(logEvent) ?? FormatFallback(logEvent);
             var lineWithNewline = line + Environment.NewLine;
-
-            if (asyncMode)
+            lock (_writeLock)
             {
-                // Serialize rotate+append; async wait outside lock after preparing content
-                await Task.Run(() =>
-                {
-                    lock (_writeLock)
-                    {
-                        RotateIfNeeded();
-                        System.IO.File.AppendAllText(_filePath, lineWithNewline);
-                    }
-                });
-            }
-            else
-            {
-                lock (_writeLock)
-                {
-                    RotateIfNeeded();
-                    System.IO.File.AppendAllText(_filePath, lineWithNewline);
-                }
+                RotateIfNeeded();
+                System.IO.File.AppendAllText(_filePath, lineWithNewline);
             }
         }
         catch (Exception ex)

@@ -37,7 +37,6 @@ dotnet_diagnostic.CA1859.severity = suggestion # 3
 dotnet_diagnostic.CA1861.severity = suggestion # 5
 dotnet_diagnostic.CA1869.severity = suggestion # 1
 dotnet_diagnostic.CA1873.severity = suggestion # 3
-dotnet_diagnostic.CA2007.severity = suggestion # 23
 dotnet_diagnostic.CA2201.severity = suggestion # 2
 dotnet_diagnostic.CA2249.severity = suggestion # 1
 dotnet_diagnostic.IDE0130.severity = suggestion # 7

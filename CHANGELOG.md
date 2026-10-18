@@ -14,7 +14,11 @@
 - Fixed: `ALogLoggerProvider` implements `ISupportExternalScope` again, so the patch does not drop that interface. Factory scopes, including Activity TraceId, SpanId, and ParentId, are copied onto the event at emit time, after the level gate. `LogContext` scopes come first; external scopes follow
 - Changed: Scopes from `ILogger.BeginScope` apply to MEL events; for `Log.*` use `LogContext.Push`
 - Changed: `GetContext()` returns one shared empty dictionary when there is no scope. Each scope node stores its depth so the depth limit is a single comparison
-- Fixed: ALog references `System.Security.Cryptography.Pkcs` 10.0.13 directly, so apps no longer get the vulnerable 9.0.4 transitively through `Microsoft.Data.SqlClient` (NU1902/NU1903 with `TreatWarningsAsErrors`).
+- Fixed: ALog references `System.Security.Cryptography.Pkcs` 10.0.13 directly, so apps no longer get the vulnerable version that `Microsoft.Data.SqlClient` pulls in transitively (NU1902/NU1903 with `TreatWarningsAsErrors`).
+- Fixed: `AzureLogWriter` and `HttpLogWriter` no longer deadlock when they log synchronously on a thread with a `SynchronizationContext` (UI thread, classic ASP.NET); the synchronous path uses `HttpClient.Send`.
+- Fixed: ALog no longer resumes on the caller's `SynchronizationContext`, and `SqlLogWriter` has a truly synchronous path, so no synchronous write blocks on a task.
+- Breaking (behavior): without the background queue, `FileLogWriter` writes synchronously on the calling thread (no `Task.Run`); `WriteAsync` completes inline.
+- Breaking (behavior): synchronous writes through `AzureLogWriter` and `HttpLogWriter` use `HttpClient.Send`. If you pass an `HttpClient` whose handler does not support synchronous `Send`, those writes fail like any writer error; enable the background queue for such handlers.
 
 ## 0.2.0
 
