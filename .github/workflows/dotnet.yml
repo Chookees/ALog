@@ -11,10 +11,17 @@ on:
     types: [opened, synchronize, reopened, edited]
     branches: [ "master" ]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    # The coverage gate reads the pull-request body. Contents stay read.
+    permissions:
+      contents: read
+      pull-requests: read
     env:
       COVERAGE_ENFORCE: "true"
       # Only the value 1 enables the SQL live tests. true (any case) does too.
@@ -37,6 +44,13 @@ jobs:
         echo "dotnet --version ${version}"
         test "$version" = "10.0.402"
 
+    - name: Install CI Python tools
+      run: |
+        python3 -m venv "$RUNNER_TEMP/ci-venv"
+        echo "$RUNNER_TEMP/ci-venv/bin" >> "$GITHUB_PATH"
+        export PATH="$RUNNER_TEMP/ci-venv/bin:$PATH"
+        python3 -m pip install --require-hashes --only-binary=:all: -r eng/requirements-ci.txt
+
     - name: Script tests
       run: |
         bash eng/test_vuln_check.sh
@@ -44,6 +58,7 @@ jobs:
         bash eng/test_consumer_smoke.sh
         bash eng/test_s4_grep.sh
         python3 eng/test_coverage_gate.py
+        python3 eng/test_coverage_badge.py
         python3 eng/test_coverage_exception_check.py
         python3 eng/test_analyzer_ratchet_check.py
         bash eng/test_bb_grep.sh
@@ -119,11 +134,19 @@ jobs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         GITHUB_EVENT_NAME: ${{ github.event_name }}
       run: |
-        args=(--cobertura-dir TestResults --ratchet eng/coverage-ratchet.json --summary "$GITHUB_STEP_SUMMARY")
+        args=(--cobertura-dir TestResults --ratchet eng/coverage-ratchet.json --summary "$GITHUB_STEP_SUMMARY" --measurement "$RUNNER_TEMP/coverage-lines.json")
         if [ -n "${COVERAGE_BASELINE}" ]; then
           args+=(--baseline "$COVERAGE_BASELINE")
         fi
         python3 eng/coverage-gate.py "${args[@]}"
+
+    - name: Upload coverage lines
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: coverage-lines
+        path: ${{ runner.temp }}/coverage-lines.json
+        retention-days: 1
+        if-no-files-found: error
 
     - name: Upload test results
       if: failure() && steps.test.outcome != 'skipped'
@@ -204,3 +227,28 @@ jobs:
 
     - name: Consumer smoke console
       run: bash eng/consumer-smoke.sh console
+
+  badge:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: true
+
+    - name: Download coverage lines
+      uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      with:
+        name: coverage-lines
+        path: coverage-lines
+
+    - name: Render coverage badges
+      run: python3 eng/coverage-badge.py --measurement coverage-lines/coverage-lines.json --output-dir "$RUNNER_TEMP/coverage-badges"
+
+    - name: Publish coverage badges
+      run: python3 eng/publish-coverage-badges.py --svg-dir "$RUNNER_TEMP/coverage-badges"
