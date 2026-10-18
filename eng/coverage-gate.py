@@ -8,8 +8,10 @@ library sources needs ``// Coverage-Ausnahme: <reason>`` on the line above it.
 ``COVERAGE_ENFORCE=true`` also applies the targets (lines > 90, branches >= 80).
 S4 leaves that switch false. Floor versus measured, and floor versus the base
 ratchet, fail the job only on a pull request. A push writes those gaps to the
-job summary and emits ``::warning::`` without failing. Allocation is deliberate:
-the script runs once per job and exits. Next file: ``eng/coverage-ratchet.json``.
+job summary and emits ``::warning::`` without failing. ``--measurement`` writes
+the same line percents and line floors for the coverage badge, so the badge
+job does not run the tests again. Allocation is deliberate: the script runs
+once per job and exits. Next file: ``eng/coverage-ratchet.json``.
 """
 
 from __future__ import annotations
@@ -821,6 +823,106 @@ def target_gap_warnings(
     return warnings
 
 
+def line_measurement_document(
+    coverage: dict[str, PackageRates],
+    ratchet: Ratchet,
+) -> str:
+    """Serialize the line percents and line floors this run compared.
+
+    The badge job reads this document instead of running the tests again.
+    Percents use the same one-decimal text as the job summary.
+
+    Args:
+        coverage: Measured percents from the Cobertura files this run loaded.
+        ratchet: Floors loaded for the same run. Only the line floor is written.
+
+    Returns:
+        JSON text ending with a newline. Both required packages are present.
+        Keys are sorted so the same numbers always produce the same bytes.
+
+    Raises:
+        ValueError: A required package has no measurement or no line floor,
+            or the document is larger than 4000 characters.
+
+    Side effects:
+        None.
+    """
+    body: dict[str, dict[str, str]] = {}
+    for name in REQUIRED_PACKAGES:
+        measured = coverage.get(name)
+        floor = ratchet.packages.get(name)
+        if measured is None or floor is None:
+            raise ValueError(f"Line measurement is missing {name}.")
+        body[name] = {
+            "lineFloor": format_percent(floor.lines),
+            "lines": format_percent(measured.lines),
+        }
+    if len(body) != len(REQUIRED_PACKAGES):
+        raise ValueError("Line measurement did not contain both packages.")
+    text = json.dumps({"packages": body}, indent=2, sort_keys=True)
+    if len(text) > 4000:
+        raise ValueError("Line measurement is larger than 4000 characters.")
+    return text + "\n"
+
+
+def write_line_measurement(path: Path, document: str) -> None:
+    """Write the line measurement JSON for the badge job.
+
+    Args:
+        path: Destination. The parent directory must already exist.
+        document: JSON from ``line_measurement_document``, including the newline.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: The parent is missing or the document does not end with a
+            newline.
+        OSError: The file cannot be written.
+
+    Side effects:
+        Replaces the file. A temporary file beside it is renamed into place so
+        a crash does not leave a partial document.
+    """
+    if document == "" or not document.endswith("\n"):
+        raise ValueError("Line measurement must end with a newline.")
+    if path.parent != Path("") and not path.parent.exists():
+        raise ValueError(f"Measurement directory {path.parent} does not exist.")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(document, encoding="utf-8")
+    written = temporary.stat().st_size
+    if written != len(document.encode("utf-8")):
+        raise OSError(f"Wrote {written} bytes of the line measurement.")
+    temporary.replace(path)
+
+
+def emit_measurement(
+    path: str,
+    coverage: dict[str, PackageRates],
+    ratchet: Ratchet,
+) -> None:
+    """Write the measurement file when the command asked for one.
+
+    Args:
+        path: ``--measurement`` value. Empty skips the write.
+        coverage: Measured percents from this run.
+        ratchet: Floors from this run.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: A required package is missing or the path cannot be used.
+        OSError: The file cannot be written.
+
+    Side effects:
+        Writes the JSON file when ``path`` is not empty.
+    """
+    if path == "":
+        return
+    write_line_measurement(Path(path), line_measurement_document(coverage, ratchet))
+
+
 def format_summary(
     coverage: dict[str, PackageRates],
     ratchet: Ratchet,
@@ -987,6 +1089,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--baseline", default="")
     parser.add_argument("--source-root", action="append", default=None)
     parser.add_argument("--summary", default="")
+    parser.add_argument("--measurement", default="")
     return parser.parse_args(argv)
 
 
@@ -1266,7 +1369,8 @@ def run_gate(args: argparse.Namespace, env: Mapping[str, str]) -> GateResult:
 
     Side effects:
         Reads Cobertura, ratchet, optional baseline, and source files. May GET
-        the pull-request body.
+        the pull-request body. When ``--measurement`` is set, writes that JSON
+        file from the same percents the floor check uses.
     """
     paths = collect_cobertura(list(args.cobertura), list(args.cobertura_dir))
     coverage = load_cobertura(paths)
@@ -1284,7 +1388,9 @@ def run_gate(args: argparse.Namespace, env: Mapping[str, str]) -> GateResult:
     )
     comparison = collect_ratchet_comparison(coverage, ratchet, baseline, env)
     failure = format_summary(coverage, ratchet, enforce, [*result.problems, *comparison])
-    return apply_ratchet_comparison(result, comparison, comparison_is_hard(env), failure)
+    compared = apply_ratchet_comparison(result, comparison, comparison_is_hard(env), failure)
+    emit_measurement(args.measurement, coverage, ratchet)
+    return compared
 
 
 def main(argv: list[str], env: Mapping[str, str] | None = None) -> int:

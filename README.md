@@ -1,7 +1,7 @@
-[![Download ALog](https://a.fsdn.com/con/app/sf-download-button)](https://sourceforge.net/projects/alog/files/latest/download)
-![GitHub Downloads (all assets, all releases)](https://img.shields.io/github/downloads/chookees/alog/total)
-
 # ALog – A Modern, Modular, Cross-Platform Logger for .NET 10+
+[![CI](https://img.shields.io/github/actions/workflow/status/Chookees/ALog/dotnet.yml?branch=master&label=CI)](https://github.com/Chookees/ALog/actions/workflows/dotnet.yml) [![Coverage](https://raw.githubusercontent.com/Chookees/ALog/badges/coverage-ALog.svg)](https://github.com/Chookees/ALog/actions/workflows/dotnet.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](https://github.com/Chookees/ALog/blob/master/LICENSE) ![.NET 10](https://img.shields.io/badge/.NET-10-512BD4) [![GitHub downloads](https://img.shields.io/github/downloads/chookees/alog/total)](https://github.com/Chookees/ALog/releases)
+
+[![Download ALog](https://a.fsdn.com/con/app/sf-download-button)](https://sourceforge.net/projects/alog/files/latest/download)
 
 **ALog** is a powerful and extensible logging framework built for .NET 10+.  
 It is designed to be simple to use, highly configurable, and ready for modern development across platforms including Windows, Linux, and iOS.
