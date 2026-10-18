@@ -3,8 +3,6 @@
 
 # ALog – A Modern, Modular, Cross-Platform Logger for .NET 10+
 
-[![.NET](https://github.com/Chookees/ALog/actions/workflows/dotnet.yml/badge.svg?branch=master)](https://github.com/Chookees/ALog/actions/workflows/dotnet.yml?query=branch%3Amaster) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/Chookees/ALog/blob/master/LICENSE) [![.NET net10.0](https://img.shields.io/badge/.NET-net10.0-512BD4?logo=dotnet&logoColor=white)](https://github.com/Chookees/ALog/blob/master/ALog/ALog.csproj)
-
 **ALog** is a powerful and extensible logging framework built for .NET 10+.  
 It is designed to be simple to use, highly configurable, and ready for modern development across platforms including Windows, Linux, and iOS.
 
