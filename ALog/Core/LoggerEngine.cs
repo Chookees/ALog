@@ -1,4 +1,8 @@
-﻿namespace ALog.Core;
+﻿// Owns one logger: filters, enrichers, and either direct writers or the single background queue.
+// With a queue, writer disposal belongs to the queue so a call still inside Write is not disposed.
+// Next file: ALog/Core/BackgroundLogQueue.cs.
+
+namespace ALog.Core;
 
 using System;
 using System.Threading.Tasks;
@@ -340,8 +344,9 @@ public class LoggerEngine : ILogger, IDisposable
     }
 
     /// <summary>
-    /// Closes the background queue and disposes writers only after that queue's processor has finished.
-    /// A writer call that is still running at the deadline is left undisposed. A second call waits for the first.
+    /// Closes the background queue. The queue disposes idle writers at its deadline and a writer whose call
+    /// is still running only after that call returns. Without a queue, writers are disposed here.
+    /// A second call waits for the first.
     /// </summary>
     /// <remarks>
     /// Does not throw. Writer dispose failures are written to the error stream.
@@ -358,9 +363,11 @@ public class LoggerEngine : ILogger, IDisposable
 
         try
         {
-            _backgroundQueue?.Dispose();
-            if (_backgroundQueue is not null && !_backgroundQueue.ReleaseWriters)
+            if (_backgroundQueue is not null)
+            {
+                _backgroundQueue.Dispose();
                 return;
+            }
 
             DisposeWriters();
         }
@@ -374,7 +381,7 @@ public class LoggerEngine : ILogger, IDisposable
     /// Disposes every configured writer. A writer that throws does not stop the others.
     /// </summary>
     /// <remarks>
-    /// Does not throw. Called only after the queue processor has left every writer, or when there is no queue.
+    /// Does not throw. Called only when the engine has no background queue. The queue disposes its own writers.
     /// The loop is bounded by the writer list, which does not grow after the engine is built.
     /// </remarks>
     private void DisposeWriters()

@@ -1,7 +1,8 @@
 // Background queue for UseBackgroundQueue (C4).
-// One opt-in queue. A full queue drops the new event and counts it.
-// Shutdown has one close point and a fixed 5 s deadline.
-// Writers are disposed by LoggerEngine only after this processor has finished.
+// One opt-in queue. A full queue drops the new event and counts it (ALOG0070).
+// Shutdown has one close point and a fixed 5 s deadline (ALOG0071).
+// The open ALOG0070 window is written at shutdown. The first event after close is ALOG0072.
+// Idle writers are disposed at the deadline. A call that is still running is not.
 // Next file: ALog/Core/LoggerEngine.cs.
 
 namespace ALog.Core;
@@ -31,8 +32,12 @@ public class BackgroundLogQueue : IDisposable
     /// <summary>Shortest delay before the first full-queue line, so a burst shares one count.</summary>
     private static readonly TimeSpan FirstReportDelay = TimeSpan.FromMilliseconds(1);
 
-    /// <summary>At most one ALOG0070 line per window. The count is everything since the previous line.</summary>
+    /// <summary>At most one ALOG0070 line per window. The count is everything since the previous line. Shutdown flushes the open window early.</summary>
     private static readonly TimeSpan ReportWindow = TimeSpan.FromSeconds(60);
+
+    /// <summary>First event after the close point. Later closed drops are counted and not reported. ALOG0072.</summary>
+    private const string ClosedDropLine =
+        "Event dropped: ALog is shut down (the background queue was closed by Shutdown or Dispose). Later events are counted, not reported. Stop logging before you call Shutdown or Dispose.";
 
     /// <summary>Most events read in one pass. The channel never holds more than its capacity.</summary>
     private const int MaxRead = 100_000;
@@ -48,6 +53,8 @@ public class BackgroundLogQueue : IDisposable
     private readonly TimeProvider _clock;
     private readonly ITimer _reportTimer;
     private readonly object _gate = new();
+    private readonly object _reportGate = new();
+    private readonly WriterGate _writerGate;
     private readonly ManualResetEventSlim _stopped = new(false);
     private readonly ManualResetEventSlim _disposeDone = new(false);
 
@@ -59,6 +66,7 @@ public class BackgroundLogQueue : IDisposable
     private int _stop;
     private int _timerArmed;
     private int _shutdownReported;
+    private int _closedReported;
     private long _accepted;
     private long _written;
     private long _unwritten;
@@ -69,6 +77,7 @@ public class BackgroundLogQueue : IDisposable
     private long _disposeStartTimestamp;
     private bool _closed;
     private bool _frozen;
+    private bool _reportSealed;
 
     /// <summary>
     /// Starts the processor. Defaults are capacity 1000, batch 10, and a 100 ms flush interval.
@@ -138,7 +147,9 @@ public class BackgroundLogQueue : IDisposable
             SingleReader = true,
             SingleWriter = false
         });
-        _dispatcher = new LogDispatcher(writers, settings.AsyncEnabled);
+        var writerList = CopyWriters(writers);
+        _writerGate = new WriterGate(writerList);
+        _dispatcher = new LogDispatcher(writerList, settings.AsyncEnabled, _writerGate);
         _reportTimer = _clock.CreateTimer(
             static state => ((BackgroundLogQueue)state!).DeliverFullDropReport(),
             this,
@@ -241,31 +252,52 @@ public class BackgroundLogQueue : IDisposable
     /// <param name="cancellationToken">When already cancelled, the event is neither accepted nor dropped.</param>
     /// <returns>The decision. Accepted means the channel holds the event and the outstanding count includes it.</returns>
     /// <remarks>
-    /// Does not throw. Does not call a writer. May arm the ALOG0070 timer. The lock is not held while a writer runs.
+    /// Does not throw. Does not call a writer. May arm the ALOG0070 timer. The first event that sees the gate shut
+    /// reports ALOG0072 after the lock is released; later closed drops are only counted. The lock is not held while a writer runs.
     /// </remarks>
     private OfferResult Offer(LogEvent logEvent, CancellationToken cancellationToken)
     {
         if (cancellationToken.IsCancellationRequested)
             return OfferResult.Cancelled;
 
+        OfferResult result;
+        var firstClosed = false;
         lock (_gate)
+            result = DecideUnderGate(logEvent, ref firstClosed);
+
+        if (firstClosed)
+            SelfLog.ReportLine(ClosedDropLine);
+
+        return result;
+    }
+
+    /// <summary>
+    /// Accepts, drops, or closes <paramref name="logEvent"/> while <see cref="_gate"/> is held.
+    /// </summary>
+    /// <param name="logEvent">Event to place on the channel when there is room.</param>
+    /// <param name="firstClosed">Set when this call is the first closed drop for this queue. The caller reports ALOG0072 after releasing the lock.</param>
+    /// <returns>The decision. Closed and full do not queue the event.</returns>
+    /// <remarks>
+    /// Does not throw and does not call SelfLog. The lock is already held. Reporting waits so a SelfLog target can enqueue without taking this lock twice.
+    /// </remarks>
+    private OfferResult DecideUnderGate(LogEvent logEvent, ref bool firstClosed)
+    {
+        if (_closed)
         {
-            if (_closed)
-            {
-                Interlocked.Increment(ref _closedDrops);
-                return OfferResult.Closed;
-            }
-
-            if (_outstanding >= _capacity || !_channel.Writer.TryWrite(logEvent))
-            {
-                NoteFullDrop();
-                return OfferResult.Full;
-            }
-
-            _outstanding++;
-            _accepted++;
-            return OfferResult.Accepted;
+            Interlocked.Increment(ref _closedDrops);
+            firstClosed = Interlocked.CompareExchange(ref _closedReported, 1, 0) == 0;
+            return OfferResult.Closed;
         }
+
+        if (_outstanding >= _capacity || !_channel.Writer.TryWrite(logEvent))
+        {
+            NoteFullDrop();
+            return OfferResult.Full;
+        }
+
+        _outstanding++;
+        _accepted++;
+        return OfferResult.Accepted;
     }
 
     /// <summary>
@@ -327,18 +359,30 @@ public class BackgroundLogQueue : IDisposable
     /// </remarks>
     private void DeliverFullDropReport()
     {
-        var count = Interlocked.Exchange(ref _pendingFullDrops, 0);
-        if (count > 0)
+        lock (_reportGate)
         {
-            var now = _clock.GetUtcNow();
-            Volatile.Write(ref _nextReportTicks, now.UtcTicks + ReportWindow.Ticks);
-            SelfLog.ReportLine(FormatFullDrop(count));
-        }
+            if (_reportSealed)
+            {
+                // Shutdown owns the remainder. A late callback must not write a second line or a line after ALOG0071.
+                Interlocked.Exchange(ref _timerArmed, 0);
+                return;
+            }
 
-        // Drops that arrived after the exchange still see the timer as armed and do not start a second one.
-        Interlocked.Exchange(ref _timerArmed, 0);
-        if (Volatile.Read(ref _pendingFullDrops) > 0)
-            ArmReportTimer();
+            var count = Interlocked.Exchange(ref _pendingFullDrops, 0);
+            if (count > 0)
+            {
+                var now = _clock.GetUtcNow();
+                Volatile.Write(ref _nextReportTicks, now.UtcTicks + ReportWindow.Ticks);
+                // Under the lock so Dispose cannot emit ALOG0071 between this line and the seal.
+                // The target must not call Dispose; a drop re-enters Offer, which does not take this lock.
+                SelfLog.ReportLine(FormatFullDrop(count));
+            }
+
+            // Drops that arrived after the exchange still see the timer as armed and do not start a second one.
+            Interlocked.Exchange(ref _timerArmed, 0);
+            if (Volatile.Read(ref _pendingFullDrops) > 0)
+                ArmReportTimer();
+        }
     }
 
     /// <summary>
@@ -417,14 +461,14 @@ public class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Reads and writes until shutdown closes the gate and the channel is idle, or until the stop flag is set.
-    /// The loop has no numeric cap because it is the life of the logger. It ends when the stop flag is set
-    /// or the gate is closed and nothing is in flight.
+    /// Reads and writes until shutdown closes the gate and the channel is idle, the stop flag is set,
+    /// or the deadline flag says no further writer call may start.
+    /// The loop has no numeric cap because it is the life of the logger. It ends on one of those three conditions.
     /// </summary>
     /// <remarks>
     /// Writer failures are handled inside the dispatcher and do not stop the loop.
     /// A bad flush interval fails the timer and ends the loop. The method runs on the pool after its first await,
-    /// so it is not a foreground thread. It ends when the stop flag is set or the gate is closed and idle.
+    /// so it is not a foreground thread. It ends when the stop flag is set, the deadline flag is set, or the gate is closed and idle.
     /// </remarks>
     private async Task ProcessLogsAsync()
     {
@@ -432,7 +476,7 @@ public class BackgroundLogQueue : IDisposable
         using var timer = new PeriodicTimer(_flushInterval);
         try
         {
-            while (Volatile.Read(ref _stop) == 0)
+            while (Volatile.Read(ref _stop) == 0 && !_writerGate.DeadlineReached)
             {
                 var count = ReadBatch(batch);
                 if (count > 0)
@@ -509,10 +553,13 @@ public class BackgroundLogQueue : IDisposable
             var limit = count;
             for (var i = 0; i < limit; i++)
             {
-                if (Volatile.Read(ref _stop) != 0 || NewWritesBudgetSpent())
+                if (Volatile.Read(ref _stop) != 0 || NewWritesBudgetSpent() || _writerGate.DeadlineReached)
                     return;
 
-                await DispatchOneAsync(batch[i]).ConfigureAwait(false);
+                var completed = await DispatchOneAsync(batch[i]).ConfigureAwait(false);
+                if (!completed)
+                    return;
+
                 CommitWritten();
             }
         }
@@ -540,23 +587,24 @@ public class BackgroundLogQueue : IDisposable
     /// Hands one event to every writer. A writer failure stays on the dispatcher error path.
     /// </summary>
     /// <param name="logEvent">The event. May be the default record value.</param>
+    /// <returns>False when the deadline skipped a writer. That event stays unwritten and is part of ALOG0071.</returns>
     /// <remarks>Does not throw. Allocates nothing beyond what the dispatcher allocates. One event, so the deadline can be checked between events.</remarks>
-    private async Task DispatchOneAsync(LogEvent logEvent)
+    private async Task<bool> DispatchOneAsync(LogEvent logEvent)
     {
+        _writerGate.PrepareEvent();
         try
         {
             if (!_asyncEnabled)
-            {
                 _dispatcher.Dispatch(logEvent);
-                return;
-            }
-
-            await _dispatcher.DispatchAsync(logEvent).ConfigureAwait(false);
+            else
+                await _dispatcher.DispatchAsync(logEvent).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine("[BackgroundLogQueue] Batch processing error: " + ex.GetType().Name);
         }
+
+        return !_writerGate.EventSkipped;
     }
 
     /// <summary>
@@ -758,8 +806,9 @@ public class BackgroundLogQueue : IDisposable
     /// A second call waits until the first call has finished and does not report again.
     /// </summary>
     /// <remarks>
-    /// Does not throw. Does not dispose writers. <see cref="ReleaseWriters"/> tells the engine whether it may.
-    /// The wait is at most <see cref="ShutdownDeadline"/>. Events offered after the close are counted and not written.
+    /// Does not throw. Disposes writers that have no call running. A call still running at the deadline is left for
+    /// <see cref="WriterGate.EndWriterCall"/>, which disposes that writer only after the call returns.
+    /// The wait is at most <see cref="ShutdownDeadline"/>. Events offered after the close are counted, and the first one reports ALOG0072.
     /// </remarks>
     public void Dispose()
     {
@@ -780,6 +829,8 @@ public class BackgroundLogQueue : IDisposable
             _ = _channel.Writer.TryComplete();
             SignalProcessor();
             WaitForProcessor(NewWriteBudget);
+            // Stop new writer calls before the last slice of the deadline, including writers listed after a slow call.
+            _writerGate.MarkDeadline();
             if (!_stopped.IsSet)
             {
                 Volatile.Write(ref _stop, 1);
@@ -811,32 +862,26 @@ public class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Freezes the written count, emits ALOG0071 once when events remain, and releases resources the processor has left.
+    /// Freezes the written count, flushes ALOG0070, emits ALOG0071 once when events remain, and disposes idle writers.
     /// </summary>
     /// <remarks>
-    /// Does not throw. Does not dispose writers. A processor that is still inside a writer call keeps its wait sources,
+    /// Does not throw. A processor that is still inside a writer call keeps its wait sources,
     /// because disposing them would race that call. ALOG0071 is not emitted for a clean drain.
+    /// ALOG0070 for the open window is written before ALOG0071, even when the 60 s window has not ended.
     /// </remarks>
     private void PublishOutcome()
     {
         var ended = _stopped.IsSet;
-        long unwritten;
-        lock (_gate)
-        {
-            _frozen = true;
-            unwritten = _accepted - _written;
-            _unwritten = unwritten;
-        }
-
+        var unwritten = FreezeUnwritten();
+        PublishReports(unwritten);
         ReleaseWriters = ended;
-        if (unwritten > 0 && Interlocked.Exchange(ref _shutdownReported, 1) == 0)
-            SelfLog.ReportLine(FormatShutdown(unwritten));
 
         // Observe the processor so a fault is not an unobserved task exception. The deadline wait is the event above.
         if (_backgroundTask.IsFaulted)
             _ = _backgroundTask.Exception;
 
         _reportTimer.Dispose();
+        _writerGate.DisposeIdleWriters();
 
         if (!ended)
             return;
@@ -844,6 +889,76 @@ public class BackgroundLogQueue : IDisposable
         DisposeQuiet(_shutdownSignal);
         DisposeQuiet(_wakeCts);
         _stopped.Dispose();
+    }
+
+    /// <summary>
+    /// Snapshots accepted events that have not been committed. Later commits do not change the snapshot.
+    /// </summary>
+    /// <returns>The unwritten count. Zero when every accepted event was committed before the snapshot.</returns>
+    /// <remarks>Does not throw. Takes <see cref="_gate"/>. Called once from the winning <see cref="Dispose"/>.</remarks>
+    private long FreezeUnwritten()
+    {
+        lock (_gate)
+        {
+            _frozen = true;
+            var unwritten = _accepted - _written;
+            _unwritten = unwritten;
+            return unwritten;
+        }
+    }
+
+    /// <summary>
+    /// Writes the open ALOG0070 window, then ALOG0071 when <paramref name="unwritten"/> is positive.
+    /// A timer callback that arrives during this call sees the seal and writes nothing.
+    /// </summary>
+    /// <param name="unwritten">Accepted events still outstanding. Zero writes no ALOG0071. Negative is treated as zero.</param>
+    /// <remarks>
+    /// Does not throw. Holds <see cref="_reportGate"/> across both lines so they cannot be reordered.
+    /// A second <see cref="Dispose"/> does not call this. No drops writes no ALOG0070.
+    /// </remarks>
+    private void PublishReports(long unwritten)
+    {
+        lock (_reportGate)
+        {
+            _reportSealed = true;
+            PublishPendingFullDrops();
+            if (unwritten > 0 && Interlocked.Exchange(ref _shutdownReported, 1) == 0)
+                SelfLog.ReportLine(FormatShutdown(unwritten));
+        }
+
+        // Covers the sealed callback path and drops a callback that lost the race for the lock.
+        DeliverFullDropReport();
+    }
+
+    /// <summary>
+    /// Writes one ALOG0070 line for drops still waiting in the open window. Zero writes nothing.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. The caller holds <see cref="_reportGate"/>. The count is removed with an exchange so a timer callback cannot report it too.
+    /// </remarks>
+    private void PublishPendingFullDrops()
+    {
+        var count = Interlocked.Exchange(ref _pendingFullDrops, 0);
+        if (count <= 0)
+            return;
+
+        SelfLog.ReportLine(FormatFullDrop(count));
+    }
+
+    /// <summary>
+    /// Copies <paramref name="writers"/> so the dispatcher and the dispose gate share one list and one order.
+    /// </summary>
+    /// <param name="writers">Configured writers. Null throws. The list is not retained.</param>
+    /// <returns>A new list of the same instances, in the same order. Empty when the source is empty.</returns>
+    /// <remarks>Does not throw for an empty list. Called once from the constructor. The loop is bounded by the source count.</remarks>
+    private static List<ILogWriter> CopyWriters(IReadOnlyList<ILogWriter> writers)
+    {
+        ArgumentNullException.ThrowIfNull(writers);
+        var copy = new List<ILogWriter>(writers.Count);
+        for (var i = 0; i < writers.Count; i++)
+            copy.Add(writers[i]);
+
+        return copy;
     }
 
     /// <summary>
@@ -906,5 +1021,136 @@ public class BackgroundLogQueue : IDisposable
 
         /// <summary>Clock for the full-queue report. The shutdown deadline does not use it.</summary>
         internal TimeProvider Clock { get; }
+    }
+
+    /// <summary>
+    /// Tracks which writer call is running and disposes writers that are idle after the shutdown deadline.
+    /// A writer is disposed only when no call to it is running, so Dispose never overlaps Write.
+    /// </summary>
+    private sealed class WriterGate : IWriterCallGate
+    {
+        private readonly IReadOnlyList<ILogWriter> _writers;
+        private readonly int[] _inFlight;
+        private readonly int[] _disposed;
+        private int _deadline;
+        private int _skipped;
+
+        /// <summary>
+        /// Allocates one in-flight slot and one disposed slot per writer.
+        /// </summary>
+        /// <param name="writers">The dispatcher list. Not null. Not mutated. May be empty.</param>
+        /// <remarks>Does not throw. The arrays are fixed for the life of the queue. Called once from the constructor.</remarks>
+        internal WriterGate(IReadOnlyList<ILogWriter> writers)
+        {
+            _writers = writers;
+            _inFlight = new int[writers.Count];
+            _disposed = new int[writers.Count];
+        }
+
+        /// <summary>True after <see cref="MarkDeadline"/>. The processor must not start another writer call.</summary>
+        internal bool DeadlineReached => Volatile.Read(ref _deadline) != 0;
+
+        /// <summary>True when the event just dispatched skipped at least one writer because the deadline had passed.</summary>
+        internal bool EventSkipped => Volatile.Read(ref _skipped) != 0;
+
+        /// <summary>
+        /// Clears the skip flag for the next event.
+        /// </summary>
+        /// <remarks>Does not throw. Called on the processor before each event so an earlier skip cannot mark a later event.</remarks>
+        internal void PrepareEvent()
+        {
+            Interlocked.Exchange(ref _skipped, 0);
+        }
+
+        /// <summary>
+        /// Stops new writer calls. Idle writers can be disposed after this.
+        /// </summary>
+        /// <remarks>Does not throw. Safe to call more than once. Does not dispose by itself.</remarks>
+        internal void MarkDeadline()
+        {
+            Volatile.Write(ref _deadline, 1);
+        }
+
+        /// <inheritdoc />
+        public bool BeginWriterCall(int index)
+        {
+            if ((uint)index >= (uint)_inFlight.Length)
+                return false;
+
+            // Mark busy first. Shutdown then either sees the call and leaves the writer, or the recheck below skips the call.
+            Interlocked.Exchange(ref _inFlight[index], 1);
+            if (Volatile.Read(ref _deadline) == 0)
+                return true;
+
+            Interlocked.Exchange(ref _inFlight[index], 0);
+            Interlocked.Exchange(ref _skipped, 1);
+            DisposeIfIdle(index);
+            return false;
+        }
+
+        /// <inheritdoc />
+        public void EndWriterCall(int index)
+        {
+            if ((uint)index >= (uint)_inFlight.Length)
+                return;
+
+            Interlocked.Exchange(ref _inFlight[index], 0);
+            if (Volatile.Read(ref _deadline) != 0)
+                DisposeIfIdle(index);
+        }
+
+        /// <summary>
+        /// Disposes every writer that has no call running. A writer inside Write is left until <see cref="EndWriterCall"/>.
+        /// </summary>
+        /// <remarks>
+        /// Does not throw. Marks the deadline first. The loop is bounded by the writer list.
+        /// shortcut: writers listed after a call that is still running are not invoked until that call returns; their events stay in the ALOG0071 count. Per-writer queues are P1.
+        /// </remarks>
+        internal void DisposeIdleWriters()
+        {
+            MarkDeadline();
+            // shortcut: one shared queue calls writers in list order; a call that is still running blocks later writers until per-writer queues (P1). Those events stay in the ALOG0071 count.
+            var count = _inFlight.Length;
+            for (var i = 0; i < count; i++)
+            {
+                if (Volatile.Read(ref _inFlight[i]) != 0)
+                    continue;
+
+                DisposeIfIdle(i);
+            }
+        }
+
+        /// <summary>
+        /// Disposes writer <paramref name="index"/> when it is idle and has not already been disposed.
+        /// </summary>
+        /// <param name="index">Position in <see cref="_writers"/>. Must be inside the list.</param>
+        /// <remarks>
+        /// Does not throw. A writer dispose failure is written to the error stream and the other writers still run.
+        /// The disposed flag is taken with an exchange so two threads cannot dispose the same writer.
+        /// </remarks>
+        private void DisposeIfIdle(int index)
+        {
+            if (Volatile.Read(ref _deadline) == 0)
+                return;
+
+            if (Volatile.Read(ref _inFlight[index]) != 0)
+                return;
+
+            if (Interlocked.CompareExchange(ref _disposed[index], 1, 0) != 0)
+                return;
+
+            var writer = _writers[index];
+            if (writer is null)
+                return;
+
+            try
+            {
+                writer.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[LoggerEngine] Writer dispose failed: " + ex);
+            }
+        }
     }
 }

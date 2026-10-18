@@ -14,7 +14,7 @@ namespace ALog.Tests;
 /// <summary>
 /// The C4 queue contract. Overflow drops, shutdown reports the remainder, and a batch continues after a throw.
 /// </summary>
-public sealed class C4QueueFixTests
+public sealed partial class C4QueueFixTests
 {
     private const string DropMarker = " events dropped: the background queue is full (capacity ";
     private const string DeadlinePrefix = "Shutdown deadline of 5 s reached: ";
@@ -22,7 +22,7 @@ public sealed class C4QueueFixTests
 
     /// <summary>
     /// Capacity 100 and 1000 writes drop 900 immediately, then one ALOG0070 line carries 900.
-    /// Flush while the writer is blocked stays silent: no ALOG0071.
+    /// The 10 ms bound is measured after the first call. Flush while the writer is blocked stays silent: no ALOG0071.
     /// </summary>
     /// <returns>A task that finishes after flush and dispose.</returns>
     [Fact(Timeout = 20000)]
@@ -50,6 +50,10 @@ public sealed class C4QueueFixTests
             {
                 var started = Stopwatch.GetTimestamp();
                 queue.TryEnqueue(Event("n-" + i.ToString(CultureInfo.InvariantCulture)));
+                // C4-01: the 10 ms limit is warm. The first call in the process may pay for JIT.
+                if (i == 0)
+                    continue;
+
                 var elapsed = Stopwatch.GetElapsedTime(started);
                 if (elapsed > slowest)
                     slowest = elapsed;
@@ -86,6 +90,7 @@ public sealed class C4QueueFixTests
 
     /// <summary>
     /// Each WriteAsync on a full queue is already complete when the call returns.
+    /// The 10 ms bound starts at the second call.
     /// </summary>
     /// <returns>A task that finishes after the overflow calls.</returns>
     [Fact(Timeout = 15000)]
@@ -104,7 +109,10 @@ public sealed class C4QueueFixTests
             {
                 var started = Stopwatch.GetTimestamp();
                 var pending = queue.EnqueueAsync(Event("a-" + i.ToString(CultureInfo.InvariantCulture)));
-                Assert.True(Stopwatch.GetElapsedTime(started) < TimeSpan.FromMilliseconds(10));
+                // C4-01: the 10 ms limit is warm. The first call in the process may pay for JIT.
+                if (i > 0)
+                    Assert.True(Stopwatch.GetElapsedTime(started) < TimeSpan.FromMilliseconds(10));
+
                 Assert.True(pending.IsCompletedSuccessfully);
             }
 
@@ -198,7 +206,7 @@ public sealed class C4QueueFixTests
     /// <summary>
     /// A 10 ms writer and 1,000 queued events return inside 5.2 s with one ALOG0071 line.
     /// Written plus the reported remainder is 1,000. A fast writer of 100,000 events reports nothing.
-    /// Flush after dispose does not add a line.
+    /// Flush after dispose does not add a line. A log after dispose adds one ALOG0072 and no second ALOG0071.
     /// </summary>
     /// <returns>A task that finishes after both engines shut down.</returns>
     [Fact(Timeout = 60000)]
@@ -240,7 +248,11 @@ public sealed class C4QueueFixTests
             engine.Dispose();
             engine.Log("after-shutdown", LogLevel.Info);
             lock (lines)
-                Assert.Single(lines);
+            {
+                Assert.Equal(2, lines.Count);
+                Assert.StartsWith(DeadlinePrefix, lines[0], StringComparison.Ordinal);
+                Assert.Equal(ClosedLine, lines[1]);
+            }
         }
         finally
         {
@@ -347,7 +359,7 @@ public sealed class C4QueueFixTests
 
     /// <summary>
     /// Shutdown twice in a row, and twice in parallel, does not throw, reports ALOG0071 at most once,
-    /// and does not write after the writer is disposed.
+    /// reports ALOG0072 once for a later write, and does not write after the writer is disposed.
     /// </summary>
     /// <returns>A task that finishes after the parallel shutdown.</returns>
     [Fact(Timeout = 30000)]
@@ -375,7 +387,11 @@ public sealed class C4QueueFixTests
             sequential.Log("after", LogLevel.Info);
             Assert.Equal(0, slow.WritesAfterDispose);
             lock (lines)
-                Assert.Single(lines);
+            {
+                Assert.Equal(2, lines.Count);
+                Assert.StartsWith(DeadlinePrefix, lines[0], StringComparison.Ordinal);
+                Assert.Equal(ClosedLine, lines[1]);
+            }
         }
         finally
         {
@@ -405,7 +421,11 @@ public sealed class C4QueueFixTests
             parallel.Log("after", LogLevel.Info);
             Assert.False(hanging.Disposed);
             lock (lines)
-                Assert.Single(lines);
+            {
+                Assert.Equal(2, lines.Count);
+                Assert.StartsWith(DeadlinePrefix, lines[0], StringComparison.Ordinal);
+                Assert.Equal(ClosedLine, lines[1]);
+            }
         }
         finally
         {
