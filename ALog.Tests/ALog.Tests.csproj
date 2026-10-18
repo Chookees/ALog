@@ -31,6 +31,10 @@
   <ItemGroup>
     <ProjectReference Include="..\ALog\ALog.csproj" />
     <ProjectReference Include="..\ALog.Extensions.Logging\ALog.Extensions.Logging.csproj" />
+    <!-- Built with the tests so the hang probe exists before the child-process test starts it. Not a test assembly. -->
+    <ProjectReference Include="..\eng\c4-hang-probe\ALog.HangProbe.csproj">
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
   </ItemGroup>
 
 </Project>

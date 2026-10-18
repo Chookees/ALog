@@ -337,6 +337,64 @@ public sealed class MelNoThrowTests : IDisposable
     }
 
     /// <summary>
+    /// A message that ends with a period and a space is trimmed before the sentence period,
+    /// so the line reads <c>x. ALog wrote</c> and not <c>x. . ALog wrote</c>.
+    /// </summary>
+    /// <remarks>No I/O. U-C4-03. The space is whitespace, removed together with the period.</remarks>
+    [Fact]
+    public void MessageEndingWithPeriodAndSpace_IsOneSentence()
+    {
+        var lines = new List<string>();
+        using var harness = new Harness("QA.Trail", lines);
+
+        harness.Log("state", null, (_, _) => throw new InvalidOperationException("x. "));
+
+        AssertNoCallerError(harness);
+        Assert.Equal(
+            "A log message from category 'QA.Trail' could not be formatted: InvalidOperationException: x" + SentenceTail,
+            Assert.Single(Reports(lines)));
+    }
+
+    /// <summary>
+    /// A message that ends with a period and a newline is trimmed the same way as a trailing space.
+    /// The newline is whitespace, so <c>x.\n</c> also reads <c>x. ALog wrote</c>.
+    /// </summary>
+    /// <remarks>No I/O. U-C4-03. The newline is flattened and then removed with the period.</remarks>
+    [Fact]
+    public void MessageEndingWithPeriodAndNewline_IsOneSentence()
+    {
+        var lines = new List<string>();
+        using var harness = new Harness("QA.Nl", lines);
+
+        harness.Log("state", null, (_, _) => throw new InvalidOperationException("x.\n"));
+
+        AssertNoCallerError(harness);
+        Assert.Equal(
+            "A log message from category 'QA.Nl' could not be formatted: InvalidOperationException: x" + SentenceTail,
+            Assert.Single(Reports(lines)));
+    }
+
+    /// <summary>
+    /// A message that is only periods and whitespace becomes <c>(no message)</c>
+    /// so the sentence does not collapse into a bare colon.
+    /// </summary>
+    /// <remarks>No I/O. U-C4-03. Spaces, newlines, and periods are stripped together.</remarks>
+    [Fact]
+    public void MessageThatIsOnlyPeriodsAndWhitespace_UsesNoMessage()
+    {
+        var lines = new List<string>();
+        using var harness = new Harness("QA.Empty", lines);
+
+        harness.Log("state", null, (_, _) => throw new InvalidOperationException(" \n. \t."));
+
+        AssertNoCallerError(harness);
+        Assert.Equal(
+            "A log message from category 'QA.Empty' could not be formatted: InvalidOperationException: (no message)"
+                + SentenceTail,
+            Assert.Single(Reports(lines)));
+    }
+
+    /// <summary>
     /// A two-million-character exception message is cut to 500 characters and marked
     /// <c> [truncated]</c>. The diagnostic line stays under 700 characters, and the event is still written.
     /// </summary>
@@ -742,7 +800,7 @@ public sealed class MelNoThrowTests : IDisposable
 
     /// <summary>
     /// A broken exception message still produces ALOG0022 and the event.
-    /// A null message and a throwing message both become empty text in the sentence.
+    /// A null message and a throwing message both become <c>(no message)</c> in the sentence.
     /// A null error is ignored. <see cref="SelfLog.ReportLine"/> ignores null and empty.
     /// A null category is written as an empty name.
     /// </summary>
@@ -782,8 +840,8 @@ public sealed class MelNoThrowTests : IDisposable
             Assert.Equal("kept", harness.Writer.Events[1].Message);
             var reports = Reports(lines);
             Assert.Equal(3, reports.Count);
-            Assert.Equal(Expected("QA.BadMessage", "ThrowingMessageException", string.Empty), reports[1]);
-            Assert.Equal(Expected("QA.NullMessage", "NullMessageException", string.Empty), reports[2]);
+            Assert.Equal(Expected("QA.BadMessage", "ThrowingMessageException", "(no message)"), reports[1]);
+            Assert.Equal(Expected("QA.NullMessage", "NullMessageException", "(no message)"), reports[2]);
             Assert.DoesNotContain("\n", reports[1], StringComparison.Ordinal);
         }
         finally

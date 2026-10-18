@@ -183,6 +183,7 @@ public sealed class CoverageEngineTests : IDisposable
 
     /// <summary>
     /// Direct queue calls cover dispose, a second dispose, and a batch whose writer throws.
+    /// An enqueue after dispose completes successfully and is counted as a closed drop. It does not throw.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task Queue_Dispose_RejectsLaterEnqueue_AndBatchErrorsStayInside()
@@ -197,7 +198,8 @@ public sealed class CoverageEngineTests : IDisposable
         await queue.FlushAsync();
         queue.Dispose();
         Assert.False(queue.TryEnqueue(Event("two")));
-        await Assert.ThrowsAsync<ObjectDisposedException>(async () => await queue.EnqueueAsync(Event("three")));
+        var rejected = queue.EnqueueAsync(Event("three"));
+        Assert.True(rejected.IsCompletedSuccessfully);
         await queue.FlushAsync();
         queue.Dispose();
     }

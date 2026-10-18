@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Threading.Channels;
@@ -329,13 +330,14 @@ public sealed class SyncWriteContractTests
     }
 
     /// <summary>
-    /// A full channel returns false from <see cref="BackgroundLogQueue.TryEnqueue"/> after five seconds.
+    /// A full queue returns false from <see cref="BackgroundLogQueue.TryEnqueue"/> immediately.
+    /// The event is counted as a drop. The caller does not wait out the shutdown deadline.
     /// </summary>
     /// <remarks>
-    /// The reader is blocked inside the writer, so the extra event cannot be accepted.
-    /// The wait is the production bound. The writer is released afterwards.
+    /// The reader is blocked inside the writer, so the outstanding count stays at capacity.
+    /// The writer is released afterwards so dispose can finish.
     /// </remarks>
-    /// <returns>A task that finishes after the timed enqueue returns false.</returns>
+    /// <returns>A task that finishes after the overflow enqueue returns false.</returns>
     [Fact(Timeout = 30000)]
     public async Task Queue_TryEnqueue_ReturnsFalseWhenTheWaitExpires()
     {
@@ -354,11 +356,11 @@ public sealed class SyncWriteContractTests
                 await Task.Delay(10);
 
             Assert.True(writer.EnteredCount > 0);
-            Assert.True(queue.TryEnqueue(Event("fills")));
-            var started = DateTime.UtcNow;
+            var started = Stopwatch.StartNew();
             var accepted = queue.TryEnqueue(Event("overflow"));
             Assert.False(accepted);
-            Assert.True(DateTime.UtcNow - started >= TimeSpan.FromSeconds(4));
+            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(50), "elapsed " + started.Elapsed.ToString());
+            Assert.Equal(1, queue.FullDropCount);
         }
         finally
         {
@@ -368,11 +370,12 @@ public sealed class SyncWriteContractTests
     }
 
     /// <summary>
-    /// Closing the channel while a capacity wait is in progress returns false.
+    /// An enqueue after the queue has closed returns false without throwing.
+    /// Dispose while a writer call is still running returns inside the deadline.
     /// </summary>
     /// <remarks>
-    /// Dispose completes the channel. The waiting enqueue treats that as "not accepted"
-    /// and does not throw. The blocked writer is released so dispose can finish.
+    /// The blocked writer is released after the deadline assertions so the processor can leave.
+    /// A second dispose waits for the first and does not throw.
     /// </remarks>
     /// <returns>A task that finishes after dispose returns.</returns>
     [Fact(Timeout = 30000)]
@@ -385,7 +388,6 @@ public sealed class SyncWriteContractTests
             batchSize: 1,
             flushInterval: TimeSpan.FromSeconds(30),
             asyncEnabled: false);
-        Task<bool>? overflow = null;
         Task? disposing = null;
         try
         {
@@ -395,21 +397,21 @@ public sealed class SyncWriteContractTests
                 await Task.Delay(10);
 
             Assert.True(writer.EnteredCount > 0);
-            Assert.True(queue.TryEnqueue(Event("fills")));
-            overflow = Task.Run(() => queue.TryEnqueue(Event("closing")));
-            await Task.Delay(300);
-            Assert.False(overflow.IsCompleted);
+            var started = Stopwatch.StartNew();
             disposing = Task.Run(() => queue.Dispose());
-            var accepted = await overflow.WaitAsync(TimeSpan.FromSeconds(3));
+            var accepted = queue.TryEnqueue(Event("closing"));
             Assert.False(accepted);
+            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(50), "elapsed " + started.Elapsed.ToString());
+            await disposing.WaitAsync(TimeSpan.FromSeconds(8));
+            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(5200), "dispose " + started.Elapsed.ToString());
+            Assert.False(queue.TryEnqueue(Event("after")));
+            queue.Dispose();
         }
         finally
         {
             writer.Release();
             if (disposing is not null)
                 await disposing.WaitAsync(TimeSpan.FromSeconds(8));
-            else
-                queue.Dispose();
         }
     }
 

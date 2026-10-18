@@ -104,14 +104,19 @@ public static class Log
         }
     }
 
+    /// <summary>
+    /// Disposes the current engine, if there is one, and drops the reference.
+    /// A second call disposes nothing. The caller that wins the exchange runs Dispose.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Writes that still hold the old reference reach the engine, which drops them after the queue closes.
+    /// A write that arrives after the reference is cleared throws the same "call Init" exception as a write before the first Init.
+    /// </remarks>
     public static void Shutdown()
     {
-        if (_logger is IDisposable disposable)
-        {
+        var logger = Interlocked.Exchange(ref _logger, null);
+        if (logger is IDisposable disposable)
             disposable.Dispose();
-        }
-
-        _logger = null;
     }
 
     public static void Reset() => Shutdown();

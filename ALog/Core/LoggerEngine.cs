@@ -1,4 +1,8 @@
-﻿namespace ALog.Core;
+﻿// Owns one logger: filters, enrichers, and either direct writers or the single background queue.
+// With a queue, writer disposal belongs to the queue so a call still inside Write is not disposed.
+// Next file: ALog/Core/BackgroundLogQueue.cs.
+
+namespace ALog.Core;
 
 using System;
 using System.Threading.Tasks;
@@ -12,7 +16,8 @@ public class LoggerEngine : ILogger, IDisposable
     private readonly LogDispatcher _dispatcher;
     private readonly BackgroundLogQueue? _backgroundQueue;
     private readonly MinimumLevelCache _levels;
-    private bool _disposed;
+    private readonly ManualResetEventSlim _disposeDone = new(false);
+    private int _disposeOnce;
 
     public LoggerEngine(ILogConfiguration config)
     {
@@ -324,6 +329,12 @@ public class LoggerEngine : ILogger, IDisposable
         }
     }
 
+    /// <summary>
+    /// The background queue when one was configured. Null when the queue is off.
+    /// Tests read the accept and drop counts. Production callers use <see cref="FlushAsync"/> and <see cref="Dispose"/>.
+    /// </summary>
+    internal BackgroundLogQueue? Queue => _backgroundQueue;
+
     public async Task FlushAsync()
     {
         if (_backgroundQueue != null)
@@ -332,16 +343,56 @@ public class LoggerEngine : ILogger, IDisposable
         }
     }
 
+    /// <summary>
+    /// Closes the background queue. The queue disposes idle writers at its deadline and a writer whose call
+    /// is still running only after that call returns. Without a queue, writers are disposed here.
+    /// A second call waits for the first.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Writer dispose failures are written to the error stream.
+    /// Without a queue, writers are disposed immediately, as they were before the queue deadline existed.
+    /// The wait for a second call is the same 5 s bound as the queue deadline.
+    /// </remarks>
     public void Dispose()
     {
-        if (_disposed)
-            return;
-
-        _disposed = true;
-        _backgroundQueue?.Dispose();
-
-        foreach (var writer in _config.Writers)
+        if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
         {
+            _ = _disposeDone.Wait(TimeSpan.FromSeconds(5));
+            return;
+        }
+
+        try
+        {
+            if (_backgroundQueue is not null)
+            {
+                _backgroundQueue.Dispose();
+                return;
+            }
+
+            DisposeWriters();
+        }
+        finally
+        {
+            _disposeDone.Set();
+        }
+    }
+
+    /// <summary>
+    /// Disposes every configured writer. A writer that throws does not stop the others.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Called only when the engine has no background queue. The queue disposes its own writers.
+    /// The loop is bounded by the writer list, which does not grow after the engine is built.
+    /// </remarks>
+    private void DisposeWriters()
+    {
+        var writers = _config.Writers;
+        for (var i = 0; i < writers.Count; i++)
+        {
+            var writer = writers[i];
+            if (writer is null)
+                continue;
+
             try
             {
                 writer.Dispose();
