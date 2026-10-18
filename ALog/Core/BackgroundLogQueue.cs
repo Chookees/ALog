@@ -1025,26 +1025,22 @@ public class BackgroundLogQueue : IDisposable
 
     /// <summary>
     /// Tracks which writer call is running and disposes writers that are idle after the shutdown deadline.
-    /// A writer is disposed only when no call to it is running, so Dispose never overlaps Write.
+    /// The same instance registered twice shares one slot, so it is disposed only when none of those calls is running, and only once.
     /// </summary>
     private sealed class WriterGate : IWriterCallGate
     {
-        private readonly IReadOnlyList<ILogWriter> _writers;
-        private readonly int[] _inFlight;
-        private readonly int[] _disposed;
+        private readonly WriterSlot[] _slots;
         private int _deadline;
         private int _skipped;
 
         /// <summary>
-        /// Allocates one in-flight slot and one disposed slot per writer.
+        /// Builds one slot per registration. Registrations of the same instance share that slot.
         /// </summary>
-        /// <param name="writers">The dispatcher list. Not null. Not mutated. May be empty.</param>
-        /// <remarks>Does not throw. The arrays are fixed for the life of the queue. Called once from the constructor.</remarks>
+        /// <param name="writers">The dispatcher list. Not null. Not mutated. May be empty. Duplicates are kept.</param>
+        /// <remarks>Does not throw. Reference equality decides which registrations share a slot. Called once from the constructor.</remarks>
         internal WriterGate(IReadOnlyList<ILogWriter> writers)
         {
-            _writers = writers;
-            _inFlight = new int[writers.Count];
-            _disposed = new int[writers.Count];
+            _slots = BuildSlots(writers);
         }
 
         /// <summary>True after <see cref="MarkDeadline"/>. The processor must not start another writer call.</summary>
@@ -1074,83 +1070,153 @@ public class BackgroundLogQueue : IDisposable
         /// <inheritdoc />
         public bool BeginWriterCall(int index)
         {
-            if ((uint)index >= (uint)_inFlight.Length)
+            if ((uint)index >= (uint)_slots.Length)
                 return false;
 
-            // Mark busy first. Shutdown then either sees the call and leaves the writer, or the recheck below skips the call.
-            Interlocked.Exchange(ref _inFlight[index], 1);
+            var slot = _slots[index];
+            // Mark the instance busy first. Shutdown then either sees the call and leaves it, or the recheck below skips the call.
+            slot.Enter();
             if (Volatile.Read(ref _deadline) == 0)
                 return true;
 
-            Interlocked.Exchange(ref _inFlight[index], 0);
+            slot.Leave();
             Interlocked.Exchange(ref _skipped, 1);
-            DisposeIfIdle(index);
+            DisposeIfIdle(slot);
             return false;
         }
 
         /// <inheritdoc />
         public void EndWriterCall(int index)
         {
-            if ((uint)index >= (uint)_inFlight.Length)
+            if ((uint)index >= (uint)_slots.Length)
                 return;
 
-            Interlocked.Exchange(ref _inFlight[index], 0);
+            var slot = _slots[index];
+            slot.Leave();
             if (Volatile.Read(ref _deadline) != 0)
-                DisposeIfIdle(index);
+                DisposeIfIdle(slot);
         }
 
         /// <summary>
-        /// Disposes every writer that has no call running. A writer inside Write is left until <see cref="EndWriterCall"/>.
+        /// Disposes every instance that has no call running through any registration.
+        /// A call that is still inside Write is left until <see cref="EndWriterCall"/>.
         /// </summary>
         /// <remarks>
-        /// Does not throw. Marks the deadline first. The loop is bounded by the writer list.
+        /// Does not throw. Marks the deadline first. The loop is bounded by the registration list.
         /// shortcut: writers listed after a call that is still running are not invoked until that call returns; their events stay in the ALOG0071 count. Per-writer queues are P1.
         /// </remarks>
         internal void DisposeIdleWriters()
         {
             MarkDeadline();
             // shortcut: one shared queue calls writers in list order; a call that is still running blocks later writers until per-writer queues (P1). Those events stay in the ALOG0071 count.
-            var count = _inFlight.Length;
+            var count = _slots.Length;
             for (var i = 0; i < count; i++)
-            {
-                if (Volatile.Read(ref _inFlight[i]) != 0)
-                    continue;
-
-                DisposeIfIdle(i);
-            }
+                DisposeIfIdle(_slots[i]);
         }
 
         /// <summary>
-        /// Disposes writer <paramref name="index"/> when it is idle and has not already been disposed.
+        /// Disposes <paramref name="slot"/> when no registration of that instance is inside a call, and only once.
         /// </summary>
-        /// <param name="index">Position in <see cref="_writers"/>. Must be inside the list.</param>
+        /// <param name="slot">The shared instance slot. Not null.</param>
         /// <remarks>
-        /// Does not throw. A writer dispose failure is written to the error stream and the other writers still run.
-        /// The disposed flag is taken with an exchange so two threads cannot dispose the same writer.
+        /// Does not throw. A writer dispose failure is written to the error stream and the other instances still run.
+        /// The disposed flag is taken once per instance, so a second registration cannot dispose it again.
         /// </remarks>
-        private void DisposeIfIdle(int index)
+        private void DisposeIfIdle(WriterSlot slot)
         {
             if (Volatile.Read(ref _deadline) == 0)
                 return;
 
-            if (Volatile.Read(ref _inFlight[index]) != 0)
+            if (slot.InFlight != 0)
                 return;
 
-            if (Interlocked.CompareExchange(ref _disposed[index], 1, 0) != 0)
+            if (!slot.TryMarkDisposed())
                 return;
 
-            var writer = _writers[index];
-            if (writer is null)
+            if (slot.Writer is null)
                 return;
 
             try
             {
-                writer.Dispose();
+                slot.Writer.Dispose();
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine("[LoggerEngine] Writer dispose failed: " + ex);
             }
+        }
+
+        /// <summary>
+        /// One slot per distinct instance, in registration order. Later copies of an instance point at the earlier slot.
+        /// </summary>
+        /// <param name="writers">Registrations. Not null. The same reference may appear more than once.</param>
+        /// <returns>One entry per registration. Empty when there are no writers.</returns>
+        /// <remarks>Does not throw. Both loops are bounded by the registration count. Reference equality is the match.</remarks>
+        private static WriterSlot[] BuildSlots(IReadOnlyList<ILogWriter> writers)
+        {
+            var unique = new WriterSlot[writers.Count];
+            var uniqueCount = 0;
+            var slots = new WriterSlot[writers.Count];
+            for (var i = 0; i < writers.Count; i++)
+            {
+                WriterSlot? match = null;
+                for (var j = 0; j < uniqueCount; j++)
+                {
+                    if (ReferenceEquals(unique[j].Writer, writers[i]))
+                    {
+                        match = unique[j];
+                        break;
+                    }
+                }
+
+                if (match is null)
+                {
+                    match = new WriterSlot(writers[i]);
+                    unique[uniqueCount] = match;
+                    uniqueCount++;
+                }
+
+                slots[i] = match;
+            }
+
+            return slots;
+        }
+
+        /// <summary>
+        /// The in-flight count and the single dispose flag for one writer instance.
+        /// </summary>
+        private sealed class WriterSlot
+        {
+            private int _inFlight;
+            private int _disposed;
+
+            /// <summary>
+            /// Stores the instance the registrations share.
+            /// </summary>
+            /// <param name="writer">The instance. May be null when a registration was null.</param>
+            /// <remarks>Does not throw. Called once per distinct instance while the gate is built.</remarks>
+            internal WriterSlot(ILogWriter writer) => Writer = writer;
+
+            /// <summary>The registered instance. Null when the registration was null.</summary>
+            internal ILogWriter Writer { get; }
+
+            /// <summary>Calls currently inside Write across every registration of this instance. Zero means idle.</summary>
+            internal int InFlight => Volatile.Read(ref _inFlight);
+
+            /// <summary>Counts one call as running. Paired with <see cref="Leave"/>.</summary>
+            /// <remarks>Does not throw. Safe from the processor and from shutdown.</remarks>
+            internal void Enter() => Interlocked.Increment(ref _inFlight);
+
+            /// <summary>Counts one call as finished.</summary>
+            /// <remarks>Does not throw. The count does not go negative when every enter has a leave.</remarks>
+            internal void Leave() => Interlocked.Decrement(ref _inFlight);
+
+            /// <summary>
+            /// Claims the one dispose of this instance.
+            /// </summary>
+            /// <returns>True the first time. False when another registration or thread already claimed it.</returns>
+            /// <remarks>Does not throw. Does not call <see cref="IDisposable.Dispose"/>.</remarks>
+            internal bool TryMarkDisposed() => Interlocked.CompareExchange(ref _disposed, 1, 0) == 0;
         }
     }
 }

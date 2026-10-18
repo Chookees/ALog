@@ -279,6 +279,52 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
+    /// The same blocking instance registered twice is not disposed while either registration is inside Write.
+    /// After the call returns it is disposed at most once.
+    /// </summary>
+    /// <returns>A task that finishes after the blocked call is released.</returns>
+    [Fact(Timeout = 20000)]
+    public async Task DuplicateWriter_IsNotDisposedWhileACallIsRunning()
+    {
+        var previous = SelfLog.Target;
+        SelfLog.Enable(static _ => { });
+        var release = new ManualResetEventSlim(false);
+        var writer = new ProbeWriter(release: release);
+        var engine = new LoggerEngine(new LoggerConfig()
+            .AddWriter(writer)
+            .AddWriter(writer)
+            .UseBackgroundQueue(true, 10, 1, TimeSpan.FromHours(1))
+            .UseAsync(false));
+        try
+        {
+            for (var i = 0; i < 5; i++)
+                engine.Log("dup", LogLevel.Info);
+
+            Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(5)));
+            var started = Stopwatch.StartNew();
+            engine.Dispose();
+            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(5200), "elapsed " + started.Elapsed.ToString());
+            Assert.False(writer.DisposeOverlappedWrite);
+            Assert.False(writer.Disposed);
+            Assert.Equal(0, writer.DisposeCount);
+            release.Set();
+            Assert.True(await WaitUntil(
+                () => writer.DisposeCount == 1 && writer.DisposeOrder > writer.FinishOrder && !writer.DisposeOverlappedWrite,
+                TimeSpan.FromSeconds(5)));
+            Assert.Equal(1, writer.DisposeCount);
+            var queue = engine.Queue!;
+            var unwritten = queue.UnwrittenCount;
+            Assert.Equal(queue.AcceptedCount, queue.WrittenCount + unwritten);
+            Assert.True(unwritten >= 1);
+        }
+        finally
+        {
+            release.Set();
+            SelfLog.Target = previous;
+        }
+    }
+
+    /// <summary>
     /// A writer whose call takes 5.5 s is not disposed while that call runs.
     /// Shutdown returns inside 5.2 s. Dispose runs only after the call returns, and not during Write.
     /// </summary>
@@ -474,6 +520,7 @@ public sealed partial class C4QueueFixTests
         private int _disposed;
         private int _after;
         private int _overlap;
+        private int _disposeCount;
         private int _order;
         private int _finishOrder;
         private int _disposeOrder;
@@ -506,6 +553,9 @@ public sealed partial class C4QueueFixTests
 
         /// <summary>True when <see cref="Dispose"/> ran while <see cref="Write"/> was inside the call.</summary>
         internal bool DisposeOverlappedWrite => Volatile.Read(ref _overlap) != 0;
+
+        /// <summary>How many times <see cref="Dispose"/> has been entered. A shared instance must be disposed at most once.</summary>
+        internal int DisposeCount => Volatile.Read(ref _disposeCount);
 
         /// <summary>Order stamp taken when the call returns. Zero if the call has not returned.</summary>
         internal int FinishOrder => Volatile.Read(ref _finishOrder);
@@ -556,6 +606,7 @@ public sealed partial class C4QueueFixTests
             if (Volatile.Read(ref _inWrite) != 0)
                 Interlocked.Exchange(ref _overlap, 1);
 
+            Interlocked.Increment(ref _disposeCount);
             _inner?.Dispose();
             Volatile.Write(ref _disposeOrder, Interlocked.Increment(ref _order));
             Interlocked.Exchange(ref _disposed, 1);

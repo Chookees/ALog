@@ -517,8 +517,7 @@ public sealed partial class C4QueueFixTests
     {
         var root = FindRepoRoot();
         var config = typeof(C4QueueFixTests).Assembly.GetCustomAttribute<AssemblyConfigurationAttribute>()?.Configuration;
-        if (string.IsNullOrEmpty(config))
-            config = "Debug";
+        Assert.False(string.IsNullOrEmpty(config));
 
         var start = new ProcessStartInfo
         {
