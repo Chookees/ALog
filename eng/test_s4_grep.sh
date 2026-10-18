@@ -551,17 +551,18 @@ pass "coverage gate stays in CI and README AddALog blocks import ALog"
 python3 - << 'PY'
 """B1-01 and the README badge line.
 
-The badge job runs only on a push to master, needs build, and is the only job
-allowed to write contents. The workflow default stays contents: read. Both
-READMEs carry CI, Coverage, License, and .NET 10 in that order directly under
-the H1. The repository README also keeps GitHub downloads.
+The badge job's condition, needs, and permissions are checked from parsed
+YAML, not by counting lines. The workflow default stays exactly contents
+read, and no other job grants write. Both READMEs carry CI, Coverage,
+License, and .NET 10 in that order directly under the H1. The repository
+README also keeps GitHub downloads.
 """
 
-import os
+import importlib.util
 import sys
+from pathlib import Path
 
 WORKFLOW = ".github/workflows/dotnet.yml"
-CONDITION = "if: github.event_name == 'push' && github.ref == 'refs/heads/master'"
 ACTIONS = "https://github.com/Chookees/ALog/actions/workflows/dotnet.yml"
 LICENSE = "https://github.com/Chookees/ALog/blob/master/LICENSE"
 CI_IMAGE = "https://img.shields.io/github/actions/workflow/status/Chookees/ALog/dotnet.yml?branch=master&label=CI"
@@ -747,43 +748,48 @@ def next_nonempty(text, heading):
     return ""
 
 
+def load_badge_checker():
+    """Load the structural B1-01 checker.
+
+    Returns:
+        The badge_workflow_check module.
+
+    Raises:
+        SystemExit: The checker cannot be loaded.
+    """
+    path = "eng/badge_workflow_check.py"
+    spec = importlib.util.spec_from_file_location("badge_workflow_check", path)
+    if spec is None or spec.loader is None:
+        fail("badge workflow checker is missing")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def check_workflow():
-    """Lock B1-01: trigger, needs, and the write permission.
+    """Lock B1-01 from parsed YAML, plus the trigger text.
 
     Returns:
         None.
 
     Raises:
-        SystemExit: One of the three points is missing.
+        SystemExit: The badge job, its permissions, or the trigger is wrong.
     """
+    checker = load_badge_checker()
+    try:
+        document = checker.load_workflow(Path(WORKFLOW))
+    except (OSError, ValueError) as error:
+        fail(f"workflow cannot be parsed: {error}")
+    for problem in checker.check_badge_workflow(document):
+        fail(problem)
     text = read_text(WORKFLOW)
-    preamble, jobs = split_jobs(text)
-    if "permissions:\n  contents: read\n" not in preamble + "\n":
-        fail("workflow default is not contents: read")
-    if "contents: write" in preamble:
-        fail("workflow default grants contents write")
+    preamble, _jobs = split_jobs(text)
     if "badges" in preamble:
         fail("workflow triggers mention badges")
     if preamble.count('branches: [ "master" ]') != 2:
         fail("push and pull_request must both target only master")
     if "--force" in text or "push -f" in text:
         fail("workflow contains a force push")
-    badge = jobs.get("badge")
-    if badge is None:
-        fail("badge job is missing")
-    if badge.count(CONDITION) != 1:
-        fail("badge push condition is missing")
-    if "pull_request" in badge:
-        fail("badge job mentions pull_request")
-    if "\n    needs: build\n" not in "\n" + badge + "\n":
-        fail("badge job does not need build")
-    if badge.count("contents: write") != 1:
-        fail("badge job write permission is not exactly contents: write")
-    for name, body in jobs.items():
-        if name == "badge":
-            continue
-        if "contents: write" in body or CONDITION in body:
-            fail(f"{name} must not write contents or use the badge condition")
 
 
 def badge_markers(coverage_file):
@@ -852,6 +858,7 @@ def check_readmes():
 check_workflow()
 check_readmes()
 PY
+python3 eng/test_badge_workflow.py
 pass "B1 badge job and README badges"
 
 if [ "$failures" -ne 0 ]; then

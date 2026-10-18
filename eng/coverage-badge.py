@@ -321,8 +321,8 @@ def write_package_files(document: str, output_dir: Path) -> list[str]:
 
     Args:
         document: Coverage-gate measurement JSON.
-        output_dir: Destination directory. It is created when missing. Its
-            parent must exist.
+        output_dir: Destination directory. It is created when missing,
+            including any missing parent directories.
 
     Returns:
         The two file names, in package order.

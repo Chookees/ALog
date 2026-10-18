@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Publish the coverage SVGs to the orphan branch ``badges``.
 
-Implements arc_spec B1-03. The branch is created on the first master run when
-origin does not have it yet. A later run commits only when the SVG bytes
-changed, and the only push is a fast-forward of ``refs/heads/badges``. Nothing
-in this file force-pushes, and the push refspec never names master. The
-workflow triggers stay on master and on pull requests against master, so this
-push does not start another run. Next file: ``eng/coverage-badge.py``.
+Implements arc_spec B1-03, including the v5.20 overlap rule. There is no
+concurrency group. After fetching origin, a run writes only when ``GITHUB_SHA``
+is still the head of ``origin/master``. An older run exits 0 with a notice
+and leaves the previous SVG in place, which is also what happens when the
+newest commit's build fails and never reaches this script. A rejected badges
+push is retried at most three times, each time with a new fetch and a new
+head check. If it still fails, the process exits 0 with a warning that
+states the reason. A script error, invalid input, or a missing SVG stays
+red. Nothing in this file force-pushes, and the push refspec never names
+master. Next file: ``eng/coverage-badge.py``.
 """
 
 from __future__ import annotations
@@ -30,13 +34,17 @@ _PUSH = ["git", "push", "origin", "refs/heads/badges:refs/heads/badges"]
 # identity has to be the bot. This is not a person.
 _BOT_NAME = "github-actions[bot]"
 _BOT_EMAIL = "41898282+github-actions[bot]@users.noreply.github.com"
+# The first push is not a retry. Three further attempts follow a conflict.
+_MAX_PUSH_ATTEMPTS = 4
+_SHA_CHARS = "0123456789abcdef"
 
 
 class PushRejected(RuntimeError):
     """A non-forced push of badges was rejected.
 
-    The caller may retry once by checking out the new tip. This is not a
-    signal to force-push.
+    The caller may retry at most three times, fetching master again before
+    each retry. This is not a signal to force-push, and exhausting the
+    retries is a warning rather than a failed workflow.
     """
 
 
@@ -517,41 +525,228 @@ def _read_svg_dir(directory: Path) -> dict[str, bytes]:
     return found
 
 
+def _is_commit_sha(value: str) -> bool:
+    """Return whether a string is a full lowercase git commit id.
+
+    Args:
+        value: Candidate SHA. Surrounding space must already have been removed.
+            Uppercase hex is rejected so a comparison cannot miss a match that
+            ``git rev-parse`` would spell in lowercase.
+
+    Returns:
+        True when the value is 40 characters from ``0-9`` and ``a-f``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if len(value) != 40:
+        return False
+    for char in value:
+        if char not in _SHA_CHARS:
+            return False
+    return True
+
+
+def _workflow_command(kind: str, message: str) -> str:
+    """Format one GitHub Actions workflow command.
+
+    Args:
+        kind: ``notice`` or ``warning``.
+        message: Reason shown in the log. Empty text is rejected so a skip
+            cannot exit 0 without saying why. Percent signs are escaped
+            because the workflow command grammar uses them.
+
+    Returns:
+        A single line such as ``::notice::...`` of at most 520 characters.
+
+    Raises:
+        ValueError: The kind is unknown or the message is empty.
+
+    Side effects:
+        None.
+    """
+    if kind not in {"notice", "warning"}:
+        raise ValueError("workflow command must be notice or warning")
+    cleaned = " ".join(message.split())
+    if cleaned == "":
+        raise ValueError("workflow command message is empty")
+    escaped = cleaned.replace("%", "%25")
+    if len(escaped) > 500:
+        escaped = escaped[:500]
+    return f"::{kind}::{escaped}"
+
+
+def _fetch_origin_master(repo: Path) -> str:
+    """Fetch origin's master branch and return that commit id.
+
+    Args:
+        repo: Repository whose ``origin`` remote points at the real remote.
+            The fetch updates the remote-tracking ref only. It does not move
+            the local ``master`` branch and it does not push. The refspec
+            starts with ``+`` so the tracking ref follows origin even when a
+            shallow history cannot prove a fast-forward. That is not a
+            force-push: nothing is written to origin.
+
+    Returns:
+        The 40-character lowercase SHA of ``refs/remotes/origin/master``.
+
+    Raises:
+        RuntimeError: The fetch fails or the ref is missing afterwards.
+
+    Side effects:
+        Contacts origin and writes the remote-tracking ref.
+    """
+    _run_git(
+        repo,
+        [
+            "fetch",
+            "--no-tags",
+            "origin",
+            "+refs/heads/master:refs/remotes/origin/master",
+        ],
+        timeout=60,
+    )
+    sha = _ref_sha(repo, "refs/remotes/origin/master")
+    if sha is None:
+        raise RuntimeError("origin/master is missing after fetch")
+    return sha
+
+
+def _master_head(repo: Path, *, fetch: bool) -> str:
+    """Return the commit that currently owns badge publication.
+
+    Args:
+        repo: Repository root.
+        fetch: When true, fetch origin first. When false, read the local
+            ``master`` ref. Tests that have no remote pass false. CI passes
+            true.
+
+    Returns:
+        The 40-character SHA of the master head.
+
+    Raises:
+        RuntimeError: The ref cannot be read, or the fetch fails.
+
+    Side effects:
+        May contact origin. Does not push.
+    """
+    if fetch:
+        return _fetch_origin_master(repo)
+    sha = _ref_sha(repo, "refs/heads/master")
+    if sha is None:
+        raise RuntimeError("master is missing")
+    return sha
+
+
 def publish_with_retry(
     repo: Path,
     generated: Mapping[str, bytes],
+    expected_sha: str,
     *,
     fetch: bool,
     push: bool,
-) -> str:
-    """Update badges, and retry once when a non-forced push is rejected.
+) -> tuple[str, str]:
+    """Publish badges for the current master head, or skip a stale run.
 
     Args:
         repo: Repository root.
         generated: The two SVG bodies.
-        fetch: Passed through to ``sync_badges``.
-        push: Passed through to ``sync_badges``.
+        expected_sha: ``GITHUB_SHA`` for this run. It must be 40 lowercase
+            hex characters, or the same id in uppercase.
+        fetch: When true, each attempt fetches origin master and, inside
+            ``sync_badges``, the badges branch. When false, the local master
+            ref is the head.
+        push: When true, push after a new commit. A conflict is retried.
 
     Returns:
-        ``committed`` or ``unchanged``, from the attempt that finished.
+        ``("committed", "")`` or ``("unchanged", "")`` when this SHA is still
+        master and the update finished. ``("skipped", head)`` when a newer
+        commit is master; the caller prints a notice and must not treat that
+        as a failure. ``("conflict", reason)`` when all four attempts were
+        rejected; the caller prints a warning and must not treat that as a
+        failure either.
 
     Raises:
-        RuntimeError: Both attempts were rejected, or git failed another way.
-        ValueError: The SVG map is unusable.
+        ValueError: The SHA or the SVG map is unusable, or the path is not a
+            repository.
+        RuntimeError: Git fails for a reason other than a rejected badges push.
 
     Side effects:
-        May fetch, commit, and push. At most two attempts. A retry checks out
-        the remote tip again instead of force-pushing.
+        May fetch, commit, and push badges. At most four attempts. Each
+        attempt checks the master head again. A retry does not force-push.
     """
-    last = "push was rejected"
-    for attempt in range(1, 3):
+    _assert_git_repo(repo)
+    _require_svgs(generated)
+    if not isinstance(expected_sha, str):
+        raise ValueError("expected master sha is not a 40-character commit id")
+    normalized = expected_sha.strip().lower()
+    if not _is_commit_sha(normalized):
+        raise ValueError("expected master sha is not a 40-character commit id")
+    last_error = "the badges push was rejected"
+    for attempt in range(1, _MAX_PUSH_ATTEMPTS + 1):
+        head = _master_head(repo, fetch=fetch)
+        if head != normalized:
+            return ("skipped", head)
         try:
-            return sync_badges(repo, generated, fetch=fetch, push=push)
+            return (sync_badges(repo, generated, fetch=fetch, push=push), "")
         except PushRejected as error:
-            last = str(error)
-            if attempt == 2 or not push:
+            last_error = str(error) or last_error
+            if not push or attempt == _MAX_PUSH_ATTEMPTS:
                 break
-    raise RuntimeError(f"push to badges was rejected: {last}")
+    return ("conflict", last_error)
+
+
+def _report_outcome(outcome: str, detail: str, expected_sha: str) -> int:
+    """Print the publisher result and choose the process status.
+
+    Args:
+        outcome: ``committed``, ``unchanged``, ``skipped``, or ``conflict``.
+        detail: The current master SHA for a skip, or the push error for a
+            conflict. Empty for a successful update.
+        expected_sha: The run's commit id, already validated. Included in the
+            notice so the log shows which run stepped aside.
+
+    Returns:
+        0 for a successful update, a stale run, or a push conflict that
+        exhausted its retries. The last two are not red.
+
+    Raises:
+        RuntimeError: The outcome is unknown, or a skip or conflict has no
+            reason. A silent success is not allowed.
+
+    Side effects:
+        Writes one line to stdout.
+    """
+    if outcome in {"committed", "unchanged"}:
+        print(outcome)
+        return 0
+    if outcome == "skipped":
+        if not _is_commit_sha(detail):
+            raise RuntimeError("skipped badge publish without the current master sha")
+        print(
+            _workflow_command(
+                "notice",
+                "Coverage badges were not published because "
+                f"{expected_sha} is not the head of origin/master ({detail}). "
+                "A newer master commit writes the badge. If that commit's "
+                "build fails, the previous badge stays.",
+            )
+        )
+        return 0
+    if outcome == "conflict":
+        if detail.strip() == "":
+            raise RuntimeError("badge push failed without a reason")
+        print(
+            _workflow_command(
+                "warning",
+                "Coverage badges were not published after 3 retries: " + detail,
+            )
+        )
+        return 0
+    raise RuntimeError(f"unknown badge publish outcome: {outcome}")
 
 
 def main(argv: list[str]) -> int:
@@ -559,37 +754,43 @@ def main(argv: list[str]) -> int:
 
     Args:
         argv: Arguments without the program name. ``--svg-dir`` is required.
-            ``--no-fetch`` and ``--no-push`` are for tests.
+            ``--sha`` overrides ``GITHUB_SHA``. ``--no-fetch`` and
+            ``--no-push`` are for tests.
 
     Returns:
-        0 when the branch was updated or already matched. 2 when publishing
-        failed.
+        0 when the branch was updated, already matched, skipped because this
+        commit is not master, or the badges push was rejected after retries.
+        2 when the input is invalid, an SVG is missing, or git fails for
+        another reason.
 
     Raises:
         SystemExit: argparse rejects the command line.
 
     Side effects:
         Reads the SVG directory and may fetch, commit, and push badges.
+        Writes a workflow command when the run does not publish.
     """
     parser = argparse.ArgumentParser(prog="publish-coverage-badges.py")
     parser.add_argument("--svg-dir", required=True)
     parser.add_argument("--repo", default=".")
+    parser.add_argument("--sha", default="")
     parser.add_argument("--no-fetch", action="store_true")
     parser.add_argument("--no-push", action="store_true")
     args = parser.parse_args(argv)
+    sha = args.sha or os.environ.get("GITHUB_SHA", "")
     try:
         generated = _read_svg_dir(Path(args.svg_dir))
-        outcome = publish_with_retry(
+        outcome, detail = publish_with_retry(
             Path(args.repo).resolve(),
             generated,
+            sha,
             fetch=not args.no_fetch,
             push=not args.no_push,
         )
+        return _report_outcome(outcome, detail, sha.strip().lower())
     except (ValueError, OSError, RuntimeError) as error:
         print(f"coverage badges were not published: {error}", file=sys.stderr)
         return 2
-    print(outcome)
-    return 0
 
 
 if __name__ == "__main__":
