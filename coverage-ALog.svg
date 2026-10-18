@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="115" height="20" role="img" aria-label="Coverage: 97.1%">
+<title>Coverage: 97.1%</title>
+<linearGradient id="smooth" x2="0" y1="100%">
+<stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+<stop offset="1" stop-opacity=".1"/>
+</linearGradient>
+<clipPath id="round"><rect width="115" height="20" rx="3" fill="#fff"/></clipPath>
+<g clip-path="url(#round)">
+<rect width="68" height="20" fill="#555"/>
+<rect x="68" width="47" height="20" fill="#4c1"/>
+<rect width="115" height="20" fill="url(#smooth)"/>
+</g>
+<g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" font-size="11">
+<text x="34" y="14">coverage</text>
+<text x="91" y="14">97.1%</text>
+</g>
+</svg>
