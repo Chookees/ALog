@@ -634,6 +634,60 @@ class CoverageBadgeTests(unittest.TestCase):
             self.assertFalse(err.strip().startswith("::"))
             self.assertEqual((origin / "push-attempts").read_text().strip(), "1")
 
+    def test_git_reason_trailing_period_is_not_doubled(self) -> None:
+        """A git reason loses trailing whitespace and periods before Check.
+
+        The sentence contributes exactly one period. A reason that is only
+        whitespace and periods becomes ``git failed``. A percent sign stays.
+
+        Side effects:
+            None.
+        """
+        tail = (
+            ". Check that the badge job has contents: write "
+            "and that no ruleset blocks the badges branch."
+        )
+        kept = (
+            ("repository exists.", "repository exists"),
+            ("repository exists. \n", "repository exists"),
+            ("repository exists...", "repository exists"),
+            ("kept 100%.", "kept 100%"),
+            ("", "git failed"),
+            ("...", "git failed"),
+            (". \n", "git failed"),
+        )
+        for reason, body in kept:
+            with self.subTest(reason=reason):
+                self.assertEqual(
+                    self.publish._real_push_failure(reason),
+                    "git push failed: " + body + tail,
+                )
+
+    def test_missing_file_pushurl_has_one_period_before_check(self) -> None:
+        """A missing file remote ends on repository exists with one period.
+
+        Side effects:
+            Creates a temporary bare origin and points its push URL at
+            ``file:///nonexistent.git``.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            _origin, work, sha = self._one_master_commit(root)
+            self._git(
+                work,
+                ["remote", "set-url", "--push", "origin", "file:///nonexistent.git"],
+            )
+            code, out, err = self._publish(work, sha, "missing-remote")
+            ending = (
+                "repository exists. Check that the badge job has contents: write "
+                "and that no ruleset blocks the badges branch."
+            )
+            self._assert_real_push_error(code, out, err, "repository exists")
+            line = err.strip()
+            self.assertTrue(line.endswith(ending), line)
+            self.assertNotIn("exists..", line)
+            self.assertNotIn("%25", line)
+
     def test_percent_is_escaped_once_inside_workflow_commands(self) -> None:
         """A 100% git reason is escaped once in notice and warning text.
 
@@ -761,10 +815,13 @@ class CoverageBadgeTests(unittest.TestCase):
         self.assertEqual(self.publish._classify_push(stdout, stderr, 1), "conflict")
 
     def test_remote_rejected_cannot_lock_ref_prefix_is_a_conflict(self) -> None:
-        """A remote rejection whose reason starts with cannot lock ref is a conflict.
+        """A cannot-lock remote rejection warns even without the stderr line.
+
+        A reason that starts with ``cannot lock ref`` is a conflict on its
+        own. The publisher retries, then exits 0 with a warning.
 
         Side effects:
-            None.
+            Creates a temporary bare origin and a git wrapper on ``PATH``.
         """
         for reason in (
             "cannot lock ref",
@@ -772,6 +829,24 @@ class CoverageBadgeTests(unittest.TestCase):
         ):
             stdout = f"!\trefs/heads/badges:refs/heads/badges\t[remote rejected] ({reason})\n"
             self.assertEqual(self.publish._classify_push(stdout, "", 1), "conflict", reason)
+            self._assert_remote_lock_warns(reason, "")
+
+    def test_remote_rejected_cannot_lock_ref_with_the_lock_line_warns(self) -> None:
+        """Porcelain cannot-lock plus the badges lock line still warns.
+
+        Stderr is the exact line ``remote: error: cannot lock ref
+        'refs/heads/badges'``. The prefix is already a conflict, so the line
+        does not change the outcome. The publisher retries, then exits 0
+        with a warning.
+
+        Side effects:
+            Creates a temporary bare origin and a git wrapper on ``PATH``.
+        """
+        reason = "cannot lock ref 'refs/heads/badges'"
+        stderr = "remote: error: cannot lock ref 'refs/heads/badges'\n"
+        stdout = f"!\trefs/heads/badges:refs/heads/badges\t[remote rejected] ({reason})\n"
+        self.assertEqual(self.publish._classify_push(stdout, stderr, 1), "conflict")
+        self._assert_remote_lock_warns(reason, stderr)
 
     def test_failed_to_update_ref_without_the_lock_line_is_red(self) -> None:
         """failed to update ref is an error unless stderr has the badges lock line.
@@ -1144,6 +1219,105 @@ class CoverageBadgeTests(unittest.TestCase):
             encoding="utf-8",
         )
         hook.chmod(0o755)
+
+    def _assert_remote_lock_warns(self, reason: str, stderr: str) -> None:
+        """Require one cannot-lock porcelain push to warn after three retries.
+
+        Args:
+            reason: Text inside ``[remote rejected] (...)``. It starts with
+                ``cannot lock ref``.
+            stderr: Git standard error. Empty when the lock line is absent.
+                The exact badges lock line when the test includes it.
+
+        Returns:
+            None.
+
+        Raises:
+            AssertionError: The publisher exits red, skips, or does not warn.
+
+        Side effects:
+            Creates a temporary bare origin and a git wrapper on ``PATH``.
+        """
+        stdout = f"!\trefs/heads/badges:refs/heads/badges\t[remote rejected] ({reason})\n"
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            origin, work, sha = self._one_master_commit(root)
+            self._publish_ok(work, sha, "kept")
+            pauses = self._record_pauses()
+            self._reject_porcelain_pushes(root, origin, stdout, stderr)
+            try:
+                code, out, err = self._publish(work, sha, "lost")
+            finally:
+                self._restore_path()
+            self.assertEqual(code, 0, err)
+            self.assertIn("::warning::", out)
+            self.assertIn("after 3 retries", out)
+            self.assertNotIn("::notice::", out)
+            self.assertNotIn("were not published", err)
+            self.assertEqual(pauses, [1, 2, 4])
+            self.assertEqual((origin / "push-attempts").read_text().strip(), "4")
+            self.assertEqual(self._badge_text(origin), "<svg>kept</svg>")
+            if stderr != "":
+                self.assertIn("remote: error: cannot lock ref 'refs/heads/badges'", out)
+
+    def _reject_porcelain_pushes(self, root: Path, origin: Path, stdout: str, stderr: str) -> None:
+        """Prepend a git wrapper that rejects every push with fixed porcelain.
+
+        Args:
+            root: Temporary directory that will hold the wrapper.
+            origin: Bare origin. Each rejected push increments ``push-attempts``.
+            stdout: Porcelain text. It names ``refs/heads/badges``.
+            stderr: Standard error. Empty when the lock line is absent.
+
+        Returns:
+            None.
+
+        Raises:
+            OSError: The wrapper cannot be written.
+
+        Side effects:
+            Prepends ``root/bin`` to ``PATH``. The caller restores it.
+        """
+        bindir = root / "bin"
+        bindir.mkdir()
+        script = bindir / "git"
+        script.write_text(self._porcelain_push_script(origin, stdout, stderr), encoding="utf-8")
+        script.chmod(0o755)
+        self._saved_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = str(bindir) + os.pathsep + self._saved_path
+
+    def _porcelain_push_script(self, origin: Path, stdout: str, stderr: str) -> str:
+        """Return a git wrapper that prints one rejection and exits 1.
+
+        Args:
+            origin: Bare origin path baked into the script.
+            stdout: Porcelain text the wrapper writes.
+            stderr: Standard error the wrapper writes.
+
+        Returns:
+            A complete shell script. Commands other than push run real git.
+
+        Raises:
+            None.
+
+        Side effects:
+            None.
+        """
+        lines = [
+            "#!/bin/sh",
+            "real=/usr/bin/git",
+            f"origin={shlex.quote(str(origin))}",
+            f"out={shlex.quote(stdout)}",
+            f"err={shlex.quote(stderr)}",
+            'is_push=0; for arg in "$@"; do [ "$arg" = push ] && is_push=1; done',
+            '[ "$is_push" = 1 ] || exec "$real" "$@"',
+            'n=0; [ -f "$origin/push-attempts" ] && n=$(cat "$origin/push-attempts")',
+            'n=$((n + 1)); printf "%s\\n" "$n" > "$origin/push-attempts"',
+            'printf "%s" "$out"',
+            'printf "%s" "$err" >&2',
+            "exit 1",
+        ]
+        return "\n".join(lines) + "\n"
 
     def _divert_badges_pushes(self, root: Path, origin: Path, mode: str) -> None:
         """Prepend a git wrapper that turns a badges push into a conflict.

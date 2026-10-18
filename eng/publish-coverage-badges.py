@@ -545,16 +545,17 @@ def _push_error_text(stdout: str, stderr: str) -> str:
     return _safe_git_error(text)
 
 
-def _real_push_failure(reason: str) -> str:
-    """Build the red message for a badges push that is not a conflict.
+def _trim_push_reason(reason: str) -> str:
+    """Remove trailing whitespace and periods from a git reason together.
 
     Args:
-        reason: One-line git reason. Empty text is replaced so the sentence
-            still names a failure. Percent signs are not escaped.
+        reason: Git text. Interior periods stay. A percent sign stays.
+            Newlines at the end count as whitespace, the same way ALOG0022
+            drops a trailing period and the space or newline after it.
 
     Returns:
-        ``git push failed: <reason>. Check that the badge job has contents:
-        write and that no ruleset blocks the badges branch.``
+        The reason with that suffix removed. Empty when only whitespace and
+        periods remain.
 
     Raises:
         None.
@@ -562,11 +563,45 @@ def _real_push_failure(reason: str) -> str:
     Side effects:
         None.
     """
-    if reason.strip() == "":
-        reason = "git failed"
+    end = len(reason)
+    # Bounded by the text length. Live reasons are already capped at 500.
+    for _index in range(end):
+        if end == 0:
+            break
+        char = reason[end - 1]
+        if char != "." and not char.isspace():
+            break
+        end -= 1
+    return reason[:end]
+
+
+def _real_push_failure(reason: str) -> str:
+    """Build the red message for a badges push that is not a conflict.
+
+    Args:
+        reason: One-line git reason. Trailing whitespace and periods are
+            removed together before the sentence period is added, so a reason
+            that already ends with a period does not produce two. Empty text,
+            or text that is only whitespace and periods, becomes
+            ``git failed``. Percent signs are not escaped.
+
+    Returns:
+        ``git push failed: <reason>. Check that the badge job has contents:
+        write and that no ruleset blocks the badges branch.`` Exactly one
+        period stands before ``Check``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    cleaned = _trim_push_reason(reason)
+    if cleaned == "":
+        cleaned = "git failed"
     return (
         "git push failed: "
-        + reason
+        + cleaned
         + ". Check that the badge job has contents: write "
         + "and that no ruleset blocks the badges branch."
     )
