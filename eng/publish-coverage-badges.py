@@ -11,8 +11,10 @@ head check, waiting 1, 2, and 4 seconds before those retries. Only a real
 concurrency rejection is retried: porcelain ``[rejected] (non-fast-forward)``,
 ``[rejected] (fetch first)``, ``[rejected] (stale info)``, a ``cannot lock
 ref`` that is not a remote rejection, or ``[remote rejected]`` only when its
-reason starts with ``cannot lock ref`` or is exactly ``failed to update ref``
-and stderr contains the badges lock line. Every other remote rejection exits
+reason starts with ``cannot lock ref``, or the reason is a ref-lock name
+(``failed to update ref``, or git 2.55's ``incorrect old value provided``
+and ``reference already exists``) and stderr contains the badges lock line.
+Every other remote rejection exits
 2 with one line and is not retried. Percent signs are escaped once, and only
 inside ``::notice::`` and ``::warning::``. If a real conflict is still failing after
 the retries, the process exits 0 with a warning that states the reason. A
@@ -53,6 +55,17 @@ _CONFLICT_SUMMARIES = frozenset(
         "[rejected] (stale info)",
     }
 )
+# Porcelain reasons for one badges ref lock. Git 2.43 and GitHub say
+# "failed to update ref". Git 2.55 says which check failed, and the
+# cannot-lock sentence stays on stderr.
+_LOCK_REASONS = frozenset(
+    {
+        "failed to update ref",
+        "incorrect old value provided",
+        "reference already exists",
+    }
+)
+_LOCK_STDERR = "remote: error: cannot lock ref 'refs/heads/badges'"
 _MAX_STATUS_LINES = 40
 # github-actions[bot]. The token that pushes is GITHUB_TOKEN, so the commit
 # identity has to be the bot. This is not a person.
@@ -572,8 +585,9 @@ def _classify_push(stdout: str, stderr: str, returncode: int) -> str:
         ``[rejected] (non-fast-forward)``, ``[rejected] (fetch first)``, or
         ``[rejected] (stale info)``, when git reports ``cannot lock ref``
         without a ``[remote rejected]`` badges line, or when that remote
-        rejection's reason starts with ``cannot lock ref`` or is exactly
-        ``failed to update ref`` and stderr contains
+        rejection's reason starts with ``cannot lock ref``, or the reason is
+        ``failed to update ref``, ``incorrect old value provided``, or
+        ``reference already exists`` and stderr contains
         ``remote: error: cannot lock ref 'refs/heads/badges'``. ``error``
         for every other remote rejection, including a hook whose text merely
         contains ``cannot lock ref``.
@@ -724,13 +738,14 @@ def _remote_reason_is_lock(reason: str, stderr: str) -> bool:
 
     Args:
         reason: Text inside the porcelain parentheses. Matching is exact for
-            ``failed to update ref`` and a prefix match for ``cannot lock ref``.
-            A hook sentence that only contains those words later is not a lock.
-        stderr: Git standard error. The failed-to-update reason is a lock
-            only when this contains the badges ``cannot lock ref`` line.
+            the lock names and a prefix match for ``cannot lock ref``. A hook
+            sentence that only contains those words later is not a lock.
+        stderr: Git standard error. A short lock name is a lock only when
+            this contains the badges ``cannot lock ref`` line.
 
     Returns:
-        True for the two lock shapes from arc_spec v5.21b. False otherwise.
+        True for a badges ref lock. False for a hook, ruleset, or any other
+        remote rejection.
 
     Raises:
         None.
@@ -740,8 +755,7 @@ def _remote_reason_is_lock(reason: str, stderr: str) -> bool:
     """
     if reason.startswith("cannot lock ref"):
         return True
-    lock_line = "remote: error: cannot lock ref 'refs/heads/badges'"
-    if reason == "failed to update ref" and lock_line in stderr:
+    if reason in _LOCK_REASONS and _LOCK_STDERR in stderr:
         return True
     return False
 

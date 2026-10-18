@@ -786,6 +786,29 @@ class CoverageBadgeTests(unittest.TestCase):
         loose = "remote: cannot lock ref 'refs/heads/badges'\n"
         self.assertEqual(self.publish._classify_push(stdout, loose, 1), "error")
 
+    def test_git_2_55_lock_reasons_with_the_lock_line_are_conflicts(self) -> None:
+        """Git 2.55 names the same badges lock with a shorter porcelain reason.
+
+        The runner's receive-pack still prints the cannot-lock line on stderr.
+        The porcelain reason is ``incorrect old value provided`` when the ref
+        moved, or ``reference already exists`` when the branch was just
+        created. Both are conflicts. The same words without that stderr line
+        are not.
+
+        Side effects:
+            None.
+        """
+        stderr = "remote: error: cannot lock ref 'refs/heads/badges': is at X but expected Y\n"
+        created = "remote: error: cannot lock ref 'refs/heads/badges': reference already exists\n"
+        cases = (
+            ("incorrect old value provided", stderr),
+            ("reference already exists", created),
+        )
+        for reason, err in cases:
+            stdout = f"!\trefs/heads/badges:refs/heads/badges\t[remote rejected] ({reason})\n"
+            self.assertEqual(self.publish._classify_push(stdout, err, 1), "conflict", reason)
+            self.assertEqual(self.publish._classify_push(stdout, "", 1), "error", reason)
+
     def test_hook_reason_with_cannot_lock_ref_in_the_middle_is_red(self) -> None:
         """A hook reason that only contains cannot lock ref in the middle is an error.
 
