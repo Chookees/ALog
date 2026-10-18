@@ -12,7 +12,8 @@ public class LoggerEngine : ILogger, IDisposable
     private readonly LogDispatcher _dispatcher;
     private readonly BackgroundLogQueue? _backgroundQueue;
     private readonly MinimumLevelCache _levels;
-    private bool _disposed;
+    private readonly ManualResetEventSlim _disposeDone = new(false);
+    private int _disposeOnce;
 
     public LoggerEngine(ILogConfiguration config)
     {
@@ -324,6 +325,12 @@ public class LoggerEngine : ILogger, IDisposable
         }
     }
 
+    /// <summary>
+    /// The background queue when one was configured. Null when the queue is off.
+    /// Tests read the accept and drop counts. Production callers use <see cref="FlushAsync"/> and <see cref="Dispose"/>.
+    /// </summary>
+    internal BackgroundLogQueue? Queue => _backgroundQueue;
+
     public async Task FlushAsync()
     {
         if (_backgroundQueue != null)
@@ -332,16 +339,53 @@ public class LoggerEngine : ILogger, IDisposable
         }
     }
 
+    /// <summary>
+    /// Closes the background queue and disposes writers only after that queue's processor has finished.
+    /// A writer call that is still running at the deadline is left undisposed. A second call waits for the first.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Writer dispose failures are written to the error stream.
+    /// Without a queue, writers are disposed immediately, as they were before the queue deadline existed.
+    /// The wait for a second call is the same 5 s bound as the queue deadline.
+    /// </remarks>
     public void Dispose()
     {
-        if (_disposed)
-            return;
-
-        _disposed = true;
-        _backgroundQueue?.Dispose();
-
-        foreach (var writer in _config.Writers)
+        if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
         {
+            _ = _disposeDone.Wait(TimeSpan.FromSeconds(5));
+            return;
+        }
+
+        try
+        {
+            _backgroundQueue?.Dispose();
+            if (_backgroundQueue is not null && !_backgroundQueue.ReleaseWriters)
+                return;
+
+            DisposeWriters();
+        }
+        finally
+        {
+            _disposeDone.Set();
+        }
+    }
+
+    /// <summary>
+    /// Disposes every configured writer. A writer that throws does not stop the others.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Called only after the queue processor has left every writer, or when there is no queue.
+    /// The loop is bounded by the writer list, which does not grow after the engine is built.
+    /// </remarks>
+    private void DisposeWriters()
+    {
+        var writers = _config.Writers;
+        for (var i = 0; i < writers.Count; i++)
+        {
+            var writer = writers[i];
+            if (writer is null)
+                continue;
+
             try
             {
                 writer.Dispose();

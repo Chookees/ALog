@@ -1,3 +1,4 @@
+using System.Globalization;
 using ALog;
 using ALog.Config;
 using ALog.Core;
@@ -239,11 +240,18 @@ public class GapRegressionTests : IDisposable
     }
 
     [Fact]
-    public async Task F_QA_001_SyncEnqueue_Blocks_WhenQueueFull_NoSilentDrops()
+    public async Task F_QA_001_SyncEnqueue_DropsWhenQueueFull_AndReports()
     {
         var writer = new BlockingWriter();
         const int capacity = 5;
         const int total = 20;
+        var lines = new List<string>();
+        var previous = SelfLog.Target;
+        SelfLog.Enable(line =>
+        {
+            lock (lines)
+                lines.Add(line);
+        });
 
         var config = new LoggerConfig()
             .AddWriter(writer)
@@ -253,33 +261,54 @@ public class GapRegressionTests : IDisposable
                 batchSize: 1,
                 flushInterval: TimeSpan.FromMilliseconds(50));
 
-        Log.Init(config);
-
-        // Prime: one event puts the processor into the blocking writer.
-        Log.Write("evt-0");
-
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (writer.EnteredCount == 0 && DateTime.UtcNow < deadline)
-            await Task.Delay(10);
-
-        Assert.True(writer.EnteredCount > 0, "processor never entered writer");
-
-        var producer = Task.Run(() =>
+        try
         {
-            for (var i = 1; i < total; i++)
-                Log.Write($"evt-{i}");
-        });
+            Log.Init(config);
+            Log.Write("evt-0");
 
-        // With capacity full and writer blocked, sync path must backpressure (not finish via drops).
-        var finishedEarly = await Task.WhenAny(producer, Task.Delay(300)) == producer;
-        Assert.False(finishedEarly, "sync producers finished without backpressure (likely drops)");
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (writer.EnteredCount == 0 && DateTime.UtcNow < deadline)
+                await Task.Delay(10);
 
-        writer.Release();
-        await producer.WaitAsync(TimeSpan.FromSeconds(10));
-        await Log.FlushAsync();
-        Log.Shutdown();
+            Assert.True(writer.EnteredCount > 0, "processor never entered writer");
 
-        Assert.Equal(total, writer.Events.Count);
+            var producer = Task.Run(() =>
+            {
+                for (var i = 1; i < total; i++)
+                    Log.Write($"evt-{i}");
+            });
+
+            // A full queue drops. The producers must not sit out the old five-second wait.
+            var finished = await Task.WhenAny(producer, Task.Delay(300)) == producer;
+            Assert.True(finished, "sync producers blocked instead of dropping");
+            await producer.WaitAsync(TimeSpan.FromSeconds(5));
+
+            var reported = false;
+            for (var i = 0; i < 50 && !reported; i++)
+            {
+                lock (lines)
+                    reported = lines.Exists(line => line.Contains("events dropped: the background queue is full", StringComparison.Ordinal));
+                if (!reported)
+                    await Task.Delay(20);
+            }
+
+            Assert.True(reported, "ALOG0070 was not written");
+            writer.Release();
+            await Log.FlushAsync();
+            Log.Shutdown();
+
+            int dropped;
+            lock (lines)
+                dropped = SumReportedDrops(lines);
+
+            Assert.Equal(total, writer.Events.Count + dropped);
+        }
+        finally
+        {
+            writer.Release();
+            SelfLog.Target = previous;
+            Log.Shutdown();
+        }
     }
 
     [Fact]
@@ -343,6 +372,27 @@ public class GapRegressionTests : IDisposable
             await producer.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
             await queue.FlushAsync().ConfigureAwait(false);
         });
+    }
+
+    /// <summary>
+    /// Adds the counts from every ALOG0070 line. A partial first line plus a later line still sums to the drops.
+    /// </summary>
+    /// <param name="lines">Captured SelfLog lines. Not null.</param>
+    /// <returns>The sum of the counts. Zero when no drop line is present.</returns>
+    private static int SumReportedDrops(List<string> lines)
+    {
+        const string marker = " events dropped: the background queue is full";
+        var sum = 0;
+        for (var i = 0; i < lines.Count; i++)
+        {
+            var at = lines[i].IndexOf(marker, StringComparison.Ordinal);
+            if (at <= 0)
+                continue;
+
+            sum += int.Parse(lines[i].AsSpan(0, at), CultureInfo.InvariantCulture);
+        }
+
+        return sum;
     }
 }
 

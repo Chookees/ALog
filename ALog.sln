@@ -25,6 +25,8 @@ Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "console", "console", "{1D56
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ALog.ConsumerSmoke", "eng\consumer-smoke\console\ALog.ConsumerSmoke.csproj", "{D8027FF8-1831-4147-8C72-2E481B66FBAD}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ALog.HangProbe", "eng\c4-hang-probe\ALog.HangProbe.csproj", "{154DFAD5-B88A-4BE5-85A3-1C035337467E}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -59,6 +61,10 @@ Global
 		{D8027FF8-1831-4147-8C72-2E481B66FBAD}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{D8027FF8-1831-4147-8C72-2E481B66FBAD}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{D8027FF8-1831-4147-8C72-2E481B66FBAD}.Release|Any CPU.Build.0 = Release|Any CPU
+		{154DFAD5-B88A-4BE5-85A3-1C035337467E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{154DFAD5-B88A-4BE5-85A3-1C035337467E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{154DFAD5-B88A-4BE5-85A3-1C035337467E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{154DFAD5-B88A-4BE5-85A3-1C035337467E}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -68,6 +74,7 @@ Global
 		{0488CFCF-6B24-CA32-1554-AF8EBF6D953F} = {7525B257-249C-EE79-B10A-65D0BC27ABA9}
 		{1D56F8AA-5ED7-C3E7-8207-38204C13D36F} = {0488CFCF-6B24-CA32-1554-AF8EBF6D953F}
 		{D8027FF8-1831-4147-8C72-2E481B66FBAD} = {1D56F8AA-5ED7-C3E7-8207-38204C13D36F}
+		{154DFAD5-B88A-4BE5-85A3-1C035337467E} = {7525B257-249C-EE79-B10A-65D0BC27ABA9}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {871AB757-DF71-4C2E-A362-514D4C40A0F8}

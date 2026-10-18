@@ -46,6 +46,7 @@ internal sealed class BlockingWriter : ILogWriter
     public List<LogEvent> Events { get; } = new();
     public int EnteredCount { get; private set; }
     public int WriteThreadId { get; private set; } = -1;
+    public bool Disposed { get; private set; }
 
     public void Release() => _gate.Set();
 
@@ -67,7 +68,11 @@ internal sealed class BlockingWriter : ILogWriter
         return Task.CompletedTask;
     }
 
-    public void Dispose() => _gate.Dispose();
+    public void Dispose()
+    {
+        Disposed = true;
+        _gate.Dispose();
+    }
 }
 
 internal sealed class TrackingFormatter : ILogFormatter

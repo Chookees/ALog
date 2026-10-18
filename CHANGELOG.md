@@ -23,6 +23,7 @@
 - Fixed: `AddALog` matches message-template values by name, not by position, so ASP.NET Core and EF Core messages render correctly and keep the right property names.
 - Fixed: `AddALog` no longer throws into the application when a log message cannot be formatted. ALog writes the event with its message template and reports ALOG0022.
 - Fixed: `AddALog` stores `{@Order}` and `{$Order}` as the property `Order`, and keeps the property values when a message has no `{OriginalFormat}`.
+- Fixed: with the background queue, a full queue no longer blocks the caller for 5 seconds and then drops events silently, and shutdown no longer loses queued events silently or writes to a disposed writer. Dropped and unwritten events are counted and reported (ALOG0070, ALOG0071).
 
 ## 0.2.0
 

@@ -479,8 +479,8 @@ internal static class MelFormatGuard
     internal const int MaxPairs = 256;
 
     /// <summary>
-    /// Most characters of an exception message copied into ALOG0022, after trailing periods are removed.
-    /// A longer message is cut and marked <c> [truncated]</c>.
+    /// Most characters of an exception message copied into ALOG0022, after trailing whitespace and periods are removed together.
+    /// A longer message is cut and marked <c> [truncated]</c>. Nothing left becomes <c>(no message)</c>.
     /// </summary>
     internal const int MaxExceptionMessageLength = 500;
 
@@ -533,9 +533,9 @@ internal static class MelFormatGuard
     /// <param name="category">Logger category. Not null. Inserted as written. Not trimmed or shortened.</param>
     /// <param name="error">Failure whose type name and message fill the sentence. Not null. The type name is not shortened.</param>
     /// <returns>
-    /// One line. The message has no trailing period of its own, so the sentence contributes exactly one period
-    /// before <c>ALog wrote the event</c>. A message longer than <see cref="MaxExceptionMessageLength"/>
-    /// is cut and ends with <c> [truncated]</c>.
+    /// One line. Trailing whitespace and periods are removed from the message first, so the sentence contributes
+    /// exactly one period before <c>ALog wrote the event</c>. A message longer than <see cref="MaxExceptionMessageLength"/>
+    /// is cut and ends with <c> [truncated]</c>. A message that is only whitespace and periods becomes <c>(no message)</c>.
     /// </returns>
     /// <remarks>
     /// Does not throw. Newlines in the message become spaces before the trim, so the report stays one physical line.
@@ -551,22 +551,39 @@ internal static class MelFormatGuard
 
     /// <summary>
     /// Prepares an exception message for the ALOG0022 slot.
-    /// Trailing periods are removed first. What remains is then cut to <see cref="MaxExceptionMessageLength"/>
-    /// characters when it is longer, without splitting a surrogate pair, and <c> [truncated]</c> is appended.
+    /// Newlines become spaces, then trailing whitespace and periods are removed together.
+    /// What remains is cut to <see cref="MaxExceptionMessageLength"/> characters when it is longer,
+    /// without splitting a surrogate pair, and <c> [truncated]</c> is appended.
+    /// Nothing left becomes <c>(no message)</c>.
     /// </summary>
     /// <param name="detail">Exception message. Not null. May contain newlines. May be millions of characters.</param>
     /// <returns>
     /// The text that sits between the exception type and the sentence period.
     /// At most <see cref="MaxExceptionMessageLength"/> characters of the message, plus <c> [truncated]</c> when cut.
+    /// <c>(no message)</c> when only whitespace and periods remain.
     /// </returns>
     /// <remarks>
-    /// Does not throw. Copies only the kept prefix of a long message. Safe to call from the logging thread.
+    /// Does not throw. <c>Replace</c> copies the whole flattened message. The trim then walks that copy from the end,
+    /// and only the kept prefix is cut to 500 characters. Safe to call from the logging thread.
     /// </remarks>
     private static string FitDetail(string detail)
     {
-        var flat = detail.Replace('\r', ' ').Replace('\n', ' ').TrimEnd('.');
-        if (flat.Length <= MaxExceptionMessageLength)
-            return flat;
+        var flat = detail.Replace('\r', ' ').Replace('\n', ' ');
+        var end = flat.Length;
+        for (var i = 0; i < flat.Length && end > 0; i++)
+        {
+            var ch = flat[end - 1];
+            if (ch != '.' && !char.IsWhiteSpace(ch))
+                break;
+
+            end--;
+        }
+
+        if (end == 0)
+            return "(no message)";
+
+        if (end <= MaxExceptionMessageLength)
+            return flat.Substring(0, end);
 
         var cut = MaxExceptionMessageLength;
         // A high surrogate at the cut would leave its pair on the discarded side.
