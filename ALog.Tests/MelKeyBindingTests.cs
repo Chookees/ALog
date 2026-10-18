@@ -61,15 +61,15 @@ public sealed class MelKeyBindingTests
     }
 
     /// <summary>
-    /// <c>{@Order}</c> stays <c>@Order</c>. ALog's template parser does not treat <c>@</c> as an operator,
-    /// so the bridge must not rename it to <c>Order</c> (C3-02).
+    /// ALog's own template parser still does not treat <c>@</c> as an operator.
+    /// The MEL bridge stores <c>{@Order}</c> as the property <c>Order</c> (C3b-02).
     /// </summary>
     /// <remarks>
-    /// No I/O. Also calls <see cref="MessageTemplate.Format(string, object?[])"/> so a later parser change
-    /// that starts stripping <c>@</c> fails this test together with the bridge.
+    /// No I/O. The parser assertions are the original C3 check and are unchanged.
+    /// A later parser change that starts stripping <c>@</c> fails this test.
     /// </remarks>
     [Fact]
-    public void AtSign_StaysInTheName_LikeTheTemplateParser()
+    public void AtSign_ParserKeepsTheMarker_BridgeStoresOrder()
     {
         var order = new AtOrder("box");
         var parsed = MessageTemplate.Format("{@Order}", order);
@@ -85,8 +85,8 @@ public sealed class MelKeyBindingTests
 
         var evt = Emit(state, "shipped {@Order}", "shipped box");
 
-        AssertProperty(evt, "@Order", order);
-        Assert.False(evt.Properties!.ContainsKey("Order"));
+        AssertProperty(evt, "Order", order);
+        Assert.False(evt.Properties!.ContainsKey("@Order"));
     }
 
     /// <summary>
@@ -217,21 +217,21 @@ public sealed class MelKeyBindingTests
     }
 
     /// <summary>
-    /// No <c>{OriginalFormat}</c>, or an empty one, keeps the formatter text and drops the named pairs.
-    /// The bridge must not invent a template from the remaining keys.
+    /// No <c>{OriginalFormat}</c>, or an empty one, keeps the formatter text and the named pairs.
+    /// The template stays empty. The bridge must not copy the formatter text into the template (C3b-03).
     /// </summary>
     /// <remarks>
-    /// No I/O. Covers both sides of the template guard in the binder.
+    /// No I/O. Covers a missing key and an empty value. A null value is covered by the C3b tests.
     /// </remarks>
     [Fact]
-    public void MissingOrEmptyOriginalFormat_KeepsFormatterText_WithoutNamedProperties()
+    public void MissingOrEmptyOriginalFormat_KeepsFormatterText_AndNamedProperties()
     {
         var missing = EmitPlain(
             new List<KeyValuePair<string, object?>> { new("A", "alpha") },
             "plain");
         Assert.Equal("plain", missing.Message);
-        Assert.Equal("plain", missing.MessageTemplate);
-        Assert.False(missing.Properties!.ContainsKey("A"));
+        Assert.Equal(string.Empty, missing.MessageTemplate);
+        Assert.Equal("alpha", missing.Properties!["A"]);
 
         var empty = EmitPlain(
             new List<KeyValuePair<string, object?>>
@@ -241,8 +241,8 @@ public sealed class MelKeyBindingTests
             },
             "plain");
         Assert.Equal("plain", empty.Message);
-        Assert.Equal("plain", empty.MessageTemplate);
-        Assert.False(empty.Properties!.ContainsKey("A"));
+        Assert.Equal(string.Empty, empty.MessageTemplate);
+        Assert.Equal("alpha", empty.Properties!["A"]);
     }
 
     /// <summary>

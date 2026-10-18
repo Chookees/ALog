@@ -61,18 +61,57 @@ public static class SelfLog
         }
     }
 
+    /// <summary>
+    /// Writes one internal failure line for <paramref name="source"/> and <paramref name="exception"/>.
+    /// A null exception is ignored. Disabled mode writes nothing. The line is one physical line.
+    /// </summary>
+    /// <param name="source">Short source name. Null or empty becomes <c>ALog</c>.</param>
+    /// <param name="exception">Failure to describe. Null is ignored and nothing is written.</param>
+    /// <remarks>
+    /// Does not throw, including when the target or stderr throws.
+    /// Safe to call from any thread. The mode and target are read with volatile loads.
+    /// </remarks>
     internal static void Report(string source, Exception exception)
     {
         if (exception is null)
             return;
 
-        var mode = Volatile.Read(ref _mode);
+        Deliver(Volatile.Read(ref _mode), BuildLine(source, exception));
+    }
+
+    /// <summary>
+    /// Writes one diagnostic line that is already the full text.
+    /// Used for catalog sentences that must appear verbatim, such as ALOG0022.
+    /// </summary>
+    /// <param name="line">The whole line. Null or empty writes nothing. Newlines are the caller's responsibility.</param>
+    /// <remarks>
+    /// Does not throw, including when the target or stderr throws.
+    /// A disabled SelfLog drops the line. Safe to call from any thread.
+    /// </remarks>
+    internal static void ReportLine(string line)
+    {
+        if (string.IsNullOrEmpty(line))
+            return;
+
+        Deliver(Volatile.Read(ref _mode), line);
+    }
+
+    /// <summary>
+    /// Sends <paramref name="line"/> to the current SelfLog target, to stderr, or nowhere.
+    /// </summary>
+    /// <param name="mode">One of the mode constants. Any other value is treated as stderr.</param>
+    /// <param name="line">Text to write. Not null. Written as one call.</param>
+    /// <remarks>
+    /// Does not throw. Swallows a target or stderr failure so diagnostics cannot escape.
+    /// Safe to call from any thread after the mode has been read.
+    /// </remarks>
+    private static void Deliver(int mode, string line)
+    {
         if (mode == ModeDisabled)
             return;
 
         try
         {
-            var line = BuildLine(source, exception);
             if (mode == ModeTarget)
             {
                 Volatile.Read(ref _target)?.Invoke(line);

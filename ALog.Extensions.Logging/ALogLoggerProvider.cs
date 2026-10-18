@@ -1,9 +1,13 @@
-// MEL bridge. The message text is the formatter's. Property names come from state keys.
-// {OriginalFormat} is the template and is not a property. The scan stops at MelScopeAdapter.MaxProperties.
+// MEL bridge. When formatting succeeds, the event text is the formatter's text.
+// {OriginalFormat} is the template. It is searched across the whole list, not only the first 128 entries.
+// A null or throwing formatter, or a throwing state access, does not escape into the application:
+// the event is still written and ALOG0022 is reported once per category and exception type, up to 256 pairs.
+// A property name drops one leading '@' or '$'. ALog's own template parser is unchanged.
 // Next: MelScopeAdapter.cs for scopes, LoggerEngine.LogCaptured for the write.
 namespace ALog.Extensions.Logging;
 
 using System.Collections.Concurrent;
+using ALog;
 using ALog.Config;
 using ALog.Core;
 using Microsoft.Extensions.Logging;
@@ -110,6 +114,19 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
     // Same spelling MEL uses. Compared ordinally so a similar key stays a property.
     private const string OriginalFormat = "{OriginalFormat}";
 
+    // The message on the synthetic failure used when the formatter delegate is null.
+    private const string NullFormatterMessage = "The formatter is null.";
+
+    /// <summary>
+    /// Fixed ceiling for a state that is only an enumerable.
+    /// A list is bounded by its <c>Count</c> instead, so a template at any index is still found.
+    /// </summary>
+    /// <remarks>
+    /// shortcut: non-list enumerables stop at 1024 entries. Raise this when a real MEL state
+    /// that is not a list is longer than 1024 and its template sits past that index.
+    /// </remarks>
+    internal const int MaxEnumeratedEntries = 1024;
+
     public ALogLogger(
         string category,
         LoggerEngine engine,
@@ -160,6 +177,20 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
     private int Global()
         => _levels is null ? (int)ALogLevel.Trace : (int)_levels.Global;
 
+    /// <summary>
+    /// Writes one MEL call. A null formatter, a throwing formatter, or a throwing state
+    /// does not escape: the event is still written and ALOG0022 is reported once per pair.
+    /// </summary>
+    /// <typeparam name="TState">State type MEL passed. A key/value list is read. Other types are plain text.</typeparam>
+    /// <param name="logLevel">MEL level. <see cref="MelLogLevel.None"/> and levels below the floor return before any work.</param>
+    /// <param name="eventId">MEL event id. Stored by MEL on the call. This bridge does not copy it onto the event.</param>
+    /// <param name="state">MEL state. Null is logged as plain text when the formatter succeeds.</param>
+    /// <param name="exception">Exception from the caller. Null when the call had none. Kept on the event even when formatting fails.</param>
+    /// <param name="formatter">Renders the state. Null is reported as <c>ArgumentNullException</c> and is not called.</param>
+    /// <remarks>
+    /// Does not throw for a formatter or state failure. Allocates the property bag only when a pair is kept.
+    /// Factory scopes are attached for this call only. Safe to call from several logging threads; the report set is locked.
+    /// </remarks>
     public void Log<TState>(
         MelLogLevel logLevel,
         EventId eventId,
@@ -170,15 +201,34 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
         if (!IsEnabled(logLevel))
             return;
 
-        ArgumentNullException.ThrowIfNull(formatter);
-
-        var message = formatter(state, exception);
         var alogLevel = LogLevelMapper.ToALog(logLevel);
+        var formatFailure = ReadFormatter(state, exception, formatter, out var message);
 
         // The level gate already returned. Factory scopes, including the
         // activity scope, are copied only for this emit and then removed.
         using var external = MelScopeAdapter.AttachExternal(_scopes());
-        Write(state, exception, message, alogLevel);
+        var bound = BindState(state);
+        var failure = formatFailure ?? bound.Failure;
+        if (failure is not null)
+            MelFormatGuard.Report(_category, failure);
+
+        if (failure is null && !bound.Recognized)
+        {
+            _engine.LogStructured(_category, alogLevel, exception, message ?? string.Empty);
+            return;
+        }
+
+        var template = UsableTemplate(bound.Template);
+        var text = failure is null ? message ?? string.Empty : template ?? string.Empty;
+        _engine.LogCaptured(new LoggerEngine.CapturedLog
+        {
+            Category = _category,
+            Level = alogLevel,
+            Exception = exception,
+            Message = text,
+            MessageTemplate = template ?? string.Empty,
+            Properties = bound.Properties
+        });
     }
 
     private void EnsureCurrent()
@@ -192,101 +242,315 @@ internal sealed class ALogLogger : Microsoft.Extensions.Logging.ILogger
     }
 
     /// <summary>
-    /// Writes one MEL call. Named state goes to <see cref="LoggerEngine.LogCaptured"/> with the formatter text.
-    /// Anything else is logged as the formatter text alone, because there is no template to keep.
+    /// Calls the formatter. A null delegate becomes an <see cref="ArgumentNullException"/>
+    /// whose message is <c>The formatter is null.</c> A throw is returned, not rethrown.
     /// </summary>
-    /// <typeparam name="TState">State type MEL passed. A key/value list is read; other types are not.</typeparam>
-    /// <param name="state">MEL state. Null is logged as plain text.</param>
-    /// <param name="exception">Exception from MEL. Null when the call had none.</param>
-    /// <param name="message">Text the formatter returned. This is the event text when a template is present.</param>
-    /// <param name="alogLevel">ALog level already mapped from MEL. The engine drops it when it is below the minimum.</param>
+    /// <typeparam name="TState">State type the formatter expects.</typeparam>
+    /// <param name="state">State passed to the formatter. Not inspected here.</param>
+    /// <param name="exception">Caller exception passed to the formatter. Null when the call had none.</param>
+    /// <param name="formatter">MEL formatter. Null is not called.</param>
+    /// <param name="message">Formatter text when the call succeeded. Null when it failed or returned null.</param>
+    /// <returns>The failure, or null when the formatter returned.</returns>
     /// <remarks>
-    /// Allocates the property bag only when a non-empty <c>{OriginalFormat}</c> is inside the scan window.
-    /// Does not render the template. Safe to call from the logging thread; the engine is the same one <c>LogStructured</c> uses.
+    /// Does not throw. Does not allocate except for the synthetic null-formatter exception.
+    /// Safe to call from the logging thread.
     /// </remarks>
-    private void Write<TState>(TState state, Exception? exception, string message, ALogLevel alogLevel)
+    private static Exception? ReadFormatter<TState>(
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string>? formatter,
+        out string? message)
     {
-        if (state is IReadOnlyList<KeyValuePair<string, object?>> values)
-        {
-            var captured = TryBind(values, message, alogLevel, exception);
-            if (captured.HasValue)
-            {
-                _engine.LogCaptured(captured.Value);
-                return;
-            }
-        }
+        message = null;
+        if (formatter is null)
+            return new ArgumentNullException(null, NullFormatterMessage);
 
-        _engine.LogStructured(_category, alogLevel, exception, message);
+        try
+        {
+            message = formatter(state, exception);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
     }
 
     /// <summary>
-    /// Binds MEL pairs by key for one event. The first <c>{OriginalFormat}</c> is the template.
-    /// Every other pair becomes a property named by <see cref="MessageTemplate.ReadPropertyName"/>.
+    /// Reads a list or a pair sequence into a <see cref="Bound"/>. Anything else is not recognized.
     /// </summary>
-    /// <param name="values">State pairs in MEL's order. The list is not reordered. Null is rejected by the caller.</param>
-    /// <param name="message">Formatter text stored as the event message, including null at runtime.</param>
-    /// <param name="level">ALog level copied onto the captured event.</param>
-    /// <param name="exception">Exception copied onto the captured event. Null is allowed.</param>
-    /// <returns>
-    /// The captured event, or null when the first template is missing or empty.
-    /// A null return tells <see cref="Write{TState}"/> to keep the formatter text without named properties.
-    /// </returns>
+    /// <typeparam name="TState">State type MEL passed.</typeparam>
+    /// <param name="state">MEL state. Null is not a pair list.</param>
+    /// <returns>The pairs read before the first failure. <see cref="Bound.Recognized"/> is false for other types.</returns>
     /// <remarks>
-    /// Reads at most <see cref="MelScopeAdapter.MaxProperties"/> pairs so a huge state cannot grow without a bound.
-    /// The first of two equal names wins (ordinal). A null value is stored. Does not throw for a bad key.
-    /// Allocates the bag. Not safe to share the returned bag across threads before the engine copies it.
+    /// Does not throw. A list is bounded by <c>Count</c>. A pure enumerable stops at <see cref="MaxEnumeratedEntries"/>.
+    /// Safe to call from the logging thread. The state is not modified.
     /// </remarks>
-    private LoggerEngine.CapturedLog? TryBind(
-        IReadOnlyList<KeyValuePair<string, object?>> values,
-        string message,
-        ALogLevel level,
-        Exception? exception)
+    private static Bound BindState<TState>(TState state)
     {
-        var limit = values.Count;
-        if (limit > MelScopeAdapter.MaxProperties)
-            limit = MelScopeAdapter.MaxProperties;
+        if (state is IReadOnlyList<KeyValuePair<string, object?>> list)
+            return BindList(list);
 
-        var sawFormat = false;
-        string? template = null;
-        Dictionary<string, object>? props = null;
-        for (var i = 0; i < limit; i++)
+        if (state is IEnumerable<KeyValuePair<string, object?>> pairs)
+            return BindEnumerable(pairs);
+
+        return default;
+    }
+
+    /// <summary>
+    /// Reads <paramref name="list"/> by index. <c>Count</c> or the indexer may throw; the failure is stored.
+    /// </summary>
+    /// <param name="list">State list. Not null. Not modified.</param>
+    /// <returns>A recognized binding. Properties stop after the first 128 entries. The template search uses the whole count.</returns>
+    /// <remarks>
+    /// Does not throw. Allocates the property bag only when a property is kept.
+    /// The loop is bounded by the count read once at the start.
+    /// </remarks>
+    private static Bound BindList(IReadOnlyList<KeyValuePair<string, object?>> list)
+    {
+        var bound = new Bound { Recognized = true };
+        int count;
+        try
         {
-            var pair = values[i];
-            if (string.Equals(pair.Key, OriginalFormat, StringComparison.Ordinal))
-            {
-                // The first template wins. A later one must not replace it or become a property.
-                if (!sawFormat)
-                {
-                    sawFormat = true;
-                    template = pair.Value?.ToString();
-                }
-
-                continue;
-            }
-
-            var name = MessageTemplate.ReadPropertyName(pair.Key);
-            if (name is null)
-                continue;
-
-            props ??= new Dictionary<string, object>(StringComparer.Ordinal);
-            if (props.ContainsKey(name))
-                continue;
-
-            // Dictionary<string, object> stores a null value. The annotation is the only lie.
-            props.Add(name, pair.Value!);
+            count = list.Count;
+        }
+        catch (Exception ex)
+        {
+            bound.Failure = ex;
+            return bound;
         }
 
-        if (!sawFormat || string.IsNullOrEmpty(template))
+        for (var i = 0; i < count; i++)
+        {
+            try
+            {
+                var pair = list[i];
+                Accept(ref bound, pair.Key, pair.Value, i);
+            }
+            catch (Exception ex)
+            {
+                bound.Failure = ex;
+                break;
+            }
+        }
+
+        return bound;
+    }
+
+    /// <summary>
+    /// Enumerates <paramref name="pairs"/> up to <see cref="MaxEnumeratedEntries"/>.
+    /// A throwing enumerator is stored as the failure. Pairs already accepted stay.
+    /// </summary>
+    /// <param name="pairs">Pair sequence that is not read as a list. Not null. Not modified.</param>
+    /// <returns>A recognized binding. The template search stops at the fixed ceiling.</returns>
+    /// <remarks>
+    /// Does not throw. Disposes the enumerator. Allocates the property bag only when a property is kept.
+    /// </remarks>
+    private static Bound BindEnumerable(IEnumerable<KeyValuePair<string, object?>> pairs)
+    {
+        var bound = new Bound { Recognized = true };
+        try
+        {
+            using var enumerator = pairs.GetEnumerator();
+            for (var index = 0; index < MaxEnumeratedEntries; index++)
+            {
+                if (!enumerator.MoveNext())
+                    return bound;
+
+                var pair = enumerator.Current;
+                Accept(ref bound, pair.Key, pair.Value, index);
+            }
+        }
+        catch (Exception ex)
+        {
+            bound.Failure = ex;
+        }
+
+        return bound;
+    }
+
+    /// <summary>
+    /// Stores one pair. The first <c>{OriginalFormat}</c> is the template. Other pairs inside the
+    /// 128-entry window become properties. A leading <c>@</c> or <c>$</c> is removed from the name.
+    /// </summary>
+    /// <param name="bound">Binding being filled. The template flag and the bag are updated.</param>
+    /// <param name="key">State key. Null and empty are skipped. <c>{OriginalFormat}</c> is the template.</param>
+    /// <param name="value">State value. Stored as-is, including null. Not destructured.</param>
+    /// <param name="index">Zero-based position. Properties at index 128 or later are skipped. The template is not.</param>
+    /// <remarks>
+    /// Throws only when the template value's <c>ToString</c> throws. The caller catches that.
+    /// The first of two equal names wins (ordinal). Allocates the bag on the first kept property.
+    /// </remarks>
+    private static void Accept(ref Bound bound, string? key, object? value, int index)
+    {
+        if (string.Equals(key, OriginalFormat, StringComparison.Ordinal))
+        {
+            // The first template wins, even when it is null or empty. A later one is not a property.
+            if (!bound.SawTemplate)
+            {
+                var text = value?.ToString();
+                bound.SawTemplate = true;
+                bound.Template = text;
+            }
+
+            return;
+        }
+
+        if (index >= MelScopeAdapter.MaxProperties)
+            return;
+
+        var name = PropertyName(key);
+        if (name is null)
+            return;
+
+        bound.Properties ??= new Dictionary<string, object>(StringComparer.Ordinal);
+        if (bound.Properties.ContainsKey(name))
+            return;
+
+        // Dictionary<string, object> stores a null value. The annotation is the only lie.
+        bound.Properties.Add(name, value!);
+    }
+
+    /// <summary>
+    /// Turns a MEL key into a property name. Braces and a format suffix are removed first.
+    /// One leading <c>@</c> or <c>$</c> is then removed, unless that is the whole name.
+    /// </summary>
+    /// <param name="key">State key, for example <c>{@Order}</c>, <c>$Order</c>, or <c>{Elapsed:0.00}</c>. Null returns null.</param>
+    /// <returns>The name, or null when the key has no name. <c>{@}</c> returns <c>@</c>.</returns>
+    /// <remarks>
+    /// Does not throw. Does not destructure the value. Safe to call from any thread.
+    /// ALog's template parser is not used here and still does not treat <c>@</c> as an operator.
+    /// </remarks>
+    private static string? PropertyName(string? key)
+    {
+        var name = MessageTemplate.ReadPropertyName(key);
+        if (string.IsNullOrEmpty(name))
             return null;
 
-        return new LoggerEngine.CapturedLog
+        if (name.Length > 1 && (name[0] == '@' || name[0] == '$'))
+            return name.Substring(1);
+
+        return name;
+    }
+
+    /// <summary>
+    /// Returns the template when it has text, otherwise null so the event template stays empty.
+    /// </summary>
+    /// <param name="template">First <c>{OriginalFormat}</c> value. Null and empty mean there is no template.</param>
+    /// <returns>The same string, or null when it is null or empty.</returns>
+    /// <remarks>Does not throw. Does not trim. A string of spaces is a template.</remarks>
+    private static string? UsableTemplate(string? template)
+    {
+        if (string.IsNullOrEmpty(template))
+            return null;
+
+        return template;
+    }
+
+    /// <summary>
+    /// Pairs read from one MEL state before the first failure.
+    /// </summary>
+    private struct Bound
+    {
+        /// <summary>First template text, or null when that value was null. Empty is not a usable template.</summary>
+        public string? Template;
+
+        /// <summary>True after the first <c>{OriginalFormat}</c> entry, including a null or empty one.</summary>
+        public bool SawTemplate;
+
+        /// <summary>Properties kept so far. Null when none were kept. A null entry is a present value.</summary>
+        public Dictionary<string, object>? Properties;
+
+        /// <summary>First state-access failure. Null when the read finished.</summary>
+        public Exception? Failure;
+
+        /// <summary>True when the state was a pair list or a pair sequence.</summary>
+        public bool Recognized;
+    }
+}
+
+/// <summary>
+/// Remembers which category and exception type already produced ALOG0022.
+/// The set stops at 256 pairs so it cannot grow without a bound.
+/// </summary>
+internal static class MelFormatGuard
+{
+    /// <summary>Most pairs that will ever be reported. The 257th new pair is silent.</summary>
+    internal const int MaxPairs = 256;
+
+    private static readonly object _gate = new();
+    private static readonly HashSet<string> _seen = new(MaxPairs);
+
+    /// <summary>
+    /// Writes ALOG0022 for <paramref name="category"/> and <paramref name="error"/> the first time that pair is seen.
+    /// A repeated pair, or a new pair after <see cref="MaxPairs"/>, writes nothing.
+    /// </summary>
+    /// <param name="category">Logger category. Null is stored as empty. Compared ordinally.</param>
+    /// <param name="error">Failure that prevented formatting. Null writes nothing. The type, not the message, identifies the pair.</param>
+    /// <remarks>
+    /// Does not throw. The set is locked. The line is written after the lock is released so a slow target cannot deadlock a second report.
+    /// Safe to call from several logging threads. Allocates the line and, once per new pair, a set entry.
+    /// </remarks>
+    internal static void Report(string? category, Exception? error)
+    {
+        if (error is null)
+            return;
+
+        var name = category ?? string.Empty;
+        var key = name + "\0" + error.GetType().AssemblyQualifiedName;
+        lock (_gate)
         {
-            Category = _category,
-            Level = level,
-            Exception = exception,
-            Message = message,
-            MessageTemplate = template,
-            Properties = props
-        };
+            if (_seen.Contains(key) || _seen.Count >= MaxPairs)
+                return;
+
+            _seen.Add(key);
+        }
+
+        SelfLog.ReportLine(Describe(name, error));
+    }
+
+    /// <summary>
+    /// Drops the remembered pairs. Tests call this so one case does not consume the 256-pair ceiling.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Takes the same lock as <see cref="Report"/>. Not used on the logging path.
+    /// </remarks>
+    internal static void Reset()
+    {
+        lock (_gate)
+            _seen.Clear();
+    }
+
+    /// <summary>
+    /// Builds the ALOG0022 sentence with the category, the exception type name, and the exception message filled in.
+    /// </summary>
+    /// <param name="category">Logger category. Not null. Inserted as written.</param>
+    /// <param name="error">Failure whose type name and message fill the sentence. Not null.</param>
+    /// <returns>One line. A throwing or null message becomes empty text between the colon and the period.</returns>
+    /// <remarks>Does not throw. Replaces carriage returns and newlines in the message with spaces.</remarks>
+    private static string Describe(string category, Exception error)
+    {
+        var detail = SafeDetail(error).Replace('\r', ' ').Replace('\n', ' ');
+        return "A log message from category '" + category + "' could not be formatted: "
+            + error.GetType().Name + ": " + detail
+            + ". ALog wrote the event with its message template only. Check the state object passed to ILogger.Log.";
+    }
+
+    /// <summary>
+    /// Reads <see cref="Exception.Message"/> without letting a broken getter escape.
+    /// </summary>
+    /// <param name="error">Exception whose message is needed. Not null.</param>
+    /// <returns>The message, or empty when the getter returns null or throws.</returns>
+    /// <remarks>Does not throw.</remarks>
+    private static string SafeDetail(Exception error)
+    {
+        try
+        {
+            return error.Message ?? string.Empty;
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 }
