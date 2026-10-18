@@ -478,6 +478,12 @@ internal static class MelFormatGuard
     /// <summary>Most pairs that will ever be reported. The 257th new pair is silent.</summary>
     internal const int MaxPairs = 256;
 
+    /// <summary>
+    /// Most characters of an exception message copied into ALOG0022, after trailing periods are removed.
+    /// A longer message is cut and marked <c> [truncated]</c>.
+    /// </summary>
+    internal const int MaxExceptionMessageLength = 500;
+
     private static readonly object _gate = new();
     private static readonly HashSet<string> _seen = new(MaxPairs);
 
@@ -524,16 +530,50 @@ internal static class MelFormatGuard
     /// <summary>
     /// Builds the ALOG0022 sentence with the category, the exception type name, and the exception message filled in.
     /// </summary>
-    /// <param name="category">Logger category. Not null. Inserted as written.</param>
-    /// <param name="error">Failure whose type name and message fill the sentence. Not null.</param>
-    /// <returns>One line. A throwing or null message becomes empty text between the colon and the period.</returns>
-    /// <remarks>Does not throw. Replaces carriage returns and newlines in the message with spaces.</remarks>
+    /// <param name="category">Logger category. Not null. Inserted as written. Not trimmed or shortened.</param>
+    /// <param name="error">Failure whose type name and message fill the sentence. Not null. The type name is not shortened.</param>
+    /// <returns>
+    /// One line. The message has no trailing period of its own, so the sentence contributes exactly one period
+    /// before <c>ALog wrote the event</c>. A message longer than <see cref="MaxExceptionMessageLength"/>
+    /// is cut and ends with <c> [truncated]</c>.
+    /// </returns>
+    /// <remarks>
+    /// Does not throw. Newlines in the message become spaces before the trim, so the report stays one physical line.
+    /// Allocates the line. The original exception message is not retained past this call.
+    /// </remarks>
     private static string Describe(string category, Exception error)
     {
-        var detail = SafeDetail(error).Replace('\r', ' ').Replace('\n', ' ');
+        var detail = FitDetail(SafeDetail(error));
         return "A log message from category '" + category + "' could not be formatted: "
             + error.GetType().Name + ": " + detail
             + ". ALog wrote the event with its message template only. Check the state object passed to ILogger.Log.";
+    }
+
+    /// <summary>
+    /// Prepares an exception message for the ALOG0022 slot.
+    /// Trailing periods are removed first. What remains is then cut to <see cref="MaxExceptionMessageLength"/>
+    /// characters when it is longer, without splitting a surrogate pair, and <c> [truncated]</c> is appended.
+    /// </summary>
+    /// <param name="detail">Exception message. Not null. May contain newlines. May be millions of characters.</param>
+    /// <returns>
+    /// The text that sits between the exception type and the sentence period.
+    /// At most <see cref="MaxExceptionMessageLength"/> characters of the message, plus <c> [truncated]</c> when cut.
+    /// </returns>
+    /// <remarks>
+    /// Does not throw. Copies only the kept prefix of a long message. Safe to call from the logging thread.
+    /// </remarks>
+    private static string FitDetail(string detail)
+    {
+        var flat = detail.Replace('\r', ' ').Replace('\n', ' ').TrimEnd('.');
+        if (flat.Length <= MaxExceptionMessageLength)
+            return flat;
+
+        var cut = MaxExceptionMessageLength;
+        // A high surrogate at the cut would leave its pair on the discarded side.
+        if (char.IsHighSurrogate(flat[cut - 1]))
+            cut--;
+
+        return string.Concat(flat.AsSpan(0, cut), " [truncated]".AsSpan());
     }
 
     /// <summary>

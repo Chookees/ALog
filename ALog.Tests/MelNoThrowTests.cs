@@ -19,7 +19,8 @@ public sealed class MelNoThrowTests : IDisposable
 {
     private const string Fragment = "could not be formatted";
 
-    private const string NullFormatterMessage = "The formatter is null.";
+    private const string SentenceTail =
+        ". ALog wrote the event with its message template only. Check the state object passed to ILogger.Log.";
 
     /// <summary>
     /// Clears process-wide diagnostic state so one test's reported pairs do not hide another's.
@@ -303,13 +304,88 @@ public sealed class MelNoThrowTests : IDisposable
         Assert.Equal(string.Empty, harness.Writer.Events[1].MessageTemplate);
         Assert.Equal("alpha", harness.Writer.Events[1].Properties!["A"]);
         var report = Assert.Single(Reports(lines));
-        Assert.Equal(Expected("QA.NullFmt", "ArgumentNullException", NullFormatterMessage), report);
+        Assert.Equal(
+            "A log message from category 'QA.NullFmt' could not be formatted: ArgumentNullException: The formatter is null"
+                + SentenceTail,
+            report);
+        Assert.DoesNotContain("null..", report, StringComparison.Ordinal);
         Assert.Contains(Fragment, report, StringComparison.Ordinal);
         Assert.Equal(3, harness.Witness.Calls.Count);
         Assert.True(harness.Witness.Calls[0].FormatterWasNull);
         Assert.Same(withTemplate, harness.Witness.Calls[0].State);
         Assert.True(harness.Witness.Calls[1].FormatterWasNull);
         Assert.IsType<ArgumentNullException>(harness.Witness.Calls[2].FormatError);
+    }
+
+    /// <summary>
+    /// A formatter message that already ends with a period is written with one period,
+    /// the period that closes the ALOG0022 sentence.
+    /// </summary>
+    /// <remarks>No I/O. One call. The literal line is the contract, not a helper that adds the period again.</remarks>
+    [Fact]
+    public void MessageEndingWithPeriod_IsReportedWithOnePeriod()
+    {
+        var lines = new List<string>();
+        using var harness = new Harness("QA.Dot", lines);
+
+        harness.Log("state", null, (_, _) => throw new FormatException("ends."));
+
+        AssertNoCallerError(harness);
+        Assert.Equal(
+            "A log message from category 'QA.Dot' could not be formatted: FormatException: ends" + SentenceTail,
+            Assert.Single(Reports(lines)));
+    }
+
+    /// <summary>
+    /// A two-million-character exception message is cut to 500 characters and marked
+    /// <c> [truncated]</c>. The diagnostic line stays under 700 characters, and the event is still written.
+    /// </summary>
+    /// <remarks>
+    /// No I/O. The message is one block of the letter x. The cap is the spec's 500, not a value read from the cut.
+    /// </remarks>
+    [Fact]
+    public void LongExceptionMessage_IsCutTo500_AndMarkedTruncated()
+    {
+        const int cap = 500;
+        const int limit = 700;
+        Assert.Equal(cap, MelFormatGuard.MaxExceptionMessageLength);
+        var lines = new List<string>();
+        using var harness = new Harness("L", lines);
+
+        harness.Log("state", null, (_, _) => throw new FixedMessageException(new string('x', 2_000_000)));
+
+        AssertNoCallerError(harness);
+        Assert.Single(harness.Writer.Events);
+        var report = Assert.Single(Reports(lines));
+        Assert.True(report.Length <= limit, "line length " + report.Length.ToString(CultureInfo.InvariantCulture));
+        var head = "A log message from category 'L' could not be formatted: FixedMessageException: ";
+        var mark = " [truncated]" + SentenceTail;
+        Assert.Equal(head + new string('x', cap) + mark, report);
+    }
+
+    /// <summary>
+    /// A surrogate pair that starts on the 500th character is kept whole by moving the cut back one character.
+    /// The line does not contain either half of the pair.
+    /// </summary>
+    /// <remarks>
+    /// No I/O. 499 letters, then U+D800 U+DC00, then more letters. The pair straddles the 500-character cut.
+    /// </remarks>
+    [Fact]
+    public void SurrogatePairAtTheCut_IsNotSplit()
+    {
+        const int cap = 500;
+        var lines = new List<string>();
+        using var harness = new Harness("S", lines);
+        var message = new string('a', cap - 1) + "\uD800\uDC00" + "tail";
+
+        harness.Log("state", null, (_, _) => throw new FixedMessageException(message));
+
+        AssertNoCallerError(harness);
+        var report = Assert.Single(Reports(lines));
+        var head = "A log message from category 'S' could not be formatted: FixedMessageException: ";
+        Assert.Equal(head + new string('a', cap - 1) + " [truncated]" + SentenceTail, report);
+        Assert.DoesNotContain("\uD800", report, StringComparison.Ordinal);
+        Assert.DoesNotContain("\uDC00", report, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -811,17 +887,18 @@ public sealed class MelNoThrowTests : IDisposable
     }
 
     /// <summary>
-    /// Builds the ALOG0022 sentence from uiux v5.30 with the placeholders filled in.
+    /// Builds an ALOG0022 line for a short message that is not the truncation case.
+    /// Trailing periods on <paramref name="exceptionMessage"/> are removed once, so the sentence's own period is the only one.
     /// </summary>
     /// <param name="category">Logger category, inserted as written.</param>
     /// <param name="exceptionType">Runtime type name, such as <c>InvalidOperationException</c>.</param>
-    /// <param name="exceptionMessage">Exception message, one line.</param>
+    /// <param name="exceptionMessage">Exception message. A trailing period is dropped. Longer messages are asserted as literals, not here.</param>
     /// <returns>The full diagnostic line, including the fragment <c>could not be formatted</c>.</returns>
     private static string Expected(string category, string exceptionType, string exceptionMessage)
     {
         return "A log message from category '" + category + "' could not be formatted: "
-            + exceptionType + ": " + exceptionMessage
-            + ". ALog wrote the event with its message template only. Check the state object passed to ILogger.Log.";
+            + exceptionType + ": " + exceptionMessage.TrimEnd('.')
+            + SentenceTail;
     }
 
     /// <summary>
@@ -1231,6 +1308,26 @@ public sealed class MelNoThrowTests : IDisposable
         /// <summary>Returns the typed enumerator.</summary>
         /// <returns>The pair sequence.</returns>
         IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>
+    /// Exception whose <see cref="Exception.Message"/> is a fixed string, including a multi-megabyte one.
+    /// </summary>
+    private sealed class FixedMessageException : Exception
+    {
+        private readonly string _text;
+
+        /// <summary>
+        /// Stores <paramref name="text"/> as the message. The base message is not used.
+        /// </summary>
+        /// <param name="text">Message text. Not null. Not copied.</param>
+        public FixedMessageException(string text)
+        {
+            _text = text;
+        }
+
+        /// <summary>The text passed to the constructor.</summary>
+        public override string Message => _text;
     }
 
     /// <summary>List whose indexer throws an exception with a throwing <see cref="Exception.Message"/>.</summary>
