@@ -18,7 +18,7 @@ public sealed partial class C4QueueFixTests
         "Event dropped: ALog is shut down (the background queue was closed by Shutdown or Dispose). Later events are counted, not reported. Stop logging before you call Shutdown or Dispose.";
 
     /// <summary>
-    /// The spec repro: 1 ms writer, 100,000 logs, 300 ms, 100,000 more, then Dispose.
+    /// The spec repro: 1 ms writer, 100,000 logs, the first ALOG0070 line, 100,000 more, then Dispose.
     /// The sum of ALOG0070 counts must equal <see cref="BackgroundLogQueue.FullDropCount"/>,
     /// and a remainder line sits immediately before ALOG0071.
     /// A run with no drops adds no ALOG0070 line.
@@ -46,8 +46,14 @@ public sealed partial class C4QueueFixTests
             for (var i = 0; i < 100_000; i++)
                 engine.Log("a", LogLevel.Info);
 
-            // Spec repro pause. The first report is due after 1 ms; the second burst stays in the 60 s window.
-            await Task.Delay(300);
+            // The first ALOG0070 line is the signal that the 60 s window is open. The second burst stays inside it.
+            Assert.True(
+                await WaitUntil(() =>
+                {
+                    lock (lines)
+                        return lines.Exists(line => line.Contains(DropMarker, StringComparison.Ordinal));
+                }, TimeSpan.FromSeconds(30)),
+                "ALOG0070 did not open the window");
             for (var i = 0; i < 100_000; i++)
                 engine.Log("b", LogLevel.Info);
 
@@ -64,7 +70,7 @@ public sealed partial class C4QueueFixTests
     /// Two shutdowns in a row, and two at once, each write the open-window ALOG0070 once, before ALOG0071.
     /// </summary>
     /// <returns>A task that finishes after the parallel shutdown.</returns>
-    [Fact(Timeout = 30000)]
+    [Fact(Timeout = 90000)]
     public async Task Shutdown_TwiceAndParallel_ReportsOpenWindowOnce()
     {
         var previous = SelfLog.Target;
@@ -83,7 +89,7 @@ public sealed partial class C4QueueFixTests
     /// An event logged before close does not report ALOG0072. The first event after Dispose reports it once, verbatim.
     /// </summary>
     /// <returns>A task that finishes after the late event.</returns>
-    [Fact(Timeout = 15000)]
+    [Fact(Timeout = 30000)]
     public async Task ClosedDrop_OneLateEvent_ReportsAlog0072Verbatim()
     {
         var lines = new List<string>();
@@ -124,7 +130,7 @@ public sealed partial class C4QueueFixTests
     /// Sixteen threads logging after the close point produce one ALOG0072 line and only closed-drop counts.
     /// </summary>
     /// <returns>A task that finishes when the workers return.</returns>
-    [Fact(Timeout = 15000)]
+    [Fact(Timeout = 30000)]
     public async Task ClosedDrop_SixteenThreads_ReportsAlog0072Once()
     {
         var lines = new List<string>();
@@ -185,7 +191,7 @@ public sealed partial class C4QueueFixTests
     /// The file contains the line that was written before the hang. The remainder is ALOG0071.
     /// </summary>
     /// <returns>A task that finishes after shutdown.</returns>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = 45000)]
     public async Task Deadline_DisposesHealthyWriters_NotTheHangingCall()
     {
         var lines = new List<string>();
@@ -209,10 +215,10 @@ public sealed partial class C4QueueFixTests
             for (var i = 0; i < 3; i++)
                 engine.Log("kept-line", LogLevel.Info);
 
-            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(30)));
             var started = Stopwatch.StartNew();
             engine.Dispose();
-            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(5200), "elapsed " + started.Elapsed.ToString());
+            TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
             Assert.False(hang.Disposed);
             Assert.False(hang.DisposeOverlappedWrite);
             Assert.True(front.Disposed);
@@ -241,7 +247,7 @@ public sealed partial class C4QueueFixTests
     /// and does not call the spy that already finished.
     /// </summary>
     /// <returns>A task that finishes when the processor leaves.</returns>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = 60000)]
     public async Task NoWriterCall_AfterDeadline_WhenHangReturns()
     {
         var previous = SelfLog.Target;
@@ -261,11 +267,11 @@ public sealed partial class C4QueueFixTests
             for (var i = 0; i < 3; i++)
                 engine.Log("x", LogLevel.Info);
 
-            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(30)));
             engine.Dispose();
             var frontFinished = front.Finished;
             release.Set();
-            Assert.True(await WaitUntil(() => IsProcessorStopped(engine.Queue!), TimeSpan.FromSeconds(5)));
+            Assert.True(await WaitUntil(() => IsProcessorStopped(engine.Queue!), TimeSpan.FromSeconds(30)));
             Assert.Equal(0, back.Finished);
             Assert.Equal(frontFinished, front.Finished);
             Assert.Equal(0, front.CallsAfterDispose);
@@ -283,7 +289,7 @@ public sealed partial class C4QueueFixTests
     /// After the call returns it is disposed at most once.
     /// </summary>
     /// <returns>A task that finishes after the blocked call is released.</returns>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = 45000)]
     public async Task DuplicateWriter_IsNotDisposedWhileACallIsRunning()
     {
         var previous = SelfLog.Target;
@@ -300,17 +306,17 @@ public sealed partial class C4QueueFixTests
             for (var i = 0; i < 5; i++)
                 engine.Log("dup", LogLevel.Info);
 
-            Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(30)));
             var started = Stopwatch.StartNew();
             engine.Dispose();
-            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(5200), "elapsed " + started.Elapsed.ToString());
+            TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
             Assert.False(writer.DisposeOverlappedWrite);
             Assert.False(writer.Disposed);
             Assert.Equal(0, writer.DisposeCount);
             release.Set();
             Assert.True(await WaitUntil(
                 () => writer.DisposeCount == 1 && writer.DisposeOrder > writer.FinishOrder && !writer.DisposeOverlappedWrite,
-                TimeSpan.FromSeconds(5)));
+                TimeSpan.FromSeconds(30)));
             Assert.Equal(1, writer.DisposeCount);
             var queue = engine.Queue!;
             var unwritten = queue.UnwrittenCount;
@@ -325,16 +331,20 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// A writer whose call takes 5.5 s is not disposed while that call runs.
-    /// Shutdown returns inside 5.2 s. Dispose runs only after the call returns, and not during Write.
+    /// A writer that is still inside Write is not disposed while that call runs.
+    /// Shutdown returns inside the shutdown window. Dispose runs only after the call returns, and not during Write.
     /// </summary>
     /// <returns>A task that finishes after the slow call is disposed.</returns>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = 45000)]
     public async Task SlowCall_IsDisposedOnlyAfterItReturns()
     {
         var previous = SelfLog.Target;
         SelfLog.Enable(static _ => { });
-        var slow = new ProbeWriter(delay: TimeSpan.FromMilliseconds(5500));
+        // A fixed 5.5 s sleep can end before Dispose returns inside the 10 s window, so the
+        // "still running" check would depend on the clock. The release signal keeps the call
+        // inside Write until this test lets it finish.
+        var release = new ManualResetEventSlim(false);
+        var slow = new ProbeWriter(release: release);
         var behind = new ProbeWriter();
         var engine = new LoggerEngine(new LoggerConfig()
             .AddWriter(slow)
@@ -344,21 +354,23 @@ public sealed partial class C4QueueFixTests
         try
         {
             engine.Log("slow", LogLevel.Info);
-            Assert.True(slow.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(slow.Entered.Wait(TimeSpan.FromSeconds(30)));
             var started = Stopwatch.StartNew();
             engine.Dispose();
-            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(5200), "elapsed " + started.Elapsed.ToString());
+            TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
             Assert.False(slow.Disposed);
             Assert.False(slow.DisposeOverlappedWrite);
+            release.Set();
             Assert.True(await WaitUntil(
                 () => slow.Disposed && slow.DisposeOrder > slow.FinishOrder,
-                TimeSpan.FromSeconds(3)));
+                TimeSpan.FromSeconds(30)));
             Assert.False(slow.DisposeOverlappedWrite);
             Assert.True(behind.Disposed);
             Assert.Equal(0, behind.Finished);
         }
         finally
         {
+            release.Set();
             SelfLog.Target = previous;
         }
     }
@@ -421,7 +433,7 @@ public sealed partial class C4QueueFixTests
         try
         {
             Assert.True(queue.TryEnqueue(Event("prime")));
-            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(30)));
             for (var i = 0; i < 3; i++)
                 Assert.True(queue.TryEnqueue(Event("fill")));
 
@@ -434,7 +446,7 @@ public sealed partial class C4QueueFixTests
             {
                 var first = Task.Run(() => queue.Dispose());
                 var second = Task.Run(() => queue.Dispose());
-                await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(8));
+                await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(30));
             }
             else
             {
@@ -442,7 +454,7 @@ public sealed partial class C4QueueFixTests
                 queue.Dispose();
             }
 
-            Assert.True(started.Elapsed < TimeSpan.FromMilliseconds(5200), "elapsed " + started.Elapsed.ToString());
+            TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
             lock (lines)
             {
                 Assert.Equal(2, lines.Count);
@@ -508,7 +520,7 @@ public sealed partial class C4QueueFixTests
 
     /// <summary>
     /// Records dispose-during-write, optional sleep, and an optional inner writer.
-    /// A release handle blocks the call until the test sets it, with a 15 s bound.
+    /// A release handle blocks the call until the test sets it, with a 30 s hang bound.
     /// </summary>
     private sealed class ProbeWriter : ILogWriter
     {
@@ -533,7 +545,7 @@ public sealed partial class C4QueueFixTests
         /// <paramref name="release"/> blocks until set. <paramref name="inner"/> receives the event.
         /// </summary>
         /// <param name="delay">Sleep inside the call. Zero sleeps not at all.</param>
-        /// <param name="release">Optional block. The wait is at most 15 s.</param>
+        /// <param name="release">Optional block. The wait is at most 30 s, the hang guard, not the shutdown deadline.</param>
         /// <param name="inner">Optional writer to forward to. Null writes nowhere.</param>
         internal ProbeWriter(TimeSpan delay = default, ManualResetEventSlim? release = null, ILogWriter? inner = null)
         {
@@ -565,7 +577,7 @@ public sealed partial class C4QueueFixTests
 
         /// <summary>Sleeps, waits for release, then forwards. A dispose during the call is recorded.</summary>
         /// <param name="logEvent">Forwarded to the inner writer. May be null.</param>
-        /// <exception cref="TimeoutException">The release handle was not set within 15 s.</exception>
+        /// <exception cref="TimeoutException">The release handle was not set within 30 s.</exception>
         public void Write(LogEvent logEvent)
         {
             Interlocked.Exchange(ref _inWrite, 1);
@@ -575,8 +587,8 @@ public sealed partial class C4QueueFixTests
                 if (_delay > TimeSpan.Zero)
                     Thread.Sleep(_delay);
 
-                if (_release is not null && !_release.Wait(TimeSpan.FromSeconds(15)))
-                    throw new TimeoutException("The test did not release the writer within 15 s.");
+                if (_release is not null && !_release.Wait(TimeSpan.FromSeconds(30)))
+                    throw new TimeoutException("The test did not release the writer within 30 s.");
 
                 if (Volatile.Read(ref _disposed) != 0)
                     Interlocked.Increment(ref _after);

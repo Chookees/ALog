@@ -148,18 +148,18 @@ public sealed class ScopeAndNeverThrowTests : IDisposable
             using (Log.BeginScope("child", "C"))
             {
                 childEntered.TrySetResult();
-                Assert.True(releaseChild.Task.Wait(TimeSpan.FromSeconds(5)), "child was not released");
+                Assert.True(releaseChild.Task.Wait(TimeSpan.FromSeconds(30)), "child was not released");
                 Log.Write("sibling-child");
             }
         });
 
         try
         {
-            await childEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await childEntered.Task.WaitAsync(TimeSpan.FromSeconds(30));
             root.Dispose();
             Log.Write("sibling-parent");
             releaseChild.TrySetResult();
-            await child.WaitAsync(TimeSpan.FromSeconds(5));
+            await child.WaitAsync(TimeSpan.FromSeconds(30));
         }
         finally
         {
@@ -191,16 +191,16 @@ public sealed class ScopeAndNeverThrowTests : IDisposable
                 using (Log.BeginScope("child", "C"))
                 {
                     entered.TrySetResult();
-                    Assert.True(release.Task.Wait(TimeSpan.FromSeconds(5)), "child was not released");
+                    Assert.True(release.Task.Wait(TimeSpan.FromSeconds(30)), "child was not released");
                     Log.Write("child-after-clear");
                 }
             });
 
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await entered.Task.WaitAsync(TimeSpan.FromSeconds(30));
             Log.ClearContext();
             Log.Write("parent-after-clear");
             release.TrySetResult();
-            await child.WaitAsync(TimeSpan.FromSeconds(5));
+            await child.WaitAsync(TimeSpan.FromSeconds(30));
         }
 
         var parent = ContextOf(writer, "parent-after-clear");
@@ -498,8 +498,8 @@ public sealed class ScopeAndNeverThrowTests : IDisposable
             var left = Task.Run(() => WriteBranch("L", leftMessage, leftEntered, release));
             var right = Task.Run(() => WriteBranch("R", rightMessage, rightEntered, release));
 
-            await leftEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            await rightEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await leftEntered.Task.WaitAsync(TimeSpan.FromSeconds(30));
+            await rightEntered.Task.WaitAsync(TimeSpan.FromSeconds(30));
 
             Log.Write(parentMessage);
             release.TrySetResult();
@@ -533,7 +533,7 @@ public sealed class ScopeAndNeverThrowTests : IDisposable
         using (Log.BeginScope("branch", branch))
         {
             entered.TrySetResult();
-            Assert.True(release.Task.Wait(TimeSpan.FromSeconds(5)), "branch was not released");
+            Assert.True(release.Task.Wait(TimeSpan.FromSeconds(30)), "branch was not released");
             Log.Write(message);
         }
     }
