@@ -1,4 +1,11 @@
 # CLK-03. Each entry is one documentation id. RS0030 is an error.
+# The test BannedSymbolRuleTests lists every id the rule requires. This file is that list.
+# A public API in System.Threading, System.Threading.Tasks, System.Threading.Channels,
+# or System.Collections.Concurrent is banned when it takes a time (TimeSpan, int, uint, or long)
+# under a time name (timeout, delay, dueTime, period, milliseconds, including those words
+# inside a longer name) and it has no TimeProvider parameter. Process.WaitForExit is included.
+# ITimer.Change is not banned: that timer is the one TimeProvider.CreateTimer returns.
+# Clock reads, including DateTime.Today, and TimeProvider.System are banned too.
 # TimeProvider overloads of Delay, WaitAsync, CancellationTokenSource, and PeriodicTimer stay legal.
 # Parameterless Wait, WaitOne, WaitAny, WaitAll, Join, and SignalAndWait stay legal.
 # Three messages: reading the clock, waiting on the wall clock, and TimeProvider.System.
@@ -137,3 +144,10 @@ M:System.GC.WaitForFullGCApproach(System.TimeSpan);This waits on the wall clock,
 M:System.GC.WaitForFullGCComplete(System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
 M:System.GC.WaitForFullGCComplete(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
 M:System.Threading.SynchronizationContext.Wait(System.IntPtr[],System.Boolean,System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Timer.#ctor(System.Threading.TimerCallback,System.Object,System.Int32,System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Timer.#ctor(System.Threading.TimerCallback,System.Object,System.Int64,System.Int64);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Timer.#ctor(System.Threading.TimerCallback,System.Object,System.TimeSpan,System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Timer.#ctor(System.Threading.TimerCallback,System.Object,System.UInt32,System.UInt32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+P:System.Diagnostics.Stopwatch.Elapsed;ALog reads time only from the injected TimeProvider. Use GetUtcNow() or GetTimestamp().
+P:System.Diagnostics.Stopwatch.ElapsedMilliseconds;ALog reads time only from the injected TimeProvider. Use GetUtcNow() or GetTimestamp().
+P:System.Diagnostics.Stopwatch.ElapsedTicks;ALog reads time only from the injected TimeProvider. Use GetUtcNow() or GetTimestamp().
