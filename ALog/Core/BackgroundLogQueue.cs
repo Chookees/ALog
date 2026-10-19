@@ -1,7 +1,7 @@
 // Background queue for UseBackgroundQueue (C4).
 // One opt-in queue. A full queue drops the new event and counts it (ALOG0070).
 // Shutdown, flush, and the new-write cutoff use the injected TimeProvider (ALOG0071).
-// Production uses TimeProvider.System. Tests pass a clock they can move.
+// Production uses ProductionClock.Default. Tests pass a clock they can move.
 // The open ALOG0070 window is written at shutdown. The first event after close is ALOG0072.
 // Idle writers are disposed at the deadline. A call that is still running is not.
 // Next file: ALog/Core/LoggerEngine.cs.
@@ -110,14 +110,12 @@ public class BackgroundLogQueue : IDisposable
             batchSize,
             flushInterval ?? TimeSpan.FromMilliseconds(100),
             asyncEnabled,
-#pragma warning disable RS0030 // public constructor default; tests pass a clock to the internal constructor
-            TimeProvider.System))
-#pragma warning restore RS0030
+            ProductionClock.Default))
     {
     }
 
     /// <summary>
-    /// Starts the processor with a clock the tests can move. Production uses <see cref="TimeProvider.System"/>.
+    /// Starts the processor with a clock the tests can move. Production uses <see cref="ProductionClock.Default"/>.
     /// </summary>
     /// <param name="writers">Writers that receive each event. Not null.</param>
     /// <param name="capacity">Most events accepted while writers are behind. At least 1.</param>

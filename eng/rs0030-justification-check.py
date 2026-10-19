@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Reject an RS0030 suppression that has no justification.
+"""Reject an RS0030 suppression that is not a justified SuppressMessage.
 
 RS0030 is a warning unless product source sets it to error. A
 SuppressMessage for RS0030 still compiles when Justification is omitted, and
 IDE0076 and IDE0077 do not require that property. This script reports that
-attribute, and a `#pragma warning disable RS0030` whose line has no
-justification comment. It also requires the error severity to stay on the
-two product trees only.
+attribute. Any `#pragma warning disable RS0030` is reported too, including
+when the line has a comment. It also requires the error severity to stay on
+the two product trees only.
 
 Success prints `rs0030-justification: ok`. A hit prints one line per site
 and then `rs0030-justification: N problem(s) found.`
@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 MESSAGE = "RS0030 suppression has no Justification."
+PRAGMA_MESSAGE = "RS0030 pragma is not allowed."
 SUMMARY_OK = "rs0030-justification: ok"
 PRODUCT_GLOBS = ("[ALog/**.cs]", "[ALog.Extensions.Logging/**.cs]")
 SEVERITY_LINE = "dotnet_diagnostic.RS0030.severity = error"
@@ -276,15 +277,18 @@ def attribute_lacks_justification(arguments: str) -> bool:
     return justification.strip() == ""
 
 
-def pragma_lacks_justification(line: str) -> bool:
-    """Return whether a disable pragma for RS0030 has no comment text.
+def pragma_disables_rs0030(line: str) -> bool:
+    """Return whether a line disables RS0030 with a pragma.
+
+    A same-line comment does not make the pragma legal. The comment is
+    removed only so the directive can be recognized.
 
     Args:
         line: One physical line, without the line ending.
 
     Returns:
-        True when the line disables RS0030 and the same-line comment is
-        empty. False for other directives and for a comment that has text.
+        True when the line disables RS0030. False for other directives,
+        including `#pragma warning restore`.
 
     Raises:
         None.
@@ -292,39 +296,18 @@ def pragma_lacks_justification(line: str) -> bool:
     Side effects:
         None.
     """
-    code, comment = _split_comment(line)
+    code = line
+    marker = code.find("//")
+    if marker >= 0:
+        code = code[:marker]
+    block = re.search(r"/\*(.*?)\*/", code)
+    if block is not None:
+        code = code[:block.start()] + code[block.end():]
     matched = _PRAGMA.fullmatch(code.strip())
     if matched is None:
         return False
     identifiers = [item.strip() for item in matched.group(1).split(",") if item.strip() != ""]
-    if "RS0030" not in identifiers:
-        return False
-    return comment.strip() == ""
-
-
-def _split_comment(line: str) -> tuple[str, str]:
-    """Split a pragma line into code and its comment text.
-
-    Args:
-        line: One physical line.
-
-    Returns:
-        The code before the comment, and the comment text without the
-        marker. The comment is empty when the line has none.
-
-    Raises:
-        None.
-
-    Side effects:
-        None.
-    """
-    marker = line.find("//")
-    if marker >= 0:
-        return line[:marker], line[marker + 2:]
-    block = re.search(r"/\*(.*?)\*/", line)
-    if block is not None:
-        return line[:block.start()] + line[block.end():], block.group(1)
-    return line, ""
+    return "RS0030" in identifiers
 
 
 def source_problems(path: str, text: str) -> list[str]:
@@ -346,17 +329,17 @@ def source_problems(path: str, text: str) -> list[str]:
     """
     if path == "":
         raise ValueError("path is required")
-    return [f"{path}:{line}: {MESSAGE}" for line in _suppression_lines(text)]
+    return [f"{path}:{line}: {message}" for line, message in _suppression_lines(text)]
 
 
-def _suppression_lines(text: str) -> list[int]:
-    """Return the 1-based lines of unjustified RS0030 suppressions.
+def _suppression_lines(text: str) -> list[tuple[int, str]]:
+    """Return unjustified RS0030 suppressions and forbidden pragmas.
 
     Args:
         text: C# source.
 
     Returns:
-        Line numbers in source order.
+        Line numbers and messages in source order.
 
     Raises:
         None.
@@ -364,12 +347,12 @@ def _suppression_lines(text: str) -> list[int]:
     Side effects:
         None.
     """
-    found: list[int] = []
+    found: list[tuple[int, str]] = []
     _scan(text, 0, len(text), None, found)
     return found
 
 
-def _scan(text: str, index: int, end: int, stop: str | None, found: list[int]) -> int:
+def _scan(text: str, index: int, end: int, stop: str | None, found: list[tuple[int, str]]) -> int:
     """Scan code and record unjustified RS0030 suppressions.
 
     Args:
@@ -422,8 +405,8 @@ def _scan(text: str, index: int, end: int, stop: str | None, found: list[int]) -
             if line_end < 0 or line_end > end:
                 line_end = end
             line = text[index:line_end]
-            if pragma_lacks_justification(line):
-                found.append(line_number(text, index))
+            if pragma_disables_rs0030(line):
+                found.append((line_number(text, index), PRAGMA_MESSAGE))
             index = line_end + 1 if line_end < end else end
             continue
         if text.startswith("SuppressMessage", index) and _whole_word(text, index, len("SuppressMessage")):
@@ -433,7 +416,7 @@ def _scan(text: str, index: int, end: int, stop: str | None, found: list[int]) -
     return index
 
 
-def _read_suppress(text: str, index: int, end: int, found: list[int]) -> int:
+def _read_suppress(text: str, index: int, end: int, found: list[tuple[int, str]]) -> int:
     """Consume one SuppressMessage call and record a missing justification.
 
     Args:
@@ -473,7 +456,7 @@ def _read_suppress(text: str, index: int, end: int, found: list[int]) -> int:
             if depth == 0:
                 arguments = text[arg_at:index]
                 if attribute_lacks_justification(arguments):
-                    found.append(line_number(text, token_at))
+                    found.append((line_number(text, token_at), MESSAGE))
                 return index + 1
         index += 1
     return index
@@ -835,16 +818,17 @@ def self_check() -> None:
         ("string", "class C { string S = \"[SuppressMessage(\\\"ApiDesign\\\", \\\"RS0030\\\")]\"; }\n", False),
         ("after-string", "class C { string S = $\"x {1}\"; [SuppressMessage(\"ApiDesign\", \"RS0030\")] void M() { } }\n", True),
         ("pragma-bare", "#pragma warning disable RS0030\n", True),
-        ("pragma-kept", "#pragma warning disable RS0030 // public constructor default\n", False),
+        ("pragma-kept", "#pragma warning disable RS0030 // public constructor default\n", True),
         ("pragma-restore", "#pragma warning restore RS0030\n", False),
-        ("pragma-list", "#pragma warning disable RS0030, CS1591 // both stay\n", False),
+        ("pragma-list", "#pragma warning disable RS0030, CS1591 // both stay\n", True),
     ]
     for label, text, expect_hit in samples:
         hits = source_problems("Sample.cs", text)
-        if expect_hit and (len(hits) != 1 or MESSAGE not in hits[0]):
-            raise SystemExit(f"rs0030-justification: self-check failed for {label}")
+        wanted = PRAGMA_MESSAGE if label.startswith("pragma-") else MESSAGE
+        if expect_hit and (len(hits) != 1 or wanted not in hits[0]):
+            raise SystemExit(f"rs0030-justification: self-check failed for {label}: {hits}")
         if not expect_hit and hits:
-            raise SystemExit(f"rs0030-justification: self-check failed for {label}")
+            raise SystemExit(f"rs0030-justification: self-check failed for {label}: {hits}")
 
     good_editor = (
         "root = true\n\n[*.cs]\ndotnet_diagnostic.CA2007.severity = warning\n\n"

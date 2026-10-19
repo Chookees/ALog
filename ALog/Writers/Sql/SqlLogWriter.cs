@@ -1,6 +1,7 @@
 namespace ALog.Writers.Sql;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using ALog.Core;
@@ -126,11 +127,21 @@ public class SqlLogWriter : ILogWriter
             logEvent.Exception != null ? $"{logEvent.Exception.GetType().FullName}: {logEvent.Exception.Message}" : (object)DBNull.Value);
         command.Parameters.AddWithValue("@Context",
             logEvent.Context != null ? System.Text.Json.JsonSerializer.Serialize(logEvent.Context) : (object)DBNull.Value);
-#pragma warning disable RS0030 // CreatedAt column, not a shutdown or flush deadline
-        command.Parameters.AddWithValue("@CreatedAt", DateTime.UtcNow);
-#pragma warning restore RS0030
+        command.Parameters.AddWithValue("@CreatedAt", CreatedAtStamp());
         return command;
     }
+
+    /// <summary>
+    /// The CreatedAt value stored with the row. Not a shutdown or flush deadline.
+    /// </summary>
+    /// <returns>The current UTC time.</returns>
+    /// <remarks>Does not throw. Called once per inserted row.</remarks>
+    [SuppressMessage(
+        "ApiDesign",
+        "RS0030",
+        Justification = "CreatedAt column, not a shutdown or flush deadline. removed in P1")]
+    private static DateTime CreatedAtStamp()
+        => DateTime.UtcNow;
 
     /// <summary>
     /// Writes one SQL failure to the error stream. The event is dropped.

@@ -1,53 +1,54 @@
 # CLK-03. Each entry is one documentation id. RS0030 is an error.
 # TimeProvider overloads of Delay, WaitAsync, and CancellationTokenSource stay legal.
 # Parameterless Wait, WaitOne, WaitAny, and WaitAll stay legal.
-P:System.TimeProvider.System;wall-clock call in library code. Use the injected TimeProvider instead.
-P:System.DateTime.Now;wall-clock call in library code. Use the injected TimeProvider instead.
-P:System.DateTime.UtcNow;wall-clock call in library code. Use the injected TimeProvider instead.
-P:System.DateTimeOffset.Now;wall-clock call in library code. Use the injected TimeProvider instead.
-P:System.DateTimeOffset.UtcNow;wall-clock call in library code. Use the injected TimeProvider instead.
-P:System.Environment.TickCount;wall-clock call in library code. Use the injected TimeProvider instead.
-P:System.Environment.TickCount64;wall-clock call in library code. Use the injected TimeProvider instead.
-T:System.Diagnostics.Stopwatch;wall-clock call in library code. Use the injected TimeProvider instead.
-T:System.Threading.Timer;wall-clock call in library code. Use the injected TimeProvider instead.
-T:System.Timers.Timer;wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Thread.Sleep(System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Thread.Sleep(System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task.Delay(System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task.Delay(System.Int32,System.Threading.CancellationToken);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task.Delay(System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task.Delay(System.TimeSpan,System.Threading.CancellationToken);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.CancellationTokenSource.#ctor(System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.CancellationTokenSource.#ctor(System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.CancellationTokenSource.CancelAfter(System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.CancellationTokenSource.CancelAfter(System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitOne(System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitOne(System.Int32,System.Boolean);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitOne(System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitOne(System.TimeSpan,System.Boolean);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitAny(System.Threading.WaitHandle[],System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitAny(System.Threading.WaitHandle[],System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitAny(System.Threading.WaitHandle[],System.Int32,System.Boolean);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitAny(System.Threading.WaitHandle[],System.TimeSpan,System.Boolean);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitAll(System.Threading.WaitHandle[],System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitAll(System.Threading.WaitHandle[],System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitAll(System.Threading.WaitHandle[],System.Int32,System.Boolean);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.WaitHandle.WaitAll(System.Threading.WaitHandle[],System.TimeSpan,System.Boolean);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task.Wait(System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task.Wait(System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task.Wait(System.Int32,System.Threading.CancellationToken);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task.Wait(System.TimeSpan,System.Threading.CancellationToken);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.ManualResetEventSlim.Wait(System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.ManualResetEventSlim.Wait(System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.ManualResetEventSlim.Wait(System.Int32,System.Threading.CancellationToken);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.ManualResetEventSlim.Wait(System.TimeSpan,System.Threading.CancellationToken);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.SemaphoreSlim.Wait(System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.SemaphoreSlim.Wait(System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.SemaphoreSlim.Wait(System.Int32,System.Threading.CancellationToken);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.SemaphoreSlim.Wait(System.TimeSpan,System.Threading.CancellationToken);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task.WaitAsync(System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task.WaitAsync(System.TimeSpan,System.Threading.CancellationToken);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task`1.WaitAsync(System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.Tasks.Task`1.WaitAsync(System.TimeSpan,System.Threading.CancellationToken);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.SpinWait.SpinUntil(System.Func{System.Boolean},System.Int32);wall-clock call in library code. Use the injected TimeProvider instead.
-M:System.Threading.SpinWait.SpinUntil(System.Func{System.Boolean},System.TimeSpan);wall-clock call in library code. Use the injected TimeProvider instead.
+# Three messages: reading the clock, waiting on the wall clock, and TimeProvider.System.
+P:System.TimeProvider.System;Do not use the real clock directly. Use the TimeProvider from the options; only the default value may be TimeProvider.System.
+P:System.DateTime.Now;ALog reads time only from the injected TimeProvider. Use GetUtcNow() or GetTimestamp().
+P:System.DateTime.UtcNow;ALog reads time only from the injected TimeProvider. Use GetUtcNow() or GetTimestamp().
+P:System.DateTimeOffset.Now;ALog reads time only from the injected TimeProvider. Use GetUtcNow() or GetTimestamp().
+P:System.DateTimeOffset.UtcNow;ALog reads time only from the injected TimeProvider. Use GetUtcNow() or GetTimestamp().
+P:System.Environment.TickCount;ALog reads time only from the injected TimeProvider. Use GetUtcNow() or GetTimestamp().
+P:System.Environment.TickCount64;ALog reads time only from the injected TimeProvider. Use GetUtcNow() or GetTimestamp().
+T:System.Diagnostics.Stopwatch;ALog reads time only from the injected TimeProvider. Use GetUtcNow() or GetTimestamp().
+T:System.Threading.Timer;This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+T:System.Timers.Timer;This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Thread.Sleep(System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Thread.Sleep(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task.Delay(System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task.Delay(System.Int32,System.Threading.CancellationToken);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task.Delay(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task.Delay(System.TimeSpan,System.Threading.CancellationToken);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.CancellationTokenSource.#ctor(System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.CancellationTokenSource.#ctor(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.CancellationTokenSource.CancelAfter(System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.CancellationTokenSource.CancelAfter(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitOne(System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitOne(System.Int32,System.Boolean);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitOne(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitOne(System.TimeSpan,System.Boolean);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitAny(System.Threading.WaitHandle[],System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitAny(System.Threading.WaitHandle[],System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitAny(System.Threading.WaitHandle[],System.Int32,System.Boolean);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitAny(System.Threading.WaitHandle[],System.TimeSpan,System.Boolean);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitAll(System.Threading.WaitHandle[],System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitAll(System.Threading.WaitHandle[],System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitAll(System.Threading.WaitHandle[],System.Int32,System.Boolean);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.WaitHandle.WaitAll(System.Threading.WaitHandle[],System.TimeSpan,System.Boolean);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task.Wait(System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task.Wait(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task.Wait(System.Int32,System.Threading.CancellationToken);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task.Wait(System.TimeSpan,System.Threading.CancellationToken);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.ManualResetEventSlim.Wait(System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.ManualResetEventSlim.Wait(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.ManualResetEventSlim.Wait(System.Int32,System.Threading.CancellationToken);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.ManualResetEventSlim.Wait(System.TimeSpan,System.Threading.CancellationToken);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.SemaphoreSlim.Wait(System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.SemaphoreSlim.Wait(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.SemaphoreSlim.Wait(System.Int32,System.Threading.CancellationToken);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.SemaphoreSlim.Wait(System.TimeSpan,System.Threading.CancellationToken);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task.WaitAsync(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task.WaitAsync(System.TimeSpan,System.Threading.CancellationToken);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task`1.WaitAsync(System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.Tasks.Task`1.WaitAsync(System.TimeSpan,System.Threading.CancellationToken);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.SpinWait.SpinUntil(System.Func{System.Boolean},System.Int32);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.
+M:System.Threading.SpinWait.SpinUntil(System.Func{System.Boolean},System.TimeSpan);This waits on the wall clock, so tests cannot control it. Use the TimeProvider overload or the TimeProvider's CreateTimer.

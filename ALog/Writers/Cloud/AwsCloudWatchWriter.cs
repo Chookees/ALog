@@ -1,5 +1,6 @@
 namespace ALog.Writers.Cloud;
 
+using System.Diagnostics.CodeAnalysis;
 using ALog.Core;
 using ALog.Public.Interfaces;
 
@@ -78,21 +79,35 @@ public class AwsCloudWatchWriter : ILogWriter, IFormattableLogWriter
             if (logEvent is null)
                 throw new ArgumentNullException(nameof(logEvent));
 
-#pragma warning disable RS0030 // CloudWatch put uses a 100 s transport timeout, not a shutdown or flush deadline
-            using var timeout = new CancellationTokenSource(SyncPutTimeout);
-#pragma warning restore RS0030
-            var pending = StartPut(logEvent, timeout.Token);
-#pragma warning disable RS0030 // CloudWatch put uses a 100 s transport timeout, not a shutdown or flush deadline
-            if (!pending.Wait(SyncPutTimeout))
-#pragma warning restore RS0030
-            {
-                timeout.Cancel();
-                throw new TimeoutException("CloudWatch put exceeded the 100 second transport timeout.");
-            }
+            PutWithinTransportTimeout(logEvent);
         }
         catch (Exception ex)
         {
             Report(ex);
+        }
+    }
+
+    /// <summary>
+    /// Puts one event and waits at most <see cref="SyncPutTimeout"/>.
+    /// </summary>
+    /// <param name="logEvent">Event to put. Not null.</param>
+    /// <exception cref="TimeoutException">The put did not finish within <see cref="SyncPutTimeout"/>.</exception>
+    /// <remarks>
+    /// Does not catch a transport failure. <see cref="Write"/> reports that.
+    /// The timeout is the AWS transport bound, not a shutdown deadline.
+    /// </remarks>
+    [SuppressMessage(
+        "ApiDesign",
+        "RS0030",
+        Justification = "CloudWatch put uses a 100 s transport timeout, not a shutdown or flush deadline. removed in AWS V4")]
+    private void PutWithinTransportTimeout(LogEvent logEvent)
+    {
+        using var timeout = new CancellationTokenSource(SyncPutTimeout);
+        var pending = StartPut(logEvent, timeout.Token);
+        if (!pending.Wait(SyncPutTimeout))
+        {
+            timeout.Cancel();
+            throw new TimeoutException("CloudWatch put exceeded the 100 second transport timeout.");
         }
     }
 

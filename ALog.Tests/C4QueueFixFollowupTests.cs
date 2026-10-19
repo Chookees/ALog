@@ -538,7 +538,10 @@ public sealed partial class C4QueueFixTests
                 () => queue.DisposeWaitsStarted,
                 nameof(Shutdown_TwiceAndParallel_ReportsOpenWindowOnce));
             if (parallel)
+            {
                 await AssertSecondDisposeDoesNotWait(clock, first!, queue.Dispose);
+                Assert.Equal(1, queue.DisposeWaitsStarted);
+            }
 
             await DeadlineClock.AssertNotElapsed(
                 clock,
@@ -757,6 +760,7 @@ public sealed partial class C4QueueFixTests
                 clock,
                 first,
                 queueOnly ? queue!.Dispose : engine!.Dispose);
+            Assert.Equal(1, queue!.DisposeWaitsStarted);
             lock (lines)
                 Assert.DoesNotContain(lines, line => line.StartsWith(DeadlinePrefix, StringComparison.Ordinal));
             await DeadlineClock.AssertNotElapsed(

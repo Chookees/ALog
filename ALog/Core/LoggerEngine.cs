@@ -5,6 +5,7 @@
 namespace ALog.Core;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Threading.Tasks;
 using ALog.Config;
 using ALog.Internal;
@@ -19,7 +20,7 @@ public class LoggerEngine : ILogger, IDisposable
     private int _disposeOnce;
 
     /// <summary>
-    /// Builds the engine on <see cref="TimeProvider.System"/>.
+    /// Builds the engine on <see cref="ProductionClock.Default"/>.
     /// </summary>
     /// <param name="config">Filters, writers, and the queue switch. Not null.</param>
     /// <exception cref="ArgumentNullException"><paramref name="config"/> is null.</exception>
@@ -28,15 +29,13 @@ public class LoggerEngine : ILogger, IDisposable
     /// Safe to construct on any thread. Log after this returns.
     /// </remarks>
     public LoggerEngine(ILogConfiguration config)
-#pragma warning disable RS0030 // public constructor default; tests pass a clock to the internal constructor
-        : this(config, TimeProvider.System)
-#pragma warning restore RS0030
+        : this(config, ProductionClock.Default)
     {
     }
 
     /// <summary>
     /// Builds the engine on <paramref name="clock"/>. Tests pass a clock they can move.
-    /// Production uses <see cref="TimeProvider.System"/> through the public constructor.
+    /// Production uses <see cref="ProductionClock.Default"/> through the public constructor.
     /// </summary>
     /// <param name="config">Filters, writers, and the queue switch. Not null.</param>
     /// <param name="clock">Clock for the queue shutdown, flush, and cutoff. Not null.</param>
@@ -293,9 +292,7 @@ public class LoggerEngine : ILogger, IDisposable
             : new Dictionary<string, object>(seed.Properties, StringComparer.Ordinal);
 
         return new LogEvent(
-#pragma warning disable RS0030 // event timestamp for the log record, not a shutdown or flush deadline
-            Timestamp: DateTime.UtcNow,
-#pragma warning restore RS0030
+            Timestamp: EventTimestamp(),
             Level: seed.Level,
             Message: seed.Message,
             Exception: seed.Exception,
@@ -304,6 +301,18 @@ public class LoggerEngine : ILogger, IDisposable
             MessageTemplate: seed.MessageTemplate,
             Category: seed.Category);
     }
+
+    /// <summary>
+    /// The time stored on the event. Not a shutdown or flush deadline.
+    /// </summary>
+    /// <returns>The current UTC time.</returns>
+    /// <remarks>Does not throw. Called once per event that passes the level gate.</remarks>
+    [SuppressMessage(
+        "ApiDesign",
+        "RS0030",
+        Justification = "Event timestamp for the log record, not a shutdown or flush deadline.")]
+    private static DateTime EventTimestamp()
+        => DateTime.UtcNow;
 
     private LogEvent Enrich(LogEvent preliminary)
     {
