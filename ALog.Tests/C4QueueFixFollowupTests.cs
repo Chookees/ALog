@@ -541,13 +541,16 @@ public sealed partial class C4QueueFixTests
                 second = Task.Run(() => queue.Dispose());
 
             DeadlineClock.AssertNotReturnedBefore(
-                clock, first, BackgroundLogQueue.ShutdownDeadline, DeadlineClock.ShutdownReturnedEarly);
+                clock, first, BackgroundLogQueue.ShutdownDeadline, "shutdown");
             if (second is not null)
-                DeadlineClock.AssertStillRunning(second, DeadlineClock.ShutdownReturnedEarly);
+            {
+                DeadlineClock.AssertStillRunning(
+                    second, DeadlineClock.EarlyFire("shutdown", BackgroundLogQueue.ShutdownDeadline - DeadlineClock.Tick));
+            }
 
-            await DeadlineClock.AssertReturnedAt(clock, first, DeadlineClock.ShutdownNotReturned);
+            await DeadlineClock.AssertReturnedAt(clock, first, BackgroundLogQueue.ShutdownDeadline, "shutdown");
             if (second is not null)
-                await DeadlineClock.WaitForCompletion(second, DeadlineClock.ShutdownNotReturned);
+                await DeadlineClock.WaitForCompletion(second, DeadlineClock.LateFire("shutdown", BackgroundLogQueue.ShutdownDeadline));
             else
                 queue.Dispose();
         }

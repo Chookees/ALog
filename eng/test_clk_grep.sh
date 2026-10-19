@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# CLK-03 and U-CLK-01. The queue and the engine dispose path must not read the
-# wall clock. A test name must not claim a time it does not check.
+# CLK-03, U-CLK-01, and U-CLK-04. Queue and engine dispose code must not read
+# the wall clock. A test name must not claim a time it does not check.
+# One hit is one line. The last line is clk-grep: ok, or the problem count.
 
 set -euo pipefail
 
@@ -8,51 +9,11 @@ here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/.." && pwd)
 cd "$root"
 
-failures=0
-
-# Prints a passing check. Args: label.
-pass() {
-  printf 'ok %s\n' "$1"
-}
-
-# Records a failure. Args: message.
-fail() {
-  echo "FAIL $1" >&2
-  failures=$((failures + 1))
-}
-
-queue="ALog/Core/BackgroundLogQueue.cs"
-engine="ALog/Core/LoggerEngine.cs"
-
-# Args: label, file, extended regex. A hit fails.
-reject() {
-  local label="$1"
-  local file="$2"
-  local pattern="$3"
-  local hits
-  hits=$(grep -n -E "$pattern" "$file" || true)
-  if [ -n "$hits" ]; then
-    echo "FAIL ${label}" >&2
-    printf '%s\n' "$hits" >&2
-    failures=$((failures + 1))
-    return 0
-  fi
-  pass "$label"
-}
-
-reject "queue wall clock" "$queue" 'Stopwatch|DateTime\.UtcNow|DateTime\.Now|DateTimeOffset\.UtcNow|DateTimeOffset\.Now|\.Wait\('
-reject "queue delay without a provider" "$queue" 'Task\.Delay\('
-reject "queue one-argument periodic timer" "$queue" 'new PeriodicTimer\([^,)]*\)'
-reject "engine dispose wall wait" "$engine" 'Stopwatch|\.Wait\(|Task\.Delay\('
-
 python3 - << 'PY'
-"""Fail when a test method name claims a time the body does not check.
+"""Report wall-clock calls and test names that promise an unchecked time.
 
-Within<digits>, a trailing Ms, or Second, are time claims. A name that is the
-product deadline (ShutdownDeadline or NewWriteBudget) is allowed when the body
-uses that constant. A Within<digits> or <digits>ms name is allowed when the
-body checks that number as a bound. ReportsASecondLine and SecondWriter do not
-match, because a letter precedes Second.
+A hit is one stdout line. Success prints only "clk-grep: ok". Failure prints
+each hit and then "clk-grep: N problem(s) found." and returns 1.
 """
 
 from __future__ import annotations
@@ -66,19 +27,130 @@ METHOD = re.compile(r"\b(?:Task|void|ValueTask)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\("
 TIME_NAME = re.compile(r"Within\d|(?<![A-Za-z])Ms\b|(?<![A-Za-z])Second")
 NUMBERED = re.compile(r"Within(\d+)|(?<![A-Za-z])(\d+)[Mm]s\b")
 BOUND = re.compile(r"TimeSpan|FromMilliseconds|FromSeconds|Assert\.(True|InRange|Equal)")
+QUEUE_CALL = re.compile(
+    r"Stopwatch|DateTimeOffset\.UtcNow|DateTimeOffset\.Now|DateTime\.UtcNow|"
+    r"DateTime\.Now|\.Wait\(|Task\.Delay\(|new PeriodicTimer\([^,)]*\)"
+)
+ENGINE_CALL = re.compile(r"Stopwatch|\.Wait\(|Task\.Delay\(")
 MAX_LOOKAHEAD = 12
 MAX_BODY = 400
+MAX_FILE_LINES = 20000
+QUEUE_FILE = "ALog/Core/BackgroundLogQueue.cs"
+ENGINE_FILE = "ALog/Core/LoggerEngine.cs"
 
 
-def method_name(lines: list[str], start: int) -> str | None:
-    """Return the method name that follows a fact attribute.
+def wall_line(path: str, line_no: int, call: str) -> str:
+    """Format one wall-clock hit.
+
+    Args:
+        path: Repository-relative path. Not empty.
+        line_no: 1-based line. Greater than zero.
+        call: Matched call text. Not empty.
+
+    Returns:
+        The required one-line report.
+
+    Raises:
+        ValueError: An argument is empty or the line is not positive.
+
+    Side effects:
+        None.
+    """
+    if path == "" or call == "":
+        raise ValueError("path and call are required")
+    if line_no <= 0:
+        raise ValueError("line number must be positive")
+    return (
+        f"{path}:{line_no}: wall-clock call ({call}) in queue code. "
+        "Use the injected TimeProvider instead."
+    )
+
+
+def name_line(path: str, line_no: int, name: str) -> str:
+    """Format one test-name hit.
+
+    Args:
+        path: Repository-relative path. Not empty.
+        line_no: 1-based signature line. Greater than zero.
+        name: Test method name. Not empty.
+
+    Returns:
+        The required one-line report.
+
+    Raises:
+        ValueError: An argument is empty or the line is not positive.
+
+    Side effects:
+        None.
+    """
+    if path == "" or name == "":
+        raise ValueError("path and name are required")
+    if line_no <= 0:
+        raise ValueError("line number must be positive")
+    return (
+        f"{path}:{line_no}: test name '{name}' promises a time the test does not check. "
+        "Rename it to say what it asserts."
+    )
+
+
+def read_lines(relative: str) -> list[str]:
+    """Read a repository file, bounded at MAX_FILE_LINES.
+
+    Args:
+        relative: Path from the repository root. Not empty.
+
+    Returns:
+        The lines, without line endings.
+
+    Raises:
+        OSError: The file cannot be read.
+        ValueError: The path is empty or the file is longer than the cap.
+
+    Side effects:
+        Reads the file.
+    """
+    if relative == "":
+        raise ValueError("path is required")
+    lines = Path(relative).read_text(encoding="utf-8").splitlines()
+    if len(lines) > MAX_FILE_LINES:
+        raise ValueError(relative + " exceeds the line cap")
+    return lines
+
+
+def wall_hits(relative: str, pattern: re.Pattern[str]) -> list[str]:
+    """Return one formatted hit for each wall-clock match.
+
+    Args:
+        relative: Repository-relative source file.
+        pattern: Calls that are illegal in that file.
+
+    Returns:
+        Hits in line order. Empty when the file is clean.
+
+    Raises:
+        OSError: The file cannot be read.
+        ValueError: The file is longer than the cap.
+
+    Side effects:
+        Reads the file.
+    """
+    hits: list[str] = []
+    for index, line in enumerate(read_lines(relative), start=1):
+        for match in pattern.finditer(line):
+            hits.append(wall_line(relative, index, match.group(0)))
+    return hits
+
+
+def method_at(lines: list[str], start: int) -> tuple[str, int] | None:
+    """Return the method name and signature line after a fact attribute.
 
     Args:
         lines: File lines.
         start: Index of the attribute line.
 
     Returns:
-        The method name, or None when no signature appears within 12 lines.
+        Name and 0-based signature index, or None when no signature appears
+        within 12 lines.
 
     Raises:
         None.
@@ -90,20 +162,21 @@ def method_name(lines: list[str], start: int) -> str | None:
     for index in range(start + 1, end):
         found = METHOD.search(lines[index])
         if found:
-            return found.group(1)
+            return found.group(1), index
     return None
 
 
 def method_body(lines: list[str], start: int) -> str:
-    """Return the text from the signature through the line before the next fact.
+    """Return the text after the signature through the line before the next fact.
 
     Args:
         lines: File lines.
         start: Index of the attribute line.
 
     Returns:
-        At most 400 lines. The search stops at the next fact so a later test
-        cannot satisfy this test's bound.
+        At most 400 lines. The signature is left out, so the method name does
+        not count as a use of a deadline constant. The search stops at the next
+        fact so a later test cannot satisfy this test's bound.
 
     Raises:
         None.
@@ -111,56 +184,67 @@ def method_body(lines: list[str], start: int) -> str:
     Side effects:
         None.
     """
+    found = method_at(lines, start)
+    if found is None:
+        return ""
+    signature = found[1]
     chunk: list[str] = []
-    end = min(len(lines), start + 1 + MAX_BODY)
-    for index in range(start + 1, end):
-        if index != start + 1 and FACT.match(lines[index]):
+    end = min(len(lines), signature + 1 + MAX_BODY)
+    for index in range(signature + 1, end):
+        if FACT.match(lines[index]):
             break
         chunk.append(lines[index])
     return "\n".join(chunk)
 
 
-def violation(name: str, body: str) -> str | None:
-    """Return why a name is illegal, or None when it is allowed.
+def violation(name: str, body: str) -> bool:
+    """Return whether a name claims a time the body does not check.
 
     Args:
         name: Test method name.
         body: Method text, not including later tests.
 
     Returns:
-        A short reason, or None.
+        True when the name is illegal.
 
     Raises:
         None.
 
     Side effects:
         None.
+
+    Within<digits>, a trailing Ms, or Second, are time claims. A name that is
+    the product deadline (ShutdownDeadline or NewWriteBudget) is allowed when
+    the body uses that constant. A Within<digits> or <digits>ms name is allowed
+    when the body checks that number as a bound. ReportsASecondLine and
+    SecondWriter do not match, because a letter precedes Second.
     """
     if TIME_NAME.search(name) is None:
-        return None
+        return False
     if "ShutdownDeadline" in name and "ShutdownDeadline" in body:
-        return None
+        return False
     if "NewWriteBudget" in name and "NewWriteBudget" in body:
-        return None
+        return False
     numbers = [item[0] or item[1] for item in NUMBERED.findall(name)]
     if numbers:
         if any(number in body and BOUND.search(body) for number in numbers):
-            return None
-        return "names a duration the body does not check as a bound"
-    return "names a time the body does not check as a bound"
+            return False
+        return True
+    return True
 
 
-def scan(root: Path) -> list[str]:
+def name_hits(root: Path) -> list[str]:
     """Scan ALog.Tests for illegal test names.
 
     Args:
         root: Repository root.
 
     Returns:
-        Failure lines. Empty when every name is allowed.
+        One formatted line per illegal name, in path order.
 
     Raises:
         OSError: A test file cannot be read.
+        ValueError: A test file exceeds the line cap.
 
     Side effects:
         Reads the test tree.
@@ -168,21 +252,22 @@ def scan(root: Path) -> list[str]:
     problems: list[str] = []
     tests = root / "ALog.Tests"
     for path in sorted(tests.rglob("*.cs")):
-        lines = path.read_text(encoding="utf-8").splitlines()
+        relative = path.relative_to(root).as_posix()
+        lines = read_lines(relative)
         for index, line in enumerate(lines):
             if FACT.match(line) is None:
                 continue
-            name = method_name(lines, index)
-            if name is None:
+            found = method_at(lines, index)
+            if found is None:
                 continue
-            reason = violation(name, method_body(lines, index))
-            if reason is not None:
-                problems.append(f"{path}:{index + 1} {name} {reason}")
+            name, signature = found
+            if violation(name, method_body(lines, index)):
+                problems.append(name_line(relative, signature + 1, name))
     return problems
 
 
 def self_check() -> None:
-    """Fail the process when the name rule accepts or rejects the wrong sample.
+    """Fail the process when a sample is classified wrongly.
 
     Raises:
         SystemExit: A sample was classified wrongly.
@@ -201,41 +286,48 @@ def self_check() -> None:
         ("WaitWithin5000_OnShutdownDeadline", "BackgroundLogQueue.ShutdownDeadline", False),
     ]
     for name, body, expect_violation in samples:
-        actual = violation(name, body) is not None
+        actual = violation(name, body)
         if actual != expect_violation:
-            raise SystemExit(f"name rule mismatch for {name}")
+            raise SystemExit("clk-grep: self-check failed for " + name)
+    if QUEUE_CALL.findall("new PeriodicTimer(interval, clock)") != []:
+        raise SystemExit("clk-grep: self-check failed for two-argument PeriodicTimer")
+    if QUEUE_CALL.findall("new PeriodicTimer(interval)") != ["new PeriodicTimer(interval)"]:
+        raise SystemExit("clk-grep: self-check failed for one-argument PeriodicTimer")
+    if ENGINE_CALL.findall("DateTime.UtcNow") != []:
+        raise SystemExit("clk-grep: self-check failed for engine timestamp")
+    if QUEUE_CALL.findall("Task.Delay(") != ["Task.Delay("]:
+        raise SystemExit("clk-grep: self-check failed for Task.Delay")
+    sample = wall_line(QUEUE_FILE, 1, "Task.Delay(")
+    needle = "wall-clock call (" + "Task.Delay("
+    if needle not in sample:
+        raise SystemExit("clk-grep: self-check failed for wall line")
 
 
 def main() -> int:
-    """Run the self-check and the tree scan.
+    """Run the self-check and both scans.
 
     Returns:
-        0 when every name is allowed. 1 when a test name claims an unchecked time.
+        0 when the tree is clean. 1 when at least one hit was reported.
 
     Raises:
         SystemExit: The self-check fails.
-        OSError: A test file cannot be read.
+        OSError: A file cannot be read.
 
     Side effects:
-        Writes failures to stderr.
+        Writes the report to stdout.
     """
     self_check()
-    problems = scan(Path("."))
+    problems = wall_hits(QUEUE_FILE, QUEUE_CALL)
+    problems.extend(wall_hits(ENGINE_FILE, ENGINE_CALL))
+    problems.extend(name_hits(Path(".")))
     if problems:
-        print("FAIL test name claims a time", file=sys.stderr)
-        print("\n".join(problems), file=sys.stderr)
+        print("\n".join(problems))
+        print("clk-grep: " + str(len(problems)) + " problem(s) found.")
         return 1
-    print("ok test names")
+    print("clk-grep: ok")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
 PY
-
-if [ "$failures" -ne 0 ]; then
-  echo "FAIL clk grep ${failures}" >&2
-  exit 1
-fi
-
-echo "ok clk grep"

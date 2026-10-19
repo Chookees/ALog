@@ -3,6 +3,7 @@
 // Wall time appears only as the 30 s hang guard. Next file: ALog.Tests/C4QueueFixTests.cs.
 
 using System.Diagnostics;
+using System.Globalization;
 using ALog.Core;
 using Microsoft.Extensions.Time.Testing;
 
@@ -29,42 +30,81 @@ internal static class DeadlineClock
     /// <summary>Most polls inside <see cref="HangGuard"/>. The loop stops at this count even if the clock jumps.</summary>
     private const int MaxPolls = 4000;
 
-    /// <summary>Failure text when shutdown finishes on the tick before <see cref="BackgroundLogQueue.ShutdownDeadline"/>.</summary>
-    internal const string ShutdownReturnedEarly =
-        "shutdown returned before ShutdownDeadline (at deadline - 1 tick)";
-
-    /// <summary>Failure text when shutdown is still running at <see cref="BackgroundLogQueue.ShutdownDeadline"/>.</summary>
-    internal const string ShutdownNotReturned =
-        "shutdown has not returned at ShutdownDeadline";
-
-    /// <summary>Failure text when flush finishes on the tick before <see cref="BackgroundLogQueue.ShutdownDeadline"/>.</summary>
-    internal const string FlushReturnedEarly =
-        "flush returned before ShutdownDeadline (at deadline - 1 tick)";
-
-    /// <summary>Failure text when flush is still running at <see cref="BackgroundLogQueue.ShutdownDeadline"/>.</summary>
-    internal const string FlushNotReturned =
-        "flush has not returned at ShutdownDeadline";
-
-    /// <summary>Failure text when the new-write cutoff closes on the tick before <see cref="BackgroundLogQueue.NewWriteBudget"/>.</summary>
-    internal const string CutoffBlockedEarly = "new writes blocked before NewWriteBudget";
-
-    /// <summary>Failure text when a new writer call is still allowed at <see cref="BackgroundLogQueue.NewWriteBudget"/>.</summary>
-    internal const string CutoffStillOpen = "new writes still open at NewWriteBudget";
-
     /// <summary>
     /// Pins the product bounds at 5000 ms and 4900 ms.
     /// A one-millisecond edit of either constant fails the tests that call this, even though those tests advance by the constant.
     /// </summary>
     /// <remarks>
+    /// The failure names the constant and the unit, for example "ShutdownDeadline is 5001 ms, expected 5000 ms."
     /// Does not throw except through the assertion. Not thread-safe. Only the test thread calls it.
     /// The values are the C4 contract. They are not a new deadline.
     /// </remarks>
     internal static void AssertValues()
     {
-        Assert.Equal(5000d, BackgroundLogQueue.ShutdownDeadline.TotalMilliseconds);
-        Assert.Equal(4900d, BackgroundLogQueue.NewWriteBudget.TotalMilliseconds);
-        Assert.True(BackgroundLogQueue.NewWriteBudget < BackgroundLogQueue.ShutdownDeadline);
+        var shutdownMs = Milliseconds(BackgroundLogQueue.ShutdownDeadline);
+        var budgetMs = Milliseconds(BackgroundLogQueue.NewWriteBudget);
+        Assert.True(shutdownMs == "5000", "ShutdownDeadline is " + shutdownMs + " ms, expected 5000 ms.");
+        Assert.True(budgetMs == "4900", "NewWriteBudget is " + budgetMs + " ms, expected 4900 ms.");
+        Assert.True(
+            BackgroundLogQueue.NewWriteBudget < BackgroundLogQueue.ShutdownDeadline,
+            "NewWriteBudget must be shorter than ShutdownDeadline.");
     }
+
+    /// <summary>
+    /// Builds the failure text when <paramref name="operation"/> finishes one tick before its deadline.
+    /// </summary>
+    /// <param name="operation">shutdown, flush, or cutoff. Not null or empty.</param>
+    /// <param name="elapsed">Time since the wait started. For this step that is the deadline minus one tick.</param>
+    /// <returns>The whole assertion sentence, including <paramref name="elapsed"/>.</returns>
+    /// <exception cref="ArgumentException"><paramref name="operation"/> is empty.</exception>
+    /// <remarks>Does not throw otherwise. Does not read a clock. Not thread-safe. Only the test thread calls it.</remarks>
+    internal static string EarlyFire(string operation, TimeSpan elapsed)
+    {
+        if (string.IsNullOrEmpty(operation))
+            throw new ArgumentException("Operation name is required.", nameof(operation));
+
+        return operation
+            + " returned at deadline - 1 tick ("
+            + FormatElapsed(elapsed)
+            + "); it must keep waiting until the deadline.";
+    }
+
+    /// <summary>
+    /// Builds the failure text when <paramref name="operation"/> is still waiting at its deadline.
+    /// </summary>
+    /// <param name="operation">shutdown, flush, or cutoff. Not null or empty.</param>
+    /// <param name="elapsed">Time since the wait started. For this step that is exactly the deadline.</param>
+    /// <returns>The whole assertion sentence, including <paramref name="elapsed"/>.</returns>
+    /// <exception cref="ArgumentException"><paramref name="operation"/> is empty.</exception>
+    /// <remarks>Does not throw otherwise. Does not read a clock. Not thread-safe. Only the test thread calls it.</remarks>
+    internal static string LateFire(string operation, TimeSpan elapsed)
+    {
+        if (string.IsNullOrEmpty(operation))
+            throw new ArgumentException("Operation name is required.", nameof(operation));
+
+        return operation
+            + " had not returned at the deadline ("
+            + FormatElapsed(elapsed)
+            + "); it must return when the deadline is reached.";
+    }
+
+    /// <summary>
+    /// Formats a bound as a whole number of milliseconds.
+    /// </summary>
+    /// <param name="value">A product bound. Fractional milliseconds are rounded to the nearest millisecond.</param>
+    /// <returns>The number with no unit, in invariant digits.</returns>
+    /// <remarks>Does not throw. Used so a pin failure can say "5001 ms" rather than a raw double.</remarks>
+    private static string Milliseconds(TimeSpan value)
+        => value.TotalMilliseconds.ToString("0", CultureInfo.InvariantCulture);
+
+    /// <summary>
+    /// Formats <paramref name="elapsed"/> for an early or late failure sentence.
+    /// </summary>
+    /// <param name="elapsed">Time since the wait started. May be one tick under a whole second.</param>
+    /// <returns>An invariant <c>hh:mm:ss.fffffff</c> value.</returns>
+    /// <remarks>Does not throw. The fraction keeps a one-tick remainder visible.</remarks>
+    private static string FormatElapsed(TimeSpan elapsed)
+        => elapsed.ToString(@"hh\:mm\:ss\.fffffff", CultureInfo.InvariantCulture);
 
     /// <summary>
     /// Builds a clock that starts at 2026-06-01 UTC and does not move until <see cref="FakeTimeProvider.Advance"/>.
@@ -142,27 +182,28 @@ internal static class DeadlineClock
     /// </summary>
     /// <param name="clock">Clock the product is waiting on. Not null. Not advanced past <paramref name="bound"/> yet.</param>
     /// <param name="operation">Dispose or flush started on another thread. Not null. Must already be waiting.</param>
-    /// <param name="bound">Product bound measured from the clock's current time. Longer than one tick.</param>
-    /// <param name="message">Assertion text when the operation finishes on this step. Not empty.</param>
+    /// <param name="bound">Product bound measured from the clock's current time. Longer than one tick. The clock must not already have moved.</param>
+    /// <param name="operationName">shutdown, flush, or cutoff. Not empty. It is the subject of the failure sentence.</param>
     /// <exception cref="ArgumentNullException"><paramref name="clock"/> or <paramref name="operation"/> is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="bound"/> is not longer than one tick.</exception>
-    /// <exception cref="ArgumentException"><paramref name="message"/> is empty.</exception>
+    /// <exception cref="ArgumentException"><paramref name="operationName"/> is empty.</exception>
     /// <remarks>
     /// The clock callback runs on this thread and only wakes the waiter. <see cref="AssertStillRunning"/>
-    /// then lets that waiter finish if the timer already fired. Not thread-safe. Only the test thread calls it.
+    /// then lets that waiter finish if the timer already fired. The failure text is <see cref="EarlyFire"/>
+    /// with elapsed time <paramref name="bound"/> minus one tick. Not thread-safe. Only the test thread calls it.
     /// </remarks>
-    internal static void AssertNotReturnedBefore(FakeTimeProvider clock, Task operation, TimeSpan bound, string message)
+    internal static void AssertNotReturnedBefore(FakeTimeProvider clock, Task operation, TimeSpan bound, string operationName)
     {
         ArgumentNullException.ThrowIfNull(clock);
         ArgumentNullException.ThrowIfNull(operation);
-        if (string.IsNullOrEmpty(message))
-            throw new ArgumentException("Failure message is required.", nameof(message));
+        if (string.IsNullOrEmpty(operationName))
+            throw new ArgumentException("Operation name is required.", nameof(operationName));
 
         if (bound <= Tick)
             throw new ArgumentOutOfRangeException(nameof(bound), bound, "Bound must be longer than one tick.");
 
         clock.Advance(bound - Tick);
-        AssertStillRunning(operation, message);
+        AssertStillRunning(operation, EarlyFire(operationName, bound - Tick));
     }
 
     /// <summary>
@@ -204,23 +245,25 @@ internal static class DeadlineClock
     /// </summary>
     /// <param name="clock">Clock the product is waiting on. Not null.</param>
     /// <param name="operation">Dispose or flush that must finish on this tick. Not null.</param>
-    /// <param name="message">Assertion text when the operation is still running after the hang guard. Not empty.</param>
+    /// <param name="bound">The deadline the previous step stopped one tick short of. The clock must have started unmoved.</param>
+    /// <param name="operationName">shutdown, flush, or cutoff. Not empty.</param>
     /// <returns>A task that finishes when the operation finishes or the hang guard fails.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="clock"/> or <paramref name="operation"/> is null.</exception>
-    /// <exception cref="ArgumentException"><paramref name="message"/> is empty.</exception>
+    /// <exception cref="ArgumentException"><paramref name="operationName"/> is empty.</exception>
     /// <remarks>
     /// The operation is not required to be complete on the same statement as the advance.
+    /// The failure text is <see cref="LateFire"/> with elapsed time <paramref name="bound"/>.
     /// The follow-up wait is the 30 s hang guard. Not thread-safe. Only the test thread calls it.
     /// </remarks>
-    internal static async Task AssertReturnedAt(FakeTimeProvider clock, Task operation, string message)
+    internal static async Task AssertReturnedAt(FakeTimeProvider clock, Task operation, TimeSpan bound, string operationName)
     {
         ArgumentNullException.ThrowIfNull(clock);
         ArgumentNullException.ThrowIfNull(operation);
-        if (string.IsNullOrEmpty(message))
-            throw new ArgumentException("Failure message is required.", nameof(message));
+        if (string.IsNullOrEmpty(operationName))
+            throw new ArgumentException("Operation name is required.", nameof(operationName));
 
         clock.Advance(Tick);
-        await WaitForCompletion(operation, message);
+        await WaitForCompletion(operation, LateFire(operationName, bound));
     }
 
     /// <summary>

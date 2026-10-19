@@ -27,6 +27,12 @@ public sealed partial class C4QueueFixTests
     private int _fullQueueSyncCall;
 
     /// <summary>
+    /// Call index inside <see cref="EnqueueWarmCallsAlreadyComplete"/>.
+    /// The cumulative hang guard reads it from the test thread while the loop runs on a pool thread.
+    /// </summary>
+    private int _fullQueueAsyncCall;
+
+    /// <summary>
     /// Capacity 100 and 1000 writes drop 900 immediately, then one ALOG0070 line carries 900.
     /// Write returns while the blocked writer has finished nothing.
     /// After the first call, the median warm call and at least 990 of the 999 warm calls are under 10 ms, and no call reaches the 30 s hang guard.
@@ -97,16 +103,19 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// Each of the 1000 WriteAsync calls on a full queue returns a task that is already successful.
+    /// The 999 WriteAsync calls after the first on a full queue return a task that is already successful.
+    /// The 1000 calls share one 30 s hang guard. No call is timed on its own.
     /// </summary>
     /// <returns>A task that finishes after the overflow calls.</returns>
     /// <remarks>
-    /// Completion is the state of the returned task, read on the same statement as the call. Nothing is timed.
-    /// The finally block releases the writer and disposes the queue. Only the test thread calls it.
-    /// The fact limit is 90 seconds so a stuck call ends before the job does.
+    /// Completion is the state of the returned task, read on the same statement as the call.
+    /// The first call is outside the 999 because it starts the processor. It is still inside the hang guard.
+    /// The finally block releases the writer and disposes the queue. Not safe to run two copies at once.
+    /// The fact limit is 90 seconds so the hang guard can fail the loop before xUnit stops the test.
+    /// On timeout the message is the test name and <see cref="_fullQueueAsyncCall"/>.
     /// </remarks>
     [Fact(Timeout = 90000)]
-    public Task WriteAsync_FullQueue_CompletesSynchronously()
+    public async Task WriteAsync_FullQueue_CompletesSynchronously()
     {
         var writer = new BlockingWriter();
         var queue = new BackgroundLogQueue(
@@ -117,14 +126,15 @@ public sealed partial class C4QueueFixTests
             asyncEnabled: false);
         try
         {
-            for (var i = 0; i < 1000; i++)
-            {
-                var pending = queue.EnqueueAsync(Event("a-" + i.ToString(CultureInfo.InvariantCulture)));
-                Assert.True(
-                    pending.IsCompletedSuccessfully,
-                    "call " + i.ToString(CultureInfo.InvariantCulture) + " is still running");
-            }
-
+            Volatile.Write(ref _fullQueueAsyncCall, 0);
+            var enqueueLoop = Task.Run(() => EnqueueWarmCallsAlreadyComplete(queue));
+            var enqueueFinished = await Task.WhenAny(enqueueLoop, Task.Delay(TimeSpan.FromSeconds(30))) == enqueueLoop;
+            Assert.True(
+                enqueueFinished,
+                nameof(WriteAsync_FullQueue_CompletesSynchronously)
+                + " hung at call "
+                + Volatile.Read(ref _fullQueueAsyncCall).ToString(CultureInfo.InvariantCulture));
+            await enqueueLoop;
             Assert.Equal(100, queue.AcceptedCount);
             Assert.Equal(900, queue.FullDropCount);
         }
@@ -133,8 +143,35 @@ public sealed partial class C4QueueFixTests
             writer.Release();
             queue.Dispose();
         }
+    }
 
-        return Task.CompletedTask;
+    /// <summary>
+    /// Enqueues 1000 events and checks that each call after the first is already successful.
+    /// </summary>
+    /// <param name="queue">Queue whose writer is blocked. Not null. Not disposed here.</param>
+    /// <remarks>
+    /// Writes <see cref="_fullQueueAsyncCall"/> before each call so the cumulative hang guard can name the call it is inside.
+    /// The first call is not one of the 999. Nothing in this method reads a clock.
+    /// Not safe to run two copies at once. The pool thread writes the call index; the test thread only reads it.
+    /// </remarks>
+    private void EnqueueWarmCallsAlreadyComplete(BackgroundLogQueue queue)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        var checkedCalls = 0;
+        for (var i = 0; i < 1000; i++)
+        {
+            Volatile.Write(ref _fullQueueAsyncCall, i);
+            var pending = queue.EnqueueAsync(Event("a-" + i.ToString(CultureInfo.InvariantCulture)));
+            if (i == 0)
+                continue;
+
+            Assert.True(
+                pending.IsCompletedSuccessfully,
+                "call " + i.ToString(CultureInfo.InvariantCulture) + " is still running");
+            checkedCalls++;
+        }
+
+        Assert.Equal(999, checkedCalls);
     }
 
     /// <summary>
@@ -409,8 +446,8 @@ public sealed partial class C4QueueFixTests
                 () => engine.Queue!.DisposeWaitsStarted,
                 nameof(HangingWriter_ShutdownReturns_AndDoesNotDispose));
             DeadlineClock.AssertNotReturnedBefore(
-                clock, dispose, BackgroundLogQueue.ShutdownDeadline, DeadlineClock.ShutdownReturnedEarly);
-            await DeadlineClock.AssertReturnedAt(clock, dispose, DeadlineClock.ShutdownNotReturned);
+                clock, dispose, BackgroundLogQueue.ShutdownDeadline, "shutdown");
+            await DeadlineClock.AssertReturnedAt(clock, dispose, BackgroundLogQueue.ShutdownDeadline, "shutdown");
             Assert.False(writer.Disposed);
             Assert.False(engine.Queue!.ReleaseWriters);
             var report = Assert.Single(lines);
@@ -666,11 +703,12 @@ public sealed partial class C4QueueFixTests
                 clock,
                 flush,
                 BackgroundLogQueue.ShutdownDeadline,
-                DeadlineClock.FlushReturnedEarly);
+                "flush");
             await DeadlineClock.AssertReturnedAt(
                 clock,
                 flush,
-                DeadlineClock.FlushNotReturned);
+                BackgroundLogQueue.ShutdownDeadline,
+                "flush");
             lock (lines)
                 Assert.DoesNotContain(lines, line => line.Contains(DeadlinePrefix, StringComparison.Ordinal));
         }
@@ -853,8 +891,8 @@ public sealed partial class C4QueueFixTests
     /// <returns>A task that finishes after ALOG0072 is checked.</returns>
     /// <remarks>
     /// One tick before the budget, dispose has not returned and a new call may still start.
-    /// A cutoff that is already closed fails with <see cref="DeadlineClock.CutoffBlockedEarly"/>.
-    /// At the budget the second call is the last one, or the test fails with <see cref="DeadlineClock.CutoffStillOpen"/>.
+    /// A cutoff that is already closed fails with <see cref="DeadlineClock.EarlyFire"/>.
+    /// At the budget the second call is the last one, or the test fails with <see cref="DeadlineClock.LateFire"/>.
     /// Dispose then returns because the processor stops, without advancing the rest of the shutdown deadline.
     /// Not thread-safe. Only the test thread calls it.
     /// </remarks>
@@ -883,15 +921,25 @@ public sealed partial class C4QueueFixTests
                 () => engine.Queue!.DisposeWaitsStarted,
                 nameof(Shutdown_SlowWriter_ReportsRemainder_FastWriter_ReportsNothing));
             DeadlineClock.AssertNotReturnedBefore(
-                clock, dispose, BackgroundLogQueue.NewWriteBudget, DeadlineClock.ShutdownReturnedEarly);
-            Assert.False(engine.Queue!.NewWriterCallsBlocked, DeadlineClock.CutoffBlockedEarly);
+                clock, dispose, BackgroundLogQueue.NewWriteBudget, "shutdown");
+            Assert.False(
+                engine.Queue!.NewWriterCallsBlocked,
+                DeadlineClock.EarlyFire("cutoff", BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick));
             slow.Grant(1);
             Assert.True(await WaitUntil(() => slow.Entered == 2, TimeSpan.FromSeconds(30)));
-            Assert.False(dispose.IsCompleted, DeadlineClock.ShutdownReturnedEarly);
-            Assert.False(engine.Queue.NewWriterCallsBlocked, DeadlineClock.CutoffBlockedEarly);
+            Assert.False(
+                dispose.IsCompleted,
+                DeadlineClock.EarlyFire("shutdown", BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick));
+            Assert.False(
+                engine.Queue.NewWriterCallsBlocked,
+                DeadlineClock.EarlyFire("cutoff", BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick));
             clock.Advance(DeadlineClock.Tick);
-            Assert.True(engine.Queue.NewWriterCallsBlocked, DeadlineClock.CutoffStillOpen);
-            Assert.False(dispose.IsCompleted, DeadlineClock.ShutdownReturnedEarly);
+            Assert.True(
+                engine.Queue.NewWriterCallsBlocked,
+                DeadlineClock.LateFire("cutoff", BackgroundLogQueue.NewWriteBudget));
+            Assert.False(
+                dispose.IsCompleted,
+                DeadlineClock.EarlyFire("shutdown", BackgroundLogQueue.NewWriteBudget));
             slow.Grant(1);
             await DeadlineClock.WaitForCompletion(dispose, "slow shutdown hung");
             Assert.Equal(origin + BackgroundLogQueue.NewWriteBudget, clock.GetUtcNow());
@@ -1048,10 +1096,12 @@ public sealed partial class C4QueueFixTests
                 () => engine.Queue!.DisposeWaitsStarted >= 1,
                 "parallel shutdown did not arm the clock wait");
             DeadlineClock.AssertNotReturnedBefore(
-                clock, first, BackgroundLogQueue.ShutdownDeadline, DeadlineClock.ShutdownReturnedEarly);
-            DeadlineClock.AssertStillRunning(second, DeadlineClock.ShutdownReturnedEarly);
-            await DeadlineClock.AssertReturnedAt(clock, first, DeadlineClock.ShutdownNotReturned);
-            await DeadlineClock.WaitForCompletion(second, DeadlineClock.ShutdownNotReturned);
+                clock, first, BackgroundLogQueue.ShutdownDeadline, "shutdown");
+            DeadlineClock.AssertStillRunning(
+                second, DeadlineClock.EarlyFire("shutdown", BackgroundLogQueue.ShutdownDeadline - DeadlineClock.Tick));
+            await DeadlineClock.AssertReturnedAt(clock, first, BackgroundLogQueue.ShutdownDeadline, "shutdown");
+            await DeadlineClock.WaitForCompletion(
+                second, DeadlineClock.LateFire("shutdown", BackgroundLogQueue.ShutdownDeadline));
             engine.Log("after", LogLevel.Info);
             Assert.False(hanging.Disposed);
             lock (lines)
@@ -1107,15 +1157,14 @@ public sealed partial class C4QueueFixTests
     /// <param name="dispose">Armed dispose. Not null.</param>
     /// <returns>A task that finishes when dispose returns.</returns>
     /// <remarks>
-    /// An early return uses <see cref="DeadlineClock.ShutdownReturnedEarly"/>.
-    /// A miss at the bound uses <see cref="DeadlineClock.ShutdownNotReturned"/>.
+    /// An early return uses <see cref="DeadlineClock.EarlyFire"/> for shutdown.
+    /// A miss at the bound uses <see cref="DeadlineClock.LateFire"/>.
     /// Does not grant a writer. The final wait is the 30 s hang guard.
     /// </remarks>
     private static async Task FinishAtShutdownDeadline(FakeTimeProvider clock, Task dispose)
     {
-        DeadlineClock.AssertNotReturnedBefore(
-            clock, dispose, BackgroundLogQueue.ShutdownDeadline, DeadlineClock.ShutdownReturnedEarly);
-        await DeadlineClock.AssertReturnedAt(clock, dispose, DeadlineClock.ShutdownNotReturned);
+        DeadlineClock.AssertNotReturnedBefore(clock, dispose, BackgroundLogQueue.ShutdownDeadline, "shutdown");
+        await DeadlineClock.AssertReturnedAt(clock, dispose, BackgroundLogQueue.ShutdownDeadline, "shutdown");
     }
 
     /// <summary>
