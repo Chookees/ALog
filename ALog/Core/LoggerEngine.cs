@@ -5,6 +5,7 @@
 namespace ALog.Core;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Threading.Tasks;
 using ALog.Config;
 using ALog.Internal;
@@ -16,12 +17,38 @@ public class LoggerEngine : ILogger, IDisposable
     private readonly LogDispatcher _dispatcher;
     private readonly BackgroundLogQueue? _backgroundQueue;
     private readonly MinimumLevelCache _levels;
-    private readonly ManualResetEventSlim _disposeDone = new(false);
     private int _disposeOnce;
 
+    /// <summary>
+    /// Builds the engine on <see cref="ProductionClock.Default"/>.
+    /// </summary>
+    /// <param name="config">Filters, writers, and the queue switch. Not null.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="config"/> is null.</exception>
+    /// <remarks>
+    /// Does not throw for a writer failure. The queue, when enabled, starts before this returns.
+    /// Safe to construct on any thread. Log after this returns.
+    /// </remarks>
     public LoggerEngine(ILogConfiguration config)
+        : this(config, ProductionClock.Default)
     {
-        _config = config ?? throw new ArgumentNullException(nameof(config));
+    }
+
+    /// <summary>
+    /// Builds the engine on <paramref name="clock"/>. Tests pass a clock they can move.
+    /// Production uses <see cref="ProductionClock.Default"/> through the public constructor.
+    /// </summary>
+    /// <param name="config">Filters, writers, and the queue switch. Not null.</param>
+    /// <param name="clock">Clock for the queue shutdown, flush, and cutoff. Not null.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="config"/> or <paramref name="clock"/> is null.</exception>
+    /// <remarks>
+    /// Does not throw for a writer failure. The clock cannot be changed after this returns.
+    /// A frozen test clock does not move the queue waits until the test advances it.
+    /// </remarks>
+    internal LoggerEngine(ILogConfiguration config, TimeProvider clock)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(clock);
+        _config = config;
         _levels = new MinimumLevelCache(config);
 
         ApplyDefaultFormatter(config);
@@ -32,10 +59,12 @@ public class LoggerEngine : ILogger, IDisposable
         {
             _backgroundQueue = new BackgroundLogQueue(
                 config.Writers,
-                config.BackgroundQueueCapacity,
-                config.BackgroundQueueBatchSize,
-                config.BackgroundQueueFlushInterval,
-                config.AsyncEnabled);
+                new BackgroundLogQueue.QueueSettings(
+                    config.BackgroundQueueCapacity,
+                    config.BackgroundQueueBatchSize,
+                    config.BackgroundQueueFlushInterval,
+                    config.AsyncEnabled,
+                    clock));
         }
     }
 
@@ -263,7 +292,7 @@ public class LoggerEngine : ILogger, IDisposable
             : new Dictionary<string, object>(seed.Properties, StringComparer.Ordinal);
 
         return new LogEvent(
-            Timestamp: DateTime.UtcNow,
+            Timestamp: EventTimestamp(),
             Level: seed.Level,
             Message: seed.Message,
             Exception: seed.Exception,
@@ -272,6 +301,18 @@ public class LoggerEngine : ILogger, IDisposable
             MessageTemplate: seed.MessageTemplate,
             Category: seed.Category);
     }
+
+    /// <summary>
+    /// The time stored on the event. Not a shutdown or flush deadline.
+    /// </summary>
+    /// <returns>The current UTC time.</returns>
+    /// <remarks>Does not throw. Called once per event that passes the level gate.</remarks>
+    [SuppressMessage(
+        "ApiDesign",
+        "RS0030",
+        Justification = "Event timestamp is wall-clock time by design; it is log data, not a deadline.")]
+    private static DateTime EventTimestamp()
+        => DateTime.UtcNow;
 
     private LogEvent Enrich(LogEvent preliminary)
     {
@@ -346,35 +387,25 @@ public class LoggerEngine : ILogger, IDisposable
     /// <summary>
     /// Closes the background queue. The queue disposes idle writers at its deadline and a writer whose call
     /// is still running only after that call returns. Without a queue, writers are disposed here.
-    /// A second call waits for the first.
+    /// A second call returns immediately and does not report again.
     /// </summary>
     /// <remarks>
     /// Does not throw. Writer dispose failures are written to the error stream.
     /// Without a queue, writers are disposed immediately, as they were before the queue deadline existed.
-    /// The wait for a second call is the same 5 s bound as the queue deadline.
+    /// A second call does not wait and does not emit another ALOG0071.
     /// </remarks>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
+            return;
+
+        if (_backgroundQueue is not null)
         {
-            _ = _disposeDone.Wait(TimeSpan.FromSeconds(5));
+            _backgroundQueue.Dispose();
             return;
         }
 
-        try
-        {
-            if (_backgroundQueue is not null)
-            {
-                _backgroundQueue.Dispose();
-                return;
-            }
-
-            DisposeWriters();
-        }
-        finally
-        {
-            _disposeDone.Set();
-        }
+        DisposeWriters();
     }
 
     /// <summary>

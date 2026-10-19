@@ -1,6 +1,7 @@
 ﻿namespace ALog.Writers.File;
 
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -108,7 +109,7 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
             var directory = Path.GetDirectoryName(_filePath);
             var filename = Path.GetFileNameWithoutExtension(_filePath);
             var ext = Path.GetExtension(_filePath);
-            var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+            var timestamp = RotationStamp();
 
             var rotated = Path.Combine(directory ?? ".", $"{filename}_{timestamp}{ext}");
 
@@ -119,6 +120,18 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
             Console.Error.WriteLine($"[FileLogWriter] Rolling failed: {ex}");
         }
     }
+
+    /// <summary>
+    /// The stamp in a rotated file name. Not a shutdown or flush deadline.
+    /// </summary>
+    /// <returns>UTC time as <c>yyyyMMdd_HHmmss</c>.</returns>
+    /// <remarks>Does not throw. Called only when a file is large enough to rotate.</remarks>
+    [SuppressMessage(
+        "ApiDesign",
+        "RS0030",
+        Justification = "Rotation file name, not a shutdown or flush deadline; removed in P1.")]
+    private static string RotationStamp()
+        => DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
 
     private static void EnsureDirectoryExists(string path)
     {

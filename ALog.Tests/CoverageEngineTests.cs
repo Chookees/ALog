@@ -49,6 +49,7 @@ public sealed class CoverageEngineTests : IDisposable
         using (Log.BeginScope("request", "r1"))
             Log.Write("in-scope");
         await Log.FlushAsync();
+        await WaitForWriter(second, static writer => writer.Events.Exists(item => item.Message == "in-scope"), "flush did not reach the in-scope event");
         Log.Reset();
 
         Assert.True(first.Disposed);
@@ -150,6 +151,7 @@ public sealed class CoverageEngineTests : IDisposable
         engine.LogStructured("cat", LogLevel.Error, null, null!, "value");
         engine.Log("visible", LogLevel.Error);
         await engine.FlushAsync();
+        await WaitForWriter(writer, static item => item.Events.Exists(entry => entry.Message == "visible"), "flush did not reach the visible event");
         engine.Dispose();
         engine.Dispose();
         Assert.Contains(writer.Events, item => item.Message == "visible");
@@ -176,6 +178,10 @@ public sealed class CoverageEngineTests : IDisposable
 
         await engine.LogAsync("queued {A}", LogLevel.Info, "alpha");
         await engine.FlushAsync();
+        await WaitForWriter(
+            writer,
+            static item => item.Events.Exists(entry => entry.Message.Contains("alpha", StringComparison.Ordinal)),
+            "flush did not reach the queued event");
         engine.Dispose();
         Assert.Contains(writer.Events, item => item.Message.Contains("alpha", StringComparison.Ordinal));
         Assert.NotNull(formattable.Formatter);
@@ -196,6 +202,7 @@ public sealed class CoverageEngineTests : IDisposable
             asyncEnabled: true);
         await queue.EnqueueAsync(Event("one"));
         await queue.FlushAsync();
+        await DeadlineClock.WaitFor(() => queue.InFlightCount == 0, "flush left a writer call running");
         queue.Dispose();
         Assert.False(queue.TryEnqueue(Event("two")));
         var rejected = queue.EnqueueAsync(Event("three"));
@@ -364,6 +371,32 @@ public sealed class CoverageEngineTests : IDisposable
         var filter = new MinimumLevelFilter(LogLevel.Warn);
         Assert.False(filter.ShouldLog(evt));
         Assert.True(filter.ShouldLog(Event("err", LogLevel.Error)));
+    }
+
+    /// <summary>
+    /// Waits until <paramref name="ready"/> sees the writer state, up to the 30 s hang guard.
+    /// </summary>
+    /// <param name="writer">Writer the flush should have reached. Not null.</param>
+    /// <param name="ready">State check. Not null. A concurrent list update is treated as not ready.</param>
+    /// <param name="message">Failure text when the guard wins.</param>
+    /// <returns>A task that finishes when the state is seen.</returns>
+    /// <remarks>
+    /// The count is not taken from the flush deadline. A flush that returned early still has to show the state.
+    /// Not thread-safe. Only the test thread calls it.
+    /// </remarks>
+    private static Task WaitForWriter(RecordingWriter writer, Func<RecordingWriter, bool> ready, string message)
+    {
+        return DeadlineClock.WaitFor(() =>
+        {
+            try
+            {
+                return ready(writer);
+            }
+            catch (InvalidOperationException)
+            {
+                return false;
+            }
+        }, message);
     }
 
     /// <summary>Creates a temp directory for one factory test.</summary>

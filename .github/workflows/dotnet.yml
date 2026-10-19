@@ -62,6 +62,7 @@ jobs:
         python3 eng/test_coverage_exception_check.py
         python3 eng/test_analyzer_ratchet_check.py
         bash eng/test_bb_grep.sh
+        bash eng/test_clk_grep.sh
         bash eng/test_build_base_assemblies.sh
         python3 eng/test_coverage_metadata.py
         python3 eng/test_sync_wait_check.py
@@ -77,7 +78,13 @@ jobs:
       run: bash eng/build-property-proof.sh
 
     - name: Build
-      run: dotnet build ALog.sln -c Release --no-restore
+      run: |
+        dotnet build ALog/ALog.csproj -c Release --no-restore -p:ErrorLog='"${{ runner.temp }}/ALog.sarif,version=2.1"'
+        dotnet build ALog.Extensions.Logging/ALog.Extensions.Logging.csproj -c Release --no-restore -p:ErrorLog='"${{ runner.temp }}/ALog.Extensions.Logging.sarif,version=2.1"'
+        dotnet build ALog.sln -c Release --no-restore
+
+    - name: RS0030 justification
+      run: python3 eng/rs0030-justification-check.py --sarif "${{ runner.temp }}/ALog.sarif" --sarif "${{ runner.temp }}/ALog.Extensions.Logging.sarif"
 
     - name: Test
       id: test
@@ -156,6 +163,9 @@ jobs:
         path: TestResults
         retention-days: 7
         if-no-files-found: error
+
+    - name: RS0030 rerun
+      run: python3 eng/test_rs0030_rerun.py
 
   vuln-check:
     runs-on: ubuntu-24.04

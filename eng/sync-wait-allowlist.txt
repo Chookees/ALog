@@ -3,7 +3,4 @@
 # eng/sync-wait-check.py fails when a library hit is missing here, or a line here matches nothing.
 
 ALog/Core/BackgroundLogQueue.cs:void GetResult\( # Awaiter method required by ICriticalNotifyCompletion. It returns immediately and waits on nothing. Timeout: not applicable, because this declaration is not a wait; a call to GetResult is still rejected.
-ALog/Core/BackgroundLogQueue.cs:_stopped\.Wait\( # Dispose waits until the processor finishes or the shutdown budget ends. The processor awaits with ConfigureAwait(false), so the disposer SynchronizationContext is not captured. Timeout: 5 seconds.
-ALog/Core/BackgroundLogQueue.cs:_disposeDone\.Wait\( # A second Dispose waits until the first Dispose has published the shutdown result. The wait does not capture a SynchronizationContext. Timeout: 5 seconds.
-ALog/Core/LoggerEngine.cs:_disposeDone\.Wait\( # A second Dispose waits until the first has finished the queue deadline and the writer decision. The wait does not capture a SynchronizationContext. Timeout: 5 seconds.
 ALog/Writers/Cloud/AwsCloudWatchWriter.cs:pending\.Wait\( # The AWS SDK has no synchronous API. The put starts on the thread pool, so the caller SynchronizationContext is not captured. Timeout: 100 seconds, the default HTTP client timeout used when the SDK client timeout is unset.

@@ -57,3 +57,12 @@ dotnet_diagnostic.CA2007.severity = none
 
 [eng/**.cs]
 dotnet_diagnostic.CA2007.severity = none
+
+# CLK-03. RS0030 is a warning by default. Product libraries treat it as an error
+# in Debug and Release, including when CI is unset. Tests, samples, and tools
+# do not inherit this severity.
+[ALog/**.cs]
+dotnet_diagnostic.RS0030.severity = error
+
+[ALog.Extensions.Logging/**.cs]
+dotnet_diagnostic.RS0030.severity = error

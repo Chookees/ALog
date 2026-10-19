@@ -21,20 +21,16 @@ public sealed partial class C4QueueFixTests
     private const string DeadlineSuffix = " queued events were not written. A writer is too slow to drain the queue in time; check the target or reduce the log volume before shutdown.";
 
     /// <summary>
-    /// Mirrors the product's new-writer-call cutoff, in milliseconds.
-    /// The slow-writer shutdown returns at this cutoff, so its floor is <c>CutoffMs - 50</c>.
-    /// The 5 second deadline minus 50 ms does not apply to that test.
-    /// </summary>
-    /// <remarks>
-    /// shortcut: 4900 ms is the private field <c>BackgroundLogQueue.NewWriteBudget</c> in ALog/Core/BackgroundLogQueue.cs, initialized as <c>TimeSpan.FromMilliseconds(4900)</c>. The follow-up clock-entry-point PR will publish that as an internal constant and this test will derive the floor from it.
-    /// </remarks>
-    private const int CutoffMs = 4900;
-
-    /// <summary>
     /// Call index inside <see cref="SampleFullQueueSyncEnqueue"/>.
     /// The cumulative hang guard reads it from the test thread while the loop runs on a pool thread.
     /// </summary>
     private int _fullQueueSyncCall;
+
+    /// <summary>
+    /// Call index inside <see cref="EnqueueWarmCallsAlreadyComplete"/>.
+    /// The cumulative hang guard reads it from the test thread while the loop runs on a pool thread.
+    /// </summary>
+    private int _fullQueueAsyncCall;
 
     /// <summary>
     /// Capacity 100 and 1000 writes drop 900 immediately, then one ALOG0070 line carries 900.
@@ -50,7 +46,7 @@ public sealed partial class C4QueueFixTests
     /// On timeout the message is the test name and <see cref="_fullQueueSyncCall"/>.
     /// </remarks>
     [Fact(Timeout = 90000)]
-    public async Task FullQueue_DropsImmediately_ReportsAlog0070_FlushStaysSilent()
+    public async Task FullQueue_DropsWithoutWaiting_ReportsAlog0070_FlushStaysSilent()
     {
         var clock = new FakeTimeProvider(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
         var lines = new List<string>();
@@ -77,7 +73,7 @@ public sealed partial class C4QueueFixTests
             var enqueueFinished = await Task.WhenAny(enqueueLoop, Task.Delay(TimeSpan.FromSeconds(30))) == enqueueLoop;
             Assert.True(
                 enqueueFinished,
-                nameof(FullQueue_DropsImmediately_ReportsAlog0070_FlushStaysSilent)
+                nameof(FullQueue_DropsWithoutWaiting_ReportsAlog0070_FlushStaysSilent)
                 + " hung at call "
                 + Volatile.Read(ref _fullQueueSyncCall).ToString(CultureInfo.InvariantCulture));
             await enqueueLoop;
@@ -107,17 +103,19 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// Each of the 999 warm WriteAsync calls on a full queue returns a task that is already successful.
-    /// The median and at least 990 of those calls are under 10 ms, and no call reaches the 30 s hang guard.
+    /// The 999 WriteAsync calls after the first on a full queue return a task that is already successful.
+    /// The 1000 calls share one 30 s hang guard. No call is timed on its own.
     /// </summary>
     /// <returns>A task that finishes after the overflow calls.</returns>
     /// <remarks>
-    /// Completion is the state of the returned task, not a clock. A task that is still running fails the test.
-    /// The finally block releases the writer and disposes the queue. Only the test thread calls it.
-    /// The fact limit is 90 seconds so the hang guard can fail the call before xUnit stops the test.
+    /// Completion is the state of the returned task, read on the same statement as the call.
+    /// The first call is outside the 999 because it starts the processor. It is still inside the hang guard.
+    /// The finally block releases the writer and disposes the queue. Not safe to run two copies at once.
+    /// The fact limit is 90 seconds so the hang guard can fail the loop before xUnit stops the test.
+    /// On timeout the message is the test name and <see cref="_fullQueueAsyncCall"/>.
     /// </remarks>
     [Fact(Timeout = 90000)]
-    public async Task WriteAsync_FullQueue_CompletesWithin10ms()
+    public async Task WriteAsync_FullQueue_CompletesSynchronously()
     {
         var writer = new BlockingWriter();
         var queue = new BackgroundLogQueue(
@@ -128,26 +126,15 @@ public sealed partial class C4QueueFixTests
             asyncEnabled: false);
         try
         {
-            // The first call is left out of the 10 ms sample. It still has the 30 s hang guard.
-            // Each of the other 999 tasks must already be successful when EnqueueAsync returns.
-            var warm = new TimeSpan[999];
-            var warmCount = 0;
-            for (var i = 0; i < 1000; i++)
-            {
-                var started = Stopwatch.GetTimestamp();
-                var pending = queue.EnqueueAsync(Event("a-" + i.ToString(CultureInfo.InvariantCulture)));
-                var elapsed = Stopwatch.GetElapsedTime(started);
-                AssertWithinHangGuard(elapsed);
-                if (i == 0)
-                    continue;
-
-                Assert.True(pending.IsCompletedSuccessfully, "still running");
-                warm[warmCount] = elapsed;
-                warmCount++;
-            }
-
-            Assert.Equal(999, warmCount);
-            AssertWarmEnqueueSamplesStayUnderTenMilliseconds(warm);
+            Volatile.Write(ref _fullQueueAsyncCall, 0);
+            var enqueueLoop = Task.Run(() => EnqueueWarmCallsAlreadyComplete(queue));
+            var enqueueFinished = await Task.WhenAny(enqueueLoop, Task.Delay(TimeSpan.FromSeconds(30))) == enqueueLoop;
+            Assert.True(
+                enqueueFinished,
+                nameof(WriteAsync_FullQueue_CompletesSynchronously)
+                + " hung at call "
+                + Volatile.Read(ref _fullQueueAsyncCall).ToString(CultureInfo.InvariantCulture));
+            await enqueueLoop;
             Assert.Equal(100, queue.AcceptedCount);
             Assert.Equal(900, queue.FullDropCount);
         }
@@ -156,8 +143,35 @@ public sealed partial class C4QueueFixTests
             writer.Release();
             queue.Dispose();
         }
+    }
 
-        await Task.CompletedTask;
+    /// <summary>
+    /// Enqueues 1000 events and checks that each call after the first is already successful.
+    /// </summary>
+    /// <param name="queue">Queue whose writer is blocked. Not null. Not disposed here.</param>
+    /// <remarks>
+    /// Writes <see cref="_fullQueueAsyncCall"/> before each call so the cumulative hang guard can name the call it is inside.
+    /// The first call is not one of the 999. Nothing in this method reads a clock.
+    /// Not safe to run two copies at once. The pool thread writes the call index; the test thread only reads it.
+    /// </remarks>
+    private void EnqueueWarmCallsAlreadyComplete(BackgroundLogQueue queue)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        var checkedCalls = 0;
+        for (var i = 0; i < 1000; i++)
+        {
+            Volatile.Write(ref _fullQueueAsyncCall, i);
+            var pending = queue.EnqueueAsync(Event("a-" + i.ToString(CultureInfo.InvariantCulture)));
+            if (i == 0)
+                continue;
+
+            Assert.True(
+                pending.IsCompletedSuccessfully,
+                "call " + i.ToString(CultureInfo.InvariantCulture) + " is still running");
+            checkedCalls++;
+        }
+
+        Assert.Equal(999, checkedCalls);
     }
 
     /// <summary>
@@ -236,90 +250,31 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// A 10 ms writer and 1,000 queued events return inside the shutdown window with one ALOG0071 line.
-    /// Written plus the reported remainder is 1,000. A fast writer of 100,000 events reports nothing.
+    /// A writer held on a gate, and 1,000 queued events, report one ALOG0071 line.
+    /// One tick before <see cref="BackgroundLogQueue.NewWriteBudget"/> the cutoff is still open and dispose has not returned.
+    /// At that budget the next call is blocked, the in-flight call finishes, and dispose returns without the rest of the deadline.
+    /// Written plus the reported remainder is 1,000. A fast writer of 100,000 events reports nothing and does not move the clock.
     /// Flush after dispose does not add a line. A log after dispose adds one ALOG0072 and no second ALOG0071.
     /// </summary>
     /// <returns>A task that finishes after both engines shut down.</returns>
-    [Fact(Timeout = 60000)]
-    public async Task Shutdown_SlowWriter_ReportsRemainder_FastWriter_ReportsNothing()
+    /// <remarks>
+    /// The clock is <see cref="FakeTimeProvider"/>. The 30 s waits are hang guards. Not thread-safe.
+    /// The finally block releases the gate so a failed assert cannot leave dispose blocked.
+    /// </remarks>
+    [Fact(Timeout = 120000)]
+    public async Task Shutdown_SlowWriter_ReportsRemainder_OtherWriter_ReportsNothing()
     {
-        var lines = new List<string>();
+        DeadlineClock.AssertValues();
         var previous = SelfLog.Target;
-        SelfLog.Enable(line =>
-        {
-            lock (lines)
-                lines.Add(line);
-        });
-        var slow = new DelayWriter(TimeSpan.FromMilliseconds(10));
-        var engine = new LoggerEngine(new LoggerConfig()
-            .AddWriter(slow)
-            .UseBackgroundQueue(true, 1000, 10, TimeSpan.FromHours(1))
-            .UseAsync(false));
         try
         {
-            for (var i = 0; i < 1000; i++)
-                engine.Log("e-" + i.ToString(CultureInfo.InvariantCulture), LogLevel.Info);
-
-            var started = Stopwatch.StartNew();
-            engine.Dispose();
-            // A 10 ms writer is between calls when new writes stop, so Dispose returns at the cutoff.
-            // The 4950 ms floor does not apply here. The ceiling stays twice the 5 s deadline.
-            TransitionDeadline.AssertBetween(
-                started.Elapsed,
-                TimeSpan.FromMilliseconds(CutoffMs - 50),
-                BackgroundLogQueue.ShutdownDeadline);
-            string report;
-            lock (lines)
-                report = Assert.Single(lines);
-            var unwritten = ParseUnwritten(report);
-            Assert.Equal(
-                DeadlinePrefix + unwritten.ToString(CultureInfo.InvariantCulture) + DeadlineSuffix,
-                report);
-            Assert.Equal(1000, slow.Finished + unwritten);
-            Assert.Equal(0, slow.WritesAfterDispose);
-            Assert.True(slow.Disposed);
-            Assert.Equal(engine.Queue!.AcceptedCount, engine.Queue.WrittenCount + engine.Queue.UnwrittenCount);
-
-            await engine.FlushAsync();
-            engine.Dispose();
-            engine.Log("after-shutdown", LogLevel.Info);
-            lock (lines)
-            {
-                Assert.Equal(2, lines.Count);
-                Assert.StartsWith(DeadlinePrefix, lines[0], StringComparison.Ordinal);
-                Assert.Equal(ClosedLine, lines[1]);
-            }
+            await AssertSlowShutdownReportsRemainder();
+            await AssertFastShutdownReportsNothing();
         }
         finally
         {
             SelfLog.Target = previous;
         }
-
-        var fastLines = new List<string>();
-        SelfLog.Enable(fastLines.Add);
-        var fast = new RecordingWriter();
-        var fastEngine = new LoggerEngine(new LoggerConfig()
-            .AddWriter(fast)
-            .UseBackgroundQueue(true, 100_000, 50, TimeSpan.FromHours(1))
-            .UseAsync(false));
-        try
-        {
-            for (var i = 0; i < 100_000; i++)
-                fastEngine.Log("f", LogLevel.Info);
-
-            fastEngine.Dispose();
-            Assert.Equal(100_000, fast.Events.Count);
-            Assert.Empty(fastLines);
-            Assert.True(fast.Disposed);
-            Assert.Equal(0, fastEngine.Queue!.UnwrittenCount);
-        }
-        finally
-        {
-            SelfLog.Target = previous;
-        }
-
-        await Task.CompletedTask;
     }
 
     /// <summary>
@@ -401,80 +356,29 @@ public sealed partial class C4QueueFixTests
 
     /// <summary>
     /// Shutdown twice in a row, and twice in parallel, does not throw, reports ALOG0071 at most once,
-    /// reports ALOG0072 once for a later write, and does not write after the writer is disposed.
+    /// reports ALOG0072 once for a later write, and does not dispose a call that is still running.
+    /// One tick before <see cref="BackgroundLogQueue.ShutdownDeadline"/> the first dispose has not returned.
+    /// The second call returns without waiting. The next tick returns the first.
     /// </summary>
     /// <returns>A task that finishes after the parallel shutdown.</returns>
-    [Fact(Timeout = 60000)]
+    /// <remarks>
+    /// Both halves use <see cref="FakeTimeProvider"/>. The 30 s waits are hang guards. Not thread-safe.
+    /// The finally block releases the sequential gate and restores SelfLog.
+    /// </remarks>
+    [Fact(Timeout = 120000)]
     public async Task Shutdown_TwiceSequentialAndParallel_ThenWrite_NoException()
     {
-        var lines = new List<string>();
+        DeadlineClock.AssertValues();
         var previous = SelfLog.Target;
-        SelfLog.Enable(line =>
-        {
-            lock (lines)
-                lines.Add(line);
-        });
-        var slow = new DelayWriter(TimeSpan.FromMilliseconds(10));
-        var sequential = new LoggerEngine(new LoggerConfig()
-            .AddWriter(slow)
-            .UseBackgroundQueue(true, 1000, 10, TimeSpan.FromHours(1))
-            .UseAsync(false));
         try
         {
-            for (var i = 0; i < 1000; i++)
-                sequential.Log("s", LogLevel.Info);
-
-            sequential.Dispose();
-            sequential.Dispose();
-            sequential.Log("after", LogLevel.Info);
-            Assert.Equal(0, slow.WritesAfterDispose);
-            lock (lines)
-            {
-                Assert.Equal(2, lines.Count);
-                Assert.StartsWith(DeadlinePrefix, lines[0], StringComparison.Ordinal);
-                Assert.Equal(ClosedLine, lines[1]);
-            }
+            await AssertSequentialShutdownThenWrite();
+            await AssertParallelShutdownThenWrite();
         }
         finally
         {
             SelfLog.Target = previous;
         }
-
-        lines = new List<string>();
-        SelfLog.Enable(line =>
-        {
-            lock (lines)
-                lines.Add(line);
-        });
-        var hanging = new ForeverWriter();
-        var parallel = new LoggerEngine(new LoggerConfig()
-            .AddWriter(hanging)
-            .UseBackgroundQueue(true, 8, 1, TimeSpan.FromHours(1))
-            .UseAsync(false));
-        try
-        {
-            parallel.Log("hang", LogLevel.Info);
-            Assert.True(hanging.Entered.Wait(TimeSpan.FromSeconds(30)));
-            var started = Stopwatch.StartNew();
-            var first = Task.Run(() => parallel.Dispose());
-            var second = Task.Run(() => parallel.Dispose());
-            await Task.WhenAll(first, second).WaitAsync(TimeSpan.FromSeconds(30));
-            TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
-            parallel.Log("after", LogLevel.Info);
-            Assert.False(hanging.Disposed);
-            lock (lines)
-            {
-                Assert.Equal(2, lines.Count);
-                Assert.StartsWith(DeadlinePrefix, lines[0], StringComparison.Ordinal);
-                Assert.Equal(ClosedLine, lines[1]);
-            }
-        }
-        finally
-        {
-            SelfLog.Target = previous;
-        }
-
-        await Task.CompletedTask;
     }
 
     /// <summary>
@@ -509,30 +413,49 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// A writer blocked forever lets shutdown return inside the shutdown window. The writer is not disposed.
-    /// The remainder is one ALOG0071 line.
+    /// A writer blocked forever lets shutdown return at <see cref="BackgroundLogQueue.ShutdownDeadline"/>.
+    /// One tick earlier it has not returned. The writer is not disposed. The remainder is one ALOG0071 line.
     /// </summary>
     /// <returns>A task that finishes after shutdown.</returns>
-    [Fact(Timeout = 45000)]
+    /// <remarks>
+    /// The clock is <see cref="FakeTimeProvider"/>. The 30 s waits are hang guards. Not thread-safe.
+    /// A failed step advances the deadline in the finally block so the dispose thread can leave.
+    /// </remarks>
+    [Fact(Timeout = 90000)]
     public async Task HangingWriter_ShutdownReturns_AndDoesNotDispose()
     {
+        DeadlineClock.AssertValues();
         var lines = new List<string>();
         var previous = SelfLog.Target;
         SelfLog.Enable(lines.Add);
+        var clock = DeadlineClock.Create();
         var writer = new ForeverWriter();
         var engine = new LoggerEngine(new LoggerConfig()
             .AddWriter(writer)
             .UseBackgroundQueue(true, 10, 1, TimeSpan.FromHours(1))
-            .UseAsync(false));
+            .UseAsync(false), clock);
+        Task? dispose = null;
         try
         {
             for (var i = 0; i < 5; i++)
                 engine.Log("h-" + i.ToString(CultureInfo.InvariantCulture), LogLevel.Info);
 
             Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(30)));
-            var started = Stopwatch.StartNew();
-            engine.Dispose();
-            TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
+            dispose = await DeadlineClock.RunUntilArmed(
+                engine.Dispose,
+                () => engine.Queue!.DisposeWaitsStarted,
+                nameof(HangingWriter_ShutdownReturns_AndDoesNotDispose));
+            await DeadlineClock.AssertNotElapsed(
+                clock,
+                () => engine.Queue!.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
+            await DeadlineClock.AssertElapsed(
+                clock,
+                () => engine.Queue!.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
+            await DeadlineClock.WaitForCompletion(dispose, "shutdown hung");
             Assert.False(writer.Disposed);
             Assert.False(engine.Queue!.ReleaseWriters);
             var report = Assert.Single(lines);
@@ -543,10 +466,9 @@ public sealed partial class C4QueueFixTests
         }
         finally
         {
+            await ReleaseDispose(clock, dispose);
             SelfLog.Target = previous;
         }
-
-        await Task.CompletedTask;
     }
 
     /// <summary>
@@ -751,19 +673,18 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// A flush whose writer stays blocked returns inside the shutdown window and writes no ALOG0071.
-    /// The writer is released only after that check.
+    /// A flush whose writer stays blocked does not return one tick before <see cref="BackgroundLogQueue.ShutdownDeadline"/>.
+    /// The next tick returns it. The flush writes no ALOG0071. The writer is released only after that check.
     /// </summary>
-    /// <returns>A task that finishes after the window assert and cleanup.</returns>
+    /// <returns>A task that finishes after the deadline step and cleanup.</returns>
     /// <remarks>
-    /// <see cref="BackgroundLogQueue.FlushAsync"/> waits on <see cref="BackgroundLogQueue.ShutdownDeadline"/> with the wall clock.
-    /// The window is that deadline minus 50 ms through twice the deadline. A flush that never returns fails the 30 s hang guard.
-    /// The fact limit is 90 seconds so that guard can report before xUnit stops the test.
+    /// The clock is <see cref="FakeTimeProvider"/>. A flush that never returns fails the 30 s hang guard.
     /// Not safe to run beside another test that replaces SelfLog. Only the test thread calls it.
     /// </remarks>
     [Fact(Timeout = 90000)]
     public async Task Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071()
     {
+        DeadlineClock.AssertValues();
         var lines = new List<string>();
         var previous = SelfLog.Target;
         SelfLog.Enable(line =>
@@ -771,27 +692,32 @@ public sealed partial class C4QueueFixTests
             lock (lines)
                 lines.Add(line);
         });
+        var clock = DeadlineClock.Create();
         var writer = new BlockingWriter();
         var queue = new BackgroundLogQueue(
             new ILogWriter[] { writer },
-            capacity: 1,
-            batchSize: 1,
-            flushInterval: TimeSpan.FromSeconds(30),
-            asyncEnabled: false);
+            new BackgroundLogQueue.QueueSettings(1, 1, TimeSpan.FromSeconds(30), false, clock));
         try
         {
             Assert.True(queue.TryEnqueue(Event("blocked")));
             Assert.True(
                 await WaitUntil(() => writer.EnteredCount > 0, TimeSpan.FromSeconds(30)),
                 "processor never entered the blocked writer");
-            var started = Stopwatch.StartNew();
             var flush = queue.FlushAsync();
-            var returned = await Task.WhenAny(flush, Task.Delay(TimeSpan.FromSeconds(30))) == flush;
-            Assert.True(
-                returned,
-                nameof(Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071) + " hung");
-            await flush;
-            TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
+            await DeadlineClock.WaitFor(
+                () => queue.FlushWaitsStarted >= 1,
+                nameof(Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071) + " did not arm the flush wait");
+            await DeadlineClock.AssertNotElapsed(
+                clock,
+                () => queue.FlushDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "flush");
+            await DeadlineClock.AssertElapsed(
+                clock,
+                () => queue.FlushDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "flush");
+            await DeadlineClock.WaitForCompletion(flush, "flush hung");
             lock (lines)
                 Assert.DoesNotContain(lines, line => line.Contains(DeadlinePrefix, StringComparison.Ordinal));
         }
@@ -831,7 +757,7 @@ public sealed partial class C4QueueFixTests
         // Flush stays open while the writer is blocked. Releasing the writer is the idle signal that ends it.
         // The deadline itself is asserted by Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071.
         var flush = queue.FlushAsync();
-        Assert.False(flush.IsCompleted);
+        Assert.True(flush.IsCompleted == false, "flush returned before the writer was released.");
         writer.Release();
         await flush;
         Assert.Equal(100, queue.WrittenCount);
@@ -966,6 +892,408 @@ public sealed partial class C4QueueFixTests
         }
 
         throw new InvalidOperationException("ALog.sln was not found above the test output.");
+    }
+
+    /// <summary>
+    /// Holds the first writer call, fills the queue, and shuts down on <see cref="BackgroundLogQueue.NewWriteBudget"/>.
+    /// </summary>
+    /// <returns>A task that finishes after ALOG0072 is checked.</returns>
+    /// <remarks>
+    /// One tick before the budget, dispose has not returned and a new call may still start.
+    /// A cutoff that is already closed fails with <see cref="DeadlineClock.EarlyFire"/>.
+    /// At the budget the second call is the last one, or the test fails with <see cref="DeadlineClock.LateFire"/>.
+    /// Dispose then returns because the processor stops, without advancing the rest of the shutdown deadline.
+    /// Not thread-safe. Only the test thread calls it.
+    /// </remarks>
+    private static async Task AssertSlowShutdownReportsRemainder()
+    {
+        var lines = new List<string>();
+        SelfLog.Enable(line =>
+        {
+            lock (lines)
+                lines.Add(line);
+        });
+        var clock = DeadlineClock.Create();
+        var slow = new BudgetGateWriter();
+        var engine = EngineOnClock(slow, 1000, 1, clock);
+        var origin = clock.GetUtcNow();
+        Task? dispose = null;
+        try
+        {
+            engine.Log("e-0", LogLevel.Info);
+            Assert.True(await WaitUntil(() => slow.Entered == 1, TimeSpan.FromSeconds(30)));
+            for (var i = 1; i < 1000; i++)
+                engine.Log("e-" + i.ToString(CultureInfo.InvariantCulture), LogLevel.Info);
+
+            dispose = await DeadlineClock.RunUntilArmed(
+                engine.Dispose,
+                () => engine.Queue!.DisposeWaitsStarted,
+                nameof(Shutdown_SlowWriter_ReportsRemainder_OtherWriter_ReportsNothing));
+            clock.Advance(BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick);
+            Assert.False(
+                dispose.IsCompleted,
+                "shutdown returned while the writer was still held");
+            Assert.False(
+                engine.Queue!.NewWriterCallsBlocked,
+                DeadlineClock.EarlyFire("cutoff", BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick));
+            slow.Grant(1);
+            Assert.True(await WaitUntil(() => slow.Entered == 2, TimeSpan.FromSeconds(30)));
+            Assert.False(
+                dispose.IsCompleted,
+                "shutdown returned while the writer was still held");
+            Assert.False(
+                engine.Queue.NewWriterCallsBlocked,
+                DeadlineClock.EarlyFire("cutoff", BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick));
+            clock.Advance(DeadlineClock.Tick);
+            Assert.True(
+                engine.Queue.NewWriterCallsBlocked,
+                DeadlineClock.LateFire("cutoff", BackgroundLogQueue.NewWriteBudget));
+            Assert.False(
+                dispose.IsCompleted,
+                "shutdown returned while the writer was still held");
+            slow.Grant(1);
+            await DeadlineClock.WaitForCompletion(dispose, "slow shutdown hung");
+            Assert.Equal(origin + BackgroundLogQueue.NewWriteBudget, clock.GetUtcNow());
+            await AssertSlowRemainder(lines, slow, engine);
+        }
+        finally
+        {
+            slow.Grant(1000);
+            await ReleaseDispose(clock, dispose);
+        }
+    }
+
+    /// <summary>
+    /// Checks the slow-writer shutdown report: two calls finished, the rest are the ALOG0071 remainder, then one ALOG0072.
+    /// </summary>
+    /// <param name="lines">Captured SelfLog lines. Not null. The lock is this list.</param>
+    /// <param name="slow">Writer that was released twice. Not null.</param>
+    /// <param name="engine">Engine already disposed once. Not null. Flushed and disposed again here.</param>
+    /// <returns>A task that finishes after the late log.</returns>
+    /// <remarks>Does not move the clock. A second dispose must not add another ALOG0071. Not thread-safe.</remarks>
+    private static async Task AssertSlowRemainder(List<string> lines, BudgetGateWriter slow, LoggerEngine engine)
+    {
+        Assert.Equal(2, slow.Entered);
+        Assert.Equal(2, slow.Finished);
+        string report;
+        lock (lines)
+            report = Assert.Single(lines);
+        var unwritten = ParseUnwritten(report);
+        Assert.Equal(DeadlinePrefix + unwritten.ToString(CultureInfo.InvariantCulture) + DeadlineSuffix, report);
+        Assert.Equal(1000, slow.Finished + unwritten);
+        Assert.Equal(0, slow.WritesAfterDispose);
+        Assert.True(slow.Disposed);
+        Assert.Equal(engine.Queue!.AcceptedCount, engine.Queue.WrittenCount + engine.Queue.UnwrittenCount);
+        await engine.FlushAsync();
+        engine.Dispose();
+        engine.Log("after-shutdown", LogLevel.Info);
+        lock (lines)
+        {
+            Assert.Equal(2, lines.Count);
+            Assert.StartsWith(DeadlinePrefix, lines[0], StringComparison.Ordinal);
+            Assert.Equal(ClosedLine, lines[1]);
+        }
+    }
+
+    /// <summary>
+    /// Shuts a fast writer down on a frozen clock. Dispose returns because the processor stopped, with no ALOG0071.
+    /// </summary>
+    /// <returns>A task that finishes after the empty-report checks.</returns>
+    /// <remarks>
+    /// The clock is not advanced. A dispose that is still waiting fails the 30 s hang guard.
+    /// Not thread-safe. Only the test thread calls it.
+    /// </remarks>
+    private static async Task AssertFastShutdownReportsNothing()
+    {
+        var lines = new List<string>();
+        SelfLog.Enable(lines.Add);
+        var clock = DeadlineClock.Create();
+        var fast = new RecordingWriter();
+        var engine = EngineOnClock(fast, 100_000, 50, clock);
+        var origin = clock.GetUtcNow();
+        Task? dispose = null;
+        try
+        {
+            for (var i = 0; i < 100_000; i++)
+                engine.Log("f", LogLevel.Info);
+
+            dispose = Task.Run(() => engine.Dispose());
+            await DeadlineClock.WaitForCompletion(dispose, "fast shutdown hung");
+            Assert.Equal(origin, clock.GetUtcNow());
+            Assert.Equal(100_000, fast.Events.Count);
+            Assert.Empty(lines);
+            Assert.True(fast.Disposed);
+            Assert.Equal(0, engine.Queue!.UnwrittenCount);
+        }
+        finally
+        {
+            await ReleaseDispose(clock, dispose);
+        }
+    }
+
+    /// <summary>
+    /// Shuts down once at the deadline, then again, then logs. The second shutdown adds no ALOG0071.
+    /// </summary>
+    /// <returns>A task that finishes after ALOG0072 is checked.</returns>
+    /// <remarks>
+    /// The writer stays inside its first call until the deadline, so dispose cannot return early.
+    /// Not thread-safe. Only the test thread calls it.
+    /// </remarks>
+    private static async Task AssertSequentialShutdownThenWrite()
+    {
+        var lines = new List<string>();
+        SelfLog.Enable(line =>
+        {
+            lock (lines)
+                lines.Add(line);
+        });
+        var clock = DeadlineClock.Create();
+        var slow = new BudgetGateWriter();
+        var engine = EngineOnClock(slow, 1000, 10, clock);
+        Task? dispose = null;
+        try
+        {
+            engine.Log("s", LogLevel.Info);
+            Assert.True(await WaitUntil(() => slow.Entered == 1, TimeSpan.FromSeconds(30)));
+            for (var i = 1; i < 1000; i++)
+                engine.Log("s", LogLevel.Info);
+
+            dispose = await ArmDispose(engine, nameof(Shutdown_TwiceSequentialAndParallel_ThenWrite_NoException));
+            await FinishAtShutdownDeadline(clock, engine, dispose);
+            engine.Dispose();
+            engine.Log("after", LogLevel.Info);
+            Assert.Equal(0, slow.WritesAfterDispose);
+            lock (lines)
+            {
+                Assert.Equal(2, lines.Count);
+                Assert.StartsWith(DeadlinePrefix, lines[0], StringComparison.Ordinal);
+                Assert.Equal(ClosedLine, lines[1]);
+            }
+        }
+        finally
+        {
+            slow.Grant(1000);
+            await ReleaseDispose(clock, dispose);
+        }
+    }
+
+    /// <summary>
+    /// Starts two shutdowns while a writer is blocked. The second returns at once. The first returns on the deadline.
+    /// </summary>
+    /// <returns>A task that finishes after ALOG0072 is checked.</returns>
+    /// <remarks>
+    /// The second call does not wait and does not add an ALOG0071 line. Not thread-safe. Only the test thread calls it.
+    /// </remarks>
+    private static async Task AssertParallelShutdownThenWrite()
+    {
+        var lines = new List<string>();
+        SelfLog.Enable(line =>
+        {
+            lock (lines)
+                lines.Add(line);
+        });
+        var clock = DeadlineClock.Create();
+        var hanging = new ForeverWriter();
+        var engine = EngineOnClock(hanging, 8, 1, clock);
+        Task? first = null;
+        Task? second = null;
+        try
+        {
+            engine.Log("hang", LogLevel.Info);
+            Assert.True(hanging.Entered.Wait(TimeSpan.FromSeconds(30)));
+            first = Task.Run(() => engine.Dispose());
+            second = Task.Run(() => engine.Dispose());
+            await DeadlineClock.WaitFor(
+                () => engine.Queue!.DisposeWaitsStarted >= 1,
+                "parallel shutdown did not arm the clock wait");
+            await DeadlineClock.WaitFor(
+                () => first.IsCompleted || second.IsCompleted,
+                "second dispose did not return while the first wait was armed");
+            Assert.False(first.IsCompleted && second.IsCompleted, "both dispose calls returned before the deadline");
+            var running = first.IsCompleted ? second! : first;
+            var returned = first.IsCompleted ? first : second!;
+            await returned;
+            await DeadlineClock.AssertNotElapsed(
+                clock,
+                () => engine.Queue!.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
+            await DeadlineClock.AssertElapsed(
+                clock,
+                () => engine.Queue!.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
+            await DeadlineClock.WaitForCompletion(running, "shutdown hung");
+            engine.Log("after", LogLevel.Info);
+            Assert.False(hanging.Disposed);
+            lock (lines)
+            {
+                Assert.Equal(2, lines.Count);
+                Assert.StartsWith(DeadlinePrefix, lines[0], StringComparison.Ordinal);
+                Assert.Equal(ClosedLine, lines[1]);
+            }
+        }
+        finally
+        {
+            await ReleaseDispose(clock, first);
+            await ReleaseDispose(clock, second);
+        }
+    }
+
+    /// <summary>
+    /// Builds an engine whose queue uses <paramref name="clock"/> and does not flush on its own during a deadline step.
+    /// </summary>
+    /// <param name="writer">The only writer. Not null.</param>
+    /// <param name="capacity">Queue capacity. At least 1.</param>
+    /// <param name="batchSize">Batch size. The slow-cutoff test uses 1 so one grant starts one call.</param>
+    /// <param name="clock">Clock for shutdown and flush. Not null.</param>
+    /// <returns>An engine that has not been disposed.</returns>
+    /// <remarks>Does not throw. Synchronous writes. The flush interval is one hour so a deadline step does not tick it.</remarks>
+    private static LoggerEngine EngineOnClock(ILogWriter writer, int capacity, int batchSize, TimeProvider clock)
+    {
+        return new LoggerEngine(new LoggerConfig()
+            .AddWriter(writer)
+            .UseBackgroundQueue(true, capacity, batchSize, TimeSpan.FromHours(1))
+            .UseAsync(false), clock);
+    }
+
+    /// <summary>
+    /// Starts <see cref="LoggerEngine.Dispose"/> and waits until the shutdown wait is armed.
+    /// </summary>
+    /// <param name="engine">Engine whose writer is already blocked. Not null.</param>
+    /// <param name="name">Test name used when the wait is not armed.</param>
+    /// <returns>The dispose task. Still running.</returns>
+    /// <remarks>Does not move the clock. The arm wait is the 30 s hang guard.</remarks>
+    private static Task<Task> ArmDispose(LoggerEngine engine, string name)
+    {
+        return DeadlineClock.RunUntilArmed(
+            engine.Dispose,
+            () => engine.Queue!.DisposeWaitsStarted,
+            name);
+    }
+
+    /// <summary>
+    /// Asserts the shutdown flag is clear one tick before the deadline, set on that tick, then waits for dispose.
+    /// </summary>
+    /// <param name="clock">Clock the dispose is waiting on. Not null.</param>
+    /// <param name="engine">Engine whose queue owns the flag. Not null. The queue is not null.</param>
+    /// <param name="dispose">Armed dispose. Not null.</param>
+    /// <returns>A task that finishes when dispose returns.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="engine"/> has no queue.</exception>
+    /// <remarks>
+    /// An early flag uses <see cref="DeadlineClock.EarlyFire"/> for shutdown.
+    /// A flag that is still clear at the bound uses <see cref="DeadlineClock.LateFire"/> after the 30 s hang guard.
+    /// The final wait is a separate 30 s hang guard, and its message is not the late sentence.
+    /// Does not grant a writer.
+    /// </remarks>
+    private static async Task FinishAtShutdownDeadline(FakeTimeProvider clock, LoggerEngine engine, Task dispose)
+    {
+        ArgumentNullException.ThrowIfNull(engine);
+        var queue = engine.Queue;
+        if (queue is null)
+            throw new ArgumentNullException(nameof(engine), "Engine has no queue.");
+
+        await DeadlineClock.AssertNotElapsed(
+            clock,
+            () => queue.ShutdownDeadlineElapsed != 0,
+            BackgroundLogQueue.ShutdownDeadline,
+            "shutdown");
+        await DeadlineClock.AssertElapsed(
+            clock,
+            () => queue.ShutdownDeadlineElapsed != 0,
+            BackgroundLogQueue.ShutdownDeadline,
+            "shutdown");
+        await DeadlineClock.WaitForCompletion(dispose, "shutdown hung");
+    }
+
+    /// <summary>
+    /// Unblocks a dispose that is still waiting on <paramref name="clock"/>, then waits up to the hang guard.
+    /// </summary>
+    /// <param name="clock">Clock the dispose was given. Not null. Advanced only when the task is still running.</param>
+    /// <param name="dispose">The dispose task, or null when it was never started.</param>
+    /// <returns>A task that finishes when dispose has finished or the guard elapsed.</returns>
+    /// <remarks>
+    /// Does not assert. A second failure here would hide the original one. The advance is the product deadline,
+    /// which is already the bound the test uses. Not thread-safe.
+    /// </remarks>
+    private static async Task ReleaseDispose(FakeTimeProvider clock, Task? dispose)
+    {
+        if (dispose is null)
+            return;
+
+        if (!dispose.IsCompleted)
+            clock.Advance(BackgroundLogQueue.ShutdownDeadline);
+
+        _ = await Task.WhenAny(dispose, Task.Delay(TimeSpan.FromSeconds(30)));
+    }
+
+    /// <summary>
+    /// Blocks each write until <see cref="Grant"/> releases one permit.
+    /// Counts calls, finished calls, and calls that saw dispose.
+    /// </summary>
+    private sealed class BudgetGateWriter : ILogWriter
+    {
+        private readonly SemaphoreSlim _gate = new(0);
+        private int _entered;
+        private int _finished;
+        private int _afterDispose;
+        private int _disposed;
+
+        /// <summary>Calls that have entered <see cref="Write"/>, including the one still waiting.</summary>
+        internal int Entered => Volatile.Read(ref _entered);
+
+        /// <summary>Calls that have returned.</summary>
+        internal int Finished => Volatile.Read(ref _finished);
+
+        /// <summary>Calls that observed dispose before they returned.</summary>
+        internal int WritesAfterDispose => Volatile.Read(ref _afterDispose);
+
+        /// <summary>True after <see cref="Dispose"/>.</summary>
+        internal bool Disposed => Volatile.Read(ref _disposed) != 0;
+
+        /// <summary>
+        /// Releases <paramref name="count"/> waiting calls.
+        /// </summary>
+        /// <param name="count">How many calls may pass the gate. At least 1.</param>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="count"/> is below 1.</exception>
+        /// <remarks>Does not throw for a call that has not arrived yet. The permit stays until that call waits. Not itself a wait.</remarks>
+        internal void Grant(int count)
+        {
+            if (count < 1)
+                throw new ArgumentOutOfRangeException(nameof(count), count, "Grant count must be at least 1.");
+
+            _gate.Release(count);
+        }
+
+        /// <summary>
+        /// Counts the entry, waits for one permit, then records the call.
+        /// </summary>
+        /// <param name="logEvent">Ignored.</param>
+        /// <remarks>
+        /// The wait has no wall-clock timeout. The test grants the permit, including from a finally block.
+        /// A call that sees dispose increments <see cref="WritesAfterDispose"/>.
+        /// </remarks>
+        public void Write(LogEvent logEvent)
+        {
+            Interlocked.Increment(ref _entered);
+            _gate.Wait();
+            if (Volatile.Read(ref _disposed) != 0)
+                Interlocked.Increment(ref _afterDispose);
+
+            Interlocked.Increment(ref _finished);
+        }
+
+        /// <summary>Same gate as <see cref="Write"/>.</summary>
+        /// <param name="logEvent">Passed to <see cref="Write"/>.</param>
+        /// <returns>A completed task after the permit is taken.</returns>
+        public Task WriteAsync(LogEvent logEvent)
+        {
+            Write(logEvent);
+            return Task.CompletedTask;
+        }
+
+        /// <summary>Marks the writer disposed. Does not release a call that is waiting.</summary>
+        public void Dispose() => Interlocked.Exchange(ref _disposed, 1);
     }
 
     /// <summary>Sleeps a fixed amount on every write, and counts calls that happen after Dispose.</summary>
