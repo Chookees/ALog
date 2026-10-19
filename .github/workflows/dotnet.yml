@@ -62,6 +62,7 @@ jobs:
         python3 eng/test_coverage_exception_check.py
         python3 eng/test_analyzer_ratchet_check.py
         bash eng/test_bb_grep.sh
+        bash eng/test_clk_grep.sh
         bash eng/test_build_base_assemblies.sh
         python3 eng/test_coverage_metadata.py
         python3 eng/test_sync_wait_check.py

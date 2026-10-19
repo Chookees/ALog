@@ -16,12 +16,41 @@ public class LoggerEngine : ILogger, IDisposable
     private readonly LogDispatcher _dispatcher;
     private readonly BackgroundLogQueue? _backgroundQueue;
     private readonly MinimumLevelCache _levels;
+    private readonly TimeProvider _clock;
     private readonly ManualResetEventSlim _disposeDone = new(false);
     private int _disposeOnce;
 
+    /// <summary>
+    /// Builds the engine on <see cref="TimeProvider.System"/>.
+    /// </summary>
+    /// <param name="config">Filters, writers, and the queue switch. Not null.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="config"/> is null.</exception>
+    /// <remarks>
+    /// Does not throw for a writer failure. The queue, when enabled, starts before this returns.
+    /// Safe to construct on any thread. Log after this returns.
+    /// </remarks>
     public LoggerEngine(ILogConfiguration config)
+        : this(config, TimeProvider.System)
     {
-        _config = config ?? throw new ArgumentNullException(nameof(config));
+    }
+
+    /// <summary>
+    /// Builds the engine on <paramref name="clock"/>. Tests pass a clock they can move.
+    /// Production uses <see cref="TimeProvider.System"/> through the public constructor.
+    /// </summary>
+    /// <param name="config">Filters, writers, and the queue switch. Not null.</param>
+    /// <param name="clock">Clock for the queue shutdown, flush, and cutoff, and for a second <see cref="Dispose"/>. Not null.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="config"/> or <paramref name="clock"/> is null.</exception>
+    /// <remarks>
+    /// Does not throw for a writer failure. The clock cannot be changed after this returns.
+    /// A frozen test clock does not move the queue waits until the test advances it.
+    /// </remarks>
+    internal LoggerEngine(ILogConfiguration config, TimeProvider clock)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(clock);
+        _config = config;
+        _clock = clock;
         _levels = new MinimumLevelCache(config);
 
         ApplyDefaultFormatter(config);
@@ -32,10 +61,12 @@ public class LoggerEngine : ILogger, IDisposable
         {
             _backgroundQueue = new BackgroundLogQueue(
                 config.Writers,
-                config.BackgroundQueueCapacity,
-                config.BackgroundQueueBatchSize,
-                config.BackgroundQueueFlushInterval,
-                config.AsyncEnabled);
+                new BackgroundLogQueue.QueueSettings(
+                    config.BackgroundQueueCapacity,
+                    config.BackgroundQueueBatchSize,
+                    config.BackgroundQueueFlushInterval,
+                    config.AsyncEnabled,
+                    clock));
         }
     }
 
@@ -351,13 +382,14 @@ public class LoggerEngine : ILogger, IDisposable
     /// <remarks>
     /// Does not throw. Writer dispose failures are written to the error stream.
     /// Without a queue, writers are disposed immediately, as they were before the queue deadline existed.
-    /// The wait for a second call is the same 5 s bound as the queue deadline.
+    /// The wait for a second call is <see cref="BackgroundLogQueue.ShutdownDeadline"/> on the engine clock.
     /// </remarks>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
         {
-            _ = _disposeDone.Wait(TimeSpan.FromSeconds(5));
+            // Same bound as the queue. The timer is the only timeout, so a frozen test clock stays blocked.
+            BackgroundLogQueue.WaitUntilSignaledOrDeadline(_clock, _disposeDone);
             return;
         }
 

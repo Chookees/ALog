@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Globalization;
+using Microsoft.Extensions.Time.Testing;
 using System.Net;
 using System.Threading.Channels;
 using ALog.Core;
@@ -375,49 +376,57 @@ public sealed class SyncWriteContractTests
 
     /// <summary>
     /// An enqueue after the queue has started to close returns false without waiting for the writer.
-    /// Dispose while a writer call is still running stays inside the shutdown window.
+    /// One tick before <see cref="BackgroundLogQueue.ShutdownDeadline"/> dispose has not returned. The next tick returns it.
     /// </summary>
     /// <remarks>
-    /// The blocked writer is released after the deadline assertions so the processor can leave.
+    /// The gate is already closed once the shutdown wait is armed, so the false return does not wait for the deadline.
+    /// The blocked writer is released after the deadline steps so the processor can leave.
     /// A second dispose waits for the first and does not throw.
     /// </remarks>
     /// <returns>A task that finishes after dispose returns.</returns>
     [Fact(Timeout = 60000)]
     public async Task Queue_TryEnqueue_ReturnsFalseWhenTheChannelCloses()
     {
+        DeadlineClock.AssertValues();
+        var clock = DeadlineClock.Create();
         var writer = new BlockingWriter();
         var queue = new BackgroundLogQueue(
             new ILogWriter[] { writer },
-            capacity: 1,
-            batchSize: 1,
-            flushInterval: TimeSpan.FromSeconds(30),
-            asyncEnabled: false);
+            new BackgroundLogQueue.QueueSettings(1, 1, TimeSpan.FromSeconds(30), false, clock));
         Task? disposing = null;
         try
         {
             Assert.True(queue.TryEnqueue(Event("prime")));
-            var deadline = DateTime.UtcNow.AddSeconds(30);
-            while (writer.EnteredCount == 0 && DateTime.UtcNow < deadline)
-                await Task.Delay(10);
-
-            Assert.True(writer.EnteredCount > 0);
-            var disposeStarted = Stopwatch.StartNew();
-            disposing = Task.Run(() => queue.Dispose());
+            await DeadlineClock.WaitFor(() => writer.EnteredCount > 0, "processor never entered the blocked writer");
+            disposing = await DeadlineClock.RunUntilArmed(
+                queue.Dispose,
+                () => queue.DisposeWaitsStarted,
+                nameof(Queue_TryEnqueue_ReturnsFalseWhenTheChannelCloses));
             var enqueueStarted = Stopwatch.StartNew();
             var accepted = queue.TryEnqueue(Event("closing"));
             Assert.False(accepted);
             Assert.Empty(writer.Events);
             Assert.True(enqueueStarted.Elapsed < TimeSpan.FromSeconds(30), "hang " + enqueueStarted.Elapsed.ToString());
-            await disposing.WaitAsync(TimeSpan.FromSeconds(30));
-            TransitionDeadline.AssertFiredInWindow(disposeStarted.Elapsed, BackgroundLogQueue.ShutdownDeadline);
+            DeadlineClock.AssertNotReturnedBefore(
+                clock,
+                disposing,
+                BackgroundLogQueue.ShutdownDeadline,
+                nameof(Queue_TryEnqueue_ReturnsFalseWhenTheChannelCloses));
+            await DeadlineClock.AssertReturnedAt(
+                clock,
+                disposing,
+                nameof(Queue_TryEnqueue_ReturnsFalseWhenTheChannelCloses));
             Assert.False(queue.TryEnqueue(Event("after")));
             queue.Dispose();
         }
         finally
         {
             writer.Release();
+            if (disposing is not null && !disposing.IsCompleted)
+                clock.Advance(BackgroundLogQueue.ShutdownDeadline);
+
             if (disposing is not null)
-                await disposing.WaitAsync(TimeSpan.FromSeconds(30));
+                _ = await Task.WhenAny(disposing, Task.Delay(TimeSpan.FromSeconds(30)));
         }
     }
 

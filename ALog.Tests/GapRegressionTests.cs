@@ -190,6 +190,14 @@ public class GapRegressionTests : IDisposable
         Assert.True(w1.Disposed);
     }
 
+    /// <summary>
+    /// Flush drains the 25 queued events. The count is waited on after flush, not assumed from the flush deadline.
+    /// </summary>
+    /// <returns>A task that finishes after shutdown.</returns>
+    /// <remarks>
+    /// The wait is a 30 s hang guard on the writer count. A flush that returned at the deadline before the writes
+    /// finished still has to show 25 events. Not thread-safe. Only the test thread calls it.
+    /// </remarks>
     [Fact]
     public async Task G_M03_Flush_Drains_Queued_Events()
     {
@@ -203,6 +211,7 @@ public class GapRegressionTests : IDisposable
             Log.Write($"q-{i}");
 
         await Log.FlushAsync();
+        await DeadlineClock.WaitFor(() => WriterCount(writer) == 25, "flush did not drain 25 events");
         Log.Shutdown();
 
         Assert.Equal(25, writer.Events.Count);
@@ -349,9 +358,9 @@ public class GapRegressionTests : IDisposable
     /// </summary>
     /// <returns>A task that finishes after the blocked write is released.</returns>
     /// <remarks>
-    /// The processor runs on the constructing thread until <c>WaitForNextTickAsync</c> inside
-    /// <c>BackgroundLogQueue.WaitForWorkAsync</c>. The test reads that suspension and the wake source.
-    /// After enqueue, <c>_wakeCts</c> must be a new instance, which only the wake path replaces.
+    /// Parked means the processor has started and has entered the idle wait, with no writer call running.
+    /// Those are internal signals, not compiler-generated type names.
+    /// After enqueue, the wake source must be a new instance, which only the wake path replaces.
     /// The 30 s waits are hang guards. Not thread-safe. The delegate releases the writer.
     /// A thread-id compare is not used. The pool may reuse the producer thread after the hop.
     /// </remarks>
@@ -370,7 +379,7 @@ public class GapRegressionTests : IDisposable
                 asyncEnabled: false);
 
             AssertProcessorIsParkedInIdleWait(queue);
-            var parkedWake = WakeSource(queue);
+            var parkedWake = queue.WakeTokenSource;
             Assert.Equal(0, writer.EnteredCount);
 
             var enqueueDone = new ManualResetEventSlim(false);
@@ -392,7 +401,7 @@ public class GapRegressionTests : IDisposable
                 await Task.Delay(10).ConfigureAwait(false);
 
             Assert.True(writer.EnteredCount > 0, "processor never entered blocking writer");
-            AssertWakeSourceReplaced(queue, parkedWake);
+            Assert.False(ReferenceEquals(parkedWake, queue.WakeTokenSource), "wake path did not replace _wakeCts");
             Assert.Empty(writer.Events);
 
             writer.Release();
@@ -401,195 +410,39 @@ public class GapRegressionTests : IDisposable
         });
     }
 
-    /// <summary>Instance fields, including the compiler-generated state machine fields.</summary>
-    private const BindingFlags InstanceMembers = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
-
     /// <summary>
-    /// Roslyn's suspension number for the first await in <c>WaitForWorkAsync</c>.
-    /// That await is <c>PeriodicTimer.WaitForNextTickAsync</c>. The next number is the pool hop after a wake.
-    /// </summary>
-    private const int IdleWaitState = 0;
-
-    /// <summary>Most state-machine fields this test will scan. The generated machines are smaller than this.</summary>
-    private const int MaxStateMachineFields = 32;
-
-    /// <summary>
-    /// Fails unless the processor is suspended inside the idle wait and no writer call is running.
+    /// Fails unless the processor has started, has entered the idle wait, and has no writer call running.
     /// </summary>
     /// <param name="queue">Queue just constructed, before any enqueue. Not null.</param>
     /// <remarks>
-    /// A task that merely exists and is not completed is not enough: that is also true before the processor starts.
-    /// The proof is the live state machine: <c>ProcessLogsAsync</c> is awaiting <c>WaitForWorkAsync</c>,
-    /// and that method is on its first await, the timer wait. Not thread-safe. Only the test thread calls it.
+    /// A task that merely exists is not the proof. <see cref="BackgroundLogQueue.ProcessorHasStarted"/> is the start.
+    /// <see cref="BackgroundLogQueue.IsIdleWaitEntered"/> is the idle wait. The in-flight count must be zero.
+    /// Each failed check has its own message. Not thread-safe. Only the test thread calls it.
     /// </remarks>
     private static void AssertProcessorIsParkedInIdleWait(BackgroundLogQueue queue)
     {
         ArgumentNullException.ThrowIfNull(queue);
-        var task = ProcessorTask(queue);
-        Assert.False(task.IsCompleted, "processor left before the idle wait");
-        var processor = StateMachineOf(task);
-        var awaited = AwaitedTask(processor);
-        object? waiting = null;
-        if (awaited is not null && !awaited.IsCompleted && awaited.GetType().GetField("StateMachine", InstanceMembers) is not null)
-            waiting = StateMachineOf(awaited);
-
-        var parked = processor.GetType().Name.Contains("ProcessLogsAsync", StringComparison.Ordinal)
-            && waiting is not null
-            && waiting.GetType().Name.Contains("WaitForWorkAsync", StringComparison.Ordinal)
-            && AsyncSuspensionState(waiting) == IdleWaitState
-            && StoresValueTaskAwaiter(waiting);
-        Assert.True(parked, "processor has not entered the idle wait");
-        Assert.Equal(0, Inflight(queue));
+        Assert.True(queue.ProcessorHasStarted, "processor has not started");
+        Assert.True(queue.IsIdleWaitEntered, "processor has not entered the idle wait");
+        Assert.Equal(0, queue.InFlightCount);
     }
 
     /// <summary>
-    /// Reads the wake source the idle wait is registered on.
+    /// Reads the writer count. A concurrent add makes the list throw, which this treats as not ready yet.
     /// </summary>
-    /// <param name="queue">Open queue. Not null.</param>
-    /// <returns>The current <c>_wakeCts</c>. Not null.</returns>
-    /// <remarks>
-    /// The object identity is the proof. The wake path replaces this instance. Not thread-safe. Only the test thread calls it.
-    /// </remarks>
-    private static object WakeSource(BackgroundLogQueue queue)
+    /// <param name="writer">Writer being filled. Not null.</param>
+    /// <returns>The current count, or -1 when the list was mid-update.</returns>
+    /// <remarks>Does not throw. Used after flush so the count is not implied by the flush deadline.</remarks>
+    private static int WriterCount(RecordingWriter writer)
     {
-        ArgumentNullException.ThrowIfNull(queue);
-        var field = typeof(BackgroundLogQueue).GetField("_wakeCts", InstanceMembers);
-        Assert.NotNull(field);
-        var source = field.GetValue(queue);
-        Assert.NotNull(source);
-        return source;
-    }
-
-    /// <summary>
-    /// Fails unless the wake path has replaced the source captured before enqueue.
-    /// </summary>
-    /// <param name="queue">Queue that has accepted one event. Not null.</param>
-    /// <param name="parkedSource">The source from <see cref="WakeSource"/> before that enqueue. Not null.</param>
-    /// <remarks>
-    /// <c>ReplaceWakeCts</c> runs only after the idle wait is cancelled. A processor that had not started
-    /// does not replace the source when it later finds the event already queued. Not thread-safe.
-    /// </remarks>
-    private static void AssertWakeSourceReplaced(BackgroundLogQueue queue, object parkedSource)
-    {
-        ArgumentNullException.ThrowIfNull(queue);
-        ArgumentNullException.ThrowIfNull(parkedSource);
-        Assert.False(ReferenceEquals(parkedSource, WakeSource(queue)), "wake path did not replace _wakeCts");
-    }
-
-    /// <summary>
-    /// Reads the processor task.
-    /// </summary>
-    /// <param name="queue">Open queue. Not null.</param>
-    /// <returns>The background task. Not null.</returns>
-    /// <remarks>Does not wait. Not thread-safe. Only the test thread calls it.</remarks>
-    private static Task ProcessorTask(BackgroundLogQueue queue)
-    {
-        var field = typeof(BackgroundLogQueue).GetField("_backgroundTask", InstanceMembers);
-        Assert.NotNull(field);
-        return Assert.IsAssignableFrom<Task>(field.GetValue(queue));
-    }
-
-    /// <summary>
-    /// Reads how many writer calls are in flight.
-    /// </summary>
-    /// <param name="queue">Open queue. Not null.</param>
-    /// <returns>The in-flight count. Zero when the processor is idle.</returns>
-    /// <remarks>Does not wait. Not thread-safe. Only the test thread calls it.</remarks>
-    private static int Inflight(BackgroundLogQueue queue)
-    {
-        var field = typeof(BackgroundLogQueue).GetField("_inflight", InstanceMembers);
-        Assert.NotNull(field);
-        return (int)field.GetValue(queue)!;
-    }
-
-    /// <summary>
-    /// Reads the compiler state machine stored on an async task.
-    /// </summary>
-    /// <param name="task">Async task. Not null. Must be a state-machine box.</param>
-    /// <returns>The boxed state machine. Not null.</returns>
-    /// <remarks>A task that is not a state-machine box fails the test. Not thread-safe.</remarks>
-    private static object StateMachineOf(Task task)
-    {
-        ArgumentNullException.ThrowIfNull(task);
-        var field = task.GetType().GetField("StateMachine", InstanceMembers);
-        Assert.NotNull(field);
-        var machine = field.GetValue(task);
-        Assert.NotNull(machine);
-        return machine;
-    }
-
-    /// <summary>
-    /// Reads the task the state machine is currently awaiting.
-    /// </summary>
-    /// <param name="machine">Compiler state machine. Not null.</param>
-    /// <returns>The awaited task, or null when no awaiter holds one.</returns>
-    /// <remarks>
-    /// Skips the builder. Only awaiter fields are considered, and at most <see cref="MaxStateMachineFields"/> of them.
-    /// Not thread-safe.
-    /// </remarks>
-    private static Task? AwaitedTask(object machine)
-    {
-        ArgumentNullException.ThrowIfNull(machine);
-        var fields = machine.GetType().GetFields(InstanceMembers);
-        var limit = fields.Length;
-        if (limit > MaxStateMachineFields)
-            limit = MaxStateMachineFields;
-
-        for (var i = 0; i < limit; i++)
+        try
         {
-            if (!fields[i].FieldType.Name.Contains("Awaiter", StringComparison.Ordinal))
-                continue;
-
-            var awaiter = fields[i].GetValue(machine);
-            if (awaiter is null)
-                continue;
-
-            var taskField = awaiter.GetType().GetField("m_task", InstanceMembers);
-            if (taskField?.GetValue(awaiter) is Task awaited)
-                return awaited;
+            return writer.Events.Count;
         }
-
-        return null;
-    }
-
-    /// <summary>
-    /// Reads Roslyn's suspension number from a state machine.
-    /// </summary>
-    /// <param name="machine">Compiler state machine. Not null.</param>
-    /// <returns>The <c>&lt;&gt;1__state</c> value. Zero is the first await.</returns>
-    /// <remarks>A missing state field fails the test. Not thread-safe.</remarks>
-    private static int AsyncSuspensionState(object machine)
-    {
-        ArgumentNullException.ThrowIfNull(machine);
-        var field = machine.GetType().GetField("<>1__state", InstanceMembers);
-        Assert.NotNull(field);
-        return (int)field.GetValue(machine)!;
-    }
-
-    /// <summary>
-    /// True when the machine has the awaiter <c>WaitForNextTickAsync</c> stores.
-    /// </summary>
-    /// <param name="machine">Compiler state machine. Not null.</param>
-    /// <returns>True when a field type name contains <c>ValueTaskAwaiter</c>.</returns>
-    /// <remarks>
-    /// Scans at most <see cref="MaxStateMachineFields"/> fields. The pool-hop awaiter is a different type and does not match.
-    /// Not thread-safe.
-    /// </remarks>
-    private static bool StoresValueTaskAwaiter(object machine)
-    {
-        ArgumentNullException.ThrowIfNull(machine);
-        var fields = machine.GetType().GetFields(InstanceMembers);
-        var limit = fields.Length;
-        if (limit > MaxStateMachineFields)
-            limit = MaxStateMachineFields;
-
-        for (var i = 0; i < limit; i++)
+        catch (InvalidOperationException)
         {
-            if (fields[i].FieldType.Name.Contains("ValueTaskAwaiter", StringComparison.Ordinal))
-                return true;
+            return -1;
         }
-
-        return false;
     }
 
     /// <summary>

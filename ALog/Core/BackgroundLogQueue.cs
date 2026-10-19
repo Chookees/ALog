@@ -1,13 +1,13 @@
 // Background queue for UseBackgroundQueue (C4).
 // One opt-in queue. A full queue drops the new event and counts it (ALOG0070).
-// Shutdown has one close point and a fixed 5 s deadline (ALOG0071).
+// Shutdown, flush, and the new-write cutoff use the injected TimeProvider (ALOG0071).
+// Production uses TimeProvider.System. Tests pass a clock they can move.
 // The open ALOG0070 window is written at shutdown. The first event after close is ALOG0072.
 // Idle writers are disposed at the deadline. A call that is still running is not.
 // Next file: ALog/Core/LoggerEngine.cs.
 
 namespace ALog.Core;
 
-using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
@@ -20,14 +20,14 @@ using ALog.Public.Interfaces;
 /// </summary>
 public class BackgroundLogQueue : IDisposable
 {
-    /// <summary>How long <see cref="Dispose"/> may take in total. C4-02. Not configurable.</summary>
-    internal static readonly TimeSpan ShutdownDeadline = TimeSpan.FromSeconds(5);
+    /// <summary>How long <see cref="Dispose"/> and <see cref="FlushAsync"/> may wait. 5000 ms. C4-02. Not configurable.</summary>
+    internal static readonly TimeSpan ShutdownDeadline = TimeSpan.FromMilliseconds(5000);
 
     /// <summary>
-    /// New writes are not started after this much of <see cref="ShutdownDeadline"/>.
-    /// The rest of the deadline lets a write that already started finish.
+    /// New writer calls stop after 4900 ms of <see cref="ShutdownDeadline"/>.
+    /// The last 100 ms lets a call that already started finish. Not configurable.
     /// </summary>
-    private static readonly TimeSpan NewWriteBudget = TimeSpan.FromMilliseconds(4900);
+    internal static readonly TimeSpan NewWriteBudget = TimeSpan.FromMilliseconds(4900);
 
     /// <summary>Shortest delay before the first full-queue line, so a burst shares one count.</summary>
     private static readonly TimeSpan FirstReportDelay = TimeSpan.FromMilliseconds(1);
@@ -67,6 +67,11 @@ public class BackgroundLogQueue : IDisposable
     private int _timerArmed;
     private int _shutdownReported;
     private int _closedReported;
+    private int _processorEntered;
+    private int _idleWaitEntered;
+    private int _disposeWaitsStarted;
+    private int _flushWaitsStarted;
+    private int _cutoffReached;
     private long _accepted;
     private long _written;
     private long _unwritten;
@@ -74,6 +79,7 @@ public class BackgroundLogQueue : IDisposable
     private long _closedDrops;
     private long _pendingFullDrops;
     private long _nextReportTicks;
+    /// <summary>Provider timestamp taken when <see cref="Dispose"/> closes the gate. Zero before that.</summary>
     private long _disposeStartTimestamp;
     private bool _closed;
     private bool _frozen;
@@ -113,9 +119,9 @@ public class BackgroundLogQueue : IDisposable
     /// <param name="capacity">Most events accepted while writers are behind. At least 1.</param>
     /// <param name="batchSize">Most events read before the processor looks at the deadline again.</param>
     /// <param name="flushInterval">Idle wait. Not infinite; tests may pass a long interval and wake instead.</param>
-    /// <param name="clock">Clock for the ALOG0070 window. Not null. Not used for the shutdown deadline.</param>
+    /// <param name="clock">Clock for shutdown, flush, the new-write cutoff, and the ALOG0070 window. Not null.</param>
     /// <remarks>
-    /// Async writes are enabled. The shutdown deadline still uses a wall clock so a frozen test clock cannot stall Dispose.
+    /// Async writes are enabled. A frozen test clock does not move these waits until the test advances it.
     /// </remarks>
     internal BackgroundLogQueue(
         IReadOnlyList<ILogWriter> writers,
@@ -128,11 +134,17 @@ public class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Stores the settings and starts the processor. Both public entry points end here.
+    /// Stores the settings and starts the processor. The public constructor and the test constructor end here.
     /// </summary>
     /// <param name="writers">Writers passed to the dispatcher. Not null.</param>
     /// <param name="settings">Capacity, batch, interval, async flag, and clock. The clock is not null.</param>
-    private BackgroundLogQueue(IReadOnlyList<ILogWriter> writers, QueueSettings settings)
+    /// <exception cref="ArgumentNullException"><paramref name="settings"/> has a null clock.</exception>
+    /// <remarks>
+    /// The processor starts before this returns, so the clock cannot be changed afterwards.
+    /// Does not throw for a writer failure. A flush interval the timer rejects still leaves the
+    /// stopped signal unset, so <see cref="Dispose"/> waits out <see cref="ShutdownDeadline"/>.
+    /// </remarks>
+    internal BackgroundLogQueue(IReadOnlyList<ILogWriter> writers, QueueSettings settings)
     {
         ArgumentNullException.ThrowIfNull(settings.Clock);
         _capacity = settings.Capacity;
@@ -187,6 +199,30 @@ public class BackgroundLogQueue : IDisposable
     /// False when a writer call was still running at the deadline.
     /// </summary>
     internal bool ReleaseWriters { get; private set; }
+
+    /// <summary>Writer calls started and not yet finished. Zero when the processor is not inside a writer.</summary>
+    internal int InFlightCount => Volatile.Read(ref _inflight);
+
+    /// <summary>True after the processor method has been entered. False only before that first line.</summary>
+    internal bool ProcessorHasStarted => Volatile.Read(ref _processorEntered) != 0;
+
+    /// <summary>True after the processor has entered the idle timer wait at least once.</summary>
+    internal bool IsIdleWaitEntered => Volatile.Read(ref _idleWaitEntered) != 0;
+
+    /// <summary>The source cancelled to wake the processor. A wake replaces this instance.</summary>
+    internal CancellationTokenSource WakeTokenSource => _wakeCts;
+
+    /// <summary>How many shutdown waits have been registered on the clock. Zero before <see cref="Dispose"/> waits.</summary>
+    internal int DisposeWaitsStarted => Volatile.Read(ref _disposeWaitsStarted);
+
+    /// <summary>How many flush deadlines have been registered on the clock.</summary>
+    internal int FlushWaitsStarted => Volatile.Read(ref _flushWaitsStarted);
+
+    /// <summary>
+    /// True when a new writer call must not start.
+    /// False before shutdown reaches <see cref="NewWriteBudget"/>.
+    /// </summary>
+    internal bool NewWriterCallsBlocked => NewWritesBudgetSpent() || _writerGate.DeadlineReached;
 
     /// <summary>
     /// Queues <paramref name="logEvent"/> or drops it. The returned task is already complete unless it was cancelled.
@@ -456,7 +492,15 @@ public class BackgroundLogQueue : IDisposable
     /// <remarks>Does not throw. Cancel does not abandon a writer call that has already started.</remarks>
     private void SignalProcessor()
     {
-        _shutdownSignal.Cancel();
+        try
+        {
+            _shutdownSignal.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // PublishOutcome already disposed the source. The processor has left or is leaving.
+        }
+
         WakeProcessor();
     }
 
@@ -467,13 +511,16 @@ public class BackgroundLogQueue : IDisposable
     /// </summary>
     /// <remarks>
     /// Writer failures are handled inside the dispatcher and do not stop the loop.
-    /// A bad flush interval fails the timer and ends the loop. The method runs on the pool after its first await,
+    /// A bad flush interval throws before the loop, so the stopped signal stays unset and
+    /// <see cref="Dispose"/> still waits out the deadline. The method runs on the pool after its first await,
     /// so it is not a foreground thread. It ends when the stop flag is set, the deadline flag is set, or the gate is closed and idle.
     /// </remarks>
     private async Task ProcessLogsAsync()
     {
+        Volatile.Write(ref _processorEntered, 1);
         var batch = new List<LogEvent>(BatchCapacity());
-        using var timer = new PeriodicTimer(_flushInterval);
+        // Constructed before the loop so a rejected interval never sets the stopped signal.
+        using var timer = new PeriodicTimer(_flushInterval, _clock);
         try
         {
             while (Volatile.Read(ref _stop) == 0 && !_writerGate.DeadlineReached)
@@ -573,14 +620,20 @@ public class BackgroundLogQueue : IDisposable
     /// True when shutdown has used the new-write budget. False before <see cref="Dispose"/> starts the clock.
     /// </summary>
     /// <returns>True when a new writer call must not start.</returns>
-    /// <remarks>Does not throw. Uses the wall clock, not the report clock.</remarks>
+    /// <remarks>
+    /// Does not throw. Uses the injected clock. The cutoff timer sets the same fact at
+    /// <see cref="NewWriteBudget"/> so a blocked call observes it when it next checks.
+    /// </remarks>
     private bool NewWritesBudgetSpent()
     {
+        if (Volatile.Read(ref _cutoffReached) != 0)
+            return true;
+
         var start = Volatile.Read(ref _disposeStartTimestamp);
         if (start == 0)
             return false;
 
-        return Stopwatch.GetElapsedTime(start) >= NewWriteBudget;
+        return _clock.GetElapsedTime(start) >= NewWriteBudget;
     }
 
     /// <summary>
@@ -662,6 +715,7 @@ public class BackgroundLogQueue : IDisposable
     /// </remarks>
     private async Task WaitForWorkAsync(PeriodicTimer timer)
     {
+        Volatile.Write(ref _idleWaitEntered, 1);
         try
         {
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
@@ -779,26 +833,35 @@ public class BackgroundLogQueue : IDisposable
     /// <returns>A task that finishes when the queue is idle, the deadline passes, or the queue is already closed.</returns>
     /// <remarks>
     /// Does not throw. Does not dispose writers. A closed queue returns without waiting.
-    /// The delay does not capture a caller context.
+    /// The deadline timer uses the injected clock and does not capture a caller context.
     /// </remarks>
     public async Task FlushAsync()
     {
         if (IsGateClosed())
             return;
 
-        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Interlocked.Exchange(ref _flushTcs, tcs);
+        var idle = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref _flushTcs, idle);
         WakeProcessor();
         TryCompleteFlushIfIdle();
 
-        var completed = await Task.WhenAny(tcs.Task, Task.Delay(ShutdownDeadline)).ConfigureAwait(false);
-        if (!ReferenceEquals(completed, tcs.Task))
+        var deadline = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // The timer keeps a one-tick remainder. A millisecond-truncated delay would fire that tick early.
+        using var timer = _clock.CreateTimer(
+            static state => ((TaskCompletionSource<bool>)state!).TrySetResult(true),
+            deadline,
+            ShutdownDeadline,
+            Timeout.InfiniteTimeSpan);
+        Interlocked.Increment(ref _flushWaitsStarted);
+
+        var completed = await Task.WhenAny(idle.Task, deadline.Task).ConfigureAwait(false);
+        if (!ReferenceEquals(completed, idle.Task))
         {
-            Interlocked.CompareExchange(ref _flushTcs, null, tcs);
-            tcs.TrySetResult(false);
+            Interlocked.CompareExchange(ref _flushTcs, null, idle);
+            idle.TrySetResult(false);
         }
 
-        await tcs.Task.ConfigureAwait(false);
+        await idle.Task.ConfigureAwait(false);
     }
 
     /// <summary>
@@ -808,36 +871,21 @@ public class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. Disposes writers that have no call running. A call still running at the deadline is left for
     /// <see cref="WriterGate.EndWriterCall"/>, which disposes that writer only after the call returns.
-    /// The wait is at most <see cref="ShutdownDeadline"/>. Events offered after the close are counted, and the first one reports ALOG0072.
+    /// The wait is at most <see cref="ShutdownDeadline"/> on the injected clock. Events offered after the close are counted, and the first one reports ALOG0072.
     /// </remarks>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
         {
             // The first Dispose owns the deadline. This wait ends when that call finishes or the same bound passes.
-            _ = _disposeDone.Wait(ShutdownDeadline);
+            WaitUntilSignaledOrDeadline(_clock, _disposeDone);
             return;
         }
 
         try
         {
-            lock (_gate)
-                _closed = true;
-
-            Volatile.Write(ref _disposeStartTimestamp, Stopwatch.GetTimestamp());
-            // False means the channel was already completed. The drain still runs.
-            _ = _channel.Writer.TryComplete();
-            SignalProcessor();
-            WaitForProcessor(NewWriteBudget);
-            // Stop new writer calls before the last slice of the deadline, including writers listed after a slow call.
-            _writerGate.MarkDeadline();
-            if (!_stopped.IsSet)
-            {
-                Volatile.Write(ref _stop, 1);
-                SignalProcessor();
-                WaitForProcessor(ShutdownDeadline);
-            }
-
+            CloseGate();
+            DrainUntilDeadline();
             PublishOutcome();
         }
         finally
@@ -847,18 +895,139 @@ public class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Waits until the processor sets the stopped signal or <paramref name="budget"/> has passed since Dispose started.
+    /// Closes the gate, records the provider timestamp, and wakes the processor.
     /// </summary>
-    /// <param name="budget">Total time from the start of Dispose, not an extra delay on top of time already spent.</param>
-    /// <remarks>Does not throw. A false wait result means the budget won. The caller reads the signal again.</remarks>
-    private void WaitForProcessor(TimeSpan budget)
+    /// <remarks>
+    /// Does not throw. The channel complete result is ignored when the channel was already completed.
+    /// Called once from the winning <see cref="Dispose"/>.
+    /// </remarks>
+    private void CloseGate()
     {
-        var start = Volatile.Read(ref _disposeStartTimestamp);
-        var left = budget - Stopwatch.GetElapsedTime(start);
-        if (left <= TimeSpan.Zero)
+        lock (_gate)
+            _closed = true;
+
+        Volatile.Write(ref _disposeStartTimestamp, _clock.GetTimestamp());
+        // False means the channel was already completed. The drain still runs.
+        _ = _channel.Writer.TryComplete();
+        SignalProcessor();
+    }
+
+    /// <summary>
+    /// Waits until the processor stops or <see cref="ShutdownDeadline"/> elapses on the clock.
+    /// At <see cref="NewWriteBudget"/> the cutoff timer stops new writer calls.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. A processor that already stopped returns without registering a timer.
+    /// Both timers are disposed before this returns so a late callback cannot touch a published outcome.
+    /// </remarks>
+    private void DrainUntilDeadline()
+    {
+        if (_stopped.IsSet)
             return;
 
-        _ = _stopped.Wait(left);
+        // Both timers are registered before the wait is visible, so one clock step can hit either bound.
+        using var cutoff = _clock.CreateTimer(
+            static state => OnNewWriteCutoff(state),
+            this,
+            NewWriteBudget,
+            Timeout.InfiniteTimeSpan);
+        WaitUntilSignaledOrDeadline(_clock, _stopped, ref _disposeWaitsStarted);
+    }
+
+    /// <summary>
+    /// Marks the new-write cutoff, stops the processor from starting another call, and wakes it.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. A second fire returns immediately. Safe from the clock callback and from the processor.
+    /// </remarks>
+    private void ApplyNewWriteCutoff()
+    {
+        if (Interlocked.Exchange(ref _cutoffReached, 1) != 0)
+            return;
+
+        _writerGate.MarkDeadline();
+        Volatile.Write(ref _stop, 1);
+        SignalProcessor();
+    }
+
+    /// <summary>
+    /// Runs <see cref="ApplyNewWriteCutoff"/> for the cutoff timer.
+    /// </summary>
+    /// <param name="state">The queue. Not null.</param>
+    /// <exception cref="ArgumentException"><paramref name="state"/> is not a queue.</exception>
+    /// <remarks>Does not throw for a second fire. Called on the clock callback.</remarks>
+    private static void OnNewWriteCutoff(object? state)
+    {
+        if (state is not BackgroundLogQueue queue)
+            throw new ArgumentException("Cutoff timer is missing the queue.", nameof(state));
+
+        queue.ApplyNewWriteCutoff();
+    }
+
+    /// <summary>
+    /// Blocks until <paramref name="signaled"/> is set or <see cref="ShutdownDeadline"/> elapses on <paramref name="clock"/>.
+    /// </summary>
+    /// <param name="clock">Clock that owns the deadline. Not null.</param>
+    /// <param name="signaled">Set by the work this wait is joining. Not null. Not disposed by this method.</param>
+    /// <remarks>
+    /// Does not throw except for a null argument. The timer is the bound. There is no separate wall-clock timeout,
+    /// because that would release a frozen test clock. Does not capture a caller context.
+    /// </remarks>
+    internal static void WaitUntilSignaledOrDeadline(TimeProvider clock, ManualResetEventSlim signaled)
+    {
+        var unused = 0;
+        WaitUntilSignaledOrDeadline(clock, signaled, ref unused);
+    }
+
+    /// <summary>
+    /// Blocks until <paramref name="signaled"/> is set or the shutdown deadline elapses, then counts the registered wait.
+    /// </summary>
+    /// <param name="clock">Clock that owns the deadline. Not null.</param>
+    /// <param name="signaled">Set by the work this wait is joining. Not null.</param>
+    /// <param name="armedCount">Incremented after the deadline timer is registered. Not incremented when the signal is already set.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="clock"/> or <paramref name="signaled"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">The wait ended without the signal or the deadline.</exception>
+    /// <remarks>
+    /// Does not capture a caller context. The timer is disposed before this returns.
+    /// A signal that is already set returns without a timer.
+    /// </remarks>
+    private static void WaitUntilSignaledOrDeadline(TimeProvider clock, ManualResetEventSlim signaled, ref int armedCount)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+        ArgumentNullException.ThrowIfNull(signaled);
+        if (signaled.IsSet)
+            return;
+
+        using var wake = new ManualResetEventSlim(false);
+        using var timer = clock.CreateTimer(SignalWake, wake, ShutdownDeadline, Timeout.InfiniteTimeSpan);
+        Interlocked.Increment(ref armedCount);
+        var which = WaitHandle.WaitAny(new WaitHandle[] { signaled.WaitHandle, wake.WaitHandle });
+        if ((uint)which > 1u)
+            throw new InvalidOperationException("Shutdown wait ended without the processor or the deadline.");
+    }
+
+    /// <summary>
+    /// Sets the handle the shutdown wait is blocked on.
+    /// </summary>
+    /// <param name="state">The handle. Not null.</param>
+    /// <exception cref="ArgumentException"><paramref name="state"/> is not a handle.</exception>
+    /// <remarks>
+    /// Does not throw when the handle was already disposed. The wait has already finished in that case.
+    /// Called from the clock callback.
+    /// </remarks>
+    private static void SignalWake(object? state)
+    {
+        if (state is not ManualResetEventSlim wake)
+            throw new ArgumentException("Shutdown wake handle is missing.", nameof(state));
+
+        try
+        {
+            wake.Set();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The wait already finished and disposed the handle.
+        }
     }
 
     /// <summary>
@@ -988,16 +1157,16 @@ public class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Values both constructors share. One object so the private constructor stays within five parameters.
+    /// Values the constructors share. One object so each constructor stays within five parameters.
     /// </summary>
-    private readonly struct QueueSettings
+    internal readonly struct QueueSettings
     {
         /// <summary>Creates the settings. <paramref name="clock"/> is checked by the queue constructor.</summary>
         /// <param name="capacity">Channel and outstanding limit.</param>
         /// <param name="batchSize">Read size per wake.</param>
         /// <param name="flushInterval">Idle wait.</param>
         /// <param name="asyncEnabled">False selects the synchronous writer method.</param>
-        /// <param name="clock">Clock for ALOG0070. Not null when the constructor runs.</param>
+        /// <param name="clock">Clock for shutdown, flush, the cutoff, and ALOG0070. Not null when the constructor runs.</param>
         internal QueueSettings(int capacity, int batchSize, TimeSpan flushInterval, bool asyncEnabled, TimeProvider clock)
         {
             Capacity = capacity;
@@ -1019,7 +1188,7 @@ public class BackgroundLogQueue : IDisposable
         /// <summary>False uses <see cref="LogDispatcher.Dispatch"/>.</summary>
         internal bool AsyncEnabled { get; }
 
-        /// <summary>Clock for the full-queue report. The shutdown deadline does not use it.</summary>
+        /// <summary>Clock for shutdown, flush, the new-write cutoff, and the full-queue report.</summary>
         internal TimeProvider Clock { get; }
     }
 
