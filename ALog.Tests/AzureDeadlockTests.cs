@@ -26,9 +26,9 @@ public sealed class AzureDeadlockTests
     /// and pump are left undisposed: disposing them does not release a blocked wait.
     /// </remarks>
     [Fact(Timeout = 90000)]
-    public async Task Write_OnSingleThreadContext_ReturnsWithinOneSecondAndHandlerReceivedTheRequest()
+    public async Task Write_OnSingleThreadContext_CompletesOnSyncSend_WithoutDeadlock()
     {
-        await AssertReturnsWithinOneSecond(writerFactory: client =>
+        await AssertCompletesOnSyncSendWithoutDeadlock(writerFactory: client =>
             new AzureLogWriter(InstrumentationKey, httpClient: client));
     }
 
@@ -41,9 +41,9 @@ public sealed class AzureDeadlockTests
     /// A failure leaves the client and pump undisposed.
     /// </remarks>
     [Fact(Timeout = 90000)]
-    public async Task HttpWrite_OnSingleThreadContext_ReturnsWithinOneSecondAndHandlerReceivedTheRequest()
+    public async Task HttpWrite_OnSingleThreadContext_CompletesOnSyncSend_WithoutDeadlock()
     {
-        await AssertReturnsWithinOneSecond(writerFactory: client =>
+        await AssertCompletesOnSyncSendWithoutDeadlock(writerFactory: client =>
             new ALog.Writers.Http.HttpLogWriter("https://example.test/logs", httpClient: client));
     }
 
@@ -59,7 +59,7 @@ public sealed class AzureDeadlockTests
     /// the 30 s wait is <see cref="Task.Delay"/>, which this helper does not capture.
     /// One sync send and zero async starts means the call did not take the yielding path.
     /// </remarks>
-    private static async Task AssertReturnsWithinOneSecond(Func<HttpClient, IDisposable> writerFactory)
+    private static async Task AssertCompletesOnSyncSendWithoutDeadlock(Func<HttpClient, IDisposable> writerFactory)
     {
         var handler = new SyncSendYieldHandler();
         var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(2) };

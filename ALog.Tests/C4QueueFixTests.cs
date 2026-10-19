@@ -31,17 +31,25 @@ public sealed partial class C4QueueFixTests
     private const int CutoffMs = 4900;
 
     /// <summary>
+    /// Call index inside <see cref="SampleFullQueueSyncEnqueue"/>.
+    /// The cumulative hang guard reads it from the test thread while the loop runs on a pool thread.
+    /// </summary>
+    private int _fullQueueSyncCall;
+
+    /// <summary>
     /// Capacity 100 and 1000 writes drop 900 immediately, then one ALOG0070 line carries 900.
     /// Write returns while the blocked writer has finished nothing.
     /// After the first call, the median warm call and at least 990 of the 999 warm calls are under 10 ms, and no call reaches the 30 s hang guard.
-    /// Flush is completed by releasing the blocked writer, and it writes no ALOG0071.
+    /// The 1000 calls share one 30 s hang guard. Flush is completed by releasing the blocked writer, and it writes no ALOG0071.
     /// </summary>
     /// <returns>A task that finishes after flush and dispose.</returns>
     /// <remarks>
     /// An assertion failure fails the test. The finally block still releases the writer and the queue.
     /// SelfLog is restored to the previous target. Not safe to run beside another test that replaces SelfLog.
+    /// The fact timeout does not interrupt a synchronous loop on the test thread, so the loop is a task.
+    /// On timeout the message is the test name and <see cref="_fullQueueSyncCall"/>.
     /// </remarks>
-    [Fact(Timeout = 60000)]
+    [Fact(Timeout = 90000)]
     public async Task FullQueue_DropsImmediately_ReportsAlog0070_FlushStaysSilent()
     {
         var clock = new FakeTimeProvider(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
@@ -61,25 +69,18 @@ public sealed partial class C4QueueFixTests
             clock);
         try
         {
-            // C4-01 excludes the first call from the 10 ms sample, because that call may pay for JIT.
-            // The 30 s hang guard still applies to it. Write has returned for every call
-            // while the writer remains inside its first blocked call.
+            // One cumulative hang guard for all 1000 calls. A per-call 5 s block stays under the
+            // per-call line and would otherwise run until the job timeout.
             var warm = new TimeSpan[999];
-            var warmCount = 0;
-            for (var i = 0; i < 1000; i++)
-            {
-                var started = Stopwatch.GetTimestamp();
-                queue.TryEnqueue(Event("n-" + i.ToString(CultureInfo.InvariantCulture)));
-                var elapsed = Stopwatch.GetElapsedTime(started);
-                AssertWithinHangGuard(elapsed);
-                if (i == 0)
-                    continue;
-
-                warm[warmCount] = elapsed;
-                warmCount++;
-            }
-
-            Assert.Equal(999, warmCount);
+            Volatile.Write(ref _fullQueueSyncCall, 0);
+            var enqueueLoop = Task.Run(() => SampleFullQueueSyncEnqueue(queue, warm));
+            var enqueueFinished = await Task.WhenAny(enqueueLoop, Task.Delay(TimeSpan.FromSeconds(30))) == enqueueLoop;
+            Assert.True(
+                enqueueFinished,
+                nameof(FullQueue_DropsImmediately_ReportsAlog0070_FlushStaysSilent)
+                + " hung at call "
+                + Volatile.Read(ref _fullQueueSyncCall).ToString(CultureInfo.InvariantCulture));
+            await enqueueLoop;
             Assert.Empty(writer.Events);
             AssertWarmEnqueueSamplesStayUnderTenMilliseconds(warm);
             Assert.Equal(100, queue.AcceptedCount);
@@ -714,6 +715,95 @@ public sealed partial class C4QueueFixTests
         => new(new DateTime(2020, 1, 2, 3, 4, 5, DateTimeKind.Utc), LogLevel.Info, message, null, null);
 
     /// <summary>
+    /// Enqueues 1000 events and stores the 999 warm durations. The first call is not a warm sample.
+    /// </summary>
+    /// <param name="queue">Queue whose writer is blocked. Not null. Not disposed here.</param>
+    /// <param name="warm">Exactly 999 slots. Filled in call order. Not null.</param>
+    /// <remarks>
+    /// Writes <see cref="_fullQueueSyncCall"/> before each call so the cumulative hang guard can name the call it is inside.
+    /// The first call is left out of the 10 ms sample because it may pay for JIT. Each call still has the per-call 30 s guard.
+    /// A call that blocks for 5 s passes that per-call guard. The caller caps the whole loop at 30 s.
+    /// Not safe to run two copies at once. The pool thread writes the call index; the test thread only reads it.
+    /// </remarks>
+    private void SampleFullQueueSyncEnqueue(BackgroundLogQueue queue, TimeSpan[] warm)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        ArgumentNullException.ThrowIfNull(warm);
+        if (warm.Length != 999)
+            throw new ArgumentException("Warm sample length must be 999.", nameof(warm));
+
+        var warmCount = 0;
+        for (var i = 0; i < 1000; i++)
+        {
+            Volatile.Write(ref _fullQueueSyncCall, i);
+            var started = Stopwatch.GetTimestamp();
+            queue.TryEnqueue(Event("n-" + i.ToString(CultureInfo.InvariantCulture)));
+            var elapsed = Stopwatch.GetElapsedTime(started);
+            AssertWithinHangGuard(elapsed);
+            if (i == 0)
+                continue;
+
+            warm[warmCount] = elapsed;
+            warmCount++;
+        }
+
+        Assert.Equal(999, warmCount);
+    }
+
+    /// <summary>
+    /// A flush whose writer stays blocked returns inside the shutdown window and writes no ALOG0071.
+    /// The writer is released only after that check.
+    /// </summary>
+    /// <returns>A task that finishes after the window assert and cleanup.</returns>
+    /// <remarks>
+    /// <see cref="BackgroundLogQueue.FlushAsync"/> waits on <see cref="BackgroundLogQueue.ShutdownDeadline"/> with the wall clock.
+    /// The window is that deadline minus 50 ms through twice the deadline. A flush that never returns fails the 30 s hang guard.
+    /// The fact limit is 90 seconds so that guard can report before xUnit stops the test.
+    /// Not safe to run beside another test that replaces SelfLog. Only the test thread calls it.
+    /// </remarks>
+    [Fact(Timeout = 90000)]
+    public async Task Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071()
+    {
+        var lines = new List<string>();
+        var previous = SelfLog.Target;
+        SelfLog.Enable(line =>
+        {
+            lock (lines)
+                lines.Add(line);
+        });
+        var writer = new BlockingWriter();
+        var queue = new BackgroundLogQueue(
+            new ILogWriter[] { writer },
+            capacity: 1,
+            batchSize: 1,
+            flushInterval: TimeSpan.FromSeconds(30),
+            asyncEnabled: false);
+        try
+        {
+            Assert.True(queue.TryEnqueue(Event("blocked")));
+            Assert.True(
+                await WaitUntil(() => writer.EnteredCount > 0, TimeSpan.FromSeconds(30)),
+                "processor never entered the blocked writer");
+            var started = Stopwatch.StartNew();
+            var flush = queue.FlushAsync();
+            var returned = await Task.WhenAny(flush, Task.Delay(TimeSpan.FromSeconds(30))) == flush;
+            Assert.True(
+                returned,
+                nameof(Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071) + " hung");
+            await flush;
+            TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
+            lock (lines)
+                Assert.DoesNotContain(lines, line => line.Contains(DeadlinePrefix, StringComparison.Ordinal));
+        }
+        finally
+        {
+            writer.Release();
+            queue.Dispose();
+            SelfLog.Target = previous;
+        }
+    }
+
+    /// <summary>
     /// Releases the blocked writer and waits until flush has written every accepted event.
     /// Flush must still be waiting while the writer is blocked, and it must not write ALOG0071.
     /// </summary>
@@ -725,6 +815,7 @@ public sealed partial class C4QueueFixTests
     /// Fails the test when the processor never enters the writer, when flush returns while the writer is still blocked,
     /// or when ALOG0071 appears. Does not dispose the queue. Only the test thread calls it.
     /// The entry wait is a signal cap shared with <see cref="WaitUntil"/>, not a limit on how fast flush must return.
+    /// This check is the idle signal. The deadline window is <see cref="Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071"/>.
     /// </remarks>
     private static async Task AssertFlushCompletesWhenWriterIsReleased(
         BackgroundLogQueue queue,
@@ -737,9 +828,8 @@ public sealed partial class C4QueueFixTests
         Assert.True(
             await WaitUntil(() => writer.EnteredCount > 0, TimeSpan.FromSeconds(30)),
             "processor never entered the blocked writer");
-        // FlushAsync waits out the 5 s shutdown deadline while this writer stays blocked.
-        // That wait is the bounded deadline, not a hang, and a slow timer can pass 5.2 s.
-        // Releasing the writer completes flush on the idle signal instead.
+        // Flush stays open while the writer is blocked. Releasing the writer is the idle signal that ends it.
+        // The deadline itself is asserted by Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071.
         var flush = queue.FlushAsync();
         Assert.False(flush.IsCompleted);
         writer.Release();
@@ -795,12 +885,13 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// Fails when one call lasted 30 seconds or longer. That is the hang guard, not the 10 ms plausibility check.
+    /// Fails when one call lasted 30 seconds or longer. That is a single-call hang guard, not the 10 ms plausibility check.
     /// </summary>
     /// <param name="elapsed">Duration of one call. A negative value still passes, because it is not a hang.</param>
     /// <remarks>
     /// Does not throw except through the assertion. Not thread-safe. Only the test thread calls it.
-    /// There is no promised product deadline on enqueue. A blocked pre-C4 enqueue sits on the five-second wait and fails here.
+    /// There is no promised product deadline on enqueue. A call that blocks for 5 s is under this line and passes.
+    /// The synchronous 1000-call loop is capped separately, by one cumulative 30 s guard that names the test and the call index.
     /// </remarks>
     private static void AssertWithinHangGuard(TimeSpan elapsed)
     {
