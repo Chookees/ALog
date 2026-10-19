@@ -881,6 +881,7 @@ fi
 # when the line names ALog in any case and pins a version. Prints nothing otherwise.
 # Returns 0. A verbosity -v that is not followed by a digit is not a pin.
 # --prerelease is not --version. VersionOverride is its own form.
+# Include accepts either quote, spaces around =, and ALog in any case.
 m1_readme_version_hit() {
   local line="$1"
   if ! printf '%s\n' "$line" | grep -Eiq 'alog'; then
@@ -909,7 +910,7 @@ m1_readme_version_hit() {
     return 0
   fi
   if printf '%s\n' "$line" | grep -Eq '<PackageReference([[:space:]]|>)' \
-      && printf '%s\n' "$line" | grep -Eq 'Include="ALog[^"]*"' \
+      && printf '%s\n' "$line" | grep -Eq 'Include[[:space:]]*=[[:space:]]*['"'"'"][Aa][Ll][Oo][Gg][^'"'"'"]*' \
       && printf '%s\n' "$line" | grep -Eq 'Version[[:space:]]*=[[:space:]]*["'"'"'][0-9]'; then
     printf '%s\n' 'PackageReference'
     return 0
@@ -945,10 +946,11 @@ m1_scan_readme() {
 # Args: path. Prints "FAIL M1-02 pin in <file>:<number>: <text>" to stdout.
 # Returns 0 when the file has no pin, 1 when it has a pin or passes 2000 lines.
 # The 2000 cap stops the loop. The line text is not split again.
+# A trailing CR from a CRLF README is not part of the reported text.
 m1_print_fail_lines() {
   local file="$1"
   local number=0
-  local line reason
+  local line reason text
   local found=0
   while IFS= read -r line || [ -n "$line" ]; do
     number=$((number + 1))
@@ -958,7 +960,8 @@ m1_print_fail_lines() {
     fi
     reason=$(m1_readme_version_hit "$line")
     if [ -n "$reason" ]; then
-      printf 'FAIL M1-02 pin in %s:%s: %s\n' "$file" "$number" "$line"
+      text="${line%$'\r'}"
+      printf 'FAIL M1-02 pin in %s:%s: %s\n' "$file" "$number" "$text"
       found=1
     fi
   done < "$file"
@@ -1089,6 +1092,46 @@ m1_expect_g10_line_numbers() {
   pass "M1-02 G10 eight forms name line 2"
 }
 
+# M1-32-05. Each flexible Include pin fails on line 2. Five lines. The loop stops at 5.
+# Returns 0. A case-sensitive double-quoted Include misses these lines.
+m1_expect_include_forms() {
+  local dir file output status line expected i
+  local forms=(
+    "<PackageReference Include='ALog' Version='0.2.0' />"
+    "<PackageReference Include = \"ALog\" Version = \"0.2.0\" />"
+    "<PackageReference Include=\"alog\" Version=\"0.2.0\" />"
+    "<PackageReference Include=\"ALOG\" Version=\"0.2.0\" />"
+    "<PackageReference Include='ALog' Version=\"0.2.0\" />"
+  )
+  if [ "${#forms[@]}" -ne 5 ]; then
+    fail "M1-02 Include form count ${#forms[@]}"
+    return 0
+  fi
+  dir=$(mktemp -d)
+  i=0
+  for line in "${forms[@]}"; do
+    i=$((i + 1))
+    if [ "$i" -gt 5 ]; then
+      fail "M1-02 Include loop passed 5"
+      rm -rf "$dir"
+      return 0
+    fi
+    file="${dir}/README.md"
+    printf 'header\n%s\n' "$line" > "$file"
+    status=0
+    output=$(m1_print_fail_lines "$file") || status=$?
+    expected="FAIL M1-02 pin in ${file}:2: ${line}"
+    if [ "$status" -ne 1 ] || [ "$output" != "$expected" ]; then
+      fail "M1-02 Include form ${i} line number"
+      printf 'expected %s\nactual %s\nstatus %s\n' "$expected" "$output" "$status" >&2
+      rm -rf "$dir"
+      return 0
+    fi
+  done
+  rm -rf "$dir"
+  pass "M1-02 Include quotes, spaces, and case name line 2"
+}
+
 # M1-02. Every README*.md outside build output must be free of install pins.
 # At most 20 files are accepted. Returns 0.
 # A pin prints "FAIL M1-02 pin in <file>:<number>: <text>" on stderr.
@@ -1119,6 +1162,7 @@ m1_check_readme_versions() {
   m1_expect_injected_versions
   m1_expect_legacy_and_controls
   m1_expect_g10_line_numbers
+  m1_expect_include_forms
 }
 
 # Line-number mode: one file, then exit. The repository sweep is skipped above.

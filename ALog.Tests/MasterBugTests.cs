@@ -846,9 +846,7 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
-    /// An <see cref="IFormattable"/> property is rendered with
-    /// <c>ToString(null, CultureInfo.CurrentCulture)</c>, which differs from <c>ToString()</c>.
-    /// That is the text master wrote for the same value.
+    /// ALog renders an IFormattable value with ToString(null, CultureInfo.CurrentCulture). For BCL values this matches master byte for byte.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task PlainText_IFormattable_UsesCurrentCulture()
