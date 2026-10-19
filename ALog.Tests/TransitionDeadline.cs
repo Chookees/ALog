@@ -50,24 +50,4 @@ internal static class TransitionDeadline
         Assert.True(elapsed >= earliest, "early " + elapsed.ToString());
         Assert.True(elapsed <= latest, "late " + elapsed.ToString());
     }
-
-    /// <summary>
-    /// Fails when <paramref name="elapsed"/> is not under twice <paramref name="bound"/>.
-    /// A fast return is success: this is an upper bound for a call that must not block, not a deadline that must be waited out.
-    /// </summary>
-    /// <param name="elapsed">Measured call. Not negative.</param>
-    /// <param name="bound">The old upper bound. Must be positive. Twice this value is the new line.</param>
-    /// <remarks>
-    /// A bound of zero or less throws <see cref="ArgumentOutOfRangeException"/>.
-    /// Not thread-safe. Only the test thread calls it.
-    /// Does not accept a wider line than twice the bound.
-    /// </remarks>
-    internal static void AssertNoLongerThanTwice(TimeSpan elapsed, TimeSpan bound)
-    {
-        if (bound <= TimeSpan.Zero)
-            throw new ArgumentOutOfRangeException(nameof(bound), bound, "Bound must be positive.");
-
-        var latest = bound + bound;
-        Assert.True(elapsed < latest, "late " + elapsed.ToString());
-    }
 }

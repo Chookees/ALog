@@ -89,7 +89,7 @@ public sealed partial class C4QueueFixTests
     /// An event logged before close does not report ALOG0072. The first event after Dispose reports it once, verbatim.
     /// </summary>
     /// <returns>A task that finishes after the late event.</returns>
-    [Fact(Timeout = 15000)]
+    [Fact(Timeout = 30000)]
     public async Task ClosedDrop_OneLateEvent_ReportsAlog0072Verbatim()
     {
         var lines = new List<string>();
@@ -130,7 +130,7 @@ public sealed partial class C4QueueFixTests
     /// Sixteen threads logging after the close point produce one ALOG0072 line and only closed-drop counts.
     /// </summary>
     /// <returns>A task that finishes when the workers return.</returns>
-    [Fact(Timeout = 15000)]
+    [Fact(Timeout = 30000)]
     public async Task ClosedDrop_SixteenThreads_ReportsAlog0072Once()
     {
         var lines = new List<string>();

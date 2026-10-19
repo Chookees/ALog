@@ -66,7 +66,7 @@ public sealed class AzureDeadlockTests
         var writer = writerFactory(client);
         var pump = new SingleThreadContext();
         var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        // The runner stays blocked when Write deadlocks. The one-second wait below does not join it.
+        // The runner stays blocked when Write deadlocks. The 30 s wait below does not join it.
         _ = Task.Run(() =>
         {
             try
