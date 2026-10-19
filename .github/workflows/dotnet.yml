@@ -103,9 +103,6 @@ jobs:
         fi
         exit "$status"
 
-    - name: RS0030 rerun
-      run: python3 eng/test_rs0030_rerun.py
-
     - name: Fetch base branch
       run: |
         if [ -n "${{ github.base_ref }}" ]; then
@@ -166,6 +163,9 @@ jobs:
         path: TestResults
         retention-days: 7
         if-no-files-found: error
+
+    - name: RS0030 rerun
+      run: python3 eng/test_rs0030_rerun.py
 
   vuln-check:
     runs-on: ubuntu-24.04

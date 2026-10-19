@@ -89,38 +89,89 @@ def show(completed: subprocess.CompletedProcess[str]) -> None:
     print(completed.stderr, end="", file=sys.stderr)
 
 
+def restore_products(repo: Path) -> bool:
+    """Rebuild the product projects after the proof file is gone.
+
+    The injected build fails and can remove the Release assembly. The rebuild
+    puts that assembly back for the next reader.
+
+    Args:
+        repo: Repository root.
+
+    Returns:
+        True when both Release builds exit 0 and both assemblies exist.
+
+    Side effects:
+        Runs ``dotnet build --no-incremental`` for both product projects.
+    """
+    projects = (
+        ("ALog/ALog.csproj", "ALog/bin/Release/net10.0/ALog.dll"),
+        (
+            "ALog.Extensions.Logging/ALog.Extensions.Logging.csproj",
+            "ALog.Extensions.Logging/bin/Release/net10.0/ALog.Extensions.Logging.dll",
+        ),
+    )
+    for project, assembly in projects:
+        completed = subprocess.run(
+            [
+                "dotnet", "build", str(repo / project),
+                "-c", "Release", "--nologo", "--no-incremental",
+            ],
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0 or not (repo / assembly).is_file():
+            print(completed.stdout, end="")
+            print(completed.stderr, end="", file=sys.stderr)
+            return False
+    return True
+
+
 def main() -> int:
     """Run two green checks, then one red check, then delete the proof file.
 
     Returns:
-        0 when both clean runs exit 0 and the injected call exits 1.
-        1 when a run has the wrong exit code or the wrong summary.
+        0 when both clean runs exit 0, the injected call exits 1, and the
+        product assemblies are rebuilt.
+        1 when a run has the wrong exit code or the wrong summary, or the
+        rebuild fails.
         2 when the proof file is already present.
 
     Side effects:
         Builds the product projects. Writes and deletes ``ALog/ClkRerunProof.cs``.
+        Rebuilds both product projects after that file is gone.
     """
     repo = find_repo()
     proof = repo / PROOF
     if proof.exists():
         print("rs0030-rerun: " + PROOF + " already exists", file=sys.stderr)
         return 2
+    failed = False
     try:
         for index in (1, 2):
             completed = run_check(repo)
             if completed.returncode != 0 or OK_LINE not in completed.stdout:
                 show(completed)
                 print("rs0030-rerun: clean run " + str(index) + " exited " + str(completed.returncode), file=sys.stderr)
-                return 1
-        proof.write_text(PROOF_SOURCE, encoding="utf-8")
-        red = run_check(repo)
-        if red.returncode != 1 or RED_LINE not in red.stdout:
-            show(red)
-            print("rs0030-rerun: injected call exited " + str(red.returncode), file=sys.stderr)
-            return 1
+                failed = True
+                break
+        if not failed:
+            proof.write_text(PROOF_SOURCE, encoding="utf-8")
+            red = run_check(repo)
+            if red.returncode != 1 or RED_LINE not in red.stdout:
+                show(red)
+                print("rs0030-rerun: injected call exited " + str(red.returncode), file=sys.stderr)
+                failed = True
     finally:
         if proof.exists():
             proof.unlink()
+        if not restore_products(repo):
+            print("rs0030-rerun: product rebuild failed", file=sys.stderr)
+            failed = True
+    if failed:
+        return 1
     print("rs0030-rerun: ok")
     return 0
 
