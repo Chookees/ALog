@@ -25,6 +25,7 @@ from pathlib import Path
 FACT = re.compile(r"^\s*\[(Fact|Theory)\b")
 METHOD = re.compile(r"\b(?:Task|void|ValueTask)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 TIME_NAME = re.compile(r"Within\d|(?<![A-Za-z])Ms\b|(?<![A-Za-z])Second")
+SPEED_NAME = re.compile(r"Immediately|Fast|Quickly|Instant")
 NUMBERED = re.compile(r"Within(\d+)|(?<![A-Za-z])(\d+)[Mm]s\b")
 BOUND = re.compile(r"TimeSpan|FromMilliseconds|FromSeconds|Assert\.(True|InRange|Equal)")
 QUEUE_CALL = re.compile(
@@ -213,18 +214,24 @@ def violation(name: str, body: str) -> bool:
     Side effects:
         None.
 
-    Within<digits>, a trailing Ms, or Second, are time claims. A name that is
-    the product deadline (ShutdownDeadline or NewWriteBudget) is allowed when
-    the body uses that constant. A Within<digits> or <digits>ms name is allowed
-    when the body checks that number as a bound. ReportsASecondLine and
-    SecondWriter do not match, because a letter precedes Second.
+    Within<digits>, a trailing Ms, or Second, are time claims. A letter before
+    Second, as in SecondWriter, does not match. Immediately, Fast, Quickly,
+    and Instant match inside a PascalCase name, so DropsImmediately and
+    FastWriter are claims. A name that is the product deadline
+    (ShutdownDeadline or NewWriteBudget) is allowed when the body uses that
+    constant. A name that carries a number is allowed when the body checks
+    that number as a bound. The four speed words have no number, so they stay
+    flagged.
     """
-    if TIME_NAME.search(name) is None:
+    speed = SPEED_NAME.search(name) is not None
+    if TIME_NAME.search(name) is None and not speed:
         return False
     if "ShutdownDeadline" in name and "ShutdownDeadline" in body:
         return False
     if "NewWriteBudget" in name and "NewWriteBudget" in body:
         return False
+    if speed:
+        return True
     numbers = [item[0] or item[1] for item in NUMBERED.findall(name)]
     if numbers:
         if any(number in body and BOUND.search(body) for number in numbers):
@@ -284,6 +291,12 @@ def self_check() -> None:
         ("Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071", "BackgroundLogQueue.ShutdownDeadline", False),
         ("WaitWithin5000_OnShutdownDeadline", "no constant here", True),
         ("WaitWithin5000_OnShutdownDeadline", "BackgroundLogQueue.ShutdownDeadline", False),
+        ("FullQueue_DropsImmediately_ReportsAlog0070", "Assert.Equal(900, queue.FullDropCount);", True),
+        ("DropsImmediatelyWithin10", "Assert.True(elapsed < TimeSpan.FromMilliseconds(10));", True),
+        ("FullQueue_DropsWithoutWaiting_ReportsAlog0070", "Assert.Equal(900, queue.FullDropCount);", False),
+        ("Shutdown_SlowWriter_ReportsRemainder_FastWriter_ReportsNothing", "Assert.Empty(lines);", True),
+        ("Queue_DropsQuickly", "Assert.Equal(1, dropped);", True),
+        ("Write_ReturnsInstant", "Assert.True(done);", True),
     ]
     for name, body, expect_violation in samples:
         actual = violation(name, body)

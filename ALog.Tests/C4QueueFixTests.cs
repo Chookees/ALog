@@ -46,7 +46,7 @@ public sealed partial class C4QueueFixTests
     /// On timeout the message is the test name and <see cref="_fullQueueSyncCall"/>.
     /// </remarks>
     [Fact(Timeout = 90000)]
-    public async Task FullQueue_DropsImmediately_ReportsAlog0070_FlushStaysSilent()
+    public async Task FullQueue_DropsWithoutWaiting_ReportsAlog0070_FlushStaysSilent()
     {
         var clock = new FakeTimeProvider(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
         var lines = new List<string>();
@@ -73,7 +73,7 @@ public sealed partial class C4QueueFixTests
             var enqueueFinished = await Task.WhenAny(enqueueLoop, Task.Delay(TimeSpan.FromSeconds(30))) == enqueueLoop;
             Assert.True(
                 enqueueFinished,
-                nameof(FullQueue_DropsImmediately_ReportsAlog0070_FlushStaysSilent)
+                nameof(FullQueue_DropsWithoutWaiting_ReportsAlog0070_FlushStaysSilent)
                 + " hung at call "
                 + Volatile.Read(ref _fullQueueSyncCall).ToString(CultureInfo.InvariantCulture));
             await enqueueLoop;
@@ -262,7 +262,7 @@ public sealed partial class C4QueueFixTests
     /// The finally block releases the gate so a failed assert cannot leave dispose blocked.
     /// </remarks>
     [Fact(Timeout = 60000)]
-    public async Task Shutdown_SlowWriter_ReportsRemainder_FastWriter_ReportsNothing()
+    public async Task Shutdown_SlowWriter_ReportsRemainder_OtherWriter_ReportsNothing()
     {
         DeadlineClock.AssertValues();
         var previous = SelfLog.Target;
@@ -919,7 +919,7 @@ public sealed partial class C4QueueFixTests
             dispose = await DeadlineClock.RunUntilArmed(
                 engine.Dispose,
                 () => engine.Queue!.DisposeWaitsStarted,
-                nameof(Shutdown_SlowWriter_ReportsRemainder_FastWriter_ReportsNothing));
+                nameof(Shutdown_SlowWriter_ReportsRemainder_OtherWriter_ReportsNothing));
             DeadlineClock.AssertNotReturnedBefore(
                 clock, dispose, BackgroundLogQueue.NewWriteBudget, "shutdown");
             Assert.False(
