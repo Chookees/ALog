@@ -310,7 +310,7 @@ public class LoggerEngine : ILogger, IDisposable
     [SuppressMessage(
         "ApiDesign",
         "RS0030",
-        Justification = "Event timestamp for the log record, not a shutdown or flush deadline.")]
+        Justification = "Event timestamp is wall-clock time by design; it is log data, not a deadline.")]
     private static DateTime EventTimestamp()
         => DateTime.UtcNow;
 

@@ -1,6 +1,7 @@
 // CLK-07: every wait creates its timer and timestamp on the injected clock.
 // TimeProvider.System stays in ProductionClock only. Next file: ALog.Tests/DeadlineClock.cs.
 
+using ALog.Config;
 using ALog.Core;
 using ALog.Public.Interfaces;
 using Microsoft.Extensions.Time.Testing;
@@ -187,6 +188,100 @@ public sealed class ClockCompositionTests
         }
     }
 
+    /// <summary>
+    /// A second queue dispose does not enter the deadline wait.
+    /// </summary>
+    /// <returns>A task that finishes after the writer is released.</returns>
+    /// <remarks>
+    /// The entry count does not depend on which clock a second call would pass.
+    /// The 30 s wait is a hang guard. Not thread-safe.
+    /// </remarks>
+    [Fact(Timeout = 120000)]
+    public async Task DisposeAgain_Queue_DoesNotEnterTheDeadlineWait()
+    {
+        var clock = new CountingClock();
+        var writer = new BlockingWriter();
+        var queue = Queue(writer, clock, capacity: 4);
+        Task? dispose = null;
+        try
+        {
+            Assert.True(queue.TryEnqueue(Event("held")));
+            await DeadlineClock.WaitFor(() => writer.EnteredCount > 0, "processor never entered the blocked writer");
+            dispose = await DeadlineClock.RunUntilArmed(
+                queue.Dispose,
+                () => queue.DisposeWaitsStarted,
+                nameof(DisposeAgain_Queue_DoesNotEnterTheDeadlineWait));
+            await AssertSecondDisposeLeavesTheWait(clock, dispose, queue.Dispose);
+        }
+        finally
+        {
+            writer.Release();
+            if (dispose is not null)
+                await DeadlineClock.WaitForCompletion(dispose, "shutdown hung");
+        }
+    }
+
+    /// <summary>
+    /// A second engine dispose does not enter the deadline wait.
+    /// </summary>
+    /// <returns>A task that finishes after the writer is released.</returns>
+    /// <remarks>
+    /// The engine's second call returns before the queue wait. The entry count stays on the first call.
+    /// The 30 s wait is a hang guard. Not thread-safe.
+    /// </remarks>
+    [Fact(Timeout = 120000)]
+    public async Task DisposeAgain_Engine_DoesNotEnterTheDeadlineWait()
+    {
+        var clock = new CountingClock();
+        var writer = new BlockingWriter();
+        var engine = Engine(writer, clock);
+        Task? dispose = null;
+        try
+        {
+            engine.Log("held", LogLevel.Info);
+            await DeadlineClock.WaitFor(() => writer.EnteredCount > 0, "processor never entered the blocked writer");
+            dispose = await DeadlineClock.RunUntilArmed(
+                engine.Dispose,
+                () => engine.Queue!.DisposeWaitsStarted,
+                nameof(DisposeAgain_Engine_DoesNotEnterTheDeadlineWait));
+            await AssertSecondDisposeLeavesTheWait(clock, dispose, engine.Dispose);
+        }
+        finally
+        {
+            writer.Release();
+            if (dispose is not null)
+                await DeadlineClock.WaitForCompletion(dispose, "shutdown hung");
+        }
+    }
+
+    /// <summary>
+    /// Runs a second dispose and fails when that call enters the deadline wait.
+    /// </summary>
+    /// <param name="clock">Clock the first dispose is waiting on. Not null. This method does not advance it.</param>
+    /// <param name="first">The armed dispose. Not null. Must still be running when the second call returns.</param>
+    /// <param name="secondDispose">The second dispose. Not null.</param>
+    /// <returns>A task that finishes when the second dispose has returned.</returns>
+    /// <remarks>
+    /// The entry count is taken before the second call. A call that passes another clock still moves it.
+    /// The 30 s wait is a hang guard. Not thread-safe beyond the pool thread that runs the second call.
+    /// </remarks>
+    private static async Task AssertSecondDisposeLeavesTheWait(FakeTimeProvider clock, Task first, Action secondDispose)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+        ArgumentNullException.ThrowIfNull(first);
+        ArgumentNullException.ThrowIfNull(secondDispose);
+
+        var entries = BackgroundLogQueue.DeadlineWaitEntries;
+        var second = Task.Run(secondDispose);
+        var returned = await Task.WhenAny(second, Task.Delay(TimeSpan.FromSeconds(30))) == second;
+        Assert.True(returned, "second Dispose waited for the first deadline; it must return immediately");
+        await second;
+        Assert.True(
+            BackgroundLogQueue.DeadlineWaitEntries == entries,
+            "second Dispose entered a deadline wait; it must return immediately");
+        Assert.True(first.IsCompleted == false, "first dispose returned before the deadline");
+    }
+
     /// <summary>Builds a queue on <paramref name="clock"/> with a one-hour idle interval.</summary>
     /// <param name="writer">The only writer. Not null.</param>
     /// <param name="clock">Clock that counts its own calls. Not null.</param>
@@ -199,6 +294,22 @@ public sealed class ClockCompositionTests
         return new BackgroundLogQueue(
             new ILogWriter[] { writer },
             new BackgroundLogQueue.QueueSettings(capacity, 1, IdleInterval, false, clock));
+    }
+
+    /// <summary>Builds an engine whose queue uses <paramref name="clock"/> and a one-hour idle interval.</summary>
+    /// <param name="writer">The only writer. Not null.</param>
+    /// <param name="clock">Clock that counts its own calls. Not null.</param>
+    /// <returns>An engine that has not been disposed.</returns>
+    private static LoggerEngine Engine(ILogWriter writer, CountingClock clock)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        ArgumentNullException.ThrowIfNull(clock);
+        return new LoggerEngine(
+            new LoggerConfig()
+                .AddWriter(writer)
+                .UseBackgroundQueue(true, 4, 1, IdleInterval)
+                .UseAsync(false),
+            clock);
     }
 
     /// <summary>Builds an info event. The timestamp is fixed so the test does not read the clock.</summary>

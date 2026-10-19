@@ -129,7 +129,7 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     [SuppressMessage(
         "ApiDesign",
         "RS0030",
-        Justification = "Rotation file name, not a shutdown or flush deadline. removed in P1")]
+        Justification = "Rotation file name, not a shutdown or flush deadline; removed in P1.")]
     private static string RotationStamp()
         => DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
 

@@ -139,7 +139,7 @@ public class SqlLogWriter : ILogWriter
     [SuppressMessage(
         "ApiDesign",
         "RS0030",
-        Justification = "CreatedAt column, not a shutdown or flush deadline. removed in P1")]
+        Justification = "CreatedAt column, not a shutdown or flush deadline; removed in P1.")]
     private static DateTime CreatedAtStamp()
         => DateTime.UtcNow;
 

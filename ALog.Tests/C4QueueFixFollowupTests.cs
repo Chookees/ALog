@@ -540,7 +540,7 @@ public sealed partial class C4QueueFixTests
             if (parallel)
             {
                 await AssertSecondDisposeDoesNotWait(clock, first!, queue.Dispose);
-                Assert.Equal(1, queue.DisposeWaitsStarted);
+                Assert.True(queue.DisposeWaitsStarted == 1, "second Dispose started another shutdown wait.");
             }
 
             await DeadlineClock.AssertNotElapsed(
@@ -626,7 +626,9 @@ public sealed partial class C4QueueFixTests
         Task? dispose = null;
         try
         {
-            Assert.False(queue.NewWriteBudgetComparisonSpent);
+            Assert.True(
+                queue.NewWriteBudgetComparisonSpent == false,
+                "new write was blocked before the cutoff.");
             Assert.True(queue.TryEnqueue(Event("held")));
             await DeadlineClock.WaitFor(() => writer.EnteredCount > 0, "processor never entered the blocked writer");
             dispose = await DeadlineClock.RunUntilArmed(
@@ -690,6 +692,7 @@ public sealed partial class C4QueueFixTests
     /// <returns>A task that finishes when the second dispose has returned.</returns>
     /// <remarks>
     /// The fake-clock timestamp must be unchanged, and <paramref name="first"/> must still be running.
+    /// <see cref="BackgroundLogQueue.DeadlineWaitEntries"/> must stay where the first call left it.
     /// The 30 s wait is a hang guard. It is not a product deadline.
     /// A second dispose that waits for the first call stays inside this guard, because the clock is not advanced.
     /// Not thread-safe beyond the pool thread that runs <paramref name="secondDispose"/>.
@@ -700,12 +703,16 @@ public sealed partial class C4QueueFixTests
         ArgumentNullException.ThrowIfNull(first);
         ArgumentNullException.ThrowIfNull(secondDispose);
 
+        var entries = BackgroundLogQueue.DeadlineWaitEntries;
         var stamp = clock.GetTimestamp();
         var second = Task.Run(secondDispose);
         var returned = await Task.WhenAny(second, Task.Delay(TimeSpan.FromSeconds(30))) == second;
         Assert.True(returned, "second Dispose waited for the first deadline; it must return immediately");
         await second;
-        Assert.Equal(stamp, clock.GetTimestamp());
+        Assert.True(
+            BackgroundLogQueue.DeadlineWaitEntries == entries,
+            "second Dispose entered a deadline wait; it must return immediately");
+        Assert.True(stamp == clock.GetTimestamp(), "second Dispose moved the injected clock.");
         Assert.False(first.IsCompleted, "first dispose returned before the deadline");
     }
 
@@ -760,7 +767,7 @@ public sealed partial class C4QueueFixTests
                 clock,
                 first,
                 queueOnly ? queue!.Dispose : engine!.Dispose);
-            Assert.Equal(1, queue!.DisposeWaitsStarted);
+            Assert.True(queue!.DisposeWaitsStarted == 1, "second Dispose started another shutdown wait.");
             lock (lines)
                 Assert.DoesNotContain(lines, line => line.StartsWith(DeadlinePrefix, StringComparison.Ordinal));
             await DeadlineClock.AssertNotElapsed(
@@ -814,8 +821,8 @@ public sealed partial class C4QueueFixTests
         var armed = 0;
         var fired = 0;
         BackgroundLogQueue.WaitUntilSignaledOrDeadline(clock, signaled, () => fired++, ref armed);
-        Assert.Equal(0, armed);
-        Assert.Equal(0, fired);
+        Assert.True(armed == 0, "shutdown wait armed a timer when the signal was already set.");
+        Assert.True(fired == 0, "shutdown wait recorded the deadline when the signal was already set.");
     }
 
     /// <summary>
@@ -845,8 +852,8 @@ public sealed partial class C4QueueFixTests
         clock.SetElapsed(BackgroundLogQueue.ShutdownDeadline);
         signaled.Set();
         await DeadlineClock.WaitForCompletion(wait, "shutdown wait hung");
-        Assert.Equal(1, Volatile.Read(ref fired));
-        Assert.Equal(0, clock.CallbackRuns);
+        Assert.True(fired == 1, "shutdown wait did not record the deadline when the signal won on the bound.");
+        Assert.True(clock.CallbackRuns == 0, "shutdown wait ran the timer callback when the signal won on the bound.");
     }
 
     /// <summary>
@@ -875,10 +882,10 @@ public sealed partial class C4QueueFixTests
             nameof(ShutdownWait_CallbackAfterTheWaitReturnedDoesNotThrow) + " did not arm");
         signaled.Set();
         await DeadlineClock.WaitForCompletion(wait, "shutdown wait hung");
-        Assert.Equal(0, Volatile.Read(ref fired));
+        Assert.True(fired == 0, "shutdown wait recorded the deadline when the signal won before the bound.");
         clock.InvokeCallback();
-        Assert.Equal(1, Volatile.Read(ref fired));
-        Assert.Equal(1, clock.CallbackRuns);
+        Assert.True(fired == 1, "shutdown wait did not record the deadline from the callback after the wait.");
+        Assert.True(clock.CallbackRuns == 1, "shutdown wait did not run the timer callback after the wait.");
     }
 
     /// <summary>

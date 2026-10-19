@@ -21,7 +21,7 @@ import re
 import sys
 from pathlib import Path
 
-FACT = re.compile(r"^\s*\[(Fact|Theory)\b")
+FACT = re.compile(r"^\s*\[(Fact|Theory|SkippableFact|SkippableTheory)\b")
 METHOD = re.compile(r"\b(?:Task|void|ValueTask)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 TIME_NAME = re.compile(r"Within\d|(?<![A-Za-z])Ms\b|(?<![A-Za-z])Second", re.IGNORECASE)
 SPEED_NAME = re.compile(r"Immediately|Fast|Quickly|Instant", re.IGNORECASE)
@@ -270,6 +270,24 @@ def self_check() -> None:
             raise SystemExit("clk-grep: self-check failed for time word " + name)
     if len(name_hits) != len(expected_names):
         raise SystemExit("clk-grep: self-check reported " + str(len(name_hits)) + " name hits")
+
+    attributes = "\n".join([
+        "[Fact]",
+        "public void FactImmediately() { }",
+        "[Theory]",
+        "public void TheoryFast() { }",
+        "[SkippableFact(Timeout = 60000)]",
+        "public void SkippableQuickly() { }",
+        "[SkippableTheory]",
+        "public void SkippableInstant() { }",
+    ])
+    attribute_hits = name_hits_lines("ALog.Tests/SelfCheck.cs", attributes.splitlines())
+    attribute_names = ["FactImmediately", "TheoryFast", "SkippableQuickly", "SkippableInstant"]
+    for name in attribute_names:
+        if not any("'" + name + "'" in hit and MESSAGE in hit for hit in attribute_hits):
+            raise SystemExit("clk-grep: self-check failed for attribute " + name)
+    if len(attribute_hits) != len(attribute_names):
+        raise SystemExit("clk-grep: self-check reported " + str(len(attribute_hits)) + " attribute hits")
 
 
 def main() -> int:

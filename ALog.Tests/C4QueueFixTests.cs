@@ -757,7 +757,7 @@ public sealed partial class C4QueueFixTests
         // Flush stays open while the writer is blocked. Releasing the writer is the idle signal that ends it.
         // The deadline itself is asserted by Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071.
         var flush = queue.FlushAsync();
-        Assert.False(flush.IsCompleted);
+        Assert.True(flush.IsCompleted == false, "flush returned before the writer was released.");
         writer.Release();
         await flush;
         Assert.Equal(100, queue.WrittenCount);

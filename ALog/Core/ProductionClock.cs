@@ -21,6 +21,6 @@ internal static class ProductionClock
     [SuppressMessage(
         "ApiDesign",
         "RS0030",
-        Justification = "Public constructors default to this clock. Tests pass their own provider. This is the only TimeProvider.System in product code.")]
+        Justification = "Default clock when the app sets no TimeProvider; tests inject a FakeTimeProvider.")]
     internal static TimeProvider Default => TimeProvider.System;
 }

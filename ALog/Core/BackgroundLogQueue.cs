@@ -69,6 +69,7 @@ public class BackgroundLogQueue : IDisposable
     private int _processorEntered;
     private int _idleWaitEntered;
     private int _disposeWaitsStarted;
+    private static int _deadlineWaitEntries;
     private int _flushWaitsStarted;
     private int _shutdownDeadlineElapsed;
     private int _flushDeadlineElapsed;
@@ -216,6 +217,16 @@ public class BackgroundLogQueue : IDisposable
 
     /// <summary>How many shutdown waits have been registered on the clock. Zero before <see cref="Dispose"/> waits.</summary>
     internal int DisposeWaitsStarted => Volatile.Read(ref _disposeWaitsStarted);
+
+    /// <summary>
+    /// How many times <see cref="WaitUntilSignaledOrDeadline"/> has been entered, on any clock.
+    /// </summary>
+    /// <remarks>
+    /// The count moves when the helper is called, including a call that passes <see cref="TimeProvider.System"/>.
+    /// A second <see cref="Dispose"/> does not call the helper, so the count stays where the first call left it.
+    /// Does not throw. The value does not go backwards.
+    /// </remarks>
+    internal static int DeadlineWaitEntries => Volatile.Read(ref _deadlineWaitEntries);
 
     /// <summary>How many flush deadlines have been registered on the clock.</summary>
     internal int FlushWaitsStarted => Volatile.Read(ref _flushWaitsStarted);
@@ -1027,8 +1038,8 @@ public class BackgroundLogQueue : IDisposable
     /// <exception cref="InvalidOperationException">The wait ended without the signal or the deadline.</exception>
     /// <remarks>
     /// Does not capture a caller context. The timer is disposed before this returns.
-    /// A signal that is already set returns without a timer. There is no wall-clock timeout,
-    /// because that would release a frozen test clock.
+    /// A signal that is already set returns without a timer. The entry is still counted.
+    /// There is no wall-clock timeout, because that would release a frozen test clock.
     /// </remarks>
     internal static void WaitUntilSignaledOrDeadline(
         TimeProvider clock,
@@ -1039,6 +1050,8 @@ public class BackgroundLogQueue : IDisposable
         ArgumentNullException.ThrowIfNull(clock);
         ArgumentNullException.ThrowIfNull(signaled);
         ArgumentNullException.ThrowIfNull(onDeadline);
+        // Every entry counts, whichever clock the caller passed. A second Dispose must not get here.
+        Interlocked.Increment(ref _deadlineWaitEntries);
         if (signaled.IsSet)
             return;
 

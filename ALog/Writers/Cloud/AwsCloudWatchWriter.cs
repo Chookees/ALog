@@ -99,7 +99,7 @@ public class AwsCloudWatchWriter : ILogWriter, IFormattableLogWriter
     [SuppressMessage(
         "ApiDesign",
         "RS0030",
-        Justification = "CloudWatch put uses a 100 s transport timeout, not a shutdown or flush deadline. removed in AWS V4")]
+        Justification = "CloudWatch put uses a 100 s transport timeout, not a shutdown or flush deadline; removed in AWS V4.")]
     private void PutWithinTransportTimeout(LogEvent logEvent)
     {
         using var timeout = new CancellationTokenSource(SyncPutTimeout);
