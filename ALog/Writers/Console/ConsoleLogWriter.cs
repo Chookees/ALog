@@ -64,8 +64,8 @@ public class ConsoleLogWriter : ILogWriter, IFormattableLogWriter
             $"[{logEvent.Level}]",
             logEvent.Message,
             logEvent.Exception != null ? $"EX: {logEvent.Exception.GetType().Name}: {logEvent.Exception.Message}" : null,
-            logEvent.Context != null && logEvent.Context.Any()
-                ? $"ctx: {string.Join(", ", logEvent.Context.Select(kv => $"{kv.Key}={kv.Value}"))}"
+            logEvent.Context != null && logEvent.Context.Count > 0
+                ? "ctx: " + CaptureText.Join(logEvent.Context)
                 : null
         };
 

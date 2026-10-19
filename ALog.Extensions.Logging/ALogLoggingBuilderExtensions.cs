@@ -8,6 +8,13 @@ using Microsoft.Extensions.Options;
 
 public static class ALogLoggingBuilderExtensions
 {
+    // One sentence for one path and for both. {0} is the path list.
+    // Two paths are provisional: 'ALog:Console', 'ALog:File' until UX confirms the wording.
+    private const string SingleValueMessage =
+        "Invalid ALog configuration at '{0}': expected a section with settings, but found a single value. Put the settings inside the section, as shown in the README.";
+
+    private const int MaxSectionChildren = 32;
+
     /// <summary>
     /// Adds ALog as an <see cref="ILoggerProvider"/> using an explicit <see cref="LoggerConfig"/>.
     /// </summary>
@@ -29,8 +36,8 @@ public static class ALogLoggingBuilderExtensions
     /// <returns>The same builder, so startup can chain.</returns>
     /// <exception cref="ArgumentNullException">Thrown when <paramref name="builder"/> or <paramref name="configuration"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
-    /// Thrown when <c>ALog:Console</c> or <c>ALog:File</c> is a single value.
-    /// The message names the path and does not include the value, because that value can be a secret.
+    /// Thrown when <c>ALog:Console</c> or <c>ALog:File</c> is not a section of settings.
+    /// One exception names every affected path, console before file, and does not include the value.
     /// </exception>
     /// <remarks>
     /// Writer settings are copied now. A later reload of <paramref name="configuration"/> does not add a writer.
@@ -63,91 +70,107 @@ public static class ALogLoggingBuilderExtensions
 
     /// <summary>
     /// Binds <see cref="ALogOptions"/> from configuration without registering MEL.
-    /// A single value at <c>ALog:Console</c> or <c>ALog:File</c> is not rejected here.
+    /// <c>ALog:Console</c> and <c>ALog:File</c> must be sections with settings, not single values.
     /// </summary>
     /// <param name="configuration">Application configuration. Null is rejected.</param>
-    /// <returns>The bound options. Writer sections that are single values stay at their defaults.</returns>
+    /// <returns>The bound options. The caller owns the instance.</returns>
+    /// <exception cref="ArgumentNullException">Thrown when <paramref name="configuration"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when <c>ALog:Console</c> or <c>ALog:File</c> is not a section of settings.
+    /// The message is the same sentence <see cref="AddALog(ILoggingBuilder, IConfiguration)"/> throws.
+    /// </exception>
     /// <remarks>
-    /// <see cref="RejectSingleValueSections"/> is the startup check. Putting it on this method is the one call before <c>Bind</c>.
-    /// That call is not made yet.
+    /// Calls <see cref="RejectSingleValueSections"/> once, then binds. Does not register a logger.
+    /// Does not read the stored value into the message. Safe to call from startup.
     /// </remarks>
     public static ALogOptions GetALogOptions(this IConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
+        RejectSingleValueSections(configuration);
         var options = new ALogOptions();
         configuration.GetSection(ALogOptions.SectionName).Bind(options);
         return options;
     }
 
     /// <summary>
-    /// Stops startup when <c>ALog:Console</c> or <c>ALog:File</c> is a single value.
-    /// A missing section and a section that has children are left for the binder.
+    /// Stops startup when <c>ALog:Console</c> or <c>ALog:File</c> is not a section of settings.
+    /// A missing section is left for the binder. One exception names every affected path.
     /// </summary>
     /// <param name="configuration">Application configuration. Not null. Not modified.</param>
-    /// <exception cref="InvalidOperationException">Thrown for the first single-value section, console before file.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// Thrown when at least one writer section is malformed. Console is named before file.
+    /// The text is <see cref="SingleValueMessage"/>. The stored value is not included.
+    /// </exception>
     /// <remarks>
-    /// Called from <see cref="AddALog(ILoggingBuilder, IConfiguration)"/> before options are bound.
-    /// The two paths are the only writer sections <see cref="ALogOptions"/> binds.
-    /// Does not allocate beyond the section lookup. Safe to call from the startup thread.
+    /// Called from <see cref="AddALog(ILoggingBuilder, IConfiguration)"/> and <see cref="GetALogOptions"/>.
+    /// Looks at two paths. Does not write a log line. Safe to call from the startup thread.
     /// </remarks>
     private static void RejectSingleValueSections(IConfiguration configuration)
     {
-        RejectSingleValue(configuration, ALogOptions.SectionName + ":Console");
-        RejectSingleValue(configuration, ALogOptions.SectionName + ":File");
-    }
-
-    /// <summary>
-    /// Throws when <paramref name="path"/> stores one value and has no child settings.
-    /// </summary>
-    /// <param name="configuration">Application configuration. Not null.</param>
-    /// <param name="path">Section path, <c>ALog:Console</c> or <c>ALog:File</c>.</param>
-    /// <exception cref="InvalidOperationException">
-    /// Thrown when the section is a single value. The message is <see cref="SingleValueMessage"/>.
-    /// </exception>
-    /// <remarks>Does not throw for a missing key. A child key means the caller put settings inside the section.</remarks>
-    private static void RejectSingleValue(IConfiguration configuration, string path)
-    {
-        var section = configuration.GetSection(path);
-        if (!IsSingleValue(section))
+        var console = ALogOptions.SectionName + ":Console";
+        var file = ALogOptions.SectionName + ":File";
+        var consoleBad = IsMalformed(configuration.GetSection(console));
+        var fileBad = IsMalformed(configuration.GetSection(file));
+        if (!consoleBad && !fileBad)
             return;
 
-        throw new InvalidOperationException(SingleValueMessage(path));
+        var listed = console;
+        if (consoleBad && fileBad)
+            listed = console + "', '" + file;
+        else if (fileBad)
+            listed = file;
+
+        throw new InvalidOperationException(SingleValueMessage.Replace("{0}", listed, StringComparison.Ordinal));
     }
 
     /// <summary>
-    /// A single value has non-whitespace text and no children. JSON <c>"Console": true</c> is that shape.
-    /// JSON <c>"Console": { "Enabled": true }</c> has children and a null value.
+    /// A malformed section has a value, is an array of numeric children, or has both a value and children.
+    /// JSON <c>"Console": true</c>, <c>""</c>, whitespace, and <c>[true]</c> are malformed.
+    /// JSON <c>"Console": { "Enabled": true }</c> is not.
     /// </summary>
     /// <param name="section">The section to inspect. Not null.</param>
-    /// <returns>True when startup must stop. False when the section is missing, blank, or has settings.</returns>
+    /// <returns>True when startup must stop. False when the section is missing or holds named settings.</returns>
     /// <remarks>
-    /// Empty and whitespace values are not classified: the binder already ignores them, and this method leaves that result.
-    /// Looks at the first child only. Does not read the value into the result.
+    /// A non-null value is enough, including empty and whitespace. The value text is not returned.
+    /// At most <see cref="MaxSectionChildren"/> children are inspected.
     /// </remarks>
-    private static bool IsSingleValue(IConfigurationSection section)
+    private static bool IsMalformed(IConfigurationSection section)
     {
-        // Blank values stay with the binder. A non-whitespace value with no child is the scalar "Console": true.
-        if (string.IsNullOrWhiteSpace(section.Value))
-            return false;
+        if (section.Value is not null)
+            return true;
 
+        var seen = 0;
         foreach (var child in section.GetChildren())
         {
-            _ = child;
+            seen++;
+            if (seen > MaxSectionChildren)
+                return true;
+
+            if (!IsIndexKey(child.Key))
+                return false;
+        }
+
+        return seen > 0;
+    }
+
+    /// <summary>
+    /// An array child is named with digits only, such as <c>0</c> for JSON <c>[true]</c>.
+    /// </summary>
+    /// <param name="key">Child key. Not null. Empty is not an index.</param>
+    /// <returns>True when every character is a digit and the key is at most 9 characters.</returns>
+    /// <remarks>Does not parse the number. A named setting such as <c>Enabled</c> is not an index.</remarks>
+    private static bool IsIndexKey(string key)
+    {
+        if (key.Length == 0 || key.Length > 9)
             return false;
+
+        for (var i = 0; i < key.Length; i++)
+        {
+            var digit = key[i];
+            if (digit < '0' || digit > '9')
+                return false;
         }
 
         return true;
-    }
-
-    /// <summary>
-    /// The startup sentence for a single value stored at <paramref name="path"/>.
-    /// </summary>
-    /// <param name="path">Section path inserted between quotes. Not null.</param>
-    /// <returns>The full message. The configuration value is not part of it.</returns>
-    /// <remarks>Keep this sentence identical to the M1 text. Callers compare it exactly.</remarks>
-    private static string SingleValueMessage(string path)
-    {
-        return "Invalid ALog configuration at '" + path
-            + "': expected a section with settings, but found a single value. Put the settings inside the section, as shown in the README.";
     }
 }

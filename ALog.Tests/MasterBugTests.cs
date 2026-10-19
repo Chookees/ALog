@@ -78,11 +78,12 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
-    /// A section that has both a value and a child is not a single value.
-    /// Startup continues. This locks the child check so a real <c>Enabled</c> key is kept.
+    /// A section that has a value and a child is malformed.
+    /// <c>AddALog</c> and <c>GetALogOptions</c> throw the single-path sentence.
+    /// The value <c>true</c> is not copied into the message.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task ConsoleValueAndChild_DoesNotStopStartup()
+    public async Task ConsoleValueAndChild_StopsStartup()
     {
         await Task.CompletedTask;
         var values = new Dictionary<string, string?>
@@ -91,8 +92,126 @@ public sealed class MasterBugTests : IDisposable
             ["ALog:Console:Enabled"] = "true"
         };
         var configuration = new ConfigurationBuilder().AddInMemoryCollection(values).Build();
-        var error = Record.Exception(() => InvokeEveryOverload(configuration));
-        Assert.Null(error);
+        RequireConfigEntries(configuration, ExpectedScalarMessage("ALog:Console"), "true");
+    }
+
+    /// <summary>
+    /// <c>GetALogOptions</c> rejects <c>"Console": true</c> with the same sentence as <c>AddALog</c>.
+    /// <c>Log.Init(ALogOptions)</c> is not given configuration and still starts.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task GetALogOptions_ScalarConsole_StopsStartup()
+    {
+        await Task.CompletedTask;
+        var init = Record.Exception(() =>
+        {
+            Log.Init(new ALogOptions());
+            Log.Shutdown();
+        });
+        Assert.Null(init);
+
+        var configuration = LoadJson("""{ "ALog": { "Console": true } }""");
+        var error = Record.Exception(() => configuration.GetALogOptions());
+        var actual = error is null ? "(no exception from GetALogOptions)" : error.Message;
+        Assert.Equal(ExpectedScalarMessage("ALog:Console"), actual);
+        Assert.DoesNotContain("True", actual, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An empty string is a value. Both config entries stop with the single-path sentence.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task EmptyConsole_StopsStartup()
+    {
+        await Task.CompletedTask;
+        RequireConfigEntries(
+            LoadJson("""{ "ALog": { "Console": "" } }"""),
+            ExpectedScalarMessage("ALog:Console"));
+    }
+
+    /// <summary>
+    /// Whitespace is a value. The spaces are not copied into the sentence.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task WhitespaceConsole_StopsStartup()
+    {
+        await Task.CompletedTask;
+        RequireConfigEntries(
+            LoadJson("""{ "ALog": { "Console": "   " } }"""),
+            ExpectedScalarMessage("ALog:Console"),
+            "   ");
+    }
+
+    /// <summary>
+    /// A JSON array is only numeric children. Both entries stop. The element text is not in the sentence.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ArrayConsole_StopsStartup()
+    {
+        await Task.CompletedTask;
+        RequireConfigEntries(
+            LoadJson("""{ "ALog": { "Console": [true] } }"""),
+            ExpectedScalarMessage("ALog:Console"),
+            "True");
+    }
+
+    /// <summary>
+    /// A JSON object plus <c>ALog__Console=true</c> has a value and a child.
+    /// Both entries stop. The env value is not in the sentence.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task EnvScalarOverObject_StopsStartup()
+    {
+        await Task.CompletedTask;
+        const string name = "ALog__Console";
+        var previous = Environment.GetEnvironmentVariable(name);
+        try
+        {
+            Environment.SetEnvironmentVariable(name, "true");
+            using var stream = new MemoryStream(Encoding.UTF8.GetBytes(
+                """{ "ALog": { "Console": { "Enabled": false } } }"""));
+            var configuration = new ConfigurationBuilder()
+                .AddJsonStream(stream)
+                .AddEnvironmentVariables()
+                .Build();
+            RequireConfigEntries(configuration, ExpectedScalarMessage("ALog:Console"), "true");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable(name, previous);
+        }
+    }
+
+    /// <summary>
+    /// Console and File are both malformed. One exception names Console before File.
+    /// The provisional two-path sentence is the one constant shared with the single-path text.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ConsoleAndFileScalars_StopStartupOnce()
+    {
+        await Task.CompletedTask;
+        var configuration = LoadJson(
+            """{ "ALog": { "Console": true, "File": "Server=secret-db;Password=hunter2" } }""");
+        RequireConfigEntries(
+            configuration,
+            ExpectedScalarMessage("ALog:Console", "ALog:File"),
+            "True",
+            "hunter2");
+    }
+
+    /// <summary>
+    /// A real object section is not malformed. Neither config entry throws.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ObjectSection_DoesNotStopStartup()
+    {
+        await Task.CompletedTask;
+        var configuration = LoadJson("""{ "ALog": { "Console": { "Enabled": true } } }""");
+        var add = Record.Exception(() => InvokeEveryOverload(configuration));
+        var got = Record.Exception(() => configuration.GetALogOptions());
+        Assert.Null(add);
+        Assert.Null(got);
+        Assert.True(configuration.GetALogOptions().Console!.Enabled);
     }
 
     /// <summary>
@@ -110,6 +229,172 @@ public sealed class MasterBugTests : IDisposable
         CollectFacade(problems);
         CollectMel(problems);
         Assert.True(problems.Length == 0, problems.ToString());
+    }
+
+    /// <summary>
+    /// A scope value whose <c>ToString</c> throws still leaves a console line when the writer has no formatter.
+    /// <see cref="Log.BeginScope"/> and <see cref="LogContext.Push"/> both keep the placeholder.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ThrowingScopeToString_ConsoleStillWrites()
+    {
+        await Task.CompletedTask;
+        var problems = new StringBuilder();
+        var probe = new RecordingWriter();
+        var self = new List<string>(4);
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var previousOut = Console.Out;
+        var previousErr = Console.Error;
+        var previousSelf = SelfLog.Target;
+        try
+        {
+            Console.SetOut(stdout);
+            Console.SetError(stderr);
+            SelfLog.Enable(line =>
+            {
+                if (self.Count < 8)
+                    self.Add(line);
+            });
+            Log.Init(new LoggerConfig()
+                .AddWriter(new ConsoleLogWriter(useColors: false))
+                .AddWriter(probe)
+                .UseAsync(false)
+                .SetMinimumLevel(LogLevel.Trace));
+            var caller = Record.Exception(() =>
+            {
+                using (Log.BeginScope("FromBegin", new ThrowingProperty()))
+                    Log.Write(LogLevel.Info, "begin-scope-line");
+                using (LogContext.Push([new KeyValuePair<string, object?>("FromContext", new ThrowingProperty())]))
+                    Log.Write(LogLevel.Info, "context-scope-line");
+            });
+            var text = stdout.ToString();
+            Require(problems, caller is null, "console scope threw " + (caller is null ? "" : caller.Message));
+            Require(problems, text.Contains("begin-scope-line", StringComparison.Ordinal), "console missing begin line: " + Trim(text));
+            Require(problems, text.Contains("context-scope-line", StringComparison.Ordinal), "console missing context line: " + Trim(text));
+            Require(problems, text.Contains("FromBegin=" + CapturePlaceholder, StringComparison.Ordinal), "console missing begin placeholder: " + Trim(text));
+            Require(problems, text.Contains("FromContext=" + CapturePlaceholder, StringComparison.Ordinal), "console missing context placeholder: " + Trim(text));
+            Require(problems, !stderr.ToString().Contains("Sync write failed", StringComparison.Ordinal), "console stderr: " + Trim(stderr.ToString()));
+            Require(problems, self.Count == 0, "console scope SelfLog " + self.Count + " [" + Joined(self) + "]");
+            Require(problems, probe.Events.Count == 2, "console probe " + probe.Events.Count);
+        }
+        finally
+        {
+            Log.Shutdown();
+            Console.SetOut(previousOut);
+            Console.SetError(previousErr);
+            SelfLog.Target = previousSelf;
+        }
+
+        Assert.True(problems.Length == 0, problems.ToString());
+    }
+
+    /// <summary>
+    /// A MEL scope value whose <c>ToString</c> throws still leaves a file line when the writer has no formatter.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ThrowingScopeToString_FileStillWrites()
+    {
+        await Task.CompletedTask;
+        var problems = new StringBuilder();
+        var directory = NewDirectory();
+        var path = Path.Combine(directory, "scope.log");
+        var probe = new RecordingWriter();
+        var self = new List<string>(4);
+        var stderr = new StringWriter();
+        var previousErr = Console.Error;
+        var previousSelf = SelfLog.Target;
+        try
+        {
+            Console.SetError(stderr);
+            SelfLog.Enable(line =>
+            {
+                if (self.Count < 8)
+                    self.Add(line);
+            });
+            var config = new LoggerConfig()
+                .AddWriter(new FileLogWriter(path))
+                .AddWriter(probe)
+                .UseAsync(false)
+                .SetMinimumLevel(LogLevel.Trace);
+            using (var provider = new ALogLoggerProvider(config))
+            {
+                var logger = provider.CreateLogger("M1");
+                var caller = Record.Exception(() =>
+                {
+                    using (logger.BeginScope(new Dictionary<string, object?> { ["FromMel"] = new ThrowingProperty() }))
+                        logger.LogInformation("mel-scope-line");
+                });
+                Require(problems, caller is null, "file scope threw " + (caller is null ? "" : caller.Message));
+            }
+
+            var fileText = ReadFileOrEmpty(path);
+            Require(problems, fileText.Contains("mel-scope-line", StringComparison.Ordinal), "file missing line: " + Trim(fileText));
+            Require(problems, fileText.Contains("FromMel=" + CapturePlaceholder, StringComparison.Ordinal), "file missing placeholder: " + Trim(fileText));
+            Require(problems, !stderr.ToString().Contains("Write failed", StringComparison.Ordinal), "file stderr: " + Trim(stderr.ToString()));
+            Require(problems, !stderr.ToString().Contains("Sync write failed", StringComparison.Ordinal), "file sync stderr: " + Trim(stderr.ToString()));
+            Require(problems, self.Count == 0, "file scope SelfLog " + self.Count + " [" + Joined(self) + "]");
+            Require(problems, probe.Events.Count == 1, "file probe " + probe.Events.Count);
+            if (probe.Events.Count == 1)
+            {
+                var context = probe.Events[0].Context;
+                Require(problems, context is not null && context["FromMel"] is ThrowingProperty, "file probe lost the scope value");
+            }
+        }
+        finally
+        {
+            Console.SetError(previousErr);
+            SelfLog.Target = previousSelf;
+            DeleteDirectory(directory);
+        }
+
+        Assert.True(problems.Length == 0, problems.ToString());
+    }
+
+    /// <summary>
+    /// One plain-text line carries both the template render marker and the capture marker.
+    /// SelfLog keeps the existing argument failure and does not add a capture line.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task RenderFailureAndCaptureFailure_AreBothOnTheLine()
+    {
+        await Task.CompletedTask;
+        var probe = new RecordingWriter();
+        var self = new List<string>(4);
+        var stdout = new StringWriter();
+        var previousOut = Console.Out;
+        var previousSelf = SelfLog.Target;
+        try
+        {
+            Console.SetOut(stdout);
+            SelfLog.Enable(line =>
+            {
+                if (self.Count < 8)
+                    self.Add(line);
+            });
+            Log.Init(new LoggerConfig()
+                .AddWriter(new ConsoleLogWriter(useColors: false))
+                .AddWriter(probe)
+                .SetFormatter(new PlainTextFormatter())
+                .UseAsync(false)
+                .SetMinimumLevel(LogLevel.Trace));
+            var caller = Record.Exception(() => Log.Write(LogLevel.Info, "Value {A}", new ThrowingProperty()));
+            Assert.Null(caller);
+            var line = stdout.ToString();
+            Assert.Contains(CapturePlaceholder, line, StringComparison.Ordinal);
+            var formatAt = line.IndexOf("{A:<format error>}", StringComparison.Ordinal);
+            var captureAt = line.IndexOf(CapturePlaceholder, StringComparison.Ordinal);
+            Assert.True(formatAt >= 0 && captureAt > formatAt, line);
+            var selfLine = Assert.Single(self);
+            Assert.Contains("Message template argument 'A' failed", selfLine, StringComparison.Ordinal);
+            Assert.DoesNotContain("capture failed", Joined(self), StringComparison.Ordinal);
+        }
+        finally
+        {
+            Log.Shutdown();
+            Console.SetOut(previousOut);
+            SelfLog.Target = previousSelf;
+        }
     }
 
     /// <summary>
@@ -381,13 +666,73 @@ public sealed class MasterBugTests : IDisposable
         return matches.ToArray();
     }
 
-    /// <summary>The startup sentence for one section path. The path is the only inserted text.</summary>
-    /// <param name="path">Section path, such as <c>ALog:Console</c>. Not null.</param>
-    /// <returns>The full message a caller must see.</returns>
-    private static string ExpectedScalarMessage(string path)
+    /// <summary>
+    /// The startup sentence. One path is the U-M1-01 text.
+    /// Two paths use the same sentence with Console before File.
+    /// </summary>
+    /// <param name="paths">Affected paths, Console before File. One or two.</param>
+    /// <returns>The full message a caller must see. It does not contain the configuration value.</returns>
+    private static string ExpectedScalarMessage(params string[] paths)
     {
-        return "Invalid ALog configuration at '" + path
+        var listed = paths[0];
+        if (paths.Length == 2)
+            listed = paths[0] + "', '" + paths[1];
+
+        return "Invalid ALog configuration at '" + listed
             + "': expected a section with settings, but found a single value. Put the settings inside the section, as shown in the README.";
+    }
+
+    /// <summary>
+    /// Requires <c>AddALog</c> and <c>GetALogOptions</c> to throw <paramref name="expected"/>.
+    /// Each secret must be absent from both messages.
+    /// </summary>
+    /// <param name="configuration">Configuration passed to both entries. Not null.</param>
+    /// <param name="expected">The full sentence. Not null.</param>
+    /// <param name="secrets">Value texts that must not appear. May be empty.</param>
+    private static void RequireConfigEntries(IConfiguration configuration, string expected, params string[] secrets)
+    {
+        var problems = new StringBuilder();
+        var add = FailureOf(() => InvokeEveryOverload(configuration));
+        NoteEntry(problems, "AddALog", add, expected, secrets);
+        var got = FailureOf(() => configuration.GetALogOptions());
+        NoteEntry(problems, "GetALogOptions", got, expected, secrets);
+        Assert.True(problems.Length == 0, problems.ToString());
+    }
+
+    /// <summary>Runs <paramref name="action"/> and returns the exception message, or a no-exception marker.</summary>
+    /// <param name="action">One config entry. Not null.</param>
+    /// <returns>The message, or <c>(no exception)</c>.</returns>
+    private static string FailureOf(Action action)
+    {
+        var error = Record.Exception(action);
+        return error is null ? "(no exception)" : error.Message;
+    }
+
+    /// <summary>Appends a mismatch or a leaked secret for one config entry.</summary>
+    /// <param name="problems">Failure text. Not null.</param>
+    /// <param name="entry"><c>AddALog</c> or <c>GetALogOptions</c>.</param>
+    /// <param name="actual">Observed message. Not null.</param>
+    /// <param name="expected">Required message. Not null.</param>
+    /// <param name="secrets">Texts that must not appear.</param>
+    private static void NoteEntry(StringBuilder problems, string entry, string actual, string expected, string[] secrets)
+    {
+        if (!string.Equals(actual, expected, StringComparison.Ordinal))
+        {
+            if (problems.Length > 0)
+                problems.Append('\n');
+            problems.Append(entry).Append(": [").Append(actual).Append(']');
+            return;
+        }
+
+        for (var i = 0; i < secrets.Length; i++)
+        {
+            if (actual.Contains(secrets[i], StringComparison.Ordinal))
+            {
+                if (problems.Length > 0)
+                    problems.Append('\n');
+                problems.Append(entry).Append(" contains ").Append(secrets[i]);
+            }
+        }
     }
 
     /// <summary>Loads a JSON object into configuration. The stream is read before this returns.</summary>
