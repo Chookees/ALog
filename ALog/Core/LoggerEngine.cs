@@ -16,11 +16,7 @@ public class LoggerEngine : ILogger, IDisposable
     private readonly LogDispatcher _dispatcher;
     private readonly BackgroundLogQueue? _backgroundQueue;
     private readonly MinimumLevelCache _levels;
-    private readonly TimeProvider _clock;
-    private readonly ManualResetEventSlim _disposeDone = new(false);
     private int _disposeOnce;
-    private int _secondDisposeDeadlineElapsed;
-    private int _secondDisposeWaitsStarted;
 
     /// <summary>
     /// Builds the engine on <see cref="TimeProvider.System"/>.
@@ -32,7 +28,9 @@ public class LoggerEngine : ILogger, IDisposable
     /// Safe to construct on any thread. Log after this returns.
     /// </remarks>
     public LoggerEngine(ILogConfiguration config)
+#pragma warning disable RS0030 // public constructor default; tests pass a clock to the internal constructor
         : this(config, TimeProvider.System)
+#pragma warning restore RS0030
     {
     }
 
@@ -41,7 +39,7 @@ public class LoggerEngine : ILogger, IDisposable
     /// Production uses <see cref="TimeProvider.System"/> through the public constructor.
     /// </summary>
     /// <param name="config">Filters, writers, and the queue switch. Not null.</param>
-    /// <param name="clock">Clock for the queue shutdown, flush, and cutoff, and for a second <see cref="Dispose"/>. Not null.</param>
+    /// <param name="clock">Clock for the queue shutdown, flush, and cutoff. Not null.</param>
     /// <exception cref="ArgumentNullException"><paramref name="config"/> or <paramref name="clock"/> is null.</exception>
     /// <remarks>
     /// Does not throw for a writer failure. The clock cannot be changed after this returns.
@@ -52,7 +50,6 @@ public class LoggerEngine : ILogger, IDisposable
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(clock);
         _config = config;
-        _clock = clock;
         _levels = new MinimumLevelCache(config);
 
         ApplyDefaultFormatter(config);
@@ -296,7 +293,9 @@ public class LoggerEngine : ILogger, IDisposable
             : new Dictionary<string, object>(seed.Properties, StringComparer.Ordinal);
 
         return new LogEvent(
+#pragma warning disable RS0030 // event timestamp for the log record, not a shutdown or flush deadline
             Timestamp: DateTime.UtcNow,
+#pragma warning restore RS0030
             Level: seed.Level,
             Message: seed.Message,
             Exception: seed.Exception,
@@ -368,12 +367,6 @@ public class LoggerEngine : ILogger, IDisposable
     /// </summary>
     internal BackgroundLogQueue? Queue => _backgroundQueue;
 
-    /// <summary>How many times a second <see cref="Dispose"/> saw the shutdown deadline. Zero until that callback runs.</summary>
-    internal int SecondDisposeDeadlineElapsed => Volatile.Read(ref _secondDisposeDeadlineElapsed);
-
-    /// <summary>How many second <see cref="Dispose"/> waits have registered a deadline timer.</summary>
-    internal int SecondDisposeWaitsStarted => Volatile.Read(ref _secondDisposeWaitsStarted);
-
     public async Task FlushAsync()
     {
         if (_backgroundQueue != null)
@@ -385,52 +378,25 @@ public class LoggerEngine : ILogger, IDisposable
     /// <summary>
     /// Closes the background queue. The queue disposes idle writers at its deadline and a writer whose call
     /// is still running only after that call returns. Without a queue, writers are disposed here.
-    /// A second call waits for the first.
+    /// A second call returns immediately and does not report again.
     /// </summary>
     /// <remarks>
     /// Does not throw. Writer dispose failures are written to the error stream.
     /// Without a queue, writers are disposed immediately, as they were before the queue deadline existed.
-    /// The wait for a second call is <see cref="BackgroundLogQueue.ShutdownDeadline"/> on the engine clock.
+    /// A second call does not wait and does not emit another ALOG0071.
     /// </remarks>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
+            return;
+
+        if (_backgroundQueue is not null)
         {
-            // Same bound as the queue. The callback records the deadline before this wait returns.
-            BackgroundLogQueue.WaitUntilSignaledOrDeadline(
-                _clock,
-                _disposeDone,
-                MarkSecondDisposeDeadline,
-                ref _secondDisposeWaitsStarted);
+            _backgroundQueue.Dispose();
             return;
         }
 
-        try
-        {
-            if (_backgroundQueue is not null)
-            {
-                _backgroundQueue.Dispose();
-                return;
-            }
-
-            DisposeWriters();
-        }
-        finally
-        {
-            _disposeDone.Set();
-        }
-    }
-
-    /// <summary>
-    /// Records that a second <see cref="Dispose"/> reached the shutdown deadline.
-    /// </summary>
-    /// <remarks>
-    /// Does not throw. Called on the clock callback before that wait is released.
-    /// The count is visible to the thread that advanced the clock before this callback returns.
-    /// </remarks>
-    private void MarkSecondDisposeDeadline()
-    {
-        Interlocked.Increment(ref _secondDisposeDeadlineElapsed);
+        DisposeWriters();
     }
 
     /// <summary>

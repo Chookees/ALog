@@ -1,6 +1,0 @@
-# path:line:call: reason
-# Comments and string literals are not hits, so they are not listed here.
-# A line that moves fails the scan until this entry is updated.
-ALog/Core/BackgroundLogQueue.cs:116:TimeProvider.System: public constructor default; tests pass a clock to the internal constructor
-ALog/Core/LoggerEngine.cs:35:TimeProvider.System: public constructor default; tests pass a clock to the internal constructor
-ALog/Core/LoggerEngine.cs:299:DateTime.UtcNow: event timestamp for the log record, not a shutdown or flush deadline

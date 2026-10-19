@@ -18,6 +18,8 @@ dotnet_naming_style.camel_case_style.capitalization = camel_case
 
 dotnet_diagnostic.IDE0130.severity = warning
 dotnet_diagnostic.CA2007.severity = warning
+# CLK-03. Banned wall-clock APIs fail the build even when CI is unset.
+dotnet_diagnostic.RS0030.severity = error
 
 # analyzer-ratchet (BB): bestehende Befunde, nur schrumpfen
 dotnet_diagnostic.CA1001.severity = suggestion # 1

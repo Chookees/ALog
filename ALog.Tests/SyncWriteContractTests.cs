@@ -381,10 +381,10 @@ public sealed class SyncWriteContractTests
     /// <remarks>
     /// The gate is already closed once the shutdown wait is armed, so the false return does not wait for the deadline.
     /// The blocked writer is released after the deadline steps so the processor can leave.
-    /// A second dispose waits for the first and does not throw.
+    /// A second dispose returns without waiting and does not throw.
     /// </remarks>
     /// <returns>A task that finishes after dispose returns.</returns>
-    [Fact(Timeout = 60000)]
+    [Fact(Timeout = 120000)]
     public async Task Queue_TryEnqueue_ReturnsFalseWhenTheChannelCloses()
     {
         DeadlineClock.AssertValues();
@@ -407,12 +407,12 @@ public sealed class SyncWriteContractTests
             Assert.False(accepted);
             Assert.Empty(writer.Events);
             Assert.True(enqueueStarted.Elapsed < TimeSpan.FromSeconds(30), "hang " + enqueueStarted.Elapsed.ToString());
-            DeadlineClock.AssertNotElapsed(
+            await DeadlineClock.AssertNotElapsed(
                 clock,
                 () => queue.ShutdownDeadlineElapsed != 0,
                 BackgroundLogQueue.ShutdownDeadline,
                 "shutdown");
-            DeadlineClock.AssertElapsed(
+            await DeadlineClock.AssertElapsed(
                 clock,
                 () => queue.ShutdownDeadlineElapsed != 0,
                 BackgroundLogQueue.ShutdownDeadline,

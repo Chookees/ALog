@@ -126,7 +126,9 @@ public class SqlLogWriter : ILogWriter
             logEvent.Exception != null ? $"{logEvent.Exception.GetType().FullName}: {logEvent.Exception.Message}" : (object)DBNull.Value);
         command.Parameters.AddWithValue("@Context",
             logEvent.Context != null ? System.Text.Json.JsonSerializer.Serialize(logEvent.Context) : (object)DBNull.Value);
+#pragma warning disable RS0030 // CreatedAt column, not a shutdown or flush deadline
         command.Parameters.AddWithValue("@CreatedAt", DateTime.UtcNow);
+#pragma warning restore RS0030
         return command;
     }
 

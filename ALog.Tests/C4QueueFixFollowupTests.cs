@@ -2,6 +2,7 @@
 // close reports ALOG0072, and healthy writers are disposed while a hanging call is not.
 // Next file: ALog.Tests/C4QueueFixTests.cs.
 
+using System.Diagnostics;
 using System.Reflection;
 using ALog.Config;
 using ALog.Core;
@@ -516,7 +517,7 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// Disposes <paramref name="queue"/> on the clock. A parallel pair both wait for the same deadline.
+    /// Disposes <paramref name="queue"/> on the clock. A parallel second call returns without waiting.
     /// </summary>
     /// <param name="queue">Queue whose writer is already blocked. Not null.</param>
     /// <param name="clock">The queue clock. Not null. Not yet advanced across the deadline.</param>
@@ -530,7 +531,6 @@ public sealed partial class C4QueueFixTests
     private static async Task DisposeOpenWindow(BackgroundLogQueue queue, FakeTimeProvider clock, bool parallel)
     {
         Task? first = null;
-        Task? second = null;
         try
         {
             first = await DeadlineClock.RunUntilArmed(
@@ -539,48 +539,33 @@ public sealed partial class C4QueueFixTests
                 nameof(Shutdown_TwiceAndParallel_ReportsOpenWindowOnce));
             if (parallel)
             {
-                second = Task.Run(() => queue.Dispose());
-                await DeadlineClock.WaitFor(
-                    () => queue.SecondDisposeWaitsStarted >= 1,
-                    "parallel shutdown did not arm the second dispose wait");
+                var stamp = clock.GetTimestamp();
+                var started = Stopwatch.GetTimestamp();
+                queue.Dispose();
+                Assert.Equal(stamp, clock.GetTimestamp());
+                Assert.True(
+                    Stopwatch.GetElapsedTime(started) < TimeSpan.FromSeconds(2),
+                    "second dispose waited " + Stopwatch.GetElapsedTime(started).ToString());
+                Assert.False(first.IsCompleted, "first dispose returned before the deadline");
             }
 
-            DeadlineClock.AssertNotElapsed(
+            await DeadlineClock.AssertNotElapsed(
                 clock,
                 () => queue.ShutdownDeadlineElapsed != 0,
                 BackgroundLogQueue.ShutdownDeadline,
                 "shutdown");
-            if (second is not null)
-            {
-                DeadlineClock.AssertNotElapsedNow(
-                    () => queue.SecondDisposeDeadlineElapsed != 0,
-                    BackgroundLogQueue.ShutdownDeadline,
-                    "second dispose");
-            }
-
-            DeadlineClock.AssertElapsed(
+            await DeadlineClock.AssertElapsed(
                 clock,
                 () => queue.ShutdownDeadlineElapsed != 0,
                 BackgroundLogQueue.ShutdownDeadline,
                 "shutdown");
-            if (second is not null)
-            {
-                DeadlineClock.AssertElapsedNow(
-                    () => queue.SecondDisposeDeadlineElapsed != 0,
-                    BackgroundLogQueue.ShutdownDeadline,
-                    "second dispose");
-            }
-
             await DeadlineClock.WaitForCompletion(first, "shutdown hung");
-            if (second is not null)
-                await DeadlineClock.WaitForCompletion(second, "second dispose hung");
-            else
+            if (!parallel)
                 queue.Dispose();
         }
         finally
         {
             await ReleaseDispose(clock, first);
-            await ReleaseDispose(clock, second);
         }
     }
 
@@ -590,7 +575,8 @@ public sealed partial class C4QueueFixTests
     /// </summary>
     /// <returns>A task that finishes after the writer is released.</returns>
     /// <remarks>
-    /// The flag is set on the thread that advances the clock. A late timer fails before the 30 s hang guard.
+    /// The flag is set on the thread that advances the clock. A late timer uses the late sentence.
+    /// The helper may wait out the 30 s hang guard. The message does not say the cutoff hung.
     /// The writer stays blocked until the flag checks have finished. Not thread-safe.
     /// </remarks>
     [Fact(Timeout = 90000)]
@@ -609,12 +595,12 @@ public sealed partial class C4QueueFixTests
                 queue.Dispose,
                 () => queue.DisposeWaitsStarted,
                 nameof(CutoffTimer_StaysClearUntilNewWriteBudget));
-            DeadlineClock.AssertNotElapsed(
+            await DeadlineClock.AssertNotElapsed(
                 clock,
                 () => queue.CutoffElapsed != 0,
                 BackgroundLogQueue.NewWriteBudget,
                 "cutoff");
-            DeadlineClock.AssertElapsed(
+            await DeadlineClock.AssertElapsed(
                 clock,
                 () => queue.CutoffElapsed != 0,
                 BackgroundLogQueue.NewWriteBudget,
@@ -670,89 +656,114 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// A second queue <see cref="BackgroundLogQueue.Dispose"/> stops at <see cref="BackgroundLogQueue.ShutdownDeadline"/>
-    /// and not one tick earlier. It does not wait on the wall clock.
+    /// A second queue <see cref="BackgroundLogQueue.Dispose"/> returns on the test thread while the first call is still waiting.
+    /// It does not move the clock and it does not add an ALOG0071 line.
     /// </summary>
-    /// <returns>A task that finishes after both calls return.</returns>
+    /// <returns>A task that finishes after the first call returns.</returns>
     /// <remarks>
-    /// The writer stays blocked so the first call is still waiting when the second registers its timer.
-    /// The late check is the flag, and it fails before the 30 s hang guard. Not thread-safe.
+    /// The writer stays blocked so the first call is armed. The second call is not started on the pool.
+    /// The first call still stops at <see cref="BackgroundLogQueue.ShutdownDeadline"/>. Not thread-safe.
     /// </remarks>
-    [Fact(Timeout = 90000)]
-    public async Task DisposeAgain_Queue_StopsAtShutdownDeadline()
+    [Fact(Timeout = 120000)]
+    public async Task DisposeAgain_Queue_ReturnsWhileTheFirstWaitIsArmed()
     {
-        DeadlineClock.AssertValues();
-        var clock = DeadlineClock.Create();
-        var writer = new BlockingWriter();
-        var queue = QueueOnClock(writer, clock);
-        Task? first = null;
-        Task? second = null;
-        try
-        {
-            Assert.True(queue.TryEnqueue(Event("held")));
-            await DeadlineClock.WaitFor(() => writer.EnteredCount > 0, "processor never entered the blocked writer");
-            first = await DeadlineClock.RunUntilArmed(
-                queue.Dispose,
-                () => queue.DisposeWaitsStarted,
-                nameof(DisposeAgain_Queue_StopsAtShutdownDeadline));
-            second = Task.Run(() => queue.Dispose());
-            await DeadlineClock.WaitFor(
-                () => queue.SecondDisposeWaitsStarted >= 1,
-                nameof(DisposeAgain_Queue_StopsAtShutdownDeadline) + " did not arm the second dispose wait");
-            AssertBothClearThenSet(
-                clock,
-                () => queue.ShutdownDeadlineElapsed != 0,
-                () => queue.SecondDisposeDeadlineElapsed != 0);
-            await DeadlineClock.WaitForCompletion(first, "shutdown hung");
-            await DeadlineClock.WaitForCompletion(second, "second dispose hung");
-        }
-        finally
-        {
-            writer.Release();
-            await ReleaseDispose(clock, first);
-            await ReleaseDispose(clock, second);
-        }
+        await AssertSecondDisposeReturns(queueOnly: true);
     }
 
     /// <summary>
-    /// A second engine <see cref="LoggerEngine.Dispose"/> stops at <see cref="BackgroundLogQueue.ShutdownDeadline"/>
-    /// and not one tick earlier. It does not wait on the wall clock.
+    /// A second engine <see cref="LoggerEngine.Dispose"/> returns on the test thread while the first call is still waiting.
+    /// It does not move the clock and it does not add an ALOG0071 line.
     /// </summary>
-    /// <returns>A task that finishes after both calls return.</returns>
+    /// <returns>A task that finishes after the first call returns.</returns>
     /// <remarks>
-    /// The writer stays blocked so the first call is still inside the queue when the second registers its timer.
-    /// The late check is the engine flag, and it fails before the 30 s hang guard. Not thread-safe.
+    /// The writer stays blocked so the first call is inside the queue. The second call is not started on the pool.
+    /// The first call still stops at <see cref="BackgroundLogQueue.ShutdownDeadline"/>. Not thread-safe.
     /// </remarks>
-    [Fact(Timeout = 90000)]
-    public async Task DisposeAgain_Engine_StopsAtShutdownDeadline()
+    [Fact(Timeout = 120000)]
+    public async Task DisposeAgain_Engine_ReturnsWhileTheFirstWaitIsArmed()
+    {
+        await AssertSecondDisposeReturns(queueOnly: false);
+    }
+
+    /// <summary>
+    /// Arms one dispose on a blocked writer, calls dispose again on this thread, then finishes the first at the deadline.
+    /// </summary>
+    /// <param name="queueOnly">True disposes the queue. False disposes the engine.</param>
+    /// <returns>A task that finishes after the single ALOG0071 line is checked.</returns>
+    /// <remarks>
+    /// The second call must return before the clock moves. The late sentence belongs to the first call only.
+    /// Not thread-safe. Only the test thread calls it.
+    /// </remarks>
+    private static async Task AssertSecondDisposeReturns(bool queueOnly)
     {
         DeadlineClock.AssertValues();
+        var lines = new List<string>();
+        var previous = SelfLog.Target;
+        SelfLog.Enable(line =>
+        {
+            lock (lines)
+                lines.Add(line);
+        });
         var clock = DeadlineClock.Create();
         var writer = new BlockingWriter();
-        var engine = EngineOnClock(writer, 4, 1, clock);
+        BackgroundLogQueue? queue = null;
+        LoggerEngine? engine = null;
         Task? first = null;
-        Task? second = null;
         try
         {
-            engine.Log("held", LogLevel.Info);
+            if (queueOnly)
+            {
+                queue = QueueOnClock(writer, clock);
+                Assert.True(queue.TryEnqueue(Event("held")));
+                Assert.True(queue.TryEnqueue(Event("queued")));
+            }
+            else
+            {
+                engine = EngineOnClock(writer, 4, 1, clock);
+                engine.Log("held", LogLevel.Info);
+                engine.Log("queued", LogLevel.Info);
+                queue = engine.Queue;
+            }
+
             await DeadlineClock.WaitFor(() => writer.EnteredCount > 0, "processor never entered the blocked writer");
-            first = Task.Run(() => engine.Dispose());
-            second = Task.Run(() => engine.Dispose());
-            await DeadlineClock.WaitFor(
-                () => engine.Queue!.DisposeWaitsStarted >= 1 && engine.SecondDisposeWaitsStarted >= 1,
-                nameof(DisposeAgain_Engine_StopsAtShutdownDeadline) + " did not arm both clock waits");
-            AssertBothClearThenSet(
+            first = await DeadlineClock.RunUntilArmed(
+                queueOnly ? queue!.Dispose : engine!.Dispose,
+                () => queue!.DisposeWaitsStarted,
+                queueOnly
+                    ? nameof(DisposeAgain_Queue_ReturnsWhileTheFirstWaitIsArmed)
+                    : nameof(DisposeAgain_Engine_ReturnsWhileTheFirstWaitIsArmed));
+            var stamp = clock.GetTimestamp();
+            var started = Stopwatch.GetTimestamp();
+            if (queueOnly)
+                queue!.Dispose();
+            else
+                engine!.Dispose();
+
+            var waited = Stopwatch.GetElapsedTime(started);
+            Assert.Equal(stamp, clock.GetTimestamp());
+            Assert.True(waited < TimeSpan.FromSeconds(2), "second dispose waited " + waited.ToString());
+            Assert.False(first.IsCompleted, "first dispose returned before the deadline");
+            lock (lines)
+                Assert.DoesNotContain(lines, line => line.StartsWith(DeadlinePrefix, StringComparison.Ordinal));
+            await DeadlineClock.AssertNotElapsed(
                 clock,
-                () => engine.Queue!.ShutdownDeadlineElapsed != 0,
-                () => engine.SecondDisposeDeadlineElapsed != 0);
+                () => queue!.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
+            await DeadlineClock.AssertElapsed(
+                clock,
+                () => queue!.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
             await DeadlineClock.WaitForCompletion(first, "shutdown hung");
-            await DeadlineClock.WaitForCompletion(second, "second dispose hung");
+            lock (lines)
+                Assert.Single(lines, line => line.StartsWith(DeadlinePrefix, StringComparison.Ordinal));
         }
         finally
         {
             writer.Release();
             await ReleaseDispose(clock, first);
-            await ReleaseDispose(clock, second);
+            SelfLog.Target = previous;
         }
     }
 
@@ -867,38 +878,6 @@ public sealed partial class C4QueueFixTests
         return new BackgroundLogQueue(
             new ILogWriter[] { writer },
             new BackgroundLogQueue.QueueSettings(4, 1, TimeSpan.FromHours(1), false, clock));
-    }
-
-    /// <summary>
-    /// Checks the shutdown flag and the second-dispose flag around one deadline step.
-    /// </summary>
-    /// <param name="clock">Clock both waits share. Not null. Not yet advanced.</param>
-    /// <param name="shutdownElapsed">The first dispose deadline flag. Not null.</param>
-    /// <param name="againElapsed">The second dispose deadline flag. Not null.</param>
-    /// <remarks>
-    /// One advance lands on the deadline. Both flags are read after that advance returns.
-    /// A miss fails with <see cref="DeadlineClock.LateFire"/> before any hang guard.
-    /// </remarks>
-    private static void AssertBothClearThenSet(FakeTimeProvider clock, Func<bool> shutdownElapsed, Func<bool> againElapsed)
-    {
-        DeadlineClock.AssertNotElapsed(
-            clock,
-            shutdownElapsed,
-            BackgroundLogQueue.ShutdownDeadline,
-            "shutdown");
-        DeadlineClock.AssertNotElapsedNow(
-            againElapsed,
-            BackgroundLogQueue.ShutdownDeadline,
-            "second dispose");
-        DeadlineClock.AssertElapsed(
-            clock,
-            shutdownElapsed,
-            BackgroundLogQueue.ShutdownDeadline,
-            "shutdown");
-        DeadlineClock.AssertElapsedNow(
-            againElapsed,
-            BackgroundLogQueue.ShutdownDeadline,
-            "second dispose");
     }
 
     /// <summary>

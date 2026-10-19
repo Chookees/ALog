@@ -1,7 +1,7 @@
 // Moves a test clock across the shutdown, flush, and cutoff bounds.
 // The product sets a flag inside the timer callback, on the thread that calls Advance.
-// One tick short of a bound leaves the flag clear. The next tick sets it.
-// Wall time appears only as the 30 s hang guard after the flag is already set.
+// The helper waits one poll for that flag before judging deadline - 1 tick and the deadline.
+// A flag that is still clear at the bound may take the 30 s hang guard. The message is the late sentence.
 // Next file: ALog.Tests/C4QueueFixTests.cs.
 
 using System.Diagnostics;
@@ -21,6 +21,12 @@ internal static class DeadlineClock
 
     /// <summary>Hang guard for a wait that should already be unblocked. Not a product deadline.</summary>
     private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// One poll after <see cref="FakeTimeProvider.Advance"/>, so a wake-up can publish the flag.
+    /// Not the 30 s hang guard. The injected clock runs its callback before Advance returns.
+    /// </summary>
+    private static readonly TimeSpan CallbackPoll = TimeSpan.FromMilliseconds(10);
 
     /// <summary>Most polls inside <see cref="HangGuard"/>. The loop stops at this count even if the clock jumps.</summary>
     private const int MaxPolls = 4000;
@@ -225,21 +231,23 @@ internal static class DeadlineClock
     }
 
     /// <summary>
-    /// Advances to one tick before <paramref name="bound"/> and fails if <paramref name="elapsed"/> is already set.
+    /// Advances to one tick before <paramref name="bound"/> and fails if the callback flag is set.
     /// </summary>
     /// <param name="clock">Clock the product is waiting on. Not null. Not advanced past <paramref name="bound"/> yet.</param>
     /// <param name="elapsed">The product flag set inside the timer callback. Not null. Read on this thread.</param>
     /// <param name="bound">Product bound measured from the clock's current time. Longer than one tick.</param>
     /// <param name="operationName">shutdown, flush, cutoff, or another wait name. Not empty.</param>
+    /// <returns>A task that finishes after one poll.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="clock"/> or <paramref name="elapsed"/> is null.</exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="bound"/> is not longer than one tick.</exception>
     /// <exception cref="ArgumentException"><paramref name="operationName"/> is empty.</exception>
     /// <remarks>
-    /// <see cref="FakeTimeProvider.Advance"/> runs due callbacks before it returns, so the flag is already
-    /// updated when this checks it. There is no wall-clock pause. The failure text is <see cref="EarlyFire"/>.
+    /// <see cref="FakeTimeProvider.Advance"/> runs due callbacks before it returns. This waits one poll,
+    /// the same step as <see cref="WaitFor"/>, so a wake-up can publish the flag before the check.
+    /// A set flag fails with <see cref="EarlyFire"/>. A clear flag does not use the 30 s hang guard.
     /// Not thread-safe. Only the test thread calls it.
     /// </remarks>
-    internal static void AssertNotElapsed(FakeTimeProvider clock, Func<bool> elapsed, TimeSpan bound, string operationName)
+    internal static async Task AssertNotElapsed(FakeTimeProvider clock, Func<bool> elapsed, TimeSpan bound, string operationName)
     {
         ArgumentNullException.ThrowIfNull(clock);
         ArgumentNullException.ThrowIfNull(elapsed);
@@ -250,51 +258,27 @@ internal static class DeadlineClock
             throw new ArgumentOutOfRangeException(nameof(bound), bound, "Bound must be longer than one tick.");
 
         clock.Advance(bound - Tick);
-        AssertNotElapsedNow(elapsed, bound, operationName);
-    }
-
-    /// <summary>
-    /// Fails if <paramref name="elapsed"/> is set. Does not move <paramref name="bound"/>'s clock.
-    /// </summary>
-    /// <param name="elapsed">The product flag. Not null. The clock is already one tick short of the bound.</param>
-    /// <param name="bound">The bound the previous step stopped one tick short of. Longer than one tick.</param>
-    /// <param name="operationName">shutdown, flush, cutoff, or another wait name. Not empty.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="elapsed"/> is null.</exception>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="bound"/> is not longer than one tick.</exception>
-    /// <exception cref="ArgumentException"><paramref name="operationName"/> is empty.</exception>
-    /// <remarks>
-    /// Used for a second flag that was due on the same tick as the flag <see cref="AssertNotElapsed"/> just checked.
-    /// The failure text is <see cref="EarlyFire"/> with elapsed time <paramref name="bound"/> minus one tick.
-    /// Not thread-safe. Only the test thread calls it.
-    /// </remarks>
-    internal static void AssertNotElapsedNow(Func<bool> elapsed, TimeSpan bound, string operationName)
-    {
-        ArgumentNullException.ThrowIfNull(elapsed);
-        if (string.IsNullOrEmpty(operationName))
-            throw new ArgumentException("Operation name is required.", nameof(operationName));
-
-        if (bound <= Tick)
-            throw new ArgumentOutOfRangeException(nameof(bound), bound, "Bound must be longer than one tick.");
-
-        if (elapsed())
+        if (await PublishedByCallback(elapsed).ConfigureAwait(false))
             Assert.Fail(EarlyFire(operationName, bound - Tick));
     }
 
     /// <summary>
-    /// Advances one tick, which lands on the bound the previous step stopped short of, and fails if the flag is still clear.
+    /// Advances one tick onto the bound and fails if the callback flag stays clear.
     /// </summary>
     /// <param name="clock">Clock the product is waiting on. Not null. Currently one tick short of <paramref name="bound"/>.</param>
     /// <param name="elapsed">The product flag set inside the timer callback. Not null.</param>
     /// <param name="bound">The deadline the previous step stopped one tick short of.</param>
     /// <param name="operationName">shutdown, flush, cutoff, or another wait name. Not empty.</param>
+    /// <returns>A task that finishes when the flag is visible, or when the hang guard fires.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="clock"/> or <paramref name="elapsed"/> is null.</exception>
     /// <exception cref="ArgumentException"><paramref name="operationName"/> is empty.</exception>
     /// <remarks>
-    /// The failure is immediate. It does not wait for the operation task and it does not use the 30 s hang guard.
-    /// The failure text is <see cref="LateFire"/> with elapsed time <paramref name="bound"/>.
-    /// Not thread-safe. Only the test thread calls it.
+    /// A flag set by the callback before the poll returns is the green path.
+    /// A flag that is still clear waits up to <see cref="HangGuard"/>. The failure text is <see cref="LateFire"/>
+    /// with elapsed time <paramref name="bound"/>, including when a wall-clock timer sets the flag during that wait.
+    /// The message does not say the operation hung. Not thread-safe. Only the test thread calls it.
     /// </remarks>
-    internal static void AssertElapsed(FakeTimeProvider clock, Func<bool> elapsed, TimeSpan bound, string operationName)
+    internal static async Task AssertElapsed(FakeTimeProvider clock, Func<bool> elapsed, TimeSpan bound, string operationName)
     {
         ArgumentNullException.ThrowIfNull(clock);
         ArgumentNullException.ThrowIfNull(elapsed);
@@ -302,30 +286,36 @@ internal static class DeadlineClock
             throw new ArgumentException("Operation name is required.", nameof(operationName));
 
         clock.Advance(Tick);
-        AssertElapsedNow(elapsed, bound, operationName);
+        if (await PublishedByCallback(elapsed).ConfigureAwait(false))
+            return;
+
+        var started = Stopwatch.GetTimestamp();
+        for (var i = 0; i < MaxPolls; i++)
+        {
+            if (Stopwatch.GetElapsedTime(started) >= HangGuard)
+                break;
+
+            await Task.Delay(CallbackPoll).ConfigureAwait(false);
+            if (elapsed())
+                break;
+        }
+
+        Assert.Fail(LateFire(operationName, bound));
     }
 
     /// <summary>
-    /// Fails immediately if <paramref name="elapsed"/> is still clear. Does not move the clock.
+    /// Waits one poll, then reports whether the timer callback has published <paramref name="elapsed"/>.
     /// </summary>
-    /// <param name="elapsed">The product flag. Not null. The clock is already on the bound.</param>
-    /// <param name="bound">The bound the clock has reached.</param>
-    /// <param name="operationName">shutdown, flush, cutoff, or another wait name. Not empty.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="elapsed"/> is null.</exception>
-    /// <exception cref="ArgumentException"><paramref name="operationName"/> is empty.</exception>
+    /// <param name="elapsed">The product flag. Not null. Already checked by the caller.</param>
+    /// <returns>True when the flag is set after the poll.</returns>
     /// <remarks>
-    /// Used for a second flag that was due on the same tick <see cref="AssertElapsed"/> just crossed.
-    /// The failure text is <see cref="LateFire"/>. There is no 30 s wait.
-    /// Not thread-safe. Only the test thread calls it.
+    /// The poll is <see cref="CallbackPoll"/>, modeled on <see cref="WaitFor"/>. It is not the 30 s hang guard.
+    /// <see cref="FakeTimeProvider.Advance"/> has already run a due callback on this thread.
     /// </remarks>
-    internal static void AssertElapsedNow(Func<bool> elapsed, TimeSpan bound, string operationName)
+    private static async Task<bool> PublishedByCallback(Func<bool> elapsed)
     {
-        ArgumentNullException.ThrowIfNull(elapsed);
-        if (string.IsNullOrEmpty(operationName))
-            throw new ArgumentException("Operation name is required.", nameof(operationName));
-
-        if (!elapsed())
-            Assert.Fail(LateFire(operationName, bound));
+        await Task.Delay(CallbackPoll).ConfigureAwait(false);
+        return elapsed();
     }
 
     /// <summary>

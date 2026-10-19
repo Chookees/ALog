@@ -108,7 +108,9 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
             var directory = Path.GetDirectoryName(_filePath);
             var filename = Path.GetFileNameWithoutExtension(_filePath);
             var ext = Path.GetExtension(_filePath);
+#pragma warning disable RS0030 // rotation file name, not a shutdown or flush deadline
             var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
+#pragma warning restore RS0030
 
             var rotated = Path.Combine(directory ?? ".", $"{filename}_{timestamp}{ext}");
 

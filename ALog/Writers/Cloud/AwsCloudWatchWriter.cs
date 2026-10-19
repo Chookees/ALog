@@ -78,9 +78,13 @@ public class AwsCloudWatchWriter : ILogWriter, IFormattableLogWriter
             if (logEvent is null)
                 throw new ArgumentNullException(nameof(logEvent));
 
+#pragma warning disable RS0030 // CloudWatch put uses a 100 s transport timeout, not a shutdown or flush deadline
             using var timeout = new CancellationTokenSource(SyncPutTimeout);
+#pragma warning restore RS0030
             var pending = StartPut(logEvent, timeout.Token);
+#pragma warning disable RS0030 // CloudWatch put uses a 100 s transport timeout, not a shutdown or flush deadline
             if (!pending.Wait(SyncPutTimeout))
+#pragma warning restore RS0030
             {
                 timeout.Cancel();
                 throw new TimeoutException("CloudWatch put exceeded the 100 second transport timeout.");
