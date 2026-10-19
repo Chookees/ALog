@@ -44,6 +44,8 @@ Turn on ALog's console in `appsettings.json`:
 { "ALog": { "Console": { "Enabled": true } } }
 ```
 
+ALog reads its settings, including MinimumLevel, once at startup. Changes while the app runs have no effect; restart the app.
+
 See `samples/ALog.AspNetSample`.
 
 ---

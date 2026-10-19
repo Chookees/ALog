@@ -29,6 +29,11 @@ public sealed class MasterBugTests : IDisposable
     private const string WriterSentence =
         "Writer settings (Enabled, paths) are read at startup; only levels reload at runtime.";
 
+    private const string StartupSentence =
+        "ALog reads its settings, including MinimumLevel, once at startup. Changes while the app runs have no effect; restart the app.";
+
+    private const string LevelsReloadPhrase = "only levels reload at runtime";
+
     private const string SkipSentence =
         "To see why a test was skipped, run `dotnet test --logger \"console;verbosity=normal\"`.";
 
@@ -660,8 +665,8 @@ public sealed class MasterBugTests : IDisposable
 
     /// <summary>
     /// Locks the M1 sentences: writer remarks, install lines without a version,
-    /// the two changelog bullets, and the skip hint.
-    /// The runtime-reload sentence is absent: <c>ALog:MinimumLevel</c> is not re-read.
+    /// the two changelog bullets, the skip hint, and the startup sentence under the JSON example.
+    /// <c>only levels reload at runtime</c> is absent.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task Docs_LockMasterBugTexts()
@@ -672,8 +677,12 @@ public sealed class MasterBugTests : IDisposable
         var aspnet = Slice(readme, "### ASP.NET Core", "## Console output");
         var contributing = Slice(readme, "## Contributing", "## License");
 
-        Assert.Contains("{ \"ALog\": { \"Console\": { \"Enabled\": true } } }", aspnet, StringComparison.Ordinal);
+        var jsonAt = aspnet.IndexOf("{ \"ALog\": { \"Console\": { \"Enabled\": true } } }", StringComparison.Ordinal);
+        var startupAt = aspnet.IndexOf(StartupSentence, StringComparison.Ordinal);
+        Assert.True(jsonAt >= 0 && startupAt > jsonAt, "Startup sentence must sit under the JSON example.");
+        Assert.Equal(1, CountOf(readme, StartupSentence));
         Assert.Equal(0, CountOf(readme, WriterSentence));
+        Assert.DoesNotContain(LevelsReloadPhrase, readme, StringComparison.Ordinal);
         Assert.Contains(SkipSentence, contributing, StringComparison.Ordinal);
         Assert.Equal(1, CountOf(readme, SkipSentence));
         Assert.Contains("dotnet add package ALog", readme, StringComparison.Ordinal);
