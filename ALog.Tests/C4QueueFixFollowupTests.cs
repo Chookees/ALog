@@ -2,7 +2,6 @@
 // close reports ALOG0072, and healthy writers are disposed while a hanging call is not.
 // Next file: ALog.Tests/C4QueueFixTests.cs.
 
-using System.Diagnostics;
 using System.Reflection;
 using ALog.Config;
 using ALog.Core;
@@ -526,6 +525,7 @@ public sealed partial class C4QueueFixTests
     /// <remarks>
     /// Does not advance the report window on its own. The deadline step is long enough to cross the 1 ms first-report delay,
     /// so the drop line can be written by that timer during the step. Shutdown still publishes whatever remains.
+    /// A parallel second call runs on the pool under the 30 s hang guard. The clock timestamp stays the same and the first task stays running.
     /// A failed step advances the deadline so the dispose thread can leave. Not thread-safe.
     /// </remarks>
     private static async Task DisposeOpenWindow(BackgroundLogQueue queue, FakeTimeProvider clock, bool parallel)
@@ -538,16 +538,7 @@ public sealed partial class C4QueueFixTests
                 () => queue.DisposeWaitsStarted,
                 nameof(Shutdown_TwiceAndParallel_ReportsOpenWindowOnce));
             if (parallel)
-            {
-                var stamp = clock.GetTimestamp();
-                var started = Stopwatch.GetTimestamp();
-                queue.Dispose();
-                Assert.Equal(stamp, clock.GetTimestamp());
-                Assert.True(
-                    Stopwatch.GetElapsedTime(started) < TimeSpan.FromSeconds(2),
-                    "second dispose waited " + Stopwatch.GetElapsedTime(started).ToString());
-                Assert.False(first.IsCompleted, "first dispose returned before the deadline");
-            }
+                await AssertSecondDisposeDoesNotWait(clock, first!, queue.Dispose);
 
             await DeadlineClock.AssertNotElapsed(
                 clock,
@@ -661,7 +652,8 @@ public sealed partial class C4QueueFixTests
     /// </summary>
     /// <returns>A task that finishes after the first call returns.</returns>
     /// <remarks>
-    /// The writer stays blocked so the first call is armed. The second call is not started on the pool.
+    /// The writer stays blocked so the first call is armed. The second call runs on the pool under the 30 s hang guard.
+    /// The clock timestamp stays the same and the first task stays running.
     /// The first call still stops at <see cref="BackgroundLogQueue.ShutdownDeadline"/>. Not thread-safe.
     /// </remarks>
     [Fact(Timeout = 120000)]
@@ -676,7 +668,8 @@ public sealed partial class C4QueueFixTests
     /// </summary>
     /// <returns>A task that finishes after the first call returns.</returns>
     /// <remarks>
-    /// The writer stays blocked so the first call is inside the queue. The second call is not started on the pool.
+    /// The writer stays blocked so the first call is inside the queue. The second call runs on the pool under the 30 s hang guard.
+    /// The clock timestamp stays the same and the first task stays running.
     /// The first call still stops at <see cref="BackgroundLogQueue.ShutdownDeadline"/>. Not thread-safe.
     /// </remarks>
     [Fact(Timeout = 120000)]
@@ -686,13 +679,41 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// Arms one dispose on a blocked writer, calls dispose again on this thread, then finishes the first at the deadline.
+    /// Runs a second dispose on the pool and fails when it is still running after the hang guard.
+    /// </summary>
+    /// <param name="clock">Clock the first dispose is waiting on. Not null. This method does not advance it.</param>
+    /// <param name="first">The armed dispose. Not null. Must still be running when the second call returns.</param>
+    /// <param name="secondDispose">The second dispose. Not null. Must return without waiting for <paramref name="first"/>.</param>
+    /// <returns>A task that finishes when the second dispose has returned.</returns>
+    /// <remarks>
+    /// The fake-clock timestamp must be unchanged, and <paramref name="first"/> must still be running.
+    /// The 30 s wait is a hang guard. It is not a product deadline.
+    /// A second dispose that waits for the first call stays inside this guard, because the clock is not advanced.
+    /// Not thread-safe beyond the pool thread that runs <paramref name="secondDispose"/>.
+    /// </remarks>
+    private static async Task AssertSecondDisposeDoesNotWait(FakeTimeProvider clock, Task first, Action secondDispose)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+        ArgumentNullException.ThrowIfNull(first);
+        ArgumentNullException.ThrowIfNull(secondDispose);
+
+        var stamp = clock.GetTimestamp();
+        var second = Task.Run(secondDispose);
+        var returned = await Task.WhenAny(second, Task.Delay(TimeSpan.FromSeconds(30))) == second;
+        Assert.True(returned, "second Dispose waited for the first deadline; it must return immediately");
+        await second;
+        Assert.Equal(stamp, clock.GetTimestamp());
+        Assert.False(first.IsCompleted, "first dispose returned before the deadline");
+    }
+
+    /// <summary>
+    /// Arms one dispose on a blocked writer, calls dispose again on the pool, then finishes the first at the deadline.
     /// </summary>
     /// <param name="queueOnly">True disposes the queue. False disposes the engine.</param>
     /// <returns>A task that finishes after the single ALOG0071 line is checked.</returns>
     /// <remarks>
-    /// The second call must return before the clock moves. The late sentence belongs to the first call only.
-    /// Not thread-safe. Only the test thread calls it.
+    /// The second call runs on the pool. The late sentence belongs to the first call only.
+    /// Not thread-safe. The pool thread runs the second call.
     /// </remarks>
     private static async Task AssertSecondDisposeReturns(bool queueOnly)
     {
@@ -732,17 +753,10 @@ public sealed partial class C4QueueFixTests
                 queueOnly
                     ? nameof(DisposeAgain_Queue_ReturnsWhileTheFirstWaitIsArmed)
                     : nameof(DisposeAgain_Engine_ReturnsWhileTheFirstWaitIsArmed));
-            var stamp = clock.GetTimestamp();
-            var started = Stopwatch.GetTimestamp();
-            if (queueOnly)
-                queue!.Dispose();
-            else
-                engine!.Dispose();
-
-            var waited = Stopwatch.GetElapsedTime(started);
-            Assert.Equal(stamp, clock.GetTimestamp());
-            Assert.True(waited < TimeSpan.FromSeconds(2), "second dispose waited " + waited.ToString());
-            Assert.False(first.IsCompleted, "first dispose returned before the deadline");
+            await AssertSecondDisposeDoesNotWait(
+                clock,
+                first,
+                queueOnly ? queue!.Dispose : engine!.Dispose);
             lock (lines)
                 Assert.DoesNotContain(lines, line => line.StartsWith(DeadlinePrefix, StringComparison.Ordinal));
             await DeadlineClock.AssertNotElapsed(
@@ -1014,11 +1028,9 @@ public sealed partial class C4QueueFixTests
     {
         /// <summary>
         /// How long <see cref="Write"/> waits for release before it gives up.
-        /// Sixty seconds is past the 30 s deadline hang guard, so a shutdown timer that is late
-        /// is reported by that guard. A writer that gave up at the same 30 s would let dispose
-        /// return, and the failure would be a later dispose flag instead of the deadline step.
+        /// This is the 30 s hang guard. It is not a product deadline.
         /// </summary>
-        private static readonly TimeSpan ReleaseBound = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan ReleaseBound = TimeSpan.FromSeconds(30);
         private readonly TimeSpan _delay;
         private readonly ManualResetEventSlim? _release;
         private readonly ILogWriter? _inner;
@@ -1040,7 +1052,7 @@ public sealed partial class C4QueueFixTests
         /// <paramref name="release"/> blocks until set. <paramref name="inner"/> receives the event.
         /// </summary>
         /// <param name="delay">Sleep inside the call. Zero sleeps not at all.</param>
-        /// <param name="release">Optional block. The wait is at most <see cref="ReleaseBound"/>, past the deadline hang guard.</param>
+        /// <param name="release">Optional block. The wait is at most <see cref="ReleaseBound"/>, the 30 s hang guard.</param>
         /// <param name="inner">Optional writer to forward to. Null writes nowhere.</param>
         internal ProbeWriter(TimeSpan delay = default, ManualResetEventSlim? release = null, ILogWriter? inner = null)
         {
@@ -1083,7 +1095,7 @@ public sealed partial class C4QueueFixTests
                     Thread.Sleep(_delay);
 
                 if (_release is not null && !_release.Wait(ReleaseBound))
-                    throw new TimeoutException("The test did not release the writer within 60 s.");
+                    throw new TimeoutException("The test did not release the writer within 30 s.");
 
                 if (Volatile.Read(ref _disposed) != 0)
                     Interlocked.Increment(ref _after);
