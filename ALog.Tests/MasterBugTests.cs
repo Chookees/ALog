@@ -34,10 +34,28 @@ public sealed class MasterBugTests : IDisposable
         "Read once at startup. Changes while the app runs have no effect; restart the app.";
 
     private const string BreakingLine =
-        "- Breaking (behavior): a single value where ALog expects a section (for example `\"ALog\": { \"Console\": true }`) now stops startup with an error that names the path. Before, ALog ignored it and wrote nothing.";
+        "- Breaking (behavior): a single value or a list where ALog expects a section (for example `\"ALog\": { \"Console\": true }`) now stops startup with an error that names the path. Before, ALog ignored it and wrote nothing.";
 
     private const string FixedLine =
-        "- Fixed: `ConsoleLogWriter` and `FileLogWriter` write the line even when a property's `ToString()` throws. That property shows `[capture failed: ExceptionType]`.";
+        "- Fixed: `ConsoleLogWriter` and `FileLogWriter` write the line even when the `ToString()` of a property or scope value throws. That value shows `[capture failed: ExceptionType]`.";
+
+    private const string ConsoleSingleValueMessage =
+        "Invalid ALog configuration at 'ALog:Console': expected a section with settings, but found a single value. Put the settings inside the section, as shown in the README.";
+
+    private const string FileSingleValueMessage =
+        "Invalid ALog configuration at 'ALog:File': expected a section with settings, but found a single value. Put the settings inside the section, as shown in the README.";
+
+    private const string FileListMessage =
+        "Invalid ALog configuration at 'ALog:File': expected a section with settings, but found a list. Put the settings inside the section, as shown in the README.";
+
+    private const string ConsoleListMessage =
+        "Invalid ALog configuration at 'ALog:Console': expected a section with settings, but found a list. Put the settings inside the section, as shown in the README.";
+
+    private const string ConsoleValueAndFileListMessage =
+        "Invalid ALog configuration at 'ALog:Console' (single value) and 'ALog:File' (list): expected a section with settings at each path. Put the settings inside each section, as shown in the README.";
+
+    private const string BothSingleValuesMessage =
+        "Invalid ALog configuration at 'ALog:Console' (single value) and 'ALog:File' (single value): expected a section with settings at each path. Put the settings inside each section, as shown in the README.";
 
     /// <summary>Drops a static logger left by another test so this class starts clean.</summary>
     public MasterBugTests() => Log.Shutdown();
@@ -113,8 +131,104 @@ public sealed class MasterBugTests : IDisposable
         var configuration = LoadJson("""{ "ALog": { "Console": true } }""");
         var error = Record.Exception(() => configuration.GetALogOptions());
         var actual = error is null ? "(no exception from GetALogOptions)" : error.Message;
-        Assert.Equal(ExpectedScalarMessage("ALog:Console"), actual);
+        Assert.Equal(ConsoleSingleValueMessage, actual);
         Assert.DoesNotContain("True", actual, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>AddALog(ILoggingBuilder, IConfiguration)</c> stops on <c>"Console": true</c>
+    /// with the single-value sentence. The value is not copied into the message.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task AddALog_ConsoleSingleValue_StopsStartup()
+    {
+        await Task.CompletedTask;
+        var actual = CallAddALog(LoadJson("""{ "ALog": { "Console": true } }"""));
+        Assert.Equal(ConsoleSingleValueMessage, actual);
+        Assert.DoesNotContain("True", actual, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>AddALog(ILoggingBuilder, IConfiguration)</c> stops on a string at <c>ALog:File</c>
+    /// with the single-value sentence. The connection string is not copied into the message.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task AddALog_FileSingleValue_StopsStartup()
+    {
+        await Task.CompletedTask;
+        var actual = CallAddALog(LoadJson(
+            """{ "ALog": { "File": "Server=secret-db;Password=hunter2" } }"""));
+        Assert.Equal(FileSingleValueMessage, actual);
+        Assert.DoesNotContain("hunter2", actual, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>GetALogOptions</c> stops on <c>"Console": true</c> with the same single-value sentence as <c>AddALog</c>.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task GetALogOptions_ConsoleSingleValue_StopsStartup()
+    {
+        await Task.CompletedTask;
+        var actual = CallGetALogOptions(LoadJson("""{ "ALog": { "Console": true } }"""));
+        Assert.Equal(ConsoleSingleValueMessage, actual);
+        Assert.DoesNotContain("True", actual, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>GetALogOptions</c> stops on a string at <c>ALog:File</c> with the single-value sentence.
+    /// The connection string is not copied into the message.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task GetALogOptions_FileSingleValue_StopsStartup()
+    {
+        await Task.CompletedTask;
+        var actual = CallGetALogOptions(LoadJson(
+            """{ "ALog": { "File": "Server=secret-db;Password=hunter2" } }"""));
+        Assert.Equal(FileSingleValueMessage, actual);
+        Assert.DoesNotContain("hunter2", actual, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A JSON array at <c>ALog:File</c> is a list. Both config entries stop with the list sentence.
+    /// The element text is not copied into the message.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task FileList_StopsStartup()
+    {
+        await Task.CompletedTask;
+        var configuration = LoadJson("""{ "ALog": { "File": [true] } }""");
+        Assert.Equal(FileListMessage, CallAddALog(configuration));
+        Assert.Equal(FileListMessage, CallGetALogOptions(configuration));
+        Assert.DoesNotContain("True", CallAddALog(configuration), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Console is a single value and File is a list. One exception names Console first,
+    /// with each kind in parentheses.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ConsoleSingleValueAndFileList_StopsStartupOnce()
+    {
+        await Task.CompletedTask;
+        var configuration = LoadJson("""{ "ALog": { "Console": true, "File": [true] } }""");
+        Assert.Equal(ConsoleValueAndFileListMessage, CallAddALog(configuration));
+        Assert.Equal(ConsoleValueAndFileListMessage, CallGetALogOptions(configuration));
+        Assert.DoesNotContain("True", CallAddALog(configuration), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Lowercase keys still name the canonical path <c>ALog:Console</c>.
+    /// The configuration spelling is not copied into the message.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task LowercaseConsoleKey_ReportsCanonicalPath()
+    {
+        await Task.CompletedTask;
+        var configuration = LoadJson("""{ "alog": { "console": true } }""");
+        var actual = CallAddALog(configuration);
+        Assert.Equal(ConsoleSingleValueMessage, actual);
+        Assert.Equal(ConsoleSingleValueMessage, CallGetALogOptions(configuration));
+        Assert.DoesNotContain("alog:console", actual, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -143,7 +257,7 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
-    /// A JSON array is only numeric children. Both entries stop. The element text is not in the sentence.
+    /// A JSON array is only numeric children. Both entries stop with the list sentence. The element text is not in the sentence.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task ArrayConsole_StopsStartup()
@@ -151,7 +265,7 @@ public sealed class MasterBugTests : IDisposable
         await Task.CompletedTask;
         RequireConfigEntries(
             LoadJson("""{ "ALog": { "Console": [true] } }"""),
-            ExpectedScalarMessage("ALog:Console"),
+            ConsoleListMessage,
             "True");
     }
 
@@ -183,8 +297,8 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
-    /// Console and File are both malformed. One exception names Console before File.
-    /// The provisional two-path sentence is the one constant shared with the single-path text.
+    /// Console and File are both single values. One exception names Console before File,
+    /// with each kind in parentheses.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task ConsoleAndFileScalars_StopStartupOnce()
@@ -194,7 +308,7 @@ public sealed class MasterBugTests : IDisposable
             """{ "ALog": { "Console": true, "File": "Server=secret-db;Password=hunter2" } }""");
         RequireConfigEntries(
             configuration,
-            ExpectedScalarMessage("ALog:Console", "ALog:File"),
+            BothSingleValuesMessage,
             "True",
             "hunter2");
     }
@@ -667,19 +781,41 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
-    /// The startup sentence. One path is the U-M1-01 text.
-    /// Two paths use the same sentence with Console before File.
+    /// The one-path single-value sentence.
     /// </summary>
-    /// <param name="paths">Affected paths, Console before File. One or two.</param>
+    /// <param name="path">Canonical path, <c>ALog:Console</c> or <c>ALog:File</c>.</param>
     /// <returns>The full message a caller must see. It does not contain the configuration value.</returns>
-    private static string ExpectedScalarMessage(params string[] paths)
+    private static string ExpectedScalarMessage(string path)
     {
-        var listed = paths[0];
-        if (paths.Length == 2)
-            listed = paths[0] + "', '" + paths[1];
-
-        return "Invalid ALog configuration at '" + listed
+        return "Invalid ALog configuration at '" + path
             + "': expected a section with settings, but found a single value. Put the settings inside the section, as shown in the README.";
+    }
+
+    /// <summary>
+    /// Calls <c>AddALog(ILoggingBuilder, IConfiguration)</c> and returns the exception message.
+    /// </summary>
+    /// <param name="configuration">Configuration passed to that overload. Not null.</param>
+    /// <returns>The message, or a no-exception marker.</returns>
+    private static string CallAddALog(IConfiguration configuration)
+    {
+        var error = Record.Exception(() =>
+        {
+            var services = new ServiceCollection();
+            services.AddLogging(logging => logging.AddALog(configuration));
+            using var provider = services.BuildServiceProvider();
+        });
+        return error is null ? "(no exception from AddALog)" : error.Message;
+    }
+
+    /// <summary>
+    /// Calls <c>GetALogOptions</c> and returns the exception message.
+    /// </summary>
+    /// <param name="configuration">Configuration passed to that entry. Not null.</param>
+    /// <returns>The message, or a no-exception marker.</returns>
+    private static string CallGetALogOptions(IConfiguration configuration)
+    {
+        var error = Record.Exception(() => configuration.GetALogOptions());
+        return error is null ? "(no exception from GetALogOptions)" : error.Message;
     }
 
     /// <summary>
