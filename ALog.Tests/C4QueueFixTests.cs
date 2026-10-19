@@ -445,9 +445,17 @@ public sealed partial class C4QueueFixTests
                 engine.Dispose,
                 () => engine.Queue!.DisposeWaitsStarted,
                 nameof(HangingWriter_ShutdownReturns_AndDoesNotDispose));
-            DeadlineClock.AssertNotReturnedBefore(
-                clock, dispose, BackgroundLogQueue.ShutdownDeadline, "shutdown");
-            await DeadlineClock.AssertReturnedAt(clock, dispose, BackgroundLogQueue.ShutdownDeadline, "shutdown");
+            DeadlineClock.AssertNotElapsed(
+                clock,
+                () => engine.Queue!.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
+            DeadlineClock.AssertElapsed(
+                clock,
+                () => engine.Queue!.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
+            await DeadlineClock.WaitForCompletion(dispose, "shutdown hung");
             Assert.False(writer.Disposed);
             Assert.False(engine.Queue!.ReleaseWriters);
             var report = Assert.Single(lines);
@@ -699,16 +707,17 @@ public sealed partial class C4QueueFixTests
             await DeadlineClock.WaitFor(
                 () => queue.FlushWaitsStarted >= 1,
                 nameof(Flush_BlockedWriter_ReturnsInsideShutdownDeadline_WritesNoAlog0071) + " did not arm the flush wait");
-            DeadlineClock.AssertNotReturnedBefore(
+            DeadlineClock.AssertNotElapsed(
                 clock,
-                flush,
+                () => queue.FlushDeadlineElapsed != 0,
                 BackgroundLogQueue.ShutdownDeadline,
                 "flush");
-            await DeadlineClock.AssertReturnedAt(
+            DeadlineClock.AssertElapsed(
                 clock,
-                flush,
+                () => queue.FlushDeadlineElapsed != 0,
                 BackgroundLogQueue.ShutdownDeadline,
                 "flush");
+            await DeadlineClock.WaitForCompletion(flush, "flush hung");
             lock (lines)
                 Assert.DoesNotContain(lines, line => line.Contains(DeadlinePrefix, StringComparison.Ordinal));
         }
@@ -920,8 +929,10 @@ public sealed partial class C4QueueFixTests
                 engine.Dispose,
                 () => engine.Queue!.DisposeWaitsStarted,
                 nameof(Shutdown_SlowWriter_ReportsRemainder_OtherWriter_ReportsNothing));
-            DeadlineClock.AssertNotReturnedBefore(
-                clock, dispose, BackgroundLogQueue.NewWriteBudget, "shutdown");
+            clock.Advance(BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick);
+            Assert.False(
+                dispose.IsCompleted,
+                "shutdown returned while the writer was still held");
             Assert.False(
                 engine.Queue!.NewWriterCallsBlocked,
                 DeadlineClock.EarlyFire("cutoff", BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick));
@@ -929,7 +940,7 @@ public sealed partial class C4QueueFixTests
             Assert.True(await WaitUntil(() => slow.Entered == 2, TimeSpan.FromSeconds(30)));
             Assert.False(
                 dispose.IsCompleted,
-                DeadlineClock.EarlyFire("shutdown", BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick));
+                "shutdown returned while the writer was still held");
             Assert.False(
                 engine.Queue.NewWriterCallsBlocked,
                 DeadlineClock.EarlyFire("cutoff", BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick));
@@ -939,7 +950,7 @@ public sealed partial class C4QueueFixTests
                 DeadlineClock.LateFire("cutoff", BackgroundLogQueue.NewWriteBudget));
             Assert.False(
                 dispose.IsCompleted,
-                DeadlineClock.EarlyFire("shutdown", BackgroundLogQueue.NewWriteBudget));
+                "shutdown returned while the writer was still held");
             slow.Grant(1);
             await DeadlineClock.WaitForCompletion(dispose, "slow shutdown hung");
             Assert.Equal(origin + BackgroundLogQueue.NewWriteBudget, clock.GetUtcNow());
@@ -1048,7 +1059,7 @@ public sealed partial class C4QueueFixTests
                 engine.Log("s", LogLevel.Info);
 
             dispose = await ArmDispose(engine, nameof(Shutdown_TwiceSequentialAndParallel_ThenWrite_NoException));
-            await FinishAtShutdownDeadline(clock, dispose);
+            await FinishAtShutdownDeadline(clock, engine, dispose);
             engine.Dispose();
             engine.Log("after", LogLevel.Info);
             Assert.Equal(0, slow.WritesAfterDispose);
@@ -1093,15 +1104,28 @@ public sealed partial class C4QueueFixTests
             first = Task.Run(() => engine.Dispose());
             second = Task.Run(() => engine.Dispose());
             await DeadlineClock.WaitFor(
-                () => engine.Queue!.DisposeWaitsStarted >= 1,
-                "parallel shutdown did not arm the clock wait");
-            DeadlineClock.AssertNotReturnedBefore(
-                clock, first, BackgroundLogQueue.ShutdownDeadline, "shutdown");
-            DeadlineClock.AssertStillRunning(
-                second, DeadlineClock.EarlyFire("shutdown", BackgroundLogQueue.ShutdownDeadline - DeadlineClock.Tick));
-            await DeadlineClock.AssertReturnedAt(clock, first, BackgroundLogQueue.ShutdownDeadline, "shutdown");
-            await DeadlineClock.WaitForCompletion(
-                second, DeadlineClock.LateFire("shutdown", BackgroundLogQueue.ShutdownDeadline));
+                () => engine.Queue!.DisposeWaitsStarted >= 1 && engine.SecondDisposeWaitsStarted >= 1,
+                "parallel shutdown did not arm both clock waits");
+            DeadlineClock.AssertNotElapsed(
+                clock,
+                () => engine.Queue!.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
+            DeadlineClock.AssertNotElapsedNow(
+                () => engine.SecondDisposeDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "second dispose");
+            DeadlineClock.AssertElapsed(
+                clock,
+                () => engine.Queue!.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
+            DeadlineClock.AssertElapsedNow(
+                () => engine.SecondDisposeDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "second dispose");
+            await DeadlineClock.WaitForCompletion(first, "shutdown hung");
+            await DeadlineClock.WaitForCompletion(second, "second dispose hung");
             engine.Log("after", LogLevel.Info);
             Assert.False(hanging.Disposed);
             lock (lines)
@@ -1151,20 +1175,37 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
-    /// Asserts <paramref name="dispose"/> is still running one tick before the shutdown deadline, then waits for that tick.
+    /// Asserts the shutdown flag is clear one tick before the deadline, set on that tick, then waits for dispose.
     /// </summary>
     /// <param name="clock">Clock the dispose is waiting on. Not null.</param>
+    /// <param name="engine">Engine whose queue owns the flag. Not null. The queue is not null.</param>
     /// <param name="dispose">Armed dispose. Not null.</param>
     /// <returns>A task that finishes when dispose returns.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="engine"/> has no queue.</exception>
     /// <remarks>
-    /// An early return uses <see cref="DeadlineClock.EarlyFire"/> for shutdown.
-    /// A miss at the bound uses <see cref="DeadlineClock.LateFire"/>.
-    /// Does not grant a writer. The final wait is the 30 s hang guard.
+    /// An early flag uses <see cref="DeadlineClock.EarlyFire"/> for shutdown.
+    /// A flag that is still clear at the bound uses <see cref="DeadlineClock.LateFire"/> immediately.
+    /// The final wait is the 30 s hang guard, and its message is not the late sentence.
+    /// Does not grant a writer.
     /// </remarks>
-    private static async Task FinishAtShutdownDeadline(FakeTimeProvider clock, Task dispose)
+    private static async Task FinishAtShutdownDeadline(FakeTimeProvider clock, LoggerEngine engine, Task dispose)
     {
-        DeadlineClock.AssertNotReturnedBefore(clock, dispose, BackgroundLogQueue.ShutdownDeadline, "shutdown");
-        await DeadlineClock.AssertReturnedAt(clock, dispose, BackgroundLogQueue.ShutdownDeadline, "shutdown");
+        ArgumentNullException.ThrowIfNull(engine);
+        var queue = engine.Queue;
+        if (queue is null)
+            throw new ArgumentNullException(nameof(engine), "Engine has no queue.");
+
+        DeadlineClock.AssertNotElapsed(
+            clock,
+            () => queue.ShutdownDeadlineElapsed != 0,
+            BackgroundLogQueue.ShutdownDeadline,
+            "shutdown");
+        DeadlineClock.AssertElapsed(
+            clock,
+            () => queue.ShutdownDeadlineElapsed != 0,
+            BackgroundLogQueue.ShutdownDeadline,
+            "shutdown");
+        await DeadlineClock.WaitForCompletion(dispose, "shutdown hung");
     }
 
     /// <summary>

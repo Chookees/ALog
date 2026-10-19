@@ -407,16 +407,17 @@ public sealed class SyncWriteContractTests
             Assert.False(accepted);
             Assert.Empty(writer.Events);
             Assert.True(enqueueStarted.Elapsed < TimeSpan.FromSeconds(30), "hang " + enqueueStarted.Elapsed.ToString());
-            DeadlineClock.AssertNotReturnedBefore(
+            DeadlineClock.AssertNotElapsed(
                 clock,
-                disposing,
+                () => queue.ShutdownDeadlineElapsed != 0,
                 BackgroundLogQueue.ShutdownDeadline,
                 "shutdown");
-            await DeadlineClock.AssertReturnedAt(
+            DeadlineClock.AssertElapsed(
                 clock,
-                disposing,
+                () => queue.ShutdownDeadlineElapsed != 0,
                 BackgroundLogQueue.ShutdownDeadline,
                 "shutdown");
+            await DeadlineClock.WaitForCompletion(disposing, "shutdown hung");
             Assert.False(queue.TryEnqueue(Event("after")));
             queue.Dispose();
         }

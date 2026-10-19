@@ -71,6 +71,11 @@ public class BackgroundLogQueue : IDisposable
     private int _idleWaitEntered;
     private int _disposeWaitsStarted;
     private int _flushWaitsStarted;
+    private int _shutdownDeadlineElapsed;
+    private int _flushDeadlineElapsed;
+    private int _cutoffElapsed;
+    private int _secondDisposeDeadlineElapsed;
+    private int _secondDisposeWaitsStarted;
     private int _cutoffReached;
     private long _accepted;
     private long _written;
@@ -217,6 +222,38 @@ public class BackgroundLogQueue : IDisposable
 
     /// <summary>How many flush deadlines have been registered on the clock.</summary>
     internal int FlushWaitsStarted => Volatile.Read(ref _flushWaitsStarted);
+
+    /// <summary>How many times the shutdown deadline timer has fired. Zero until that callback runs.</summary>
+    internal int ShutdownDeadlineElapsed => Volatile.Read(ref _shutdownDeadlineElapsed);
+
+    /// <summary>How many times the flush deadline timer has fired. Zero until that callback runs.</summary>
+    internal int FlushDeadlineElapsed => Volatile.Read(ref _flushDeadlineElapsed);
+
+    /// <summary>How many times the new-write cutoff timer has fired. Zero until that callback runs.</summary>
+    internal int CutoffElapsed => Volatile.Read(ref _cutoffElapsed);
+
+    /// <summary>How many times a second <see cref="Dispose"/> saw the shutdown deadline. Zero until that callback runs.</summary>
+    internal int SecondDisposeDeadlineElapsed => Volatile.Read(ref _secondDisposeDeadlineElapsed);
+
+    /// <summary>How many second <see cref="Dispose"/> waits have registered a deadline timer.</summary>
+    internal int SecondDisposeWaitsStarted => Volatile.Read(ref _secondDisposeWaitsStarted);
+
+    /// <summary>
+    /// True when elapsed time since <see cref="Dispose"/> is at least <see cref="NewWriteBudget"/>.
+    /// False before dispose records a timestamp, and false one tick before the budget.
+    /// The cutoff timer is a separate signal.
+    /// </summary>
+    internal bool NewWriteBudgetComparisonSpent
+    {
+        get
+        {
+            var start = Volatile.Read(ref _disposeStartTimestamp);
+            if (start == 0)
+                return false;
+
+            return ElapsedPastNewWriteBudget(start);
+        }
+    }
 
     /// <summary>
     /// True when a new writer call must not start.
@@ -629,12 +666,19 @@ public class BackgroundLogQueue : IDisposable
         if (Volatile.Read(ref _cutoffReached) != 0)
             return true;
 
-        var start = Volatile.Read(ref _disposeStartTimestamp);
-        if (start == 0)
-            return false;
-
-        return _clock.GetElapsedTime(start) >= NewWriteBudget;
+        return NewWriteBudgetComparisonSpent;
     }
+
+    /// <summary>
+    /// True when <paramref name="start"/> is at least <see cref="NewWriteBudget"/> ago on the injected clock.
+    /// </summary>
+    /// <param name="start">Provider timestamp taken when dispose closed the gate. Not zero.</param>
+    /// <returns>True at the budget and after it. False one tick before it.</returns>
+    /// <remarks>
+    /// Does not throw. This is the only elapsed comparison. The cutoff timer does not change the result.
+    /// </remarks>
+    private bool ElapsedPastNewWriteBudget(long start)
+        => _clock.GetElapsedTime(start) >= NewWriteBudget;
 
     /// <summary>
     /// Hands one event to every writer. A writer failure stays on the dispatcher error path.
@@ -848,8 +892,8 @@ public class BackgroundLogQueue : IDisposable
         var deadline = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         // The timer keeps a one-tick remainder. A millisecond-truncated delay would fire that tick early.
         using var timer = _clock.CreateTimer(
-            static state => ((TaskCompletionSource<bool>)state!).TrySetResult(true),
-            deadline,
+            _ => CompleteFlushDeadline(deadline),
+            null,
             ShutdownDeadline,
             Timeout.InfiniteTimeSpan);
         Interlocked.Increment(ref _flushWaitsStarted);
@@ -865,6 +909,20 @@ public class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
+    /// Records the flush deadline, then releases the flush wait.
+    /// </summary>
+    /// <param name="signal">The deadline task. Not null. Completed here.</param>
+    /// <remarks>
+    /// Does not throw. Called on the clock callback before the flush continuation runs.
+    /// The count is visible to the thread that advanced the clock before this callback returns.
+    /// </remarks>
+    private void CompleteFlushDeadline(TaskCompletionSource<bool> signal)
+    {
+        Interlocked.Increment(ref _flushDeadlineElapsed);
+        signal.TrySetResult(true);
+    }
+
+    /// <summary>
     /// Closes the queue, drains until the deadline, and reports events that were still queued.
     /// A second call waits until the first call has finished and does not report again.
     /// </summary>
@@ -877,8 +935,12 @@ public class BackgroundLogQueue : IDisposable
     {
         if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
         {
-            // The first Dispose owns the deadline. This wait ends when that call finishes or the same bound passes.
-            WaitUntilSignaledOrDeadline(_clock, _disposeDone);
+            // The first Dispose owns the outcome. This wait ends when that call finishes or the same bound passes.
+            WaitUntilSignaledOrDeadline(
+                _clock,
+                _disposeDone,
+                MarkSecondDisposeDeadline,
+                ref _secondDisposeWaitsStarted);
             return;
         }
 
@@ -931,7 +993,7 @@ public class BackgroundLogQueue : IDisposable
             this,
             NewWriteBudget,
             Timeout.InfiniteTimeSpan);
-        WaitUntilSignaledOrDeadline(_clock, _stopped, ref _disposeWaitsStarted);
+        WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, ref _disposeWaitsStarted);
     }
 
     /// <summary>
@@ -961,7 +1023,32 @@ public class BackgroundLogQueue : IDisposable
         if (state is not BackgroundLogQueue queue)
             throw new ArgumentException("Cutoff timer is missing the queue.", nameof(state));
 
+        Interlocked.Increment(ref queue._cutoffElapsed);
         queue.ApplyNewWriteCutoff();
+    }
+
+    /// <summary>
+    /// Records that the shutdown deadline timer fired.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Called on the clock callback before the waiter is released.
+    /// The count is visible to the thread that advanced the clock before this callback returns.
+    /// </remarks>
+    private void MarkShutdownDeadline()
+    {
+        Interlocked.Increment(ref _shutdownDeadlineElapsed);
+    }
+
+    /// <summary>
+    /// Records that a second <see cref="Dispose"/> reached the shutdown deadline.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Called on the clock callback before that wait is released.
+    /// The count is visible to the thread that advanced the clock before this callback returns.
+    /// </remarks>
+    private void MarkSecondDisposeDeadline()
+    {
+        Interlocked.Increment(ref _secondDisposeDeadlineElapsed);
     }
 
     /// <summary>
@@ -969,57 +1056,96 @@ public class BackgroundLogQueue : IDisposable
     /// </summary>
     /// <param name="clock">Clock that owns the deadline. Not null.</param>
     /// <param name="signaled">Set by the work this wait is joining. Not null. Not disposed by this method.</param>
-    /// <remarks>
-    /// Does not throw except for a null argument. The timer is the bound. There is no separate wall-clock timeout,
-    /// because that would release a frozen test clock. Does not capture a caller context.
-    /// </remarks>
-    internal static void WaitUntilSignaledOrDeadline(TimeProvider clock, ManualResetEventSlim signaled)
-    {
-        var unused = 0;
-        WaitUntilSignaledOrDeadline(clock, signaled, ref unused);
-    }
-
-    /// <summary>
-    /// Blocks until <paramref name="signaled"/> is set or the shutdown deadline elapses, then counts the registered wait.
-    /// </summary>
-    /// <param name="clock">Clock that owns the deadline. Not null.</param>
-    /// <param name="signaled">Set by the work this wait is joining. Not null.</param>
+    /// <param name="onDeadline">Runs on the clock callback when the deadline elapses, before the waiter is released. Not null.</param>
     /// <param name="armedCount">Incremented after the deadline timer is registered. Not incremented when the signal is already set.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="clock"/> or <paramref name="signaled"/> is null.</exception>
+    /// <exception cref="ArgumentNullException"><paramref name="clock"/>, <paramref name="signaled"/>, or <paramref name="onDeadline"/> is null.</exception>
     /// <exception cref="InvalidOperationException">The wait ended without the signal or the deadline.</exception>
     /// <remarks>
     /// Does not capture a caller context. The timer is disposed before this returns.
-    /// A signal that is already set returns without a timer.
+    /// A signal that is already set returns without a timer. There is no wall-clock timeout,
+    /// because that would release a frozen test clock.
     /// </remarks>
-    private static void WaitUntilSignaledOrDeadline(TimeProvider clock, ManualResetEventSlim signaled, ref int armedCount)
+    internal static void WaitUntilSignaledOrDeadline(
+        TimeProvider clock,
+        ManualResetEventSlim signaled,
+        Action onDeadline,
+        ref int armedCount)
     {
         ArgumentNullException.ThrowIfNull(clock);
         ArgumentNullException.ThrowIfNull(signaled);
+        ArgumentNullException.ThrowIfNull(onDeadline);
         if (signaled.IsSet)
             return;
 
         using var wake = new ManualResetEventSlim(false);
-        using var timer = clock.CreateTimer(SignalWake, wake, ShutdownDeadline, Timeout.InfiniteTimeSpan);
+        var gate = new DeadlineGate(onDeadline);
+        var started = clock.GetTimestamp();
+        // One due value. The timer and the keep-alive check below both use it.
+        var due = ShutdownDeadline;
+        using var timer = clock.CreateTimer(
+            _ => SignalDeadline(wake, gate.Fire),
+            null,
+            due,
+            Timeout.InfiniteTimeSpan);
         Interlocked.Increment(ref armedCount);
         var which = WaitHandle.WaitAny(new WaitHandle[] { signaled.WaitHandle, wake.WaitHandle });
         if ((uint)which > 1u)
             throw new InvalidOperationException("Shutdown wait ended without the processor or the deadline.");
+
+        // The signal can win while Advance is still firing another timer that was due on the same tick.
+        // Disposing this timer then skips its callback, so the deadline is recorded here first.
+        // The reading uses the same due value as the timer. A clock that is not due yet does not record it.
+        if (!gate.HasFired && clock.GetElapsedTime(started) >= due)
+            gate.Fire();
     }
 
     /// <summary>
-    /// Sets the handle the shutdown wait is blocked on.
+    /// Records one deadline callback. The flag is stored before the caller's action runs.
     /// </summary>
-    /// <param name="state">The handle. Not null.</param>
-    /// <exception cref="ArgumentException"><paramref name="state"/> is not a handle.</exception>
+    private sealed class DeadlineGate
+    {
+        private readonly Action _onDeadline;
+        private int _fired;
+
+        /// <summary>
+        /// Stores the action the timer runs when the deadline elapses.
+        /// </summary>
+        /// <param name="onDeadline">Not null. The caller already checked.</param>
+        /// <remarks>Does not throw. Does not run <paramref name="onDeadline"/>.</remarks>
+        internal DeadlineGate(Action onDeadline)
+        {
+            _onDeadline = onDeadline;
+        }
+
+        /// <summary>True after <see cref="Fire"/> has stored the flag.</summary>
+        internal bool HasFired => Volatile.Read(ref _fired) != 0;
+
+        /// <summary>
+        /// Stores the flag, then runs the deadline action.
+        /// </summary>
+        /// <remarks>
+        /// Does not throw unless the action throws. Safe to call from the clock callback.
+        /// A second call still runs the action. The flag stays set.
+        /// </remarks>
+        internal void Fire()
+        {
+            Volatile.Write(ref _fired, 1);
+            _onDeadline();
+        }
+    }
+
+    /// <summary>
+    /// Records the deadline, then sets the handle the shutdown wait is blocked on.
+    /// </summary>
+    /// <param name="wake">The handle. Not null. May already be disposed when the wait has finished.</param>
+    /// <param name="onDeadline">Records the deadline. Not null. Runs before <paramref name="wake"/> is set.</param>
     /// <remarks>
     /// Does not throw when the handle was already disposed. The wait has already finished in that case.
     /// Called from the clock callback.
     /// </remarks>
-    private static void SignalWake(object? state)
+    private static void SignalDeadline(ManualResetEventSlim wake, Action onDeadline)
     {
-        if (state is not ManualResetEventSlim wake)
-            throw new ArgumentException("Shutdown wake handle is missing.", nameof(state));
-
+        onDeadline();
         try
         {
             wake.Set();

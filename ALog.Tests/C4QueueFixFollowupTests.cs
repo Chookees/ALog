@@ -224,7 +224,7 @@ public sealed partial class C4QueueFixTests
 
             Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(30)));
             dispose = await ArmDispose(engine, nameof(Deadline_DisposesHealthyWriters_NotTheHangingCall));
-            await FinishAtShutdownDeadline(clock, dispose);
+            await FinishAtShutdownDeadline(clock, engine, dispose);
             Assert.False(hang.Disposed);
             Assert.False(hang.DisposeOverlappedWrite);
             Assert.True(front.Disposed);
@@ -318,7 +318,7 @@ public sealed partial class C4QueueFixTests
 
             Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(30)));
             dispose = await ArmDispose(engine, nameof(DuplicateWriter_IsNotDisposedWhileACallIsRunning));
-            await FinishAtShutdownDeadline(clock, dispose);
+            await FinishAtShutdownDeadline(clock, engine, dispose);
             Assert.False(writer.DisposeOverlappedWrite);
             Assert.False(writer.Disposed);
             Assert.Equal(0, writer.DisposeCount);
@@ -371,7 +371,7 @@ public sealed partial class C4QueueFixTests
             engine.Log("slow", LogLevel.Info);
             Assert.True(slow.Entered.Wait(TimeSpan.FromSeconds(30)));
             dispose = await ArmDispose(engine, nameof(SlowCall_IsDisposedOnlyAfterItReturns));
-            await FinishAtShutdownDeadline(clock, dispose);
+            await FinishAtShutdownDeadline(clock, engine, dispose);
             Assert.False(slow.Disposed);
             Assert.False(slow.DisposeOverlappedWrite);
             release.Set();
@@ -538,19 +538,42 @@ public sealed partial class C4QueueFixTests
                 () => queue.DisposeWaitsStarted,
                 nameof(Shutdown_TwiceAndParallel_ReportsOpenWindowOnce));
             if (parallel)
-                second = Task.Run(() => queue.Dispose());
-
-            DeadlineClock.AssertNotReturnedBefore(
-                clock, first, BackgroundLogQueue.ShutdownDeadline, "shutdown");
-            if (second is not null)
             {
-                DeadlineClock.AssertStillRunning(
-                    second, DeadlineClock.EarlyFire("shutdown", BackgroundLogQueue.ShutdownDeadline - DeadlineClock.Tick));
+                second = Task.Run(() => queue.Dispose());
+                await DeadlineClock.WaitFor(
+                    () => queue.SecondDisposeWaitsStarted >= 1,
+                    "parallel shutdown did not arm the second dispose wait");
             }
 
-            await DeadlineClock.AssertReturnedAt(clock, first, BackgroundLogQueue.ShutdownDeadline, "shutdown");
+            DeadlineClock.AssertNotElapsed(
+                clock,
+                () => queue.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
             if (second is not null)
-                await DeadlineClock.WaitForCompletion(second, DeadlineClock.LateFire("shutdown", BackgroundLogQueue.ShutdownDeadline));
+            {
+                DeadlineClock.AssertNotElapsedNow(
+                    () => queue.SecondDisposeDeadlineElapsed != 0,
+                    BackgroundLogQueue.ShutdownDeadline,
+                    "second dispose");
+            }
+
+            DeadlineClock.AssertElapsed(
+                clock,
+                () => queue.ShutdownDeadlineElapsed != 0,
+                BackgroundLogQueue.ShutdownDeadline,
+                "shutdown");
+            if (second is not null)
+            {
+                DeadlineClock.AssertElapsedNow(
+                    () => queue.SecondDisposeDeadlineElapsed != 0,
+                    BackgroundLogQueue.ShutdownDeadline,
+                    "second dispose");
+            }
+
+            await DeadlineClock.WaitForCompletion(first, "shutdown hung");
+            if (second is not null)
+                await DeadlineClock.WaitForCompletion(second, "second dispose hung");
             else
                 queue.Dispose();
         }
@@ -559,6 +582,323 @@ public sealed partial class C4QueueFixTests
             await ReleaseDispose(clock, first);
             await ReleaseDispose(clock, second);
         }
+    }
+
+    /// <summary>
+    /// The cutoff timer flag stays clear one tick before <see cref="BackgroundLogQueue.NewWriteBudget"/> and is set on that tick.
+    /// The elapsed comparison is not read here.
+    /// </summary>
+    /// <returns>A task that finishes after the writer is released.</returns>
+    /// <remarks>
+    /// The flag is set on the thread that advances the clock. A late timer fails before the 30 s hang guard.
+    /// The writer stays blocked until the flag checks have finished. Not thread-safe.
+    /// </remarks>
+    [Fact(Timeout = 90000)]
+    public async Task CutoffTimer_StaysClearUntilNewWriteBudget()
+    {
+        DeadlineClock.AssertValues();
+        var clock = DeadlineClock.Create();
+        var writer = new BlockingWriter();
+        var queue = QueueOnClock(writer, clock);
+        Task? dispose = null;
+        try
+        {
+            Assert.True(queue.TryEnqueue(Event("held")));
+            await DeadlineClock.WaitFor(() => writer.EnteredCount > 0, "processor never entered the blocked writer");
+            dispose = await DeadlineClock.RunUntilArmed(
+                queue.Dispose,
+                () => queue.DisposeWaitsStarted,
+                nameof(CutoffTimer_StaysClearUntilNewWriteBudget));
+            DeadlineClock.AssertNotElapsed(
+                clock,
+                () => queue.CutoffElapsed != 0,
+                BackgroundLogQueue.NewWriteBudget,
+                "cutoff");
+            DeadlineClock.AssertElapsed(
+                clock,
+                () => queue.CutoffElapsed != 0,
+                BackgroundLogQueue.NewWriteBudget,
+                "cutoff");
+        }
+        finally
+        {
+            writer.Release();
+            await ReleaseDispose(clock, dispose);
+        }
+    }
+
+    /// <summary>
+    /// A new write is still accepted one tick before <see cref="BackgroundLogQueue.NewWriteBudget"/> and blocked on that tick.
+    /// The cutoff timer is not read here.
+    /// </summary>
+    /// <returns>A task that finishes after the writer is released.</returns>
+    /// <remarks>
+    /// The check is the shared elapsed comparison. A timer that fires early does not change this result one tick before the budget.
+    /// Not thread-safe. Only the test thread calls it.
+    /// </remarks>
+    [Fact(Timeout = 90000)]
+    public async Task NewWriteBudget_Comparison_BlocksAtTheBound()
+    {
+        DeadlineClock.AssertValues();
+        var clock = DeadlineClock.Create();
+        var writer = new BlockingWriter();
+        var queue = QueueOnClock(writer, clock);
+        Task? dispose = null;
+        try
+        {
+            Assert.False(queue.NewWriteBudgetComparisonSpent);
+            Assert.True(queue.TryEnqueue(Event("held")));
+            await DeadlineClock.WaitFor(() => writer.EnteredCount > 0, "processor never entered the blocked writer");
+            dispose = await DeadlineClock.RunUntilArmed(
+                queue.Dispose,
+                () => queue.DisposeWaitsStarted,
+                nameof(NewWriteBudget_Comparison_BlocksAtTheBound));
+            var early = BackgroundLogQueue.NewWriteBudget - DeadlineClock.Tick;
+            clock.Advance(early);
+            if (queue.NewWriteBudgetComparisonSpent)
+                Assert.Fail(DeadlineClock.ComparisonEarly(early));
+
+            clock.Advance(DeadlineClock.Tick);
+            if (!queue.NewWriteBudgetComparisonSpent)
+                Assert.Fail(DeadlineClock.ComparisonLate(BackgroundLogQueue.NewWriteBudget));
+        }
+        finally
+        {
+            writer.Release();
+            await ReleaseDispose(clock, dispose);
+        }
+    }
+
+    /// <summary>
+    /// A second queue <see cref="BackgroundLogQueue.Dispose"/> stops at <see cref="BackgroundLogQueue.ShutdownDeadline"/>
+    /// and not one tick earlier. It does not wait on the wall clock.
+    /// </summary>
+    /// <returns>A task that finishes after both calls return.</returns>
+    /// <remarks>
+    /// The writer stays blocked so the first call is still waiting when the second registers its timer.
+    /// The late check is the flag, and it fails before the 30 s hang guard. Not thread-safe.
+    /// </remarks>
+    [Fact(Timeout = 90000)]
+    public async Task DisposeAgain_Queue_StopsAtShutdownDeadline()
+    {
+        DeadlineClock.AssertValues();
+        var clock = DeadlineClock.Create();
+        var writer = new BlockingWriter();
+        var queue = QueueOnClock(writer, clock);
+        Task? first = null;
+        Task? second = null;
+        try
+        {
+            Assert.True(queue.TryEnqueue(Event("held")));
+            await DeadlineClock.WaitFor(() => writer.EnteredCount > 0, "processor never entered the blocked writer");
+            first = await DeadlineClock.RunUntilArmed(
+                queue.Dispose,
+                () => queue.DisposeWaitsStarted,
+                nameof(DisposeAgain_Queue_StopsAtShutdownDeadline));
+            second = Task.Run(() => queue.Dispose());
+            await DeadlineClock.WaitFor(
+                () => queue.SecondDisposeWaitsStarted >= 1,
+                nameof(DisposeAgain_Queue_StopsAtShutdownDeadline) + " did not arm the second dispose wait");
+            AssertBothClearThenSet(
+                clock,
+                () => queue.ShutdownDeadlineElapsed != 0,
+                () => queue.SecondDisposeDeadlineElapsed != 0);
+            await DeadlineClock.WaitForCompletion(first, "shutdown hung");
+            await DeadlineClock.WaitForCompletion(second, "second dispose hung");
+        }
+        finally
+        {
+            writer.Release();
+            await ReleaseDispose(clock, first);
+            await ReleaseDispose(clock, second);
+        }
+    }
+
+    /// <summary>
+    /// A second engine <see cref="LoggerEngine.Dispose"/> stops at <see cref="BackgroundLogQueue.ShutdownDeadline"/>
+    /// and not one tick earlier. It does not wait on the wall clock.
+    /// </summary>
+    /// <returns>A task that finishes after both calls return.</returns>
+    /// <remarks>
+    /// The writer stays blocked so the first call is still inside the queue when the second registers its timer.
+    /// The late check is the engine flag, and it fails before the 30 s hang guard. Not thread-safe.
+    /// </remarks>
+    [Fact(Timeout = 90000)]
+    public async Task DisposeAgain_Engine_StopsAtShutdownDeadline()
+    {
+        DeadlineClock.AssertValues();
+        var clock = DeadlineClock.Create();
+        var writer = new BlockingWriter();
+        var engine = EngineOnClock(writer, 4, 1, clock);
+        Task? first = null;
+        Task? second = null;
+        try
+        {
+            engine.Log("held", LogLevel.Info);
+            await DeadlineClock.WaitFor(() => writer.EnteredCount > 0, "processor never entered the blocked writer");
+            first = Task.Run(() => engine.Dispose());
+            second = Task.Run(() => engine.Dispose());
+            await DeadlineClock.WaitFor(
+                () => engine.Queue!.DisposeWaitsStarted >= 1 && engine.SecondDisposeWaitsStarted >= 1,
+                nameof(DisposeAgain_Engine_StopsAtShutdownDeadline) + " did not arm both clock waits");
+            AssertBothClearThenSet(
+                clock,
+                () => engine.Queue!.ShutdownDeadlineElapsed != 0,
+                () => engine.SecondDisposeDeadlineElapsed != 0);
+            await DeadlineClock.WaitForCompletion(first, "shutdown hung");
+            await DeadlineClock.WaitForCompletion(second, "second dispose hung");
+        }
+        finally
+        {
+            writer.Release();
+            await ReleaseDispose(clock, first);
+            await ReleaseDispose(clock, second);
+        }
+    }
+
+    /// <summary>
+    /// The shutdown wait rejects a null clock, signal, or deadline callback, and does not arm a timer.
+    /// </summary>
+    [Fact]
+    public void ShutdownWait_RejectsNullArguments()
+    {
+        using var signaled = new ManualResetEventSlim(false);
+        var clock = DeadlineClock.Create();
+        var armed = 0;
+        Assert.Throws<ArgumentNullException>(() =>
+            BackgroundLogQueue.WaitUntilSignaledOrDeadline(null!, signaled, static () => { }, ref armed));
+        Assert.Throws<ArgumentNullException>(() =>
+            BackgroundLogQueue.WaitUntilSignaledOrDeadline(clock, null!, static () => { }, ref armed));
+        Assert.Throws<ArgumentNullException>(() =>
+            BackgroundLogQueue.WaitUntilSignaledOrDeadline(clock, signaled, null!, ref armed));
+        Assert.Equal(0, armed);
+    }
+
+    /// <summary>
+    /// A signal that is already set returns without registering a deadline timer.
+    /// </summary>
+    [Fact]
+    public void ShutdownWait_ReturnsWhenAlreadySignaled()
+    {
+        using var signaled = new ManualResetEventSlim(true);
+        var clock = DeadlineClock.Create();
+        var armed = 0;
+        var fired = 0;
+        BackgroundLogQueue.WaitUntilSignaledOrDeadline(clock, signaled, () => fired++, ref armed);
+        Assert.Equal(0, armed);
+        Assert.Equal(0, fired);
+    }
+
+    /// <summary>
+    /// A signal that wins on the deadline tick still records the deadline when the timer callback has not run.
+    /// </summary>
+    /// <returns>A task that finishes when the wait returns.</returns>
+    /// <remarks>
+    /// The clock does not run the callback. The product records the deadline from the same due value as the timer.
+    /// Not thread-safe. Only the test thread moves the clock.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ShutdownWait_RecordsTheDeadlineWhenTheSignalWinsOnTheBound()
+    {
+        using var signaled = new ManualResetEventSlim(false);
+        var clock = new ManualClock();
+        var fired = 0;
+        var armed = 0;
+        var wait = Task.Run(() =>
+            BackgroundLogQueue.WaitUntilSignaledOrDeadline(
+                clock,
+                signaled,
+                () => Interlocked.Increment(ref fired),
+                ref armed));
+        await DeadlineClock.WaitFor(
+            () => Volatile.Read(ref armed) >= 1,
+            nameof(ShutdownWait_RecordsTheDeadlineWhenTheSignalWinsOnTheBound) + " did not arm");
+        clock.SetElapsed(BackgroundLogQueue.ShutdownDeadline);
+        signaled.Set();
+        await DeadlineClock.WaitForCompletion(wait, "shutdown wait hung");
+        Assert.Equal(1, Volatile.Read(ref fired));
+        Assert.Equal(0, clock.CallbackRuns);
+    }
+
+    /// <summary>
+    /// A callback that arrives after the wait has returned does not escape a disposed wake handle.
+    /// </summary>
+    /// <returns>A task that finishes after the callback.</returns>
+    /// <remarks>
+    /// The signal wins before the deadline, so the wait does not record it. The callback then runs on a disposed handle.
+    /// Not thread-safe. Only the test thread invokes the callback.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ShutdownWait_CallbackAfterTheWaitReturnedDoesNotThrow()
+    {
+        using var signaled = new ManualResetEventSlim(false);
+        var clock = new ManualClock();
+        var fired = 0;
+        var armed = 0;
+        var wait = Task.Run(() =>
+            BackgroundLogQueue.WaitUntilSignaledOrDeadline(
+                clock,
+                signaled,
+                () => Interlocked.Increment(ref fired),
+                ref armed));
+        await DeadlineClock.WaitFor(
+            () => Volatile.Read(ref armed) >= 1,
+            nameof(ShutdownWait_CallbackAfterTheWaitReturnedDoesNotThrow) + " did not arm");
+        signaled.Set();
+        await DeadlineClock.WaitForCompletion(wait, "shutdown wait hung");
+        Assert.Equal(0, Volatile.Read(ref fired));
+        clock.InvokeCallback();
+        Assert.Equal(1, Volatile.Read(ref fired));
+        Assert.Equal(1, clock.CallbackRuns);
+    }
+
+    /// <summary>
+    /// Builds a queue whose flush interval cannot tick during one deadline step.
+    /// </summary>
+    /// <param name="writer">The only writer. Not null. Not disposed here.</param>
+    /// <param name="clock">Clock for shutdown, flush, and the cutoff. Not null.</param>
+    /// <returns>An open queue.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="writer"/> or <paramref name="clock"/> is null.</exception>
+    /// <remarks>Does not throw otherwise. Synchronous writes. The caller disposes the queue.</remarks>
+    private static BackgroundLogQueue QueueOnClock(BlockingWriter writer, FakeTimeProvider clock)
+    {
+        ArgumentNullException.ThrowIfNull(writer);
+        ArgumentNullException.ThrowIfNull(clock);
+        return new BackgroundLogQueue(
+            new ILogWriter[] { writer },
+            new BackgroundLogQueue.QueueSettings(4, 1, TimeSpan.FromHours(1), false, clock));
+    }
+
+    /// <summary>
+    /// Checks the shutdown flag and the second-dispose flag around one deadline step.
+    /// </summary>
+    /// <param name="clock">Clock both waits share. Not null. Not yet advanced.</param>
+    /// <param name="shutdownElapsed">The first dispose deadline flag. Not null.</param>
+    /// <param name="againElapsed">The second dispose deadline flag. Not null.</param>
+    /// <remarks>
+    /// One advance lands on the deadline. Both flags are read after that advance returns.
+    /// A miss fails with <see cref="DeadlineClock.LateFire"/> before any hang guard.
+    /// </remarks>
+    private static void AssertBothClearThenSet(FakeTimeProvider clock, Func<bool> shutdownElapsed, Func<bool> againElapsed)
+    {
+        DeadlineClock.AssertNotElapsed(
+            clock,
+            shutdownElapsed,
+            BackgroundLogQueue.ShutdownDeadline,
+            "shutdown");
+        DeadlineClock.AssertNotElapsedNow(
+            againElapsed,
+            BackgroundLogQueue.ShutdownDeadline,
+            "second dispose");
+        DeadlineClock.AssertElapsed(
+            clock,
+            shutdownElapsed,
+            BackgroundLogQueue.ShutdownDeadline,
+            "shutdown");
+        DeadlineClock.AssertElapsedNow(
+            againElapsed,
+            BackgroundLogQueue.ShutdownDeadline,
+            "second dispose");
     }
 
     /// <summary>
@@ -590,6 +930,101 @@ public sealed partial class C4QueueFixTests
         Assert.NotNull(field);
         var handle = Assert.IsType<ManualResetEventSlim>(field.GetValue(queue));
         return handle.IsSet;
+    }
+
+    /// <summary>
+    /// A clock whose time moves only when the test says so, and whose timer callback runs only when the test invokes it.
+    /// </summary>
+    private sealed class ManualClock : TimeProvider
+    {
+        private readonly object _gate = new();
+        private long _stamp;
+        private TimerCallback? _callback;
+        private object? _state;
+        private int _callbackRuns;
+
+        /// <summary>Stamps are <see cref="TimeSpan"/> ticks.</summary>
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        /// <summary>The stamp last stored by <see cref="SetElapsed"/>.</summary>
+        /// <returns>The current stamp. Zero until <see cref="SetElapsed"/>.</returns>
+        public override long GetTimestamp() => Volatile.Read(ref _stamp);
+
+        /// <summary>How many times <see cref="InvokeCallback"/> has run the stored callback.</summary>
+        internal int CallbackRuns => Volatile.Read(ref _callbackRuns);
+
+        /// <summary>
+        /// Moves the clock to <paramref name="elapsed"/> from zero. Does not run a callback.
+        /// </summary>
+        /// <param name="elapsed">Time since the clock started. Not negative.</param>
+        internal void SetElapsed(TimeSpan elapsed)
+        {
+            if (elapsed < TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException(nameof(elapsed), elapsed, "Elapsed time cannot be negative.");
+
+            Volatile.Write(ref _stamp, elapsed.Ticks);
+        }
+
+        /// <summary>
+        /// Runs the callback stored by <see cref="CreateTimer"/>.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">No timer has been registered.</exception>
+        internal void InvokeCallback()
+        {
+            TimerCallback callback;
+            object? state;
+            lock (_gate)
+            {
+                if (_callback is null)
+                    throw new InvalidOperationException("No timer was registered.");
+
+                callback = _callback;
+                state = _state;
+            }
+
+            Interlocked.Increment(ref _callbackRuns);
+            callback(state);
+        }
+
+        /// <summary>
+        /// Stores the callback and returns a timer that does not fire by itself.
+        /// </summary>
+        /// <param name="callback">Stored and later passed to <see cref="InvokeCallback"/>. Not null.</param>
+        /// <param name="state">Passed back to <paramref name="callback"/>.</param>
+        /// <param name="dueTime">Ignored. The test moves time with <see cref="SetElapsed"/>.</param>
+        /// <param name="period">Ignored. The timer does not repeat.</param>
+        /// <returns>A timer whose <see cref="ITimer.Change"/> reports success and whose dispose does nothing.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="callback"/> is null.</exception>
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            ArgumentNullException.ThrowIfNull(callback);
+            lock (_gate)
+            {
+                _callback = callback;
+                _state = state;
+            }
+
+            return new IdleTimer();
+        }
+
+        /// <summary>A timer that never fires and has nothing to dispose.</summary>
+        private sealed class IdleTimer : ITimer
+        {
+            /// <summary>Accepts a new due time and does not schedule it.</summary>
+            /// <param name="dueTime">Ignored.</param>
+            /// <param name="period">Ignored.</param>
+            /// <returns>True. The product does not call this.</returns>
+            public bool Change(TimeSpan dueTime, TimeSpan period) => true;
+
+            /// <summary>Does nothing.</summary>
+            public void Dispose()
+            {
+            }
+
+            /// <summary>Does nothing.</summary>
+            /// <returns>A completed task.</returns>
+            public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
     }
 
     /// <summary>

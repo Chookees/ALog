@@ -19,6 +19,8 @@ public class LoggerEngine : ILogger, IDisposable
     private readonly TimeProvider _clock;
     private readonly ManualResetEventSlim _disposeDone = new(false);
     private int _disposeOnce;
+    private int _secondDisposeDeadlineElapsed;
+    private int _secondDisposeWaitsStarted;
 
     /// <summary>
     /// Builds the engine on <see cref="TimeProvider.System"/>.
@@ -366,6 +368,12 @@ public class LoggerEngine : ILogger, IDisposable
     /// </summary>
     internal BackgroundLogQueue? Queue => _backgroundQueue;
 
+    /// <summary>How many times a second <see cref="Dispose"/> saw the shutdown deadline. Zero until that callback runs.</summary>
+    internal int SecondDisposeDeadlineElapsed => Volatile.Read(ref _secondDisposeDeadlineElapsed);
+
+    /// <summary>How many second <see cref="Dispose"/> waits have registered a deadline timer.</summary>
+    internal int SecondDisposeWaitsStarted => Volatile.Read(ref _secondDisposeWaitsStarted);
+
     public async Task FlushAsync()
     {
         if (_backgroundQueue != null)
@@ -388,8 +396,12 @@ public class LoggerEngine : ILogger, IDisposable
     {
         if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
         {
-            // Same bound as the queue. The timer is the only timeout, so a frozen test clock stays blocked.
-            BackgroundLogQueue.WaitUntilSignaledOrDeadline(_clock, _disposeDone);
+            // Same bound as the queue. The callback records the deadline before this wait returns.
+            BackgroundLogQueue.WaitUntilSignaledOrDeadline(
+                _clock,
+                _disposeDone,
+                MarkSecondDisposeDeadline,
+                ref _secondDisposeWaitsStarted);
             return;
         }
 
@@ -407,6 +419,18 @@ public class LoggerEngine : ILogger, IDisposable
         {
             _disposeDone.Set();
         }
+    }
+
+    /// <summary>
+    /// Records that a second <see cref="Dispose"/> reached the shutdown deadline.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Called on the clock callback before that wait is released.
+    /// The count is visible to the thread that advanced the clock before this callback returns.
+    /// </remarks>
+    private void MarkSecondDisposeDeadline()
+    {
+        Interlocked.Increment(ref _secondDisposeDeadlineElapsed);
     }
 
     /// <summary>
