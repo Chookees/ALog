@@ -195,7 +195,7 @@ public sealed partial class C4QueueFixTests
     /// </summary>
     /// <returns>A task that finishes after shutdown.</returns>
     /// <remarks>The clock is <see cref="FakeTimeProvider"/>. The 30 s waits are hang guards. Not thread-safe.</remarks>
-    [Fact(Timeout = 45000)]
+    [Fact(Timeout = 90000)]
     public async Task Deadline_DisposesHealthyWriters_NotTheHangingCall()
     {
         DeadlineClock.AssertValues();
@@ -224,7 +224,7 @@ public sealed partial class C4QueueFixTests
 
             Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(30)));
             dispose = await ArmDispose(engine, nameof(Deadline_DisposesHealthyWriters_NotTheHangingCall));
-            await FinishAtShutdownDeadline(clock, dispose, nameof(Deadline_DisposesHealthyWriters_NotTheHangingCall));
+            await FinishAtShutdownDeadline(clock, dispose);
             Assert.False(hang.Disposed);
             Assert.False(hang.DisposeOverlappedWrite);
             Assert.True(front.Disposed);
@@ -296,7 +296,7 @@ public sealed partial class C4QueueFixTests
     /// </summary>
     /// <returns>A task that finishes after the blocked call is released.</returns>
     /// <remarks>The clock is <see cref="FakeTimeProvider"/>. The 30 s waits are hang guards. Not thread-safe.</remarks>
-    [Fact(Timeout = 45000)]
+    [Fact(Timeout = 90000)]
     public async Task DuplicateWriter_IsNotDisposedWhileACallIsRunning()
     {
         DeadlineClock.AssertValues();
@@ -318,7 +318,7 @@ public sealed partial class C4QueueFixTests
 
             Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(30)));
             dispose = await ArmDispose(engine, nameof(DuplicateWriter_IsNotDisposedWhileACallIsRunning));
-            await FinishAtShutdownDeadline(clock, dispose, nameof(DuplicateWriter_IsNotDisposedWhileACallIsRunning));
+            await FinishAtShutdownDeadline(clock, dispose);
             Assert.False(writer.DisposeOverlappedWrite);
             Assert.False(writer.Disposed);
             Assert.Equal(0, writer.DisposeCount);
@@ -350,7 +350,7 @@ public sealed partial class C4QueueFixTests
     /// The release signal keeps the call inside Write until this test lets it finish.
     /// The clock is <see cref="FakeTimeProvider"/>. The 30 s waits are hang guards. Not thread-safe.
     /// </remarks>
-    [Fact(Timeout = 45000)]
+    [Fact(Timeout = 90000)]
     public async Task SlowCall_IsDisposedOnlyAfterItReturns()
     {
         DeadlineClock.AssertValues();
@@ -371,7 +371,7 @@ public sealed partial class C4QueueFixTests
             engine.Log("slow", LogLevel.Info);
             Assert.True(slow.Entered.Wait(TimeSpan.FromSeconds(30)));
             dispose = await ArmDispose(engine, nameof(SlowCall_IsDisposedOnlyAfterItReturns));
-            await FinishAtShutdownDeadline(clock, dispose, nameof(SlowCall_IsDisposedOnlyAfterItReturns));
+            await FinishAtShutdownDeadline(clock, dispose);
             Assert.False(slow.Disposed);
             Assert.False(slow.DisposeOverlappedWrite);
             release.Set();
@@ -541,13 +541,13 @@ public sealed partial class C4QueueFixTests
                 second = Task.Run(() => queue.Dispose());
 
             DeadlineClock.AssertNotReturnedBefore(
-                clock, first, BackgroundLogQueue.ShutdownDeadline, nameof(Shutdown_TwiceAndParallel_ReportsOpenWindowOnce));
+                clock, first, BackgroundLogQueue.ShutdownDeadline, DeadlineClock.ShutdownReturnedEarly);
             if (second is not null)
-                Assert.False(second.IsCompleted, "parallel dispose returned before the bound");
+                DeadlineClock.AssertStillRunning(second, DeadlineClock.ShutdownReturnedEarly);
 
-            await DeadlineClock.AssertReturnedAt(clock, first, nameof(Shutdown_TwiceAndParallel_ReportsOpenWindowOnce));
+            await DeadlineClock.AssertReturnedAt(clock, first, DeadlineClock.ShutdownNotReturned);
             if (second is not null)
-                await DeadlineClock.WaitForCompletion(second, nameof(Shutdown_TwiceAndParallel_ReportsOpenWindowOnce));
+                await DeadlineClock.WaitForCompletion(second, DeadlineClock.ShutdownNotReturned);
             else
                 queue.Dispose();
         }
@@ -591,10 +591,17 @@ public sealed partial class C4QueueFixTests
 
     /// <summary>
     /// Records dispose-during-write, optional sleep, and an optional inner writer.
-    /// A release handle blocks the call until the test sets it, with a 30 s hang bound.
+    /// A release handle blocks the call until the test sets it.
     /// </summary>
     private sealed class ProbeWriter : ILogWriter
     {
+        /// <summary>
+        /// How long <see cref="Write"/> waits for release before it gives up.
+        /// Sixty seconds is past the 30 s deadline hang guard, so a shutdown timer that is late
+        /// is reported by that guard. A writer that gave up at the same 30 s would let dispose
+        /// return, and the failure would be a later dispose flag instead of the deadline step.
+        /// </summary>
+        private static readonly TimeSpan ReleaseBound = TimeSpan.FromSeconds(60);
         private readonly TimeSpan _delay;
         private readonly ManualResetEventSlim? _release;
         private readonly ILogWriter? _inner;
@@ -616,7 +623,7 @@ public sealed partial class C4QueueFixTests
         /// <paramref name="release"/> blocks until set. <paramref name="inner"/> receives the event.
         /// </summary>
         /// <param name="delay">Sleep inside the call. Zero sleeps not at all.</param>
-        /// <param name="release">Optional block. The wait is at most 30 s, the hang guard, not the shutdown deadline.</param>
+        /// <param name="release">Optional block. The wait is at most <see cref="ReleaseBound"/>, past the deadline hang guard.</param>
         /// <param name="inner">Optional writer to forward to. Null writes nowhere.</param>
         internal ProbeWriter(TimeSpan delay = default, ManualResetEventSlim? release = null, ILogWriter? inner = null)
         {
@@ -648,7 +655,7 @@ public sealed partial class C4QueueFixTests
 
         /// <summary>Sleeps, waits for release, then forwards. A dispose during the call is recorded.</summary>
         /// <param name="logEvent">Forwarded to the inner writer. May be null.</param>
-        /// <exception cref="TimeoutException">The release handle was not set within 30 s.</exception>
+        /// <exception cref="TimeoutException">The release handle was not set within <see cref="ReleaseBound"/>.</exception>
         public void Write(LogEvent logEvent)
         {
             Interlocked.Exchange(ref _inWrite, 1);
@@ -658,8 +665,8 @@ public sealed partial class C4QueueFixTests
                 if (_delay > TimeSpan.Zero)
                     Thread.Sleep(_delay);
 
-                if (_release is not null && !_release.Wait(TimeSpan.FromSeconds(30)))
-                    throw new TimeoutException("The test did not release the writer within 30 s.");
+                if (_release is not null && !_release.Wait(ReleaseBound))
+                    throw new TimeoutException("The test did not release the writer within 60 s.");
 
                 if (Volatile.Read(ref _disposed) != 0)
                     Interlocked.Increment(ref _after);

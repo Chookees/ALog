@@ -411,11 +411,11 @@ public sealed class SyncWriteContractTests
                 clock,
                 disposing,
                 BackgroundLogQueue.ShutdownDeadline,
-                nameof(Queue_TryEnqueue_ReturnsFalseWhenTheChannelCloses));
+                DeadlineClock.ShutdownReturnedEarly);
             await DeadlineClock.AssertReturnedAt(
                 clock,
                 disposing,
-                nameof(Queue_TryEnqueue_ReturnsFalseWhenTheChannelCloses));
+                DeadlineClock.ShutdownNotReturned);
             Assert.False(queue.TryEnqueue(Event("after")));
             queue.Dispose();
         }
