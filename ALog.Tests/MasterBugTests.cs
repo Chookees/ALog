@@ -11,6 +11,7 @@ using ALog.Writers.File;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Primitives;
 using MelLogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace ALog.Tests;
@@ -19,6 +20,7 @@ namespace ALog.Tests;
 /// M1 on master: a scalar where <c>ALog:Console</c> or <c>ALog:File</c> is bound
 /// stops startup, plain text still writes when a property's <c>ToString</c> throws,
 /// and <c>Console:Enabled</c> is not applied again when configuration reloads.
+/// <c>ALog:MinimumLevel</c> is characterized, not reloaded: that assertion flips when the level-reload item lands.
 /// </summary>
 public sealed class MasterBugTests : IDisposable
 {
@@ -552,6 +554,62 @@ public sealed class MasterBugTests : IDisposable
 
         Assert.Null(error);
         Assert.DoesNotContain(marker, buffer.ToString(), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Characterization, not an M1 fix. Console is on and the Microsoft minimum is Trace.
+    /// ALog starts at Warning. The test waits on the <c>ALog:MinimumLevel</c> change token,
+    /// with a 30 second guard, after the value becomes Debug. The Debug line is still not written.
+    /// This assertion flips when the level-reload item lands.
+    /// </summary>
+    [Fact(Timeout = 45000)]
+    public async Task Reload_MinimumLevelWarningToDebug_IsNotReloadedToday()
+    {
+        var values = new Dictionary<string, string?>
+        {
+            ["ALog:Console:Enabled"] = "true",
+            ["ALog:MinimumLevel"] = "Warning"
+        };
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(values).Build();
+        const string debugMarker = "m1-level-debug-not-reloaded";
+        const string warningMarker = "m1-level-warning-still-written";
+        var previous = Console.Out;
+        var buffer = new StringWriter();
+        Console.SetOut(buffer);
+        try
+        {
+            using var provider = new ServiceCollection().AddLogging(logging =>
+            {
+                logging.ClearProviders();
+                logging.SetMinimumLevel(MelLogLevel.Trace);
+                logging.AddALog(configuration);
+            }).BuildServiceProvider();
+
+            var fired = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var token = configuration.GetSection("ALog:MinimumLevel").GetReloadToken();
+            using (token.RegisterChangeCallback(static state =>
+            {
+                ((TaskCompletionSource)state!).TrySetResult();
+            }, fired))
+            {
+                values["ALog:MinimumLevel"] = "Debug";
+                configuration.Reload();
+                var finished = await Task.WhenAny(fired.Task, Task.Delay(TimeSpan.FromSeconds(30)));
+                Assert.True(ReferenceEquals(finished, fired.Task), "ALog:MinimumLevel change token did not fire within 30 seconds.");
+            }
+
+            var logger = provider.GetRequiredService<ILoggerFactory>().CreateLogger("M1.Level");
+            logger.LogDebug("probe {Marker}", debugMarker);
+            logger.LogWarning("probe {Marker}", warningMarker);
+        }
+        finally
+        {
+            Console.SetOut(previous);
+        }
+
+        var text = buffer.ToString();
+        Assert.DoesNotContain(debugMarker, text, StringComparison.Ordinal);
+        Assert.Contains(warningMarker, text, StringComparison.Ordinal);
     }
 
     /// <summary>
