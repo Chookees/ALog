@@ -711,7 +711,7 @@ public sealed partial class C4QueueFixTests
         await second;
         Assert.True(
             BackgroundLogQueue.DeadlineWaitEntries == entries,
-            "second Dispose entered a deadline wait; it must return immediately");
+            "second Dispose entered a deadline wait; it must return immediately.");
         Assert.True(stamp == clock.GetTimestamp(), "second Dispose moved the injected clock.");
         Assert.False(first.IsCompleted, "first dispose returned before the deadline");
     }

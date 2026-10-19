@@ -49,7 +49,7 @@ public sealed class BannedSymbolRuleTests
         var required = RequiredIds();
         Assert.True(
             required.Contains("M:System.Threading.Thread.Sleep(System.Int32)"),
-            "BannedSymbols.txt is missing M:System.Threading.Thread.Sleep(System.Int32)");
+            "BannedSymbols.txt is missing M:System.Threading.Thread.Sleep(System.Int32). Add it with message (b).");
         Assert.True(
             !required.Contains("M:System.Threading.ITimer.Change(System.TimeSpan,System.TimeSpan)"),
             "ITimer.Change is the TimeProvider timer and must stay legal.");
@@ -65,7 +65,18 @@ public sealed class BannedSymbolRuleTests
         }
 
         missing.Sort(StringComparer.Ordinal);
-        Assert.True(missing.Count == 0, "BannedSymbols.txt is missing " + string.Join(", ", missing));
+        var detail = new StringBuilder();
+        foreach (var id in missing)
+        {
+            if (detail.Length > 0)
+                detail.Append(' ');
+
+            detail.Append("BannedSymbols.txt is missing ");
+            detail.Append(id);
+            detail.Append(". Add it with message (b).");
+        }
+
+        Assert.True(missing.Count == 0, detail.ToString());
     }
 
     /// <summary>Walks up from the test output until ALog.sln is found.</summary>

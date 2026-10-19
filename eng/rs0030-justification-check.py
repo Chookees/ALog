@@ -23,15 +23,22 @@ PRAGMA = (
     'RS0030 exception needs [SuppressMessage(..., Justification = "why and when it is removed")], not #pragma.'
 )
 NO_JUST = "RS0030 exception has no Justification. Say why the wall clock is needed here."
-NOT_MEMBER = "RS0030 exception is not one of the five allowed members."
-BAD_TEXT = "RS0030 exception justification does not match the allowed text."
+NOT_MEMBER = (
+    "RS0030 exception is not one of the five allowed members."
+    " Remove the suppression and use the TimeProvider from the options; the allowlist is fixed at five entries."
+)
 BLOCK = "RS0030 exception member must be one expression. Only PutWithinTransportTimeout may have a block body."
 UNCONDITIONAL = "RS0030 exception must be [SuppressMessage] on an allowed member, not UnconditionalSuppressMessage."
 NOWARN = "RS0030 must not be listed in NoWarn or WarningsNotAsErrors."
 SEVERITY = "RS0030 severity must stay an error."
 DEFAULT = "ProductionClock.Default may only be the default clock on a public constructor."
 DERIVE = "product code must not derive from TimeProvider."
-UNSUPPRESSED = "RS0030 is not suppressed in source."
+UNSUPPRESSED = (
+    "RS0030 is not suppressed in source."
+    " Suppress it in source with [SuppressMessage] and one of the five allowed justifications;"
+    " NoWarn, #pragma and .editorconfig are not allowed."
+)
+SARIF_MISSING = "ErrorLog SARIF is missing. Build with -p:ErrorLog=<project>.sarif,version=2.1."
 SUMMARY_OK = "rs0030-justification: ok"
 SEVERITY_LINE = "dotnet_diagnostic.RS0030.severity = error"
 PRODUCT_GLOBS = ("[ALog/**.cs]", "[ALog.Extensions.Logging/**.cs]")
@@ -710,8 +717,24 @@ def one_result(result: dict, root: Path) -> list[str]:
             return [hit(path, line, BLOCK)]
         return []
     if row is not None:
-        return [hit(path, line, BAD_TEXT)]
+        return [hit(path, line, bad_text(row.justification))]
     return [hit(path, line, NOT_MEMBER)]
+
+
+def bad_text(allowed: str) -> str:
+    """Return the mismatch line, quoting the one allowed justification.
+
+    Args:
+        allowed: The allowlist justification for this file and member. Not empty.
+
+    Returns:
+        The full message. The period after the closing quote is part of the message.
+    """
+    return (
+        'RS0030 exception justification does not match the allowed text. Use the allowed text: "'
+        + allowed
+        + '".'
+    )
 
 
 def uri_path(uri: str) -> str:
@@ -1066,6 +1089,14 @@ class Queue
 
 def cases_match(rows: list[tuple[str, list[str]]]) -> bool:
     """True when every row has the expected hit, or is clean."""
+    for row in ALLOWED:
+        rendered = bad_text(row.justification)
+        if rendered != (
+            'RS0030 exception justification does not match the allowed text. Use the allowed text: "'
+            + row.justification
+            + '".'
+        ):
+            return False
     expect_hit = {
         "alias-without-justification": NO_JUST,
         "alias-namespace": NO_JUST,
@@ -1155,7 +1186,7 @@ def scan_repo(repo: Path, sarif_paths: list[str]) -> list[str]:
     for log in logs:
         sarif = Path(log)
         if not sarif.is_file():
-            problems.append(hit(sarif.name, 1, "ErrorLog SARIF is missing."))
+            problems.append(hit(sarif.name, 1, SARIF_MISSING))
             continue
         problems.extend(sarif_problems(sarif, repo))
     return problems

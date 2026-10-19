@@ -278,7 +278,7 @@ public sealed class ClockCompositionTests
         await second;
         Assert.True(
             BackgroundLogQueue.DeadlineWaitEntries == entries,
-            "second Dispose entered a deadline wait; it must return immediately");
+            "second Dispose entered a deadline wait; it must return immediately.");
         Assert.True(first.IsCompleted == false, "first dispose returned before the deadline");
     }
 
