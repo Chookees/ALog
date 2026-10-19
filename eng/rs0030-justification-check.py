@@ -35,10 +35,9 @@ DEFAULT = "ProductionClock.Default may only be the default clock on a public con
 DERIVE = "product code must not derive from TimeProvider."
 UNSUPPRESSED = (
     "RS0030 is not suppressed in source."
-    " Suppress it in source with [SuppressMessage] and one of the five allowed justifications;"
+    " Remove the banned call and use the TimeProvider from the options;"
     " NoWarn, #pragma and .editorconfig are not allowed."
 )
-SARIF_MISSING = "ErrorLog SARIF is missing. Build with -p:ErrorLog=<project>.sarif,version=2.1."
 SUMMARY_OK = "rs0030-justification: ok"
 SEVERITY_LINE = "dotnet_diagnostic.RS0030.severity = error"
 PRODUCT_GLOBS = ("[ALog/**.cs]", "[ALog.Extensions.Logging/**.cs]")
@@ -177,19 +176,74 @@ def print_cases(rows: list[tuple[str, list[str]]]) -> None:
 def report(problems: list[str]) -> int:
     """Print the repository result.
 
+    Fully identical lines are printed once. Two lines that differ both stay.
+    Dropping a duplicate does not turn a red result into a pass.
+
     Args:
         problems: Problem lines. Empty when the tree is allowed.
 
     Returns:
-        0 when there are no problems. 1 otherwise.
+        0 when no line remains. 1 when any line remains.
     """
-    if len(problems) == 0:
+    code, lines = finish(problems)
+    if code == 0:
         print(SUMMARY_OK)
         return 0
-    for line in problems:
+    for line in lines:
         print(line)
-    print("rs0030-justification: " + str(len(problems)) + " problem(s) found.")
-    return 1
+    print("rs0030-justification: " + str(len(lines)) + " problem(s) found.")
+    return code
+
+
+def unique_lines(problems: list[str]) -> list[str]:
+    """Keep the first copy of each fully identical line.
+
+    Args:
+        problems: Problem lines in discovery order.
+
+    Returns:
+        Those lines with a later character-for-character duplicate removed.
+        A line that differs by path, line number, or text stays.
+    """
+    kept: list[str] = []
+    seen: set[str] = set()
+    for line in problems:
+        if line in seen:
+            continue
+        seen.add(line)
+        kept.append(line)
+    return kept
+
+
+def finish(problems: list[str]) -> tuple[int, list[str]]:
+    """Deduplicate and choose the exit code report would use.
+
+    Args:
+        problems: Problem lines, possibly with duplicates.
+
+    Returns:
+        ``(0, [])`` when no line remains. ``(1, lines)`` when any line remains.
+    """
+    lines = unique_lines(problems)
+    if len(lines) == 0:
+        return 0, []
+    return 1, lines
+
+
+def red_lines(problems: list[str]) -> list[str]:
+    """Return the lines a red report prints.
+
+    Args:
+        problems: Problem lines, possibly with duplicates.
+
+    Returns:
+        The deduplicated lines when the exit code is 1.
+        ``exit 0`` when nothing remains, so a case that must stay red fails.
+    """
+    code, lines = finish(problems)
+    if code != 1:
+        return ["exit " + str(code)]
+    return lines
 
 
 def find_repo() -> Path:
@@ -936,7 +990,140 @@ def case_results(repo: Path) -> list[tuple[str, list[str]]]:
             "root = true\n\n[ALog/**.cs]\n" + SEVERITY_LINE + "\n\n[ALog.Extensions.Logging/**.cs]\n" + SEVERITY_LINE + "\n",
             True,
         )))
+        append_message_cases(rows, root, fixture, composition)
     return rows
+
+
+def append_message_cases(
+    rows: list[tuple[str, list[str]]],
+    root: Path,
+    fixture: Path,
+    composition: set[str],
+) -> None:
+    """Append the justification, unsuppressed, dedup, and missing-SARIF rows.
+
+    Args:
+        rows: The case table. This function appends five rows.
+        root: Temporary directory that contains the fixture.
+        fixture: Restored fixture project.
+        composition: Composition-point files.
+
+    Side effects:
+        Builds two fixture compilations and writes SARIF files under root.
+    """
+    changed_rel = "ALog/Core/LoggerEngine.cs"
+    changed_source = (
+        "using System.Diagnostics.CodeAnalysis;\n"
+        "class LoggerEngine\n"
+        "{\n"
+        "    [SuppressMessage(\"ApiDesign\", \"RS0030\", Justification = \"not the allowed sentence\")]\n"
+        "    private static object EventTimestamp() => DateTime.UtcNow;\n"
+        "}\n"
+    )
+    changed = source_problems(changed_rel, changed_source, composition)
+    changed.extend(build_case(fixture, changed_rel, changed_source))
+    rows.append(("changed-justification", red_lines(changed)))
+
+    bare_rel = "ALog/Bypass.cs"
+    bare_source = "class C\n{\n    static object M() => DateTime.UtcNow;\n}\n"
+    bare = source_problems(bare_rel, bare_source, composition)
+    bare.extend(build_case(fixture, bare_rel, bare_source))
+    rows.append(("unsuppressed", red_lines(bare)))
+
+    first_log = fixture / (bare_rel.replace("/", "_") + ".sarif")
+    second_log = fixture / "ALog.Extensions.Logging.sarif"
+    if first_log.is_file():
+        second_log.write_bytes(first_log.read_bytes())
+    duplicated = sarif_log_problems([first_log, second_log], fixture)
+    rows.append(("dedup-identical", identical_pair(duplicated)))
+    rows.append(("dedup-distinct", distinct_case(root)))
+    missing = root / "artifacts" / "ALog.Extensions.Logging.sarif"
+    rows.append(("sarif-missing", red_lines(sarif_log_problems([missing], root))))
+
+
+def identical_pair(problems: list[str]) -> list[str]:
+    """Collapse two copies of one line.
+
+    Args:
+        problems: Lines from two logs that should be the same finding.
+
+    Returns:
+        The one line a red report prints. A list that is not two equal lines
+        returns a marker the fixed expected line does not match.
+    """
+    if len(problems) != 2 or problems[0] != problems[1]:
+        return ["not a duplicate pair"]
+    return red_lines(problems)
+
+
+def distinct_case(root: Path) -> list[str]:
+    """Two different RS0030 lines on one file and line stay two lines.
+
+    Args:
+        root: Temporary directory. The source and the SARIF are written here.
+
+    Returns:
+        The two lines a red report prints.
+
+    Side effects:
+        Writes a source file and a SARIF log under root.
+    """
+    rel = "ALog/Core/LoggerEngine.cs"
+    source = "class LoggerEngine\n{\n    static object EventTimestamp() => DateTime.UtcNow;\n}\n"
+    destination = root / rel
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(source, encoding="utf-8")
+    uri = destination.resolve().as_uri()
+    sarif = root / "distinct.sarif"
+    sarif.write_text(
+        result_sarif([
+            rs0030_result(uri, 3, None),
+            rs0030_result(uri, 3, "not the allowed sentence"),
+        ]),
+        encoding="utf-8",
+    )
+    problems = sarif_log_problems([sarif], root)
+    if len(problems) != 2 or problems[0] == problems[1]:
+        return ["not two different lines"]
+    return red_lines(problems)
+
+
+def result_sarif(results: list[dict]) -> str:
+    """Build a SARIF 2.1 document.
+
+    Args:
+        results: RS0030 results. Each result already carries its artifact URI.
+
+    Returns:
+        JSON text.
+    """
+    document = {"version": "2.1.0", "runs": [{"results": results}]}
+    return json.dumps(document)
+
+
+def rs0030_result(uri: str, line: int, justification: str | None) -> dict:
+    """Build one RS0030 result.
+
+    Args:
+        uri: Artifact URI of the source file.
+        line: 1-based source line.
+        justification: In-source justification. None means the call is not suppressed.
+
+    Returns:
+        A SARIF result object.
+    """
+    result: dict = {
+        "ruleId": "RS0030",
+        "locations": [{
+            "physicalLocation": {
+                "artifactLocation": {"uri": uri},
+                "region": {"startLine": line},
+            },
+        }],
+    }
+    if justification is not None:
+        result["suppressions"] = [{"kind": "inSource", "justification": justification}]
+    return result
 
 
 def built_samples() -> list[tuple[str, str, str]]:
@@ -1089,14 +1276,33 @@ class Queue
 
 def cases_match(rows: list[tuple[str, list[str]]]) -> bool:
     """True when every row has the expected hit, or is clean."""
-    for row in ALLOWED:
-        rendered = bad_text(row.justification)
-        if rendered != (
-            'RS0030 exception justification does not match the allowed text. Use the allowed text: "'
-            + row.justification
-            + '".'
-        ):
-            return False
+    expect_exact = {
+        "changed-justification": [
+            "ALog/Core/LoggerEngine.cs:5: RS0030 exception justification does not match the allowed text."
+            ' Use the allowed text: "Event timestamp is wall-clock time by design; it is log data, not a deadline.".',
+        ],
+        "unsuppressed": [
+            "ALog/Bypass.cs:3: RS0030 is not suppressed in source."
+            " Remove the banned call and use the TimeProvider from the options;"
+            " NoWarn, #pragma and .editorconfig are not allowed.",
+        ],
+        "dedup-identical": [
+            "ALog/Bypass.cs:3: RS0030 is not suppressed in source."
+            " Remove the banned call and use the TimeProvider from the options;"
+            " NoWarn, #pragma and .editorconfig are not allowed.",
+        ],
+        "dedup-distinct": [
+            "ALog/Core/LoggerEngine.cs:3: RS0030 is not suppressed in source."
+            " Remove the banned call and use the TimeProvider from the options;"
+            " NoWarn, #pragma and .editorconfig are not allowed.",
+            "ALog/Core/LoggerEngine.cs:3: RS0030 exception justification does not match the allowed text."
+            ' Use the allowed text: "Event timestamp is wall-clock time by design; it is log data, not a deadline.".',
+        ],
+        "sarif-missing": [
+            "artifacts/ALog.Extensions.Logging.sarif: ErrorLog SARIF is missing."
+            " Build with -p:ErrorLog=artifacts/ALog.Extensions.Logging.sarif,version=2.1.",
+        ],
+    }
     expect_hit = {
         "alias-without-justification": NO_JUST,
         "alias-namespace": NO_JUST,
@@ -1131,9 +1337,14 @@ def cases_match(rows: list[tuple[str, list[str]]]) -> bool:
         "allow-sql",
         "product-editorconfig",
     }
-    if len(rows) != len(expect_hit) + len(expect_clean):
+    if len(rows) != len(expect_hit) + len(expect_clean) + len(expect_exact):
         return False
     for name, lines in rows:
+        exact = expect_exact.get(name)
+        if exact is not None:
+            if lines != exact:
+                return False
+            continue
         if name in expect_clean:
             if len(lines) != 0:
                 return False
@@ -1183,12 +1394,67 @@ def scan_repo(repo: Path, sarif_paths: list[str]) -> list[str]:
         logs = build_products(repo)
     if len(logs) < 2:
         problems.append(hit("ALog.sln", 1, "both product projects need an ErrorLog SARIF."))
+    problems.extend(sarif_log_problems([Path(log) for log in logs], repo))
+    return problems
+
+
+def repo_relative(log: str, root: Path) -> str:
+    """Return log relative to root when it points inside root.
+
+    Args:
+        log: A SARIF path. Absolute or relative.
+        root: Repository root.
+
+    Returns:
+        A forward-slash path. A relative log is normalized. An absolute log
+        inside root drops the root prefix. An absolute log outside root stays absolute.
+    """
+    path = Path(log)
+    if not path.is_absolute():
+        return path.as_posix()
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def missing_sarif_line(log: str, root: Path) -> str:
+    """One copyable line for an ErrorLog that was not written.
+
+    Args:
+        log: The path the check was given.
+        root: Repository root, used when log is inside it.
+
+    Returns:
+        ``{RelPath}: ErrorLog SARIF is missing. Build with -p:ErrorLog={RelPath},version=2.1.``
+        There is no ``:1``. RelPath is the same path in both places.
+    """
+    relative = repo_relative(log, root)
+    return (
+        relative
+        + ": ErrorLog SARIF is missing. Build with -p:ErrorLog="
+        + relative
+        + ",version=2.1."
+    )
+
+
+def sarif_log_problems(logs: list[Path], root: Path) -> list[str]:
+    """Read each ErrorLog. A missing file is one SARIF-missing line.
+
+    Args:
+        logs: Paths passed to the check, or written by the product build.
+        root: Directory used to make paths relative.
+
+    Returns:
+        Problem lines. Two logs that report the same line both contribute it.
+        The caller deduplicates.
+    """
+    problems = []
     for log in logs:
-        sarif = Path(log)
-        if not sarif.is_file():
-            problems.append(hit(sarif.name, 1, SARIF_MISSING))
+        if not log.is_file():
+            problems.append(missing_sarif_line(str(log), root))
             continue
-        problems.extend(sarif_problems(sarif, repo))
+        problems.extend(sarif_problems(log, root))
     return problems
 
 

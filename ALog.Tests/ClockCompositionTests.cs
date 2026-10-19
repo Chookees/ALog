@@ -274,7 +274,7 @@ public sealed class ClockCompositionTests
         var entries = BackgroundLogQueue.DeadlineWaitEntries;
         var second = Task.Run(secondDispose);
         var returned = await Task.WhenAny(second, Task.Delay(TimeSpan.FromSeconds(30))) == second;
-        Assert.True(returned, "second Dispose waited for the first deadline; it must return immediately");
+        Assert.True(returned, "second Dispose waited for the first deadline; it must return immediately.");
         await second;
         Assert.True(
             BackgroundLogQueue.DeadlineWaitEntries == entries,
