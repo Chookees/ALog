@@ -473,6 +473,162 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
+    /// A scope or context value whose <c>ToString</c> throws still leaves a console line
+    /// when the writer uses <see cref="PlainTextFormatter"/>. The placeholder is on the line.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ThrowingScopeToString_ConsoleWithFormatter_StillWrites()
+    {
+        await Task.CompletedTask;
+        var problems = new StringBuilder();
+        var probe = new RecordingWriter();
+        var self = new List<string>(4);
+        var stdout = new StringWriter();
+        var stderr = new StringWriter();
+        var previousOut = Console.Out;
+        var previousErr = Console.Error;
+        var previousSelf = SelfLog.Target;
+        try
+        {
+            Console.SetOut(stdout);
+            Console.SetError(stderr);
+            SelfLog.Enable(line =>
+            {
+                if (self.Count < 8)
+                    self.Add(line);
+            });
+            Log.Init(new LoggerConfig()
+                .AddWriter(new ConsoleLogWriter(useColors: false, formatter: new PlainTextFormatter()))
+                .AddWriter(probe)
+                .UseAsync(false)
+                .SetMinimumLevel(LogLevel.Trace));
+            var caller = Record.Exception(() =>
+            {
+                using (Log.BeginScope("FromBegin", new ThrowingProperty()))
+                    Log.Write(LogLevel.Info, "begin-scope-formatted");
+                using (LogContext.Push([new KeyValuePair<string, object?>("FromContext", new ThrowingProperty())]))
+                    Log.Write(LogLevel.Info, "context-scope-formatted");
+            });
+            var text = stdout.ToString();
+            Require(problems, caller is null, "formatted console scope threw " + (caller is null ? "" : caller.Message));
+            Require(problems, text.Contains("begin-scope-formatted", StringComparison.Ordinal), "formatted console missing begin line: " + Trim(text));
+            Require(problems, text.Contains("context-scope-formatted", StringComparison.Ordinal), "formatted console missing context line: " + Trim(text));
+            Require(problems, text.Contains("FromBegin=" + CapturePlaceholder, StringComparison.Ordinal), "formatted console missing begin placeholder: " + Trim(text));
+            Require(problems, text.Contains("FromContext=" + CapturePlaceholder, StringComparison.Ordinal), "formatted console missing context placeholder: " + Trim(text));
+            Require(problems, !stderr.ToString().Contains("Sync write failed", StringComparison.Ordinal), "formatted console stderr: " + Trim(stderr.ToString()));
+            Require(problems, self.Count == 0, "formatted console SelfLog " + self.Count + " [" + Joined(self) + "]");
+            Require(problems, probe.Events.Count == 2, "formatted console probe " + probe.Events.Count);
+        }
+        finally
+        {
+            Log.Shutdown();
+            Console.SetOut(previousOut);
+            Console.SetError(previousErr);
+            SelfLog.Target = previousSelf;
+        }
+
+        Assert.True(problems.Length == 0, problems.ToString());
+    }
+
+    /// <summary>
+    /// A MEL scope value whose <c>ToString</c> throws still leaves a file line
+    /// when the writer uses <see cref="PlainTextFormatter"/>.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ThrowingScopeToString_FileWithFormatter_StillWrites()
+    {
+        await Task.CompletedTask;
+        var problems = new StringBuilder();
+        var directory = NewDirectory();
+        var path = Path.Combine(directory, "scope-formatted.log");
+        var probe = new RecordingWriter();
+        var self = new List<string>(4);
+        var stderr = new StringWriter();
+        var previousErr = Console.Error;
+        var previousSelf = SelfLog.Target;
+        try
+        {
+            Console.SetError(stderr);
+            SelfLog.Enable(line =>
+            {
+                if (self.Count < 8)
+                    self.Add(line);
+            });
+            var config = new LoggerConfig()
+                .AddWriter(new FileLogWriter(path, new PlainTextFormatter()))
+                .AddWriter(probe)
+                .UseAsync(false)
+                .SetMinimumLevel(LogLevel.Trace);
+            using (var provider = new ALogLoggerProvider(config))
+            {
+                var logger = provider.CreateLogger("M1");
+                var caller = Record.Exception(() =>
+                {
+                    using (logger.BeginScope(new Dictionary<string, object?> { ["FromMel"] = new ThrowingProperty() }))
+                        logger.LogInformation("mel-scope-formatted");
+                });
+                Require(problems, caller is null, "formatted file scope threw " + (caller is null ? "" : caller.Message));
+            }
+
+            var fileText = ReadFileOrEmpty(path);
+            Require(problems, fileText.Contains("mel-scope-formatted", StringComparison.Ordinal), "formatted file missing line: " + Trim(fileText));
+            Require(problems, fileText.Contains("FromMel=" + CapturePlaceholder, StringComparison.Ordinal), "formatted file missing placeholder: " + Trim(fileText));
+            Require(problems, !stderr.ToString().Contains("Write failed", StringComparison.Ordinal), "formatted file stderr: " + Trim(stderr.ToString()));
+            Require(problems, !stderr.ToString().Contains("Sync write failed", StringComparison.Ordinal), "formatted file sync stderr: " + Trim(stderr.ToString()));
+            Require(problems, self.Count == 0, "formatted file SelfLog " + self.Count + " [" + Joined(self) + "]");
+            Require(problems, probe.Events.Count == 1, "formatted file probe " + probe.Events.Count);
+        }
+        finally
+        {
+            Console.SetError(previousErr);
+            SelfLog.Target = previousSelf;
+            DeleteDirectory(directory);
+        }
+
+        Assert.True(problems.Length == 0, problems.ToString());
+    }
+
+    /// <summary>
+    /// <c>AddALog(Action&lt;ALogOptions&gt;)</c> takes options, not a configuration section.
+    /// A console options object is not a scalar section and does not throw.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task AddALog_ActionOptions_DoesNotThrow()
+    {
+        await Task.CompletedTask;
+        var error = Record.Exception(() =>
+        {
+            using var provider = new ServiceCollection().AddLogging(logging =>
+            {
+                logging.AddALog(options =>
+                {
+                    options.Console = new ConsoleWriterOptions { Enabled = true };
+                });
+            }).BuildServiceProvider();
+        });
+        Assert.Null(error);
+    }
+
+    /// <summary>
+    /// <c>Log.Init(ALogOptions)</c> takes options, not a configuration section.
+    /// A console options object is not a scalar section and does not throw.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task LogInit_Options_DoesNotThrow()
+    {
+        await Task.CompletedTask;
+        var error = Record.Exception(() =>
+        {
+            Log.Init(new ALogOptions
+            {
+                Console = new ConsoleWriterOptions { Enabled = true }
+            });
+            Log.Shutdown();
+        });
+        Assert.Null(error);
+    }
+
+    /// <summary>
     /// One plain-text line carries both the template render marker and the capture marker.
     /// SelfLog keeps the existing argument failure and does not add a capture line.
     /// </summary>
@@ -519,9 +675,10 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
-    /// Changing <c>ALog:Console:Enabled</c> from false to true through
-    /// <see cref="IConfigurationRoot.Reload"/> does not start the console writer
-    /// and does not throw. Writer settings are read only when <c>AddALog</c> runs.
+    /// Changing <c>ALog:Console:Enabled</c> from false to true on the configuration root
+    /// does not start the console writer and does not throw.
+    /// The test checks that the new value is visible after <see cref="IConfigurationRoot.Reload"/>
+    /// before it checks the log line. Writer settings are read only when <c>AddALog</c> runs.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task Reload_ConsoleEnabledFalseToTrue_WritesNothingAndDoesNotThrow()
@@ -547,8 +704,10 @@ public sealed class MasterBugTests : IDisposable
                 logging.AddALog(configuration);
             }).BuildServiceProvider();
 
-            values["ALog:Console:Enabled"] = "true";
+            Assert.Equal("false", configuration["ALog:Console:Enabled"]);
+            configuration["ALog:Console:Enabled"] = "true";
             configuration.Reload();
+            Assert.Equal("true", configuration["ALog:Console:Enabled"]);
             var logger = provider.GetRequiredService<ILoggerFactory>().CreateLogger("M1");
             error = Record.Exception(() => logger.LogInformation("reload {Marker}", marker));
         }
@@ -563,9 +722,9 @@ public sealed class MasterBugTests : IDisposable
 
     /// <summary>
     /// Characterization, not an M1 fix. Console is on and the Microsoft minimum is Trace.
-    /// ALog starts at Warning. The test waits on the <c>ALog:MinimumLevel</c> change token,
-    /// with a 30 second guard, after the value becomes Debug. The Debug line is still not written.
-    /// This assertion flips when the level-reload item lands.
+    /// ALog starts at Warning. The test writes Debug through the configuration root, waits on the
+    /// change token with a 30 second guard, and checks that Debug is visible before it logs.
+    /// The Debug line is still not written. This assertion flips when the level-reload item lands.
     /// </summary>
     [Fact(Timeout = 45000)]
     public async Task Reload_MinimumLevelWarningToDebug_IsNotReloadedToday()
@@ -597,10 +756,12 @@ public sealed class MasterBugTests : IDisposable
                 ((TaskCompletionSource)state!).TrySetResult();
             }, fired))
             {
-                values["ALog:MinimumLevel"] = "Debug";
+                Assert.Equal("Warning", configuration["ALog:MinimumLevel"]);
+                configuration["ALog:MinimumLevel"] = "Debug";
                 configuration.Reload();
                 var finished = await Task.WhenAny(fired.Task, Task.Delay(TimeSpan.FromSeconds(30)));
                 Assert.True(ReferenceEquals(finished, fired.Task), "ALog:MinimumLevel change token did not fire within 30 seconds.");
+                Assert.Equal("Debug", configuration["ALog:MinimumLevel"]);
             }
 
             var logger = provider.GetRequiredService<ILoggerFactory>().CreateLogger("M1.Level");
@@ -618,17 +779,36 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
-    /// Plain text keeps the first 1024 properties and drops the rest so the render loop
-    /// has a fixed bound. Property 1024 (the 1025th) is not on the line.
+    /// Thirty-three numeric children plus <c>Enabled</c> is a section of settings.
+    /// Numeric keys are ordered first, so a cap of 32 would report this as a list.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task PlainText_RendersAtMost1024Properties()
+    public async Task ThirtyThreeIndexesPlusEnabled_IsASection()
     {
         await Task.CompletedTask;
-        const int cap = 1024;
-        var properties = new Dictionary<string, object>(cap + 1);
-        for (var i = 0; i < cap + 1; i++)
-            properties.Add("p" + i.ToString("0000"), "v");
+        var values = new Dictionary<string, string?>(40);
+        for (var i = 0; i < 33; i++)
+            values.Add("ALog:Console:" + i.ToString(System.Globalization.CultureInfo.InvariantCulture), "x");
+
+        values.Add("ALog:Console:Enabled", "true");
+        var configuration = new ConfigurationBuilder().AddInMemoryCollection(values).Build();
+        Assert.Equal("(no exception from AddALog)", CallAddALog(configuration));
+        Assert.Equal("(no exception from GetALogOptions)", CallGetALogOptions(configuration));
+        Assert.True(configuration.GetALogOptions().Console!.Enabled);
+    }
+
+    /// <summary>
+    /// Plain text renders every property. Two thousand properties are all on the line.
+    /// The loop is bounded by the property collection.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task PlainText_RendersTwoThousandProperties()
+    {
+        await Task.CompletedTask;
+        const int count = 2000;
+        var properties = new Dictionary<string, object>(count);
+        for (var i = 0; i < count; i++)
+            properties.Add("p" + i.ToString("0000", System.Globalization.CultureInfo.InvariantCulture), "v");
 
         var text = new PlainTextFormatter().Format(new LogEvent(
             CoverageClock.UtcNow,
@@ -638,9 +818,11 @@ public sealed class MasterBugTests : IDisposable
             null,
             properties));
 
-        Assert.Contains("p0000=v", text, StringComparison.Ordinal);
-        Assert.Contains("p1023=v", text, StringComparison.Ordinal);
-        Assert.DoesNotContain("p1024=v", text, StringComparison.Ordinal);
+        for (var i = 0; i < count; i++)
+        {
+            var token = "p" + i.ToString("0000", System.Globalization.CultureInfo.InvariantCulture) + "=v";
+            Assert.Contains(token, text, StringComparison.Ordinal);
+        }
 
         var nullText = new PlainTextFormatter().Format(new LogEvent(
             CoverageClock.UtcNow,
@@ -661,6 +843,52 @@ public sealed class MasterBugTests : IDisposable
             new Dictionary<string, object> { ["E"] = new NullToString() }));
         Assert.Contains("E=", emptyToString, StringComparison.Ordinal);
         Assert.DoesNotContain(CapturePlaceholder, emptyToString, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An <see cref="IFormattable"/> property is rendered with
+    /// <c>ToString(null, CultureInfo.CurrentCulture)</c>, which differs from <c>ToString()</c>.
+    /// That is the text master wrote for the same value.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task PlainText_IFormattable_UsesCurrentCulture()
+    {
+        await Task.CompletedTask;
+        var value = new DistinctFormattable();
+        var master = value.ToString(null, System.Globalization.CultureInfo.CurrentCulture);
+        Assert.NotEqual(value.ToString(), master);
+
+        var text = new PlainTextFormatter().Format(new LogEvent(
+            CoverageClock.UtcNow,
+            LogLevel.Info,
+            "form",
+            null,
+            null,
+            new Dictionary<string, object> { ["P"] = value }));
+
+        Assert.Contains("P=" + master, text, StringComparison.Ordinal);
+        Assert.DoesNotContain("P=" + value.ToString(), text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A throwing <see cref="IFormattable.ToString(string?, IFormatProvider?)"/> shows the capture placeholder.
+    /// Plain <c>ToString()</c> is not used as a fallback.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task PlainText_ThrowingIFormattable_ShowsCapturePlaceholder()
+    {
+        await Task.CompletedTask;
+        var value = new ThrowingFormattable();
+        var text = new PlainTextFormatter().Format(new LogEvent(
+            CoverageClock.UtcNow,
+            LogLevel.Info,
+            "form",
+            null,
+            null,
+            new Dictionary<string, object> { ["P"] = value }));
+
+        Assert.Contains("P=" + CapturePlaceholder, text, StringComparison.Ordinal);
+        Assert.DoesNotContain("plain-tostring", text, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -1359,5 +1587,46 @@ public sealed class MasterBugTests : IDisposable
         /// <summary>Returns null, which is what a broken <c>ToString</c> is allowed to do.</summary>
         /// <returns>Null. The formatter turns that into an empty value.</returns>
         public override string? ToString() => null;
+    }
+
+    /// <summary>
+    /// <see cref="IFormattable"/> text differs from <see cref="object.ToString"/>.
+    /// The formatted text is returned only when the provider is <see cref="System.Globalization.CultureInfo.CurrentCulture"/>.
+    /// </summary>
+    private sealed class DistinctFormattable : IFormattable
+    {
+        /// <summary>The plain text, which plain-text logging must not use.</summary>
+        /// <returns><c>plain-tostring</c>.</returns>
+        public override string ToString() => "plain-tostring";
+
+        /// <summary>The culture-formatted text master wrote for this value.</summary>
+        /// <param name="format">Ignored. Master passes null.</param>
+        /// <param name="formatProvider">Must be <see cref="System.Globalization.CultureInfo.CurrentCulture"/>.</param>
+        /// <returns><c>iformattable-current</c> for the current culture. Otherwise <c>wrong-provider</c>.</returns>
+        public string ToString(string? format, IFormatProvider? formatProvider)
+        {
+            if (!ReferenceEquals(formatProvider, System.Globalization.CultureInfo.CurrentCulture))
+                return "wrong-provider";
+
+            return "iformattable-current";
+        }
+    }
+
+    /// <summary>
+    /// <see cref="IFormattable"/> whose formatted text throws. Plain <c>ToString()</c> still returns.
+    /// </summary>
+    private sealed class ThrowingFormattable : IFormattable
+    {
+        /// <summary>Plain text that must not appear when formatting throws.</summary>
+        /// <returns><c>plain-tostring</c>.</returns>
+        public override string ToString() => "plain-tostring";
+
+        /// <summary>Throws <see cref="InvalidOperationException"/>.</summary>
+        /// <param name="format">Ignored.</param>
+        /// <param name="formatProvider">Ignored.</param>
+        /// <returns>This method does not return.</returns>
+        /// <exception cref="InvalidOperationException">Always thrown.</exception>
+        public string ToString(string? format, IFormatProvider? formatProvider)
+            => throw new InvalidOperationException("format-boom");
     }
 }

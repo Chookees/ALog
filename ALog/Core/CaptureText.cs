@@ -1,16 +1,17 @@
 namespace ALog.Core;
 
+using System.Globalization;
+
 /// <summary>
 /// Turns one logged value into text for a plain line.
 /// A throw becomes <c>[capture failed: ExceptionType]</c> and does not escape.
 /// </summary>
 internal static class CaptureText
 {
-    // shortcut: a plain line keeps at most 1024 pairs so the loop has a fixed bound.
-    internal const int MaxValues = 1024;
-
     /// <summary>
     /// Reads one property or scope value.
+    /// An <see cref="IFormattable"/> value uses <see cref="IFormattable.ToString(string?, IFormatProvider?)"/>
+    /// with a null format and <see cref="CultureInfo.CurrentCulture"/>. Any other value uses <see cref="object.ToString"/>.
     /// Null becomes empty. A throw becomes <c>[capture failed: ExceptionType]</c> using the short type name.
     /// </summary>
     /// <param name="value">Value from the event or from context. Null is an empty value.</param>
@@ -23,6 +24,9 @@ internal static class CaptureText
 
         try
         {
+            if (value is IFormattable formattable)
+                return formattable.ToString(null, CultureInfo.CurrentCulture) ?? string.Empty;
+
             return value.ToString() ?? string.Empty;
         }
         catch (Exception ex)
@@ -35,22 +39,17 @@ internal static class CaptureText
     /// Renders pairs as <c>name=text</c>, separated by a comma and a space.
     /// </summary>
     /// <param name="values">Properties or context. Not null. Not modified.</param>
-    /// <returns>The list. Empty when the bag is empty. At most <see cref="MaxValues"/> pairs.</returns>
+    /// <returns>The list. Empty when the bag is empty. Every pair is included.</returns>
     /// <remarks>
     /// A throwing value uses <see cref="Read"/>. Does not call SelfLog.
-    /// Allocates one string per rendered pair.
+    /// The loop is bounded by <paramref name="values"/> count.
+    /// Allocates one string per pair.
     /// </remarks>
     internal static string Join(IReadOnlyDictionary<string, object> values)
     {
-        var capacity = values.Count < MaxValues ? values.Count : MaxValues;
-        var rendered = new List<string>(capacity);
+        var rendered = new List<string>(values.Count);
         foreach (var pair in values)
-        {
-            if (rendered.Count >= MaxValues)
-                break;
-
             rendered.Add(pair.Key + "=" + Read(pair.Value));
-        }
 
         return string.Join(", ", rendered);
     }

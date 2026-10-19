@@ -34,8 +34,6 @@ public static class ALogLoggingBuilderExtensions
         List = 2
     }
 
-    private const int MaxSectionChildren = 32;
-
     /// <summary>
     /// Adds ALog as an <see cref="ILoggerProvider"/> using an explicit <see cref="LoggerConfig"/>.
     /// </summary>
@@ -194,7 +192,8 @@ public static class ALogLoggingBuilderExtensions
     /// <returns><see cref="SectionKind.Valid"/> when the section is missing or holds named settings.</returns>
     /// <remarks>
     /// A non-null value wins over children. The value text is not returned.
-    /// At most <see cref="MaxSectionChildren"/> children are inspected. More than that is a list.
+    /// Every child is inspected. The loop stops when <see cref="IConfiguration.GetChildren"/> ends.
+    /// A named child such as <c>Enabled</c> after any number of numeric keys is a section, not a list.
     /// </remarks>
     private static SectionKind Classify(IConfigurationSection section)
     {
@@ -202,17 +201,18 @@ public static class ALogLoggingBuilderExtensions
             return SectionKind.SingleValue;
 
         var seen = 0;
+        var named = false;
         foreach (var child in section.GetChildren())
         {
             seen++;
-            if (seen > MaxSectionChildren)
-                return SectionKind.List;
-
             if (!IsIndexKey(child.Key))
-                return SectionKind.Valid;
+                named = true;
         }
 
-        return seen > 0 ? SectionKind.List : SectionKind.Valid;
+        if (named || seen == 0)
+            return SectionKind.Valid;
+
+        return SectionKind.List;
     }
 
     /// <summary>

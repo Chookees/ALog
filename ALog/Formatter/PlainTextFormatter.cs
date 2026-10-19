@@ -23,7 +23,7 @@ public class PlainTextFormatter : ILogFormatter
     /// <returns>The line, without a trailing newline. Empty parts are omitted.</returns>
     /// <remarks>
     /// Does not call SelfLog and does not replace the property object on the event.
-    /// At most <see cref="CaptureText.MaxValues"/> properties and context pairs are rendered.
+    /// Every property and context pair is rendered. The loop is bounded by that collection.
     /// A throwing context value uses the same capture placeholder as a property.
     /// Allocates the line. The formatter has no shared mutable state.
     /// </remarks>
