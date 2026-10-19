@@ -28,6 +28,7 @@ public sealed class ALogOptions
 /// Options for the console writer created by <see cref="LoggerConfigFactory.FromOptions"/>.
 /// An explicit <c>AddWriter(new ConsoleLogWriter(...))</c> does not read this type.
 /// </summary>
+/// <remarks>Read once at startup. Changes while the app runs have no effect; restart the app.</remarks>
 public sealed class ConsoleWriterOptions
 {
     /// <summary>
@@ -44,6 +45,11 @@ public sealed class ConsoleWriterOptions
     public bool UseColors { get; set; } = true;
 }
 
+/// <summary>
+/// Options for the file writer created by <see cref="LoggerConfigFactory.FromOptions"/>.
+/// An explicit <c>AddWriter(new FileLogWriter(...))</c> does not read this type.
+/// </summary>
+/// <remarks>Read once at startup. Changes while the app runs have no effect; restart the app.</remarks>
 public sealed class FileWriterOptions
 {
     public bool Enabled { get; set; }

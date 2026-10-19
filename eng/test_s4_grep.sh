@@ -861,6 +861,125 @@ PY
 python3 eng/test_badge_workflow.py
 pass "B1 badge job and README badges"
 
+# M1-02. Reports which install pin a line uses.
+# Args: one line. Prints --version, -v, or PackageReference when the line
+# names ALog and pins a version in that form. Prints nothing otherwise.
+# Returns 0. A verbosity -v that is not followed by a digit is not a pin.
+m1_readme_version_hit() {
+  local line="$1"
+  case "$line" in
+    *ALog*) ;;
+    *) return 0 ;;
+  esac
+  if printf '%s\n' "$line" | grep -Eq -- '--version[[:space:]]+[0-9]'; then
+    printf '%s\n' '--version'
+    return 0
+  fi
+  if printf '%s\n' "$line" | grep -Eq 'dotnet add package' \
+      && printf '%s\n' "$line" | grep -Eq '(^|[[:space:]])-v[[:space:]]+[0-9]'; then
+    printf '%s\n' '-v'
+    return 0
+  fi
+  if printf '%s\n' "$line" | grep -Eq '<PackageReference([[:space:]]|>)' \
+      && printf '%s\n' "$line" | grep -Eq 'Include="ALog[^"]*"' \
+      && printf '%s\n' "$line" | grep -Eq 'Version="[0-9]'; then
+    printf '%s\n' 'PackageReference'
+    return 0
+  fi
+  return 0
+}
+
+# M1-02. Scans one README for install pins.
+# Args: path. Prints one "reason<TAB>line" per hit, at most 2000 lines.
+# Returns 0. A file past the cap is a failure and the rest of that file is skipped.
+m1_scan_readme() {
+  local file="$1"
+  local number=0
+  local line reason
+  while IFS= read -r line || [ -n "$line" ]; do
+    number=$((number + 1))
+    if [ "$number" -gt 2000 ]; then
+      fail "M1-02 ${file} has more than 2000 lines"
+      return 0
+    fi
+    reason=$(m1_readme_version_hit "$line")
+    if [ -n "$reason" ]; then
+      printf '%s\t%s\n' "$reason" "$line"
+    fi
+  done < "$file"
+}
+
+# M1-02. Counts hits of one reason in scan output.
+# Args: scan output, reason. Prints a number. Returns 0.
+m1_reason_count() {
+  local hits="$1"
+  local reason="$2"
+  printf '%s\n' "$hits" | grep -c "^${reason}"$'\t' || true
+}
+
+# M1-02. Requires the three injected install lines to be detected, and a
+# verbosity -v on an ALog line to be left alone.
+# Returns 0.
+m1_expect_injected_versions() {
+  local dir file hits version_count short_count package_count
+  dir=$(mktemp -d)
+  file="${dir}/README.md"
+  printf '%s\n' \
+    'dotnet add package ALog --version 1.0.0' \
+    'dotnet add package ALog.Extensions.Logging -v 0.2.0' \
+    '<PackageReference Include="ALog" Version="0.2.0" />' \
+    'Run ALog tests with dotnet test -v n' \
+    > "$file"
+  hits=$(m1_scan_readme "$file")
+  rm -rf "$dir"
+  version_count=$(m1_reason_count "$hits" '--version')
+  short_count=$(m1_reason_count "$hits" '-v')
+  package_count=$(m1_reason_count "$hits" 'PackageReference')
+  if [ "$version_count" -ne 1 ] || [ "$short_count" -ne 1 ] || [ "$package_count" -ne 1 ]; then
+    fail "M1-02 negative forms --version=${version_count} -v=${short_count} PackageReference=${package_count}"
+    printf '%s\n' "$hits" >&2
+    return 0
+  fi
+  if printf '%s\n' "$hits" | grep -F 'dotnet test -v n' >/dev/null; then
+    fail "M1-02 treats dotnet test -v as an install pin"
+    return 0
+  fi
+  pass "M1-02 negative --version, -v, and PackageReference"
+}
+
+# M1-02. Every README*.md outside build output must be free of the three pins.
+# At most 20 files are accepted. Returns 0.
+m1_check_readme_versions() {
+  local files=()
+  local file hits found=0
+  while IFS= read -r file; do
+    files+=("$file")
+  done < <(find . -type f -name 'README*.md' \
+    -not -path './.git/*' \
+    -not -path '*/bin/*' \
+    -not -path '*/obj/*' \
+    -not -path '*/TestResults/*' | sort)
+  if [ "${#files[@]}" -eq 0 ] || [ "${#files[@]}" -gt 20 ]; then
+    fail "M1-02 README count ${#files[@]} is outside 1..20"
+    return 0
+  fi
+  for file in "${files[@]}"; do
+    hits=$(m1_scan_readme "$file")
+    if [ -n "$hits" ]; then
+      echo "FAIL M1-02 pin in ${file}:" >&2
+      printf '%s\n' "$hits" >&2
+      failures=$((failures + 1))
+      found=1
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    pass "M1-02 README install snippets name no ALog version"
+  fi
+  m1_expect_injected_versions
+}
+
+m1_check_readme_versions
+
 if [ "$failures" -ne 0 ]; then
   echo "${failures} s4 grep tests failed" >&2
   exit 1
