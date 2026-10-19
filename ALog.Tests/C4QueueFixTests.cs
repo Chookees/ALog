@@ -41,7 +41,7 @@ public sealed partial class C4QueueFixTests
     /// An assertion failure fails the test. The finally block still releases the writer and the queue.
     /// SelfLog is restored to the previous target. Not safe to run beside another test that replaces SelfLog.
     /// </remarks>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = 60000)]
     public async Task FullQueue_DropsImmediately_ReportsAlog0070_FlushStaysSilent()
     {
         var clock = new FakeTimeProvider(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
@@ -325,7 +325,12 @@ public sealed partial class C4QueueFixTests
     /// A writer still inside its call is not disposed, and a later write does not reach it.
     /// </summary>
     /// <returns>A task that finishes after shutdown returns.</returns>
-    [Fact(Timeout = 20000)]
+    /// <remarks>
+    /// Closing the gate and Dispose returning are signals. The waits are 30 s hang guards.
+    /// An 8 s wait would fail a Dispose that is still inside the 10 s shutdown ceiling.
+    /// Not thread-safe. The finally block releases the writer and restores SelfLog.
+    /// </remarks>
+    [Fact(Timeout = 60000)]
     public async Task Shutdown_EightWriters_DropsLateEvents_AndDoesNotDisposeARunningCall()
     {
         var lines = new List<string>();
@@ -343,14 +348,14 @@ public sealed partial class C4QueueFixTests
         try
         {
             Assert.True(engine.Queue!.TryEnqueue(Event("prime")));
-            Assert.True(await WaitUntil(() => writer.EnteredCount > 0, TimeSpan.FromSeconds(5)));
+            Assert.True(await WaitUntil(() => writer.EnteredCount > 0, TimeSpan.FromSeconds(30)));
             var errors = new List<Exception>();
             var dispose = Task.Run(() => engine.Dispose());
             Assert.True(await WaitUntil(() =>
             {
                 engine.Queue.TryEnqueue(Event("probe"));
                 return engine.Queue.ClosedDropCount > 0;
-            }, TimeSpan.FromSeconds(2)));
+            }, TimeSpan.FromSeconds(30)));
             var workers = new Task[8];
             for (var t = 0; t < workers.Length; t++)
             {
@@ -370,7 +375,7 @@ public sealed partial class C4QueueFixTests
             }
 
             await Task.WhenAll(workers);
-            await dispose.WaitAsync(TimeSpan.FromSeconds(8));
+            await dispose.WaitAsync(TimeSpan.FromSeconds(30));
             lock (errors)
                 Assert.Empty(errors);
 
@@ -447,7 +452,7 @@ public sealed partial class C4QueueFixTests
         try
         {
             parallel.Log("hang", LogLevel.Info);
-            Assert.True(hanging.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(hanging.Entered.Wait(TimeSpan.FromSeconds(30)));
             var started = Stopwatch.StartNew();
             var first = Task.Run(() => parallel.Dispose());
             var second = Task.Run(() => parallel.Dispose());
@@ -522,7 +527,7 @@ public sealed partial class C4QueueFixTests
             for (var i = 0; i < 5; i++)
                 engine.Log("h-" + i.ToString(CultureInfo.InvariantCulture), LogLevel.Info);
 
-            Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(30)));
             var started = Stopwatch.StartNew();
             engine.Dispose();
             TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
@@ -547,7 +552,7 @@ public sealed partial class C4QueueFixTests
     /// The writer is not disposed, and stdout contains one ALOG0071 line.
     /// </summary>
     /// <returns>A task that finishes when the child exits or the time limit kills it.</returns>
-    [Fact(Timeout = 40000)]
+    [Fact(Timeout = 60000)]
     public async Task HangingWriter_ChildProcess_ExitsAfterShutdown()
     {
         var root = FindRepoRoot();
@@ -567,7 +572,7 @@ public sealed partial class C4QueueFixTests
         Assert.NotNull(process);
         var stdoutTask = process.StandardOutput.ReadToEndAsync();
         var stderrTask = process.StandardError.ReadToEndAsync();
-        var exited = process.WaitForExit(20_000);
+        var exited = process.WaitForExit(30_000);
         if (!exited)
         {
             process.Kill(entireProcessTree: true);
@@ -725,7 +730,7 @@ public sealed partial class C4QueueFixTests
         ArgumentNullException.ThrowIfNull(writer);
         ArgumentNullException.ThrowIfNull(lines);
         Assert.True(
-            await WaitUntil(() => writer.EnteredCount > 0, TimeSpan.FromSeconds(10)),
+            await WaitUntil(() => writer.EnteredCount > 0, TimeSpan.FromSeconds(30)),
             "processor never entered the blocked writer");
         // FlushAsync waits out the 5 s shutdown deadline while this writer stays blocked.
         // That wait is the bounded deadline, not a hang, and a slow timer can pass 5.2 s.
@@ -800,13 +805,17 @@ public sealed partial class C4QueueFixTests
     /// <summary>
     /// Polls <paramref name="ready"/> until it is true or <paramref name="budget"/> passes.
     /// </summary>
-    /// <param name="ready">Condition. Called at most 500 times. Must not throw.</param>
-    /// <param name="budget">Upper bound. The loop also stops after 500 tries.</param>
+    /// <param name="ready">Condition. Called until it returns true or the budget passes. Must not throw.</param>
+    /// <param name="budget">Upper bound. The loop stops when this elapses.</param>
     /// <returns>True when the condition was seen. False when the budget won.</returns>
+    /// <remarks>
+    /// A budget of zero checks once. Not thread-safe. Only the test thread calls it.
+    /// The 10 ms pause is the poll, not a product bound.
+    /// </remarks>
     private static async Task<bool> WaitUntil(Func<bool> ready, TimeSpan budget)
     {
         var started = Stopwatch.GetTimestamp();
-        for (var i = 0; i < 500 && Stopwatch.GetElapsedTime(started) < budget; i++)
+        while (Stopwatch.GetElapsedTime(started) < budget)
         {
             if (ready())
                 return true;

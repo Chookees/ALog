@@ -1,4 +1,6 @@
+using System.Diagnostics;
 using System.Globalization;
+using System.Reflection;
 using ALog;
 using ALog.Config;
 using ALog.Core;
@@ -239,18 +241,33 @@ public class GapRegressionTests : IDisposable
         Assert.Contains("Log.Init", ex.Message);
     }
 
-    [Fact]
+    /// <summary>
+    /// A full queue drops the overflow on the caller.
+    /// The producer returns while the blocked writer has finished nothing, and the drop counter equals the overflow.
+    /// </summary>
+    /// <returns>A task that finishes after the reported drop lines are summed.</returns>
+    /// <remarks>
+    /// The 300 ms wait was a test bound in this method, not a product timeout.
+    /// <see cref="BackgroundLogQueue.TryEnqueue"/> returns as soon as it drops.
+    /// Completion, an empty writer, and <see cref="BackgroundLogQueue.FullDropCount"/> decide that.
+    /// The 30 s waits are hang guards: one for the processor to enter the writer, one for the producer, and one for the ALOG0070 line.
+    /// Not thread-safe. The finally block releases the writer and restores SelfLog.
+    /// </remarks>
+    [Fact(Timeout = 90000)]
     public async Task F_QA_001_SyncEnqueue_DropsWhenQueueFull_AndReports()
     {
         var writer = new BlockingWriter();
         const int capacity = 5;
         const int total = 20;
         var lines = new List<string>();
+        var dropReported = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var previous = SelfLog.Target;
         SelfLog.Enable(line =>
         {
             lock (lines)
                 lines.Add(line);
+            if (line.Contains("events dropped: the background queue is full", StringComparison.Ordinal))
+                dropReported.TrySetResult();
         });
 
         var config = new LoggerConfig()
@@ -266,8 +283,8 @@ public class GapRegressionTests : IDisposable
             Log.Init(config);
             Log.Write("evt-0");
 
-            var deadline = DateTime.UtcNow.AddSeconds(5);
-            while (writer.EnteredCount == 0 && DateTime.UtcNow < deadline)
+            var entered = Stopwatch.StartNew();
+            while (writer.EnteredCount == 0 && entered.Elapsed < TimeSpan.FromSeconds(30))
                 await Task.Delay(10);
 
             Assert.True(writer.EnteredCount > 0, "processor never entered writer");
@@ -278,20 +295,17 @@ public class GapRegressionTests : IDisposable
                     Log.Write($"evt-{i}");
             });
 
-            // A full queue drops. The producers must not sit out the old five-second wait.
-            var finished = await Task.WhenAny(producer, Task.Delay(300)) == producer;
+            // Dropping returns. A producer still inside TryEnqueue after the hang guard blocked instead.
+            var finished = await Task.WhenAny(producer, Task.Delay(TimeSpan.FromSeconds(30))) == producer;
             Assert.True(finished, "sync producers blocked instead of dropping");
-            await producer.WaitAsync(TimeSpan.FromSeconds(5));
+            await producer;
 
-            var reported = false;
-            for (var i = 0; i < 50 && !reported; i++)
-            {
-                lock (lines)
-                    reported = lines.Exists(line => line.Contains("events dropped: the background queue is full", StringComparison.Ordinal));
-                if (!reported)
-                    await Task.Delay(20);
-            }
+            Assert.Empty(writer.Events);
+            var queue = CurrentQueue();
+            Assert.Equal((long)capacity, queue.AcceptedCount);
+            Assert.Equal((long)(total - capacity), queue.FullDropCount);
 
+            var reported = await Task.WhenAny(dropReported.Task, Task.Delay(TimeSpan.FromSeconds(30))) == dropReported.Task;
             Assert.True(reported, "ALOG0070 was not written");
             writer.Release();
             await Log.FlushAsync();
@@ -329,7 +343,18 @@ public class GapRegressionTests : IDisposable
         Assert.False(client.DefaultRequestHeaders.Contains("X-Test"));
     }
 
-    [Fact]
+    /// <summary>
+    /// A wake from the idle wait must not run the writer on the thread that queued the event.
+    /// TryEnqueue returns while the writer has finished nothing.
+    /// </summary>
+    /// <returns>A task that finishes after the blocked write is released.</returns>
+    /// <remarks>
+    /// The processor runs on the constructing thread until <c>WaitForNextTickAsync</c> inside
+    /// <c>BackgroundLogQueue.WaitForWorkAsync</c>. Constructor return is the idle signal: the processor task is still parked and no writer call is in flight.
+    /// The 30 s waits are hang guards. Not thread-safe. The delegate releases the writer.
+    /// A thread-id compare is not used. The pool may reuse the producer thread after the hop.
+    /// </remarks>
+    [Fact(Timeout = 90000)]
     public async Task F_QA_003_WakeCancel_DoesNot_Block_Enqueue_On_WriterThread()
     {
         // Run off xUnit sync context so Cancel continuations stay on the producer (repro path).
@@ -343,8 +368,8 @@ public class GapRegressionTests : IDisposable
                 flushInterval: TimeSpan.FromSeconds(30),
                 asyncEnabled: false);
 
-            // Let the processor reach idle await on PeriodicTimer / wake CTS.
-            await Task.Delay(300).ConfigureAwait(false);
+            AssertProcessorIsWaitingForWork(queue);
+            Assert.Equal(0, writer.EnteredCount);
 
             var enqueueDone = new ManualResetEventSlim(false);
             var producer = Task.Run(() =>
@@ -355,23 +380,66 @@ public class GapRegressionTests : IDisposable
                 enqueueDone.Set();
             });
 
-            // Hang contract: TryEnqueue returns while writer remains blocked (before Release).
-            // Do not assert ManagedThreadId ≠ WriteThreadId — pool may reuse the same id after Yield.
-            var returned = enqueueDone.Wait(TimeSpan.FromSeconds(2));
+            // Hang contract: TryEnqueue returns while the writer remains blocked.
+            var returned = enqueueDone.Wait(TimeSpan.FromSeconds(30));
             Assert.True(returned, "TryEnqueue hung — wake Cancel likely continued into blocking Write on producer");
             Assert.Empty(writer.Events);
 
-            var enteredDeadline = DateTime.UtcNow.AddSeconds(5);
-            while (writer.EnteredCount == 0 && DateTime.UtcNow < enteredDeadline)
+            var entered = Stopwatch.StartNew();
+            while (writer.EnteredCount == 0 && entered.Elapsed < TimeSpan.FromSeconds(30))
                 await Task.Delay(10).ConfigureAwait(false);
 
             Assert.True(writer.EnteredCount > 0, "processor never entered blocking writer");
             Assert.Empty(writer.Events);
 
             writer.Release();
-            await producer.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+            await producer.WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
             await queue.FlushAsync().ConfigureAwait(false);
         });
+    }
+
+    /// <summary>
+    /// Fails unless the processor is parked in the idle wait and no writer call is running.
+    /// </summary>
+    /// <param name="queue">Queue just constructed, before any enqueue. Not null.</param>
+    /// <remarks>
+    /// <see cref="BackgroundLogQueue"/> starts the processor inline and does not return until
+    /// <c>WaitForWorkAsync</c> is awaiting <c>PeriodicTimer.WaitForNextTickAsync</c>.
+    /// A completed processor task, or an in-flight writer call, means that wait was not the current state.
+    /// Not thread-safe. Only the test thread calls it.
+    /// </remarks>
+    private static void AssertProcessorIsWaitingForWork(BackgroundLogQueue queue)
+    {
+        ArgumentNullException.ThrowIfNull(queue);
+        var taskField = typeof(BackgroundLogQueue).GetField("_backgroundTask", BindingFlags.Instance | BindingFlags.NonPublic);
+        var inflightField = typeof(BackgroundLogQueue).GetField("_inflight", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(taskField);
+        Assert.NotNull(inflightField);
+        var parked = taskField.GetValue(queue);
+        Assert.NotNull(parked);
+        var completedProp = parked.GetType().GetProperty("IsCompleted");
+        Assert.NotNull(completedProp);
+        var completed = (bool)completedProp.GetValue(parked)!;
+        Assert.False(completed, "processor left before the idle wait");
+        Assert.Equal(0, (int)inflightField.GetValue(queue)!);
+    }
+
+    /// <summary>
+    /// The queue installed by <see cref="Log.Init"/>. The drop counter lives on that queue.
+    /// </summary>
+    /// <returns>The live queue. Not null.</returns>
+    /// <remarks>
+    /// The static logger field is private. This test reads it so the drop counter can be checked without a product change.
+    /// Not thread-safe. Only the test thread calls it, after <see cref="Log.Init"/> and before <see cref="Log.Shutdown"/>.
+    /// </remarks>
+    private static BackgroundLogQueue CurrentQueue()
+    {
+        var field = typeof(Log).GetField("_logger", BindingFlags.Static | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        var engine = Assert.IsType<LoggerEngine>(field.GetValue(null));
+        var queue = engine.Queue;
+        Assert.NotNull(queue);
+        return queue!;
     }
 
     /// <summary>

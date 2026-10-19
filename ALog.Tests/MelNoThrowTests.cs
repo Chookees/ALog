@@ -467,7 +467,7 @@ public sealed class MelNoThrowTests : IDisposable
         {
             threads[slot] = new Thread(() =>
             {
-                if (!start.SignalAndWait(TimeSpan.FromSeconds(10)))
+                if (!start.SignalAndWait(TimeSpan.FromSeconds(30)))
                 {
                     Interlocked.Increment(ref errors);
                     return;

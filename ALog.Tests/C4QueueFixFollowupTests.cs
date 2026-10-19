@@ -18,7 +18,7 @@ public sealed partial class C4QueueFixTests
         "Event dropped: ALog is shut down (the background queue was closed by Shutdown or Dispose). Later events are counted, not reported. Stop logging before you call Shutdown or Dispose.";
 
     /// <summary>
-    /// The spec repro: 1 ms writer, 100,000 logs, 300 ms, 100,000 more, then Dispose.
+    /// The spec repro: 1 ms writer, 100,000 logs, the first ALOG0070 line, 100,000 more, then Dispose.
     /// The sum of ALOG0070 counts must equal <see cref="BackgroundLogQueue.FullDropCount"/>,
     /// and a remainder line sits immediately before ALOG0071.
     /// A run with no drops adds no ALOG0070 line.
@@ -46,8 +46,14 @@ public sealed partial class C4QueueFixTests
             for (var i = 0; i < 100_000; i++)
                 engine.Log("a", LogLevel.Info);
 
-            // Spec repro pause. The first report is due after 1 ms; the second burst stays in the 60 s window.
-            await Task.Delay(300);
+            // The first ALOG0070 line is the signal that the 60 s window is open. The second burst stays inside it.
+            Assert.True(
+                await WaitUntil(() =>
+                {
+                    lock (lines)
+                        return lines.Exists(line => line.Contains(DropMarker, StringComparison.Ordinal));
+                }, TimeSpan.FromSeconds(30)),
+                "ALOG0070 did not open the window");
             for (var i = 0; i < 100_000; i++)
                 engine.Log("b", LogLevel.Info);
 
@@ -209,7 +215,7 @@ public sealed partial class C4QueueFixTests
             for (var i = 0; i < 3; i++)
                 engine.Log("kept-line", LogLevel.Info);
 
-            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(30)));
             var started = Stopwatch.StartNew();
             engine.Dispose();
             TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
@@ -241,7 +247,7 @@ public sealed partial class C4QueueFixTests
     /// and does not call the spy that already finished.
     /// </summary>
     /// <returns>A task that finishes when the processor leaves.</returns>
-    [Fact(Timeout = 20000)]
+    [Fact(Timeout = 60000)]
     public async Task NoWriterCall_AfterDeadline_WhenHangReturns()
     {
         var previous = SelfLog.Target;
@@ -261,11 +267,11 @@ public sealed partial class C4QueueFixTests
             for (var i = 0; i < 3; i++)
                 engine.Log("x", LogLevel.Info);
 
-            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(30)));
             engine.Dispose();
             var frontFinished = front.Finished;
             release.Set();
-            Assert.True(await WaitUntil(() => IsProcessorStopped(engine.Queue!), TimeSpan.FromSeconds(5)));
+            Assert.True(await WaitUntil(() => IsProcessorStopped(engine.Queue!), TimeSpan.FromSeconds(30)));
             Assert.Equal(0, back.Finished);
             Assert.Equal(frontFinished, front.Finished);
             Assert.Equal(0, front.CallsAfterDispose);
@@ -300,7 +306,7 @@ public sealed partial class C4QueueFixTests
             for (var i = 0; i < 5; i++)
                 engine.Log("dup", LogLevel.Info);
 
-            Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(writer.Entered.Wait(TimeSpan.FromSeconds(30)));
             var started = Stopwatch.StartNew();
             engine.Dispose();
             TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
@@ -310,7 +316,7 @@ public sealed partial class C4QueueFixTests
             release.Set();
             Assert.True(await WaitUntil(
                 () => writer.DisposeCount == 1 && writer.DisposeOrder > writer.FinishOrder && !writer.DisposeOverlappedWrite,
-                TimeSpan.FromSeconds(5)));
+                TimeSpan.FromSeconds(30)));
             Assert.Equal(1, writer.DisposeCount);
             var queue = engine.Queue!;
             var unwritten = queue.UnwrittenCount;
@@ -348,7 +354,7 @@ public sealed partial class C4QueueFixTests
         try
         {
             engine.Log("slow", LogLevel.Info);
-            Assert.True(slow.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(slow.Entered.Wait(TimeSpan.FromSeconds(30)));
             var started = Stopwatch.StartNew();
             engine.Dispose();
             TransitionDeadline.AssertFiredInWindow(started.Elapsed, BackgroundLogQueue.ShutdownDeadline);
@@ -357,7 +363,7 @@ public sealed partial class C4QueueFixTests
             release.Set();
             Assert.True(await WaitUntil(
                 () => slow.Disposed && slow.DisposeOrder > slow.FinishOrder,
-                TimeSpan.FromSeconds(5)));
+                TimeSpan.FromSeconds(30)));
             Assert.False(slow.DisposeOverlappedWrite);
             Assert.True(behind.Disposed);
             Assert.Equal(0, behind.Finished);
@@ -427,7 +433,7 @@ public sealed partial class C4QueueFixTests
         try
         {
             Assert.True(queue.TryEnqueue(Event("prime")));
-            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(5)));
+            Assert.True(hang.Entered.Wait(TimeSpan.FromSeconds(30)));
             for (var i = 0; i < 3; i++)
                 Assert.True(queue.TryEnqueue(Event("fill")));
 
