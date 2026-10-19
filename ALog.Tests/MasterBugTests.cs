@@ -202,8 +202,9 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
-    /// Locks the M1 sentences: startup note under the JSON example, writer remarks,
-    /// install lines without a version, the two changelog bullets, and the skip hint.
+    /// Locks the M1 sentences: writer remarks, install lines without a version,
+    /// the two changelog bullets, and the skip hint.
+    /// The runtime-reload sentence is absent: <c>ALog:MinimumLevel</c> is not re-read.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task Docs_LockMasterBugTexts()
@@ -212,14 +213,10 @@ public sealed class MasterBugTests : IDisposable
         var readme = ReadRepoFile("README.md");
         var packageReadme = ReadRepoFile("ALog.Extensions.Logging/README.md");
         var aspnet = Slice(readme, "### ASP.NET Core", "## Console output");
-        var console = Slice(readme, "## Console output", "## Quick Start");
         var contributing = Slice(readme, "## Contributing", "## License");
-        var jsonAt = aspnet.IndexOf("{ \"ALog\": { \"Console\": { \"Enabled\": true } } }", StringComparison.Ordinal);
-        var sentenceAt = aspnet.IndexOf(WriterSentence, StringComparison.Ordinal);
 
-        Assert.True(jsonAt >= 0 && sentenceAt > jsonAt, "Writer sentence must follow the JSON example.");
-        Assert.Equal(1, CountOf(readme, WriterSentence));
-        Assert.DoesNotContain(WriterSentence, console, StringComparison.Ordinal);
+        Assert.Contains("{ \"ALog\": { \"Console\": { \"Enabled\": true } } }", aspnet, StringComparison.Ordinal);
+        Assert.Equal(0, CountOf(readme, WriterSentence));
         Assert.Contains(SkipSentence, contributing, StringComparison.Ordinal);
         Assert.Equal(1, CountOf(readme, SkipSentence));
         Assert.Contains("dotnet add package ALog", readme, StringComparison.Ordinal);

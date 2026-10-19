@@ -44,8 +44,6 @@ Turn on ALog's console in `appsettings.json`:
 { "ALog": { "Console": { "Enabled": true } } }
 ```
 
-Writer settings (Enabled, paths) are read at startup; only levels reload at runtime.
-
 See `samples/ALog.AspNetSample`.
 
 ---

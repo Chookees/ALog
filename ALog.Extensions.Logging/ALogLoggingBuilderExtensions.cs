@@ -63,7 +63,14 @@ public static class ALogLoggingBuilderExtensions
 
     /// <summary>
     /// Binds <see cref="ALogOptions"/> from configuration without registering MEL.
+    /// A single value at <c>ALog:Console</c> or <c>ALog:File</c> is not rejected here.
     /// </summary>
+    /// <param name="configuration">Application configuration. Null is rejected.</param>
+    /// <returns>The bound options. Writer sections that are single values stay at their defaults.</returns>
+    /// <remarks>
+    /// <see cref="RejectSingleValueSections"/> is the startup check. Putting it on this method is the one call before <c>Bind</c>.
+    /// That call is not made yet.
+    /// </remarks>
     public static ALogOptions GetALogOptions(this IConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
@@ -108,15 +115,19 @@ public static class ALogLoggingBuilderExtensions
     }
 
     /// <summary>
-    /// A single value has text and no children. JSON <c>"Console": true</c> is that shape.
+    /// A single value has non-whitespace text and no children. JSON <c>"Console": true</c> is that shape.
     /// JSON <c>"Console": { "Enabled": true }</c> has children and a null value.
     /// </summary>
     /// <param name="section">The section to inspect. Not null.</param>
-    /// <returns>True when startup must stop. False when the section is missing or has settings.</returns>
-    /// <remarks>Looks at the first child only. Does not read the value into the result.</remarks>
+    /// <returns>True when startup must stop. False when the section is missing, blank, or has settings.</returns>
+    /// <remarks>
+    /// Empty and whitespace values are not classified: the binder already ignores them, and this method leaves that result.
+    /// Looks at the first child only. Does not read the value into the result.
+    /// </remarks>
     private static bool IsSingleValue(IConfigurationSection section)
     {
-        if (section.Value is null)
+        // Blank values stay with the binder. A non-whitespace value with no child is the scalar "Console": true.
+        if (string.IsNullOrWhiteSpace(section.Value))
             return false;
 
         foreach (var child in section.GetChildren())
