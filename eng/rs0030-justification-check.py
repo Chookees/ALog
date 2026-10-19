@@ -5,7 +5,10 @@ CI builds each product project with ``-p:ErrorLog=<file>.sarif,version=2.1``.
 This script reads every RS0030 result, including suppressed ones, and requires
 an in-source suppression whose justification is one of the five allowlist texts
 on that file and member. NoWarn and WarningsNotAsErrors come from
-``dotnet msbuild -getProperty``. Success prints ``rs0030-justification: ok``.
+``dotnet msbuild -getProperty``. When no SARIF path is passed, the script
+builds both product projects with ``--no-incremental`` so a later run on the
+same tree still compiles and writes a fresh ErrorLog. Success prints
+``rs0030-justification: ok``.
 """
 
 from __future__ import annotations
@@ -1516,7 +1519,8 @@ def build_products(repo: Path) -> list[str]:
         The two log paths. A failed build still returns a path when the log was written.
 
     Side effects:
-        Runs ``dotnet build`` for ALog and ALog.Extensions.Logging.
+        Runs ``dotnet build --no-incremental`` for ALog and ALog.Extensions.Logging.
+        The compiler runs every time, so the ErrorLog is written again on a rerun.
     """
     logs = []
     root = Path(tempfile.mkdtemp(prefix="rs0030-product-"))
@@ -1529,7 +1533,7 @@ def build_products(repo: Path) -> list[str]:
         subprocess.run(
             [
                 "dotnet", "build", str(csproj),
-                "-c", "Release", "--nologo",
+                "-c", "Release", "--nologo", "--no-incremental",
                 '-p:ErrorLog="' + str(sarif) + ',version=2.1"',
             ],
             cwd=repo,
