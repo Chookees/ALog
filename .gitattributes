@@ -63,3 +63,4 @@
 #*.RTF   diff=astextplain
 NOTICE text eol=lf
 LICENSE text eol=lf
+*.sh text eol=lf
