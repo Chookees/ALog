@@ -97,7 +97,7 @@ Log.Shutdown();
 
 ### Example output
 
-Step 1 and Step 2 together are a complete program: [`samples/ALog.QuickstartSample`](samples/ALog.QuickstartSample). Running it prints this to the console:
+Step 1 and Step 2 together are a complete program: [`samples/ALog.QuickstartSample`](https://github.com/Chookees/ALog/tree/master/samples/ALog.QuickstartSample). Running it prints this to the console:
 
 ![Console output of the Quick Start sample from Step 1 and Step 2](https://raw.githubusercontent.com/Chookees/ALog/master/docs/images/quickstart-console.png)
 

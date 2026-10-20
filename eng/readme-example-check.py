@@ -38,9 +38,11 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 ISO_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z")
 CLOCK_TIMESTAMP = re.compile(r"\d{2}:\d{2}:\d{2}")
 TIMESTAMP_TOKEN = "<timestamp>"
+# Absolute tree URL: nuget.org renders this README and does not resolve a relative link.
 EXAMPLE_INTRO = (
     "Step 1 and Step 2 together are a complete program: "
-    "[`samples/ALog.QuickstartSample`](samples/ALog.QuickstartSample). "
+    "[`samples/ALog.QuickstartSample`]"
+    "(https://github.com/Chookees/ALog/tree/master/samples/ALog.QuickstartSample). "
     "Running it prints this to the console:"
 )
 IMAGE_LINE = (
@@ -430,6 +432,10 @@ def outside_marker_problem(program: str) -> str | None:
 
 def wording_problem(readme: str) -> str | None:
     """Require the Example output heading, sentences, image, and position.
+
+    The sample link in the sentence above the image must be the absolute
+    GitHub tree URL. nuget.org shows the packed README and does not resolve
+    a relative sample link, so a relative URL is a failed check.
 
     Args:
         readme: Normalized README text.
