@@ -3,6 +3,7 @@
 ## 0.2.1
 
 - Breaking (dependency): `Microsoft.Data.SqlClient` moves from 6.0.2 to 7.1.1. If your app references `Microsoft.Data.SqlClient` directly, upgrade it to 7.x as well.
+- Changed: ALog is now licensed under the Apache License 2.0 instead of MIT. Versions up to and including 0.2.0 stay under the MIT License.
 - Fixed: inner scope wins on duplicate keys; scopes are isolated across parallel tasks; dispose restores the correct parent
 - Fixed: logging never throws into the application; errors go to SelfLog
 - Fixed: a throwing filter drops the event and writes one SelfLog line, so a broken filter cannot leak the event. A throwing enricher is still skipped and the event is logged

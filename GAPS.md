@@ -100,7 +100,8 @@ Severity levels: **extraordinary** > **high** > **medium** > **low**
 ## Low
 
 ### G-L01 — README clone URL is a placeholder (`yourusername`)
-### G-L02 — Author / maintainer name inconsistency (csproj “Artur Zubert” vs README “Artur Bobb / Chookees”)
+### G-L02 — Author / maintainer name inconsistency (resolved)
+Resolved in the Apache 2.0 PR: csproj, nuspec, NOTICE and README all name Artur Bobb.
 ### G-L03 — Typos in comments/demo (`Fassade`, `successfull`, `Testerror`, gitignore `secrects`)
 ### G-L04 — `MinimumLevelFilter` overlaps `SetMinimumLevel` with little documentation of composition
 ### G-L05 — No `global.json` to pin SDK for contributors

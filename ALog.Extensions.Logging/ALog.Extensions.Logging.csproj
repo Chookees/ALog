@@ -5,18 +5,19 @@
     <PackageId>ALog.Extensions.Logging</PackageId>
     <Version>0.2.1</Version>
     <Title>ALog.Extensions.Logging</Title>
-    <Authors>Artur Zubert</Authors>
+    <Authors>Artur Bobb</Authors>
     <Description>Microsoft.Extensions.Logging provider and configuration binding for ALog.</Description>
     <PackageProjectUrl>https://github.com/Chookees/ALog</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Chookees/ALog</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageTags>logging;dotnet;alog;microsoft.extensions.logging</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
 
   <ItemGroup>
     <None Include="README.md" Pack="true" PackagePath="\" />
+    <None Include="..\NOTICE" Pack="true" PackagePath="\" />
   </ItemGroup>
 
   <ItemGroup>

@@ -824,7 +824,7 @@ def badge_markers(coverage_file):
     return [
         "[![CI](" + CI_IMAGE + ")](" + ACTIONS + ")",
         coverage,
-        "[![License: MIT](https://img.shields.io/badge/License-MIT-blue)](" + LICENSE + ")",
+        "[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue)](" + LICENSE + ")",
         "![.NET 10](" + NET_IMAGE + ")",
     ]
 

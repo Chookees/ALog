@@ -39,7 +39,7 @@ else
   pass "no alloc budget file"
 fi
 
-authors='<Authors>Artur Zubert</Authors>'
+authors='<Authors>Artur Bobb</Authors>'
 if ! grep -F -q "$authors" ALog/ALog.csproj; then
   fail "ALog authors changed"
 else
