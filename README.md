@@ -28,7 +28,7 @@ dotnet add package ALog
 dotnet add package ALog.Extensions.Logging
 ```
 
-Source: https://github.com/Chookees/ALog · Optional future sink split: [`docs/PACKAGE_SPLIT.md`](docs/PACKAGE_SPLIT.md)
+Source: https://github.com/Chookees/ALog · Optional future sink split: [`docs/PACKAGE_SPLIT.md`](https://github.com/Chookees/ALog/blob/master/docs/PACKAGE_SPLIT.md)
 
 ### ASP.NET Core
 
@@ -283,7 +283,7 @@ For ideas like new formatters or writers, feel free to open a discussion first.
 
 ## License
 
-Apache License 2.0 © Artur Bobb. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Versions up to and including 0.2.0 were released under the MIT License.
+Apache License 2.0 © Artur Bobb. See [LICENSE](https://github.com/Chookees/ALog/blob/master/LICENSE) and [NOTICE](https://github.com/Chookees/ALog/blob/master/NOTICE). Versions up to and including 0.2.0 were released under the MIT License.
 
 ---
 
