@@ -621,7 +621,7 @@ public sealed class AwsV4Tests
     /// <returns>A task that finishes after the follow-up event is accepted.</returns>
     /// <remarks>Fails while a missing slice recreates the stream more than once in the same batch.</remarks>
     [Fact(Timeout = 30000)]
-    public async Task Put_SecondSliceMissing_RecreatesOnceAndTheNextBatchCreates()
+    public async Task Put_LaterSliceMissing_RecreatesOnceAndTheNextBatchCreates()
     {
         var client = CountingCloudWatch.Create();
         client.NotFoundAtPuts = [1, 3];
