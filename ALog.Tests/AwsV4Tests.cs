@@ -289,9 +289,12 @@ public sealed class AwsV4Tests
 
     /// <summary>
     /// A network failure while creating the group is reported and not thrown.
-    /// The next write creates the group and delivers the event.
+    /// The next write creates the group and the stream, then delivers the event.
     /// </summary>
-    /// <remarks>Fails while the failure is not sent through <see cref="SelfLog"/>.</remarks>
+    /// <remarks>
+    /// Fails while the failure is not sent through <see cref="SelfLog"/>.
+    /// Also fails when the stream is marked ready before the create succeeds, because the next write then skips <c>CreateLogStream</c>.
+    /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task Write_NetworkFailure_IsReported_AndNextWriteDelivers()
     {
@@ -308,8 +311,12 @@ public sealed class AwsV4Tests
             Assert.Contains("[AwsCloudWatchWriter]", error, StringComparison.Ordinal);
             Assert.Contains("AwsCloudWatchWriter", string.Join("\n", lines), StringComparison.Ordinal);
             Assert.Equal(0, client.Puts);
+            Assert.Equal(1, client.CreateGroups);
+            Assert.Equal(0, client.CreateStreams);
 
             writer.Write(Plain("kept"));
+            Assert.Equal(2, client.CreateGroups);
+            Assert.Equal(1, client.CreateStreams);
             Assert.Equal(1, client.Puts);
             Assert.Equal("kept", client.Batches[0][0]);
             Assert.Equal(0, client.Describes);
@@ -322,9 +329,10 @@ public sealed class AwsV4Tests
 
     /// <summary>
     /// The async path reports a create failure and delivers on the following call.
+    /// The second call is the one that creates the stream.
     /// </summary>
     /// <returns>A task that finishes after the second write.</returns>
-    /// <remarks>Separate from the synchronous network-failure case.</remarks>
+    /// <remarks>Separate from the synchronous network-failure case. A ready flag set before create leaves <c>CreateLogStream</c> at zero.</remarks>
     [Fact(Timeout = 30000)]
     public async Task WriteAsync_NetworkFailure_IsReported_AndNextWriteDelivers()
     {
@@ -340,8 +348,12 @@ public sealed class AwsV4Tests
             Assert.Contains("[AwsCloudWatchWriter]", error, StringComparison.Ordinal);
             Assert.Contains("AwsCloudWatchWriter", string.Join("\n", lines), StringComparison.Ordinal);
             Assert.Equal(0, client.Puts);
+            Assert.Equal(1, client.CreateGroups);
+            Assert.Equal(0, client.CreateStreams);
 
             await writer.WriteAsync(Plain("kept"));
+            Assert.Equal(2, client.CreateGroups);
+            Assert.Equal(1, client.CreateStreams);
             Assert.Equal(1, client.Puts);
             Assert.Equal("kept", client.Batches[0][0]);
             Assert.Equal(0, client.Describes);
@@ -350,6 +362,290 @@ public sealed class AwsV4Tests
         {
             SelfLog.Target = previous;
         }
+    }
+
+    /// <summary>
+    /// Two writers that share one transport and use different streams both deliver.
+    /// Each stream is created once. The shared group is created once.
+    /// </summary>
+    /// <remarks>Fails while one ready flag on the transport skips the second stream.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task Write_TwoWritersSharingTransport_CreateEachStreamOnce()
+    {
+        await Task.CompletedTask;
+        var client = CountingCloudWatch.Create();
+        using var transport = new AwsSdkCloudWatchLogsTransport(client.Client);
+        using var alpha = new AwsCloudWatchWriter("group", "alpha", transport);
+        using var beta = new AwsCloudWatchWriter("group", "beta", transport);
+        WriteMany(alpha, "a", 100);
+        WriteMany(beta, "b", 100);
+
+        Assert.Equal(200, client.Puts);
+        Assert.Equal(1, client.CreateGroups);
+        Assert.Equal(2, client.CreateStreams);
+        Assert.Equal(0, client.Describes);
+        Assert.Equal(100, CountMessages(client, "a"));
+        Assert.Equal(100, CountMessages(client, "b"));
+    }
+
+    /// <summary>
+    /// The async path delivers both streams when two writers share one transport.
+    /// </summary>
+    /// <returns>A task that finishes after both writers have sent 100 events.</returns>
+    /// <remarks>Separate from the synchronous shared-transport case.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task WriteAsync_TwoWritersSharingTransport_CreateEachStreamOnce()
+    {
+        var client = CountingCloudWatch.Create();
+        using var transport = new AwsSdkCloudWatchLogsTransport(client.Client);
+        using var alpha = new AwsCloudWatchWriter("group", "alpha", transport);
+        using var beta = new AwsCloudWatchWriter("group", "beta", transport);
+        await WriteManyAsync(alpha, "a", 100);
+        await WriteManyAsync(beta, "b", 100);
+
+        Assert.Equal(200, client.Puts);
+        Assert.Equal(1, client.CreateGroups);
+        Assert.Equal(2, client.CreateStreams);
+        Assert.Equal(0, client.Describes);
+        Assert.Equal(100, CountMessages(client, "a"));
+        Assert.Equal(100, CountMessages(client, "b"));
+    }
+
+    /// <summary>
+    /// Eight concurrent writes create the stream once. The fake holds every put until all eight have entered.
+    /// </summary>
+    /// <returns>A task that finishes after all eight writes return.</returns>
+    /// <remarks>Fails while create has no gate. The fact timeout is the only wall-clock bound.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task EightThreads_CreateTheStreamOnce()
+    {
+        var client = CountingCloudWatch.Create();
+        client.ReleasePutsAfter = 8;
+        using var writer = OwnedWriter(client);
+        var writes = new Task[8];
+        for (var index = 0; index < writes.Length; index++)
+        {
+            var name = "t" + index.ToString();
+            writes[index] = Task.Run(() => writer.Write(Plain(name)));
+        }
+
+        await Task.WhenAll(writes);
+        Assert.Equal(1, client.CreateGroups);
+        Assert.Equal(1, client.CreateStreams);
+        Assert.Equal(8, client.Puts);
+        Assert.Equal(0, client.Describes);
+    }
+
+    /// <summary>
+    /// Two events whose UTF-8 size plus 26 bytes each is exactly 1,048,576 go in one put.
+    /// </summary>
+    /// <remarks>An overhead of 27 bytes makes this pair look too large and splits it.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ByteLimit_Exact1048576Bytes_SendsOnePut()
+    {
+        var client = CountingCloudWatch.Create();
+        using var transport = new AwsSdkCloudWatchLogsTransport(client.Client);
+        var message = new string('a', (PutByteLimit / 2) - EventOverhead);
+        AwsCloudWatchLogEvent[] events = [new(message, 1_000), new(message, 2_000)];
+
+        await ((IAwsCloudWatchLogsTransport)transport).PutLogEventsAsync("group", "stream", events);
+
+        Assert.Equal(1, client.Puts);
+        Assert.Equal(2, client.Batches[0].Count);
+    }
+
+    /// <summary>
+    /// One byte past 1,048,576, counting 26 bytes of overhead per event, needs a second put.
+    /// </summary>
+    /// <remarks>An overhead of 25 bytes still fits this pair in one put.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ByteLimit_OneByteOver1048576_SendsTwoPuts()
+    {
+        var client = CountingCloudWatch.Create();
+        using var transport = new AwsSdkCloudWatchLogsTransport(client.Client);
+        var message = new string('a', (PutByteLimit / 2) - EventOverhead);
+        AwsCloudWatchLogEvent[] events = [new(message, 1_000), new(message + "b", 2_000)];
+
+        await ((IAwsCloudWatchLogsTransport)transport).PutLogEventsAsync("group", "stream", events);
+
+        Assert.Equal(2, client.Puts);
+        Assert.Single(client.Batches[0]);
+        Assert.Single(client.Batches[1]);
+    }
+
+    /// <summary>
+    /// A stream deleted after the first put is created again and the same event is sent once more.
+    /// </summary>
+    /// <remarks>The following event does not create again. Fails while a missing stream is not retried.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task Write_StreamDeletedOnce_RecreatesAndResendsTheBatch()
+    {
+        await Task.CompletedTask;
+        var client = CountingCloudWatch.Create();
+        using var writer = OwnedWriter(client);
+        writer.Write(Plain("first"));
+        client.StreamMissing = true;
+        writer.Write(Plain("second"));
+        writer.Write(Plain("third"));
+
+        Assert.Equal(2, client.CreateGroups);
+        Assert.Equal(2, client.CreateStreams);
+        Assert.Equal(4, client.Puts);
+        Assert.Equal(2, CountMessages(client, "second"));
+        Assert.Equal(1, CountMessages(client, "third"));
+        Assert.Equal(0, client.Describes);
+    }
+
+    /// <summary>
+    /// The async path recreates a deleted stream and resends that event once.
+    /// </summary>
+    /// <returns>A task that finishes after the recovered write.</returns>
+    /// <remarks>Separate from the synchronous deleted-stream case.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task WriteAsync_StreamDeletedOnce_RecreatesAndResendsTheBatch()
+    {
+        var client = CountingCloudWatch.Create();
+        using var writer = OwnedWriter(client);
+        await writer.WriteAsync(Plain("first"));
+        client.StreamMissing = true;
+        await writer.WriteAsync(Plain("second"));
+
+        Assert.Equal(2, client.CreateStreams);
+        Assert.Equal(3, client.Puts);
+        Assert.Equal(2, CountMessages(client, "second"));
+    }
+
+    /// <summary>
+    /// Two later batches each find the stream missing. Each one creates it once and resends once.
+    /// </summary>
+    /// <remarks>A loop inside one batch would create more than once per event.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task Write_StreamDeletedTwice_RecreatesOnceEachTime()
+    {
+        await Task.CompletedTask;
+        var client = CountingCloudWatch.Create();
+        using var writer = OwnedWriter(client);
+        writer.Write(Plain("first"));
+        client.StreamMissing = true;
+        writer.Write(Plain("second"));
+        client.StreamMissing = true;
+        writer.Write(Plain("third"));
+
+        Assert.Equal(3, client.CreateGroups);
+        Assert.Equal(3, client.CreateStreams);
+        Assert.Equal(5, client.Puts);
+        Assert.Equal(2, CountMessages(client, "second"));
+        Assert.Equal(2, CountMessages(client, "third"));
+    }
+
+    /// <summary>
+    /// When the re-create fails, the writer reports it, does not throw, and does not try another put.
+    /// The next event creates the stream and delivers.
+    /// </summary>
+    /// <remarks>Fails while a failed re-create is retried inside the same batch.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task Write_RecreateFailure_IsReportedWithoutLooping()
+    {
+        await Task.CompletedTask;
+        var client = CountingCloudWatch.Create();
+        using var writer = OwnedWriter(client);
+        writer.Write(Plain("first"));
+        client.StreamMissing = true;
+        client.StreamFailures = 1;
+        var lines = new List<string>();
+        var previous = SelfLog.Target;
+        SelfLog.Enable(line => lines.Add(line));
+        try
+        {
+            string error = string.Empty;
+            var thrown = Record.Exception(() =>
+            {
+                error = CaptureError(() => writer.Write(Plain("lost")));
+            });
+            Assert.Null(thrown);
+            Assert.Contains("[AwsCloudWatchWriter]", error, StringComparison.Ordinal);
+            Assert.Contains("AwsCloudWatchWriter", string.Join("\n", lines), StringComparison.Ordinal);
+            Assert.Equal(2, client.CreateGroups);
+            Assert.Equal(2, client.CreateStreams);
+            Assert.Equal(2, client.Puts);
+
+            writer.Write(Plain("kept"));
+            Assert.Equal(2, client.CreateGroups);
+            Assert.Equal(3, client.CreateStreams);
+            Assert.Equal(3, client.Puts);
+            Assert.Equal(1, CountMessages(client, "kept"));
+        }
+        finally
+        {
+            SelfLog.Target = previous;
+        }
+    }
+
+    /// <summary>
+    /// A stream that stays missing costs one re-create and one resend per batch, then the event is dropped.
+    /// </summary>
+    /// <remarks>Fails while the same batch creates more than once or retries without returning.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task Write_PermanentNotFound_RecreatesOncePerBatch()
+    {
+        await Task.CompletedTask;
+        var client = CountingCloudWatch.Create();
+        using var writer = OwnedWriter(client);
+        writer.Write(Plain("first"));
+        client.AlwaysNotFound = true;
+        var lines = new List<string>();
+        var previous = SelfLog.Target;
+        SelfLog.Enable(line => lines.Add(line));
+        try
+        {
+            var firstError = CaptureError(() => writer.Write(Plain("a")));
+            var secondError = CaptureError(() => writer.Write(Plain("b")));
+            Assert.Contains("ResourceNotFoundException", firstError, StringComparison.Ordinal);
+            Assert.Contains("ResourceNotFoundException", secondError, StringComparison.Ordinal);
+            Assert.Contains("AwsCloudWatchWriter", string.Join("\n", lines), StringComparison.Ordinal);
+            Assert.Equal(4, client.CreateGroups);
+            Assert.Equal(4, client.CreateStreams);
+            Assert.Equal(5, client.Puts);
+            Assert.Equal(2, CountMessages(client, "a"));
+        }
+        finally
+        {
+            SelfLog.Target = previous;
+        }
+    }
+
+    /// <summary>
+    /// Two slices in one batch get one re-create. The second slice is also missing and is not created again.
+    /// The next batch creates the stream, because the failed batch left it unready.
+    /// </summary>
+    /// <returns>A task that finishes after the follow-up event is accepted.</returns>
+    /// <remarks>Fails while a missing slice recreates the stream more than once in the same batch.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task Put_SecondSliceMissing_RecreatesOnceAndTheNextBatchCreates()
+    {
+        var client = CountingCloudWatch.Create();
+        client.NotFoundAtPuts = [1, 3];
+        using var transport = new AwsSdkCloudWatchLogsTransport(client.Client);
+        AwsCloudWatchLogEvent[] events =
+        [
+            new("early", 1_000),
+            new("late", 1_000 + DayMilliseconds + 1),
+        ];
+
+        var thrown = await Record.ExceptionAsync(() =>
+            ((IAwsCloudWatchLogsTransport)transport).PutLogEventsAsync("group", "stream", events));
+
+        Assert.IsType<ResourceNotFoundException>(thrown);
+        Assert.Equal(2, client.CreateGroups);
+        Assert.Equal(2, client.CreateStreams);
+        Assert.Equal(3, client.Puts);
+
+        await transport.PutLogEventAsync("group", "stream", "after", 2_000);
+        Assert.Equal(3, client.CreateGroups);
+        Assert.Equal(3, client.CreateStreams);
+        Assert.Equal(4, client.Puts);
+        Assert.Equal(1, CountMessages(client, "after"));
+        Assert.Equal(0, client.Describes);
     }
 
     /// <summary>
@@ -550,6 +846,59 @@ public sealed class AwsV4Tests
     }
 
     /// <summary>
+    /// Writes <paramref name="count"/> events whose messages start with <paramref name="prefix"/>.
+    /// </summary>
+    /// <param name="writer">Writer under test. Not null.</param>
+    /// <param name="prefix">Message prefix. Not null.</param>
+    /// <param name="count">How many events. Zero writes nothing.</param>
+    /// <remarks>The loop is bounded by <paramref name="count"/>.</remarks>
+    private static void WriteMany(AwsCloudWatchWriter writer, string prefix, int count)
+    {
+        for (var index = 0; index < count; index++)
+            writer.Write(Plain(prefix + index.ToString()));
+    }
+
+    /// <summary>
+    /// Writes <paramref name="count"/> events asynchronously.
+    /// </summary>
+    /// <param name="writer">Writer under test. Not null.</param>
+    /// <param name="prefix">Message prefix. Not null.</param>
+    /// <param name="count">How many events. Zero writes nothing.</param>
+    /// <returns>A task that finishes after the last write.</returns>
+    /// <remarks>The loop is bounded by <paramref name="count"/>.</remarks>
+    private static async Task WriteManyAsync(AwsCloudWatchWriter writer, string prefix, int count)
+    {
+        for (var index = 0; index < count; index++)
+            await writer.WriteAsync(Plain(prefix + index.ToString()));
+    }
+
+    /// <summary>
+    /// Counts recorded put messages that start with <paramref name="prefix"/>.
+    /// A failed put is still recorded, so a resend of the same text counts once per attempt that stored it.
+    /// </summary>
+    /// <param name="client">Fake client. Not null.</param>
+    /// <param name="prefix">Message prefix. Not null.</param>
+    /// <returns>How many stored messages start with <paramref name="prefix"/>.</returns>
+    /// <remarks>The loops are bounded by the recorded batches.</remarks>
+    private static int CountMessages(CountingCloudWatch client, string prefix)
+    {
+        var found = 0;
+        var batches = client.Batches.Count;
+        for (var batch = 0; batch < batches; batch++)
+        {
+            var messages = client.Batches[batch];
+            var count = messages.Count;
+            for (var index = 0; index < count; index++)
+            {
+                if (messages[index].StartsWith(prefix, StringComparison.Ordinal))
+                    found++;
+            }
+        }
+
+        return found;
+    }
+
+    /// <summary>
     /// Builds an info event whose message is the whole text. No property bag and no context.
     /// </summary>
     /// <param name="message">Rendered message. Not null.</param>
@@ -629,6 +978,27 @@ internal class CountingCloudWatch : DispatchProxy
     /// <summary>How many create-group calls still throw a network error. Decremented on each throw.</summary>
     internal int GroupFailures { get; set; }
 
+    /// <summary>How many create-stream calls still throw a network error. Decremented on each throw.</summary>
+    internal int StreamFailures { get; set; }
+
+    /// <summary>When true, the next put throws <see cref="ResourceNotFoundException"/> until a create-stream succeeds.</summary>
+    internal bool StreamMissing { get; set; }
+
+    /// <summary>When true, every put throws <see cref="ResourceNotFoundException"/>.</summary>
+    internal bool AlwaysNotFound { get; set; }
+
+    /// <summary>
+    /// 1-based numbers of live puts that throw <see cref="ResourceNotFoundException"/>.
+    /// Empty schedules nothing. The array is not changed by the fake.
+    /// </summary>
+    internal int[] NotFoundAtPuts { get; set; } = [];
+
+    /// <summary>
+    /// When positive, each put blocks until this many puts have entered.
+    /// Zero disables the barrier. The fact timeout is the hang net.
+    /// </summary>
+    internal int ReleasePutsAfter { get; set; }
+
     /// <summary>When true, every operation returns a null response object.</summary>
     internal bool NullResponses { get; set; }
 
@@ -643,6 +1013,12 @@ internal class CountingCloudWatch : DispatchProxy
 
     /// <summary>How many put calls have been seen.</summary>
     internal int Puts { get; private set; }
+
+    private readonly object _sync = new();
+    private readonly HashSet<string> _liveStreams = new(StringComparer.Ordinal);
+    private int _putOrdinal;
+    private int _putsWaiting;
+    private readonly TaskCompletionSource _putGate = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>Messages of each put, in call order. One list per request.</summary>
     internal List<List<string>> Batches { get; } = [];
@@ -681,7 +1057,7 @@ internal class CountingCloudWatch : DispatchProxy
             return Task.FromResult(CreateGroup());
 
         if (name == "CreateLogStreamAsync")
-            return Task.FromResult(CreateStream());
+            return Task.FromResult(CreateStream(args));
 
         if (name == "DescribeLogStreamsAsync")
         {
@@ -701,41 +1077,81 @@ internal class CountingCloudWatch : DispatchProxy
     /// <exception cref="AmazonServiceException">A configured network failure is still pending.</exception>
     private CreateLogGroupResponse? CreateGroup()
     {
-        CreateGroups++;
-        if (GroupFailures > 0)
+        lock (_sync)
         {
-            GroupFailures--;
-            throw new AmazonServiceException("network");
+            CreateGroups++;
+            if (GroupFailures > 0)
+            {
+                GroupFailures--;
+                throw new AmazonServiceException("network");
+            }
+
+            if (GroupExists)
+                throw new ResourceAlreadyExistsException("group");
+
+            return NullResponses ? null : new CreateLogGroupResponse();
         }
-
-        if (GroupExists)
-            throw new ResourceAlreadyExistsException("group");
-
-        return NullResponses ? null : new CreateLogGroupResponse();
     }
 
     /// <summary>Records one create-stream call and returns the configured response or failure.</summary>
     /// <returns>A response, or null when null responses are requested.</returns>
     /// <exception cref="ResourceAlreadyExistsException">The stream already exists.</exception>
-    private CreateLogStreamResponse? CreateStream()
+    private CreateLogStreamResponse? CreateStream(object?[] args)
     {
-        CreateStreams++;
-        if (StreamExists)
-            throw new ResourceAlreadyExistsException("stream");
+        var request = (CreateLogStreamRequest)args[0]!;
+        var stream = request.LogStreamName ?? string.Empty;
+        lock (_sync)
+        {
+            CreateStreams++;
+            if (StreamFailures > 0)
+            {
+                StreamFailures--;
+                throw new AmazonServiceException("network");
+            }
 
-        return NullResponses ? null : new CreateLogStreamResponse();
+            StreamMissing = false;
+            _liveStreams.Add(stream);
+            if (StreamExists)
+                throw new ResourceAlreadyExistsException("stream");
+
+            return NullResponses ? null : new CreateLogStreamResponse();
+        }
     }
 
     /// <summary>Records one put, including a null sequence token and a null rejected-info payload.</summary>
     /// <param name="args">The put request is argument 0.</param>
     /// <returns>A response with null token and null indexes, or a null response when requested.</returns>
-    /// <remarks>A null log-event list is recorded as an empty batch.</remarks>
+    /// <remarks>
+    /// A null log-event list is recorded as an empty batch.
+    /// A stream this fake never created is not <see cref="ResourceNotFoundException"/>.
+    /// The missing-stream resend must not hide a create that was skipped.
+    /// </remarks>
     private PutLogEventsResponse? Put(object?[] args)
     {
         var request = (PutLogEventsRequest)args[0]!;
-        Puts++;
-        SequenceTokens.Add(request.SequenceToken);
-        Batches.Add(CopyMessages(request.LogEvents));
+        var stream = request.LogStreamName ?? string.Empty;
+        var missing = false;
+        var neverCreated = false;
+        lock (_sync)
+        {
+            neverCreated = !_liveStreams.Contains(stream);
+            if (!neverCreated)
+            {
+                _putOrdinal++;
+                missing = AlwaysNotFound || StreamMissing || ScheduledNotFound(_putOrdinal);
+                Puts++;
+                SequenceTokens.Add(request.SequenceToken);
+                Batches.Add(CopyMessages(request.LogEvents));
+            }
+        }
+
+        if (neverCreated)
+            throw new AmazonServiceException("stream was never created");
+
+        WaitForPeerPuts();
+        if (missing)
+            throw new ResourceNotFoundException("missing");
+
         if (NullResponses)
             return null;
 
@@ -752,6 +1168,38 @@ internal class CountingCloudWatch : DispatchProxy
                 TooOldLogEventEndIndex = null,
             },
         };
+    }
+
+    /// <summary>
+    /// Blocks until <see cref="ReleasePutsAfter"/> puts have entered, then lets them all continue.
+    /// </summary>
+    /// <remarks>Does nothing when the barrier is off. No timeout here; the fact timeout is the hang net.</remarks>
+    private void WaitForPeerPuts()
+    {
+        if (ReleasePutsAfter <= 0)
+            return;
+
+        if (Interlocked.Increment(ref _putsWaiting) >= ReleasePutsAfter)
+            _putGate.TrySetResult();
+
+        _putGate.Task.GetAwaiter().GetResult();
+    }
+
+    /// <summary>True when this 1-based put number was listed in <see cref="NotFoundAtPuts"/>.</summary>
+    /// <param name="ordinal">Put number for this call. The first counted put is 1.</param>
+    /// <returns>True when the test scheduled a missing-stream failure for <paramref name="ordinal"/>.</returns>
+    /// <remarks>The loop is bounded by the schedule length. An empty schedule matches nothing.</remarks>
+    private bool ScheduledNotFound(int ordinal)
+    {
+        var at = NotFoundAtPuts;
+        var count = at.Length;
+        for (var index = 0; index < count; index++)
+        {
+            if (at[index] == ordinal)
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>Copies put messages so a later mutation of the request cannot change the assertion.</summary>

@@ -8,7 +8,8 @@ using Amazon.Runtime;
 
 /// <summary>
 /// CloudWatch Logs transport backed by AWSSDK.CloudWatchLogs.
-/// One writer instance creates its group and stream once. Later calls only put events.
+/// Each log group and each log stream is created once, including when writers share this transport.
+/// A missing stream is created again and that same batch is sent once.
 /// PutLogEvents limits are applied here: 10,000 events, 1,048,576 bytes, and 24 hours.
 /// </summary>
 public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
@@ -21,7 +22,8 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
     private readonly IAmazonCloudWatchLogs _client;
     private readonly bool _ownsClient;
     private readonly SemaphoreSlim _gate = new(1, 1);
-    private int _ready;
+    private readonly HashSet<string> _groups = new(StringComparer.Ordinal);
+    private readonly HashSet<ReadyKey> _streams = new();
     private int _disposed;
 
     /// <summary>
@@ -79,7 +81,8 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
 
     /// <summary>
     /// Puts the events in list order, splitting where a PutLogEvents limit would be exceeded.
-    /// The group and the stream are created at most once. A null or empty list does nothing.
+    /// The group and the stream are created at most once until a put reports the stream missing.
+    /// A null or empty list does nothing.
     /// </summary>
     /// <param name="logGroupName">Log group name. Not null.</param>
     /// <param name="logStreamName">Log stream name. Not null.</param>
@@ -89,8 +92,9 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
     /// <remarks>
     /// Does not sort. Does not set a sequence token. Does not call DescribeLogStreams.
     /// The loop stops after at most <paramref name="events"/> count slices.
+    /// One batch recreates a missing stream at most once and resends the failed slice once.
     /// A null SDK response is ignored. <see cref="ResourceAlreadyExistsException"/> on create is success.
-    /// Any other create failure leaves the group unready so the next batch tries again.
+    /// Any other create failure leaves that resource unready so the next batch tries again.
     /// </remarks>
     public async Task PutLogEventsAsync(
         string logGroupName,
@@ -104,18 +108,75 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
         await EnsureReadyAsync(logGroupName, logStreamName, cancellationToken).ConfigureAwait(false);
         var start = 0;
         var count = events.Count;
+        var recovered = false;
         for (var step = 0; step < count && start < count; step++)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var length = SliceLength(events, start);
             var slice = new PutSlice(logGroupName, logStreamName, events, start, length);
-            await SendSliceAsync(slice, cancellationToken).ConfigureAwait(false);
+            recovered = await SendOrRecoverAsync(slice, recovered, cancellationToken).ConfigureAwait(false);
             start += length;
         }
     }
 
     /// <summary>
-    /// Creates the group and the stream once. A later call returns without calling AWS.
+    /// Sends one slice. The first missing-stream failure in this batch is created and sent once.
+    /// </summary>
+    /// <param name="slice">Group, stream, and the event range.</param>
+    /// <param name="recovered">True when this batch already recreated a missing stream.</param>
+    /// <param name="cancellationToken">Cancels the put and the re-create.</param>
+    /// <returns>True when this batch has used its one re-create.</returns>
+    /// <remarks>A second missing-stream failure in the same batch clears readiness and escapes.</remarks>
+    private async Task<bool> SendOrRecoverAsync(
+        PutSlice slice,
+        bool recovered,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await SendSliceAsync(slice, cancellationToken).ConfigureAwait(false);
+            return recovered;
+        }
+        catch (ResourceNotFoundException) when (!recovered)
+        {
+            await RecreateAndResendAsync(slice, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+        catch (ResourceNotFoundException)
+        {
+            await ForgetAsync(slice.LogGroupName, slice.LogStreamName, cancellationToken).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Clears the group and stream, creates them once, and sends <paramref name="slice"/> once.
+    /// </summary>
+    /// <param name="slice">The slice that the service rejected as missing.</param>
+    /// <param name="cancellationToken">Cancels the create and the resend.</param>
+    /// <returns>A task that completes when the resend is accepted.</returns>
+    /// <remarks>
+    /// A create failure or a second put failure leaves the stream unready and escapes.
+    /// There is no further attempt in this batch.
+    /// </remarks>
+    private async Task RecreateAndResendAsync(PutSlice slice, CancellationToken cancellationToken)
+    {
+        await ForgetAsync(slice.LogGroupName, slice.LogStreamName, cancellationToken).ConfigureAwait(false);
+        await EnsureReadyAsync(slice.LogGroupName, slice.LogStreamName, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await SendSliceAsync(slice, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            await ForgetAsync(slice.LogGroupName, slice.LogStreamName, cancellationToken).ConfigureAwait(false);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Creates the group and the stream when this pair is not already recorded.
+    /// A later call for the same pair returns without calling AWS.
     /// </summary>
     /// <param name="logGroupName">Log group name. Not null.</param>
     /// <param name="logStreamName">Log stream name. Not null.</param>
@@ -123,7 +184,8 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
     /// <returns>A task that completes when both resources exist.</returns>
     /// <remarks>
     /// <see cref="ResourceAlreadyExistsException"/> counts as success.
-    /// Any other exception leaves the ready flag clear and escapes.
+    /// A failed group create is not recorded. A failed stream create leaves the group recorded
+    /// when that call succeeded, so the next batch retries the stream.
     /// The gate wait has no timeout. Callers on the sync path bound the whole put instead.
     /// </remarks>
     private async Task EnsureReadyAsync(
@@ -131,18 +193,46 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
         string logStreamName,
         CancellationToken cancellationToken)
     {
-        if (Volatile.Read(ref _ready) == 1)
-            return;
-
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            if (Volatile.Read(ref _ready) == 1)
+            var key = new ReadyKey(logGroupName, logStreamName);
+            if (_streams.Contains(key))
                 return;
 
-            await CreateGroupAsync(logGroupName, cancellationToken).ConfigureAwait(false);
+            if (!_groups.Contains(logGroupName))
+            {
+                await CreateGroupAsync(logGroupName, cancellationToken).ConfigureAwait(false);
+                _groups.Add(logGroupName);
+            }
+
             await CreateStreamAsync(logGroupName, logStreamName, cancellationToken).ConfigureAwait(false);
-            Volatile.Write(ref _ready, 1);
+            _streams.Add(key);
+        }
+        finally
+        {
+            _ = _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Forgets one group and one stream so the next create runs again.
+    /// </summary>
+    /// <param name="logGroupName">Log group name. Not null.</param>
+    /// <param name="logStreamName">Log stream name. Not null.</param>
+    /// <param name="cancellationToken">Cancels the wait for the gate.</param>
+    /// <returns>A task that completes after the pair is removed.</returns>
+    /// <remarks>Does not call AWS. Other streams of the same group are forgotten with the group.</remarks>
+    private async Task ForgetAsync(
+        string logGroupName,
+        string logStreamName,
+        CancellationToken cancellationToken)
+    {
+        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            _groups.Remove(logGroupName);
+            _streams.Remove(new ReadyKey(logGroupName, logStreamName));
         }
         finally
         {
@@ -371,6 +461,48 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
         _gate.Dispose();
         if (_ownsClient)
             _client.Dispose();
+    }
+
+    /// <summary>
+    /// Group and stream pair used as the readiness key.
+    /// </summary>
+    private readonly struct ReadyKey : IEquatable<ReadyKey>
+    {
+        /// <summary>
+        /// Stores one pair. Compared ordinal so two names that differ only by case stay distinct.
+        /// </summary>
+        /// <param name="group">Log group name. Not null.</param>
+        /// <param name="stream">Log stream name. Not null.</param>
+        internal ReadyKey(string group, string stream)
+        {
+            Group = group;
+            Stream = stream;
+        }
+
+        /// <summary>Log group name.</summary>
+        internal string Group { get; }
+
+        /// <summary>Log stream name.</summary>
+        internal string Stream { get; }
+
+        /// <summary>True when both names match ordinal.</summary>
+        /// <param name="other">The other key.</param>
+        /// <returns>True when <paramref name="other"/> names the same group and stream.</returns>
+        public bool Equals(ReadyKey other)
+            => string.Equals(Group, other.Group, StringComparison.Ordinal)
+            && string.Equals(Stream, other.Stream, StringComparison.Ordinal);
+
+        /// <summary>True when <paramref name="obj"/> is the same pair.</summary>
+        /// <param name="obj">The value to compare. Null is not equal.</param>
+        /// <returns>True when <paramref name="obj"/> is an equal <see cref="ReadyKey"/>.</returns>
+        public override bool Equals(object? obj) => obj is ReadyKey other && Equals(other);
+
+        /// <summary>Ordinal hash of the group and the stream.</summary>
+        /// <returns>A hash code for this pair.</returns>
+        public override int GetHashCode()
+            => HashCode.Combine(
+                StringComparer.Ordinal.GetHashCode(Group),
+                StringComparer.Ordinal.GetHashCode(Stream));
     }
 
     /// <summary>
