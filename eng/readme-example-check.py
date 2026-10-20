@@ -57,7 +57,12 @@ STEP_HEADINGS = (
     ("step1", "### Step 1: Configure ALog"),
     ("step2", "### Step 2: Start Logging"),
 )
-SCREENSHOT_RERECORD = "The screenshot must be re-recorded."
+CONSOLE_PNG = "docs/images/quickstart-console.png"
+CONSOLE_TXT = "docs/images/quickstart-console.txt"
+HEADER_SCRIPT = "eng/readme-example-check.py"
+END_OF_OUTPUT = "<end of output>"
+END_OF_FILE = "<end of file>"
+MAX_COMPARE_LINES = MAX_TEXT_BYTES
 
 
 def normalize_newlines(text: str) -> str:
@@ -250,46 +255,93 @@ def last_commit(root: Path, relative: str) -> tuple[str | None, str | None]:
     return sha, None
 
 
-def png_problem(path: Path) -> str | None:
-    """Validate the screenshot's signature, IHDR, width, and size.
+def png_broken_message(found: str) -> str:
+    """Return the U-DOC-06 line for a missing or broken screenshot file.
 
     Args:
-        path: ``docs/images/quickstart-console.png``.
+        found: ``file missing``, ``no PNG signature``, or ``no IHDR chunk``.
 
     Returns:
-        A problem string, or None when the PNG is inside the uiux limits.
+        The full FAIL line. Callers print it unchanged.
 
     Raises:
         None.
 
     Side effects:
-        Reads the file when it is under 300 KB.
+        None.
+    """
+    return (
+        f"FAIL {CONSOLE_PNG}: expected a PNG file, found {found}. "
+        f"Retake the screenshot as described in the header of {HEADER_SCRIPT}."
+    )
+
+
+def png_limits_message(width: int, size: int) -> str:
+    """Return the U-DOC-06 line for a PNG outside the width or size limit.
+
+    ``size // 1024`` is the KB figure because the accepted limit is
+    ``300 * 1024`` bytes. A file of that many bytes is 300 KB and fails.
+
+    Args:
+        width: IHDR width in pixels.
+        size: File size in bytes. Negative sizes are reported as 0 KB.
+
+    Returns:
+        The full FAIL line. Callers print it unchanged.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    kb = size // 1024
+    if kb < 0:
+        kb = 0
+    return (
+        f"FAIL {CONSOLE_PNG}: expected 900 to 1400 px wide and under 300 KB, "
+        f"found {width} px, {kb} KB. Retake the screenshot with a fitting "
+        "window size; crop only, do not scale or recompress."
+    )
+
+
+def png_problem(path: Path) -> str | None:
+    """Validate the screenshot's signature, IHDR, width, and size.
+
+    A missing file, a bad signature, and a missing IHDR are three separate
+    U-DOC-06 texts. Width and size are checked only after those, so a large
+    non-PNG is reported as broken rather than as the wrong dimensions.
+
+    Args:
+        path: ``docs/images/quickstart-console.png``.
+
+    Returns:
+        A U-DOC-06 FAIL line, or None when the PNG is inside the uiux limits.
+
+    Raises:
+        None.
+
+    Side effects:
+        Reads the first 24 bytes and the file size.
     """
     if not path.is_file():
-        return "docs/images/quickstart-console.png is missing."
-    size = path.stat().st_size
-    if size < 24:
-        return "docs/images/quickstart-console.png is too small to be a PNG."
-    if size >= MAX_PNG_BYTES:
-        return "docs/images/quickstart-console.png is not under 300 KB."
+        return png_broken_message("file missing")
     try:
-        data = path.read_bytes()
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            header = handle.read(24)
     except OSError:
-        return "docs/images/quickstart-console.png could not be read."
-    if len(data) != size or len(data) < 24:
-        return "docs/images/quickstart-console.png could not be read."
-    if data[:8] != PNG_SIGNATURE:
-        return "docs/images/quickstart-console.png PNG signature is not valid."
-    length = int.from_bytes(data[8:12], "big")
-    if data[12:16] != b"IHDR" or length != 13:
-        return "docs/images/quickstart-console.png IHDR chunk is missing."
-    width = int.from_bytes(data[16:20], "big")
-    height = int.from_bytes(data[20:24], "big")
-    if height < 1 or width < MIN_PNG_WIDTH or width > MAX_PNG_WIDTH:
-        return (
-            "docs/images/quickstart-console.png width "
-            f"{width} px is outside 900-1400."
-        )
+        return png_broken_message("file missing")
+    if len(header) < 8 or header[:8] != PNG_SIGNATURE:
+        return png_broken_message("no PNG signature")
+    if len(header) < 24:
+        return png_broken_message("no IHDR chunk")
+    length = int.from_bytes(header[8:12], "big")
+    if header[12:16] != b"IHDR" or length != 13:
+        return png_broken_message("no IHDR chunk")
+    width = int.from_bytes(header[16:20], "big")
+    if width < MIN_PNG_WIDTH or width > MAX_PNG_WIDTH or size >= MAX_PNG_BYTES:
+        return png_limits_message(width, size)
     return None
 
 
@@ -607,6 +659,74 @@ def is_subsequence(need: list[str], have: list[str]) -> bool:
     return True
 
 
+def stdout_fail_message(line_number: int, expected: str, found: str) -> str:
+    """Return the U-DOC-06 line for the first console mismatch.
+
+    Args:
+        line_number: 1-based line in the TXT after timestamp replacement.
+        expected: That TXT line, or ``<end of file>`` when the TXT ended.
+        found: The sample line, or ``<end of output>`` when the sample ended.
+
+    Returns:
+        The full FAIL line. Callers print it unchanged.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        f"FAIL {CONSOLE_TXT}:{line_number}: expected \"{expected}\", "
+        f"found \"{found}\" in the sample output. "
+        "The console output changed, so the screenshot is out of date: "
+        "run dotnet run --project samples/ALog.QuickstartSample, "
+        f"retake {CONSOLE_PNG} as described in the header of {HEADER_SCRIPT}, "
+        "and commit it together with the new quickstart-console.txt."
+    )
+
+
+def first_console_mismatch(expected_text: str, found_text: str) -> str:
+    """Name the first LF line that differs after timestamp replacement.
+
+    The walk stops at the first difference. A side with no line at that
+    index is the end marker, not an empty string. No other character is
+    changed. The loop is capped at the text read limit.
+
+    Args:
+        expected_text: Normalized ``quickstart-console.txt``.
+        found_text: Normalized sample transcript. Known to differ.
+
+    Returns:
+        The U-DOC-06 FAIL line for that first difference.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    expected_lines = expected_text.split("\n")
+    found_lines = found_text.split("\n")
+    if len(expected_lines) > MAX_COMPARE_LINES:
+        expected_lines = expected_lines[:MAX_COMPARE_LINES]
+    if len(found_lines) > MAX_COMPARE_LINES:
+        found_lines = found_lines[:MAX_COMPARE_LINES]
+    count = len(expected_lines)
+    if len(found_lines) > count:
+        count = len(found_lines)
+    index = 0
+    while index < count:
+        expected_line = expected_lines[index] if index < len(expected_lines) else None
+        found_line = found_lines[index] if index < len(found_lines) else None
+        if expected_line != found_line:
+            shown_expected = END_OF_FILE if expected_line is None else expected_line
+            shown_found = END_OF_OUTPUT if found_line is None else found_line
+            return stdout_fail_message(index + 1, shown_expected, shown_found)
+        index += 1
+    return stdout_fail_message(1, END_OF_FILE, END_OF_OUTPUT)
+
+
 def stdout_problem(stdout_text: str, console_text: str) -> str | None:
     """Compare the run transcript with the committed console text.
 
@@ -615,8 +735,8 @@ def stdout_problem(stdout_text: str, console_text: str) -> str | None:
         console_text: ``docs/images/quickstart-console.txt``.
 
     Returns:
-        None when the texts match after timestamp replacement. Otherwise a
-        problem that tells the reader the screenshot must be re-recorded.
+        None when the texts match after timestamp replacement. Otherwise the
+        U-DOC-06 line for the first differing line.
 
     Raises:
         None.
@@ -624,12 +744,11 @@ def stdout_problem(stdout_text: str, console_text: str) -> str | None:
     Side effects:
         None.
     """
-    if normalize_timestamps(stdout_text) == normalize_timestamps(console_text):
+    expected_text = normalize_timestamps(console_text)
+    found_text = normalize_timestamps(stdout_text)
+    if expected_text == found_text:
         return None
-    return (
-        "docs/images/quickstart-console.txt does not match the run stdout. "
-        + SCREENSHOT_RERECORD
-    )
+    return first_console_mismatch(expected_text, found_text)
 
 
 def tracked_log_problem(root: Path) -> str | None:
@@ -676,7 +795,7 @@ def same_commit_problem(root: Path) -> str | None:
 
     Returns:
         None when ``git log -1 --format=%H -- <file>`` is the same hash for
-        both screenshot files.
+        both screenshot files. Otherwise the U-DOC-06 line with both 7-character hashes.
 
     Raises:
         None.
@@ -692,9 +811,10 @@ def same_commit_problem(root: Path) -> str | None:
         return txt_problem_text
     if png != txt:
         return (
-            "docs/images/quickstart-console.png and "
-            "docs/images/quickstart-console.txt were last changed in "
-            "different commits."
+            f"FAIL {CONSOLE_PNG} and quickstart-console.txt: "
+            "expected both last changed in the same commit, "
+            f"found png {png[:7]}, txt {txt[:7]}. "
+            "Retake the screenshot from the current output and commit the PNG together with the TXT."
         )
     return None
 
@@ -796,6 +916,32 @@ def png_chunk(tag: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", crc)
 
 
+def encode_png(width: int, height: int) -> bytes:
+    """Encode a black RGB PNG so a self-test can choose an illegal size.
+
+    Args:
+        width: Pixel width from 1 to 4000.
+        height: Pixel height from 1 to 8.
+
+    Returns:
+        A PNG with a valid signature and a 13-byte IHDR.
+
+    Raises:
+        ValueError: A dimension is outside the encoder's bounds.
+
+    Side effects:
+        None.
+    """
+    if width < 1 or width > 4000 or height < 1 or height > 8:
+        raise ValueError("png fixture dimensions are out of range.")
+    row = b"\x00" + (b"\x00\x00\x00" * width)
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    encoded = PNG_SIGNATURE + png_chunk(b"IHDR", ihdr)
+    encoded += png_chunk(b"IDAT", zlib.compress(row * height, 9))
+    encoded += png_chunk(b"IEND", b"")
+    return encoded
+
+
 def write_fixture_png(path: Path, width: int) -> None:
     """Write a small valid RGB PNG for the self-test.
 
@@ -814,13 +960,7 @@ def write_fixture_png(path: Path, width: int) -> None:
     """
     if width < MIN_PNG_WIDTH or width > MAX_PNG_WIDTH:
         raise ValueError("fixture png width is outside 900-1400.")
-    height = 2
-    row = b"\x00" + (b"\x00\x00\x00" * width)
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    encoded = PNG_SIGNATURE + png_chunk(b"IHDR", ihdr)
-    encoded += png_chunk(b"IDAT", zlib.compress(row + row, 9))
-    encoded += png_chunk(b"IEND", b"")
-    path.write_bytes(encoded)
+    path.write_bytes(encode_png(width, 2))
 
 
 def fixture_entry(timestamp: str, level: str, message: str) -> str:
@@ -1074,11 +1214,36 @@ def report_case(label: str, problems: list[str], phrase: str) -> int:
     return 1
 
 
+def report_exact(label: str, problems: list[str], expected: str) -> int:
+    """Require one red case to be exactly one U-DOC-06 line.
+
+    Args:
+        label: Case name.
+        problems: Check output.
+        expected: The full failure line, with runtime fields already filled.
+
+    Returns:
+        0 when that line is the only problem, 1 otherwise.
+
+    Raises:
+        None.
+
+    Side effects:
+        Writes one line to stdout or stderr.
+    """
+    if problems == [expected]:
+        sys.stdout.write(f"ok {label}\n")
+        return 0
+    sys.stderr.write(f"FAIL {label}: expected exact {expected!r}: {problems!r}\n")
+    return 1
+
+
 def self_test() -> int:
-    """Prove the six red cases and the unchanged green case.
+    """Prove the U-DOC-06 red texts and the unchanged green case.
 
     Each red case starts from a fresh fixture so one mutation cannot hide
-    another. The green case is that fixture before any mutation.
+    another. The green case is that fixture before any mutation. The stdout,
+    commit, PNG, and size cases require the full failure line, not a fragment.
 
     Returns:
         0 when every case has the required color, 1 otherwise.
@@ -1096,7 +1261,12 @@ def self_test() -> int:
             failures += case_unchanged(tmp / "green")
             failures += case_missing_png(tmp / "missing")
             failures += case_bad_signature(tmp / "signature")
+            failures += case_no_ihdr(tmp / "ihdr")
+            failures += case_png_narrow(tmp / "narrow")
+            failures += case_png_too_large(tmp / "large")
             failures += case_txt_differs(tmp / "txt")
+            failures += case_stdout_shorter(tmp / "short-out")
+            failures += case_txt_shorter(tmp / "short-txt")
             failures += case_excerpt_edited(tmp / "excerpt")
             failures += case_code_differs(tmp / "code")
             failures += case_different_commits(tmp / "commits")
@@ -1146,10 +1316,11 @@ def case_missing_png(root: Path) -> int:
     """
     stdout_path, log_path = write_fixture(root)
     (root / "docs/images/quickstart-console.png").unlink()
-    return report_case(
+    return report_exact(
         "missing png",
         check_repository(root, stdout_path, log_path),
-        "quickstart-console.png is missing",
+        "FAIL docs/images/quickstart-console.png: expected a PNG file, found file missing. "
+        "Retake the screenshot as described in the header of eng/readme-example-check.py.",
     )
 
 
@@ -1173,35 +1344,201 @@ def case_bad_signature(root: Path) -> int:
     data = bytearray(png.read_bytes())
     data[0] = ord("X")
     png.write_bytes(data)
-    return report_case(
+    return report_exact(
         "broken signature",
         check_repository(root, stdout_path, log_path),
-        "PNG signature is not valid",
+        "FAIL docs/images/quickstart-console.png: expected a PNG file, found no PNG signature. "
+        "Retake the screenshot as described in the header of eng/readme-example-check.py.",
     )
 
 
-def case_txt_differs(root: Path) -> int:
-    """A console text file that is not the run transcript must be red.
+def case_no_ihdr(root: Path) -> int:
+    """A signature without an IHDR chunk must use the IHDR failure text.
 
     Args:
         root: Directory for this case.
 
     Returns:
-        0 when the check says the screenshot must be re-recorded.
+        0 when the only problem is the missing-IHDR line.
 
     Raises:
         OSError, RuntimeError, ValueError: The fixture could not be created.
 
     Side effects:
-        Writes a temporary repository and edits the TXT.
+        Writes a temporary repository and replaces the PNG with a header only.
+    """
+    stdout_path, log_path = write_fixture(root)
+    png = root / "docs/images/quickstart-console.png"
+    png.write_bytes(PNG_SIGNATURE + b"\x00\x00\x00\x00IEND")
+    return report_exact(
+        "no ihdr",
+        check_repository(root, stdout_path, log_path),
+        "FAIL docs/images/quickstart-console.png: expected a PNG file, found no IHDR chunk. "
+        "Retake the screenshot as described in the header of eng/readme-example-check.py.",
+    )
+
+
+def case_png_narrow(root: Path) -> int:
+    """A PNG narrower than 900 px must use the dimension failure text.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the only problem quotes 800 px and the file's KB size.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and replaces the PNG.
+    """
+    stdout_path, log_path = write_fixture(root)
+    png = root / "docs/images/quickstart-console.png"
+    png.write_bytes(encode_png(800, 2))
+    kb = png.stat().st_size // 1024
+    return report_exact(
+        "png too narrow",
+        check_repository(root, stdout_path, log_path),
+        "FAIL docs/images/quickstart-console.png: expected 900 to 1400 px wide and under 300 KB, "
+        f"found 800 px, {kb} KB. Retake the screenshot with a fitting window size; "
+        "crop only, do not scale or recompress.",
+    )
+
+
+def case_png_too_large(root: Path) -> int:
+    """A PNG of 300 KiB must use the size failure text.
+
+    Padding keeps the IHDR, so the failure is the size and not a broken file.
+    300 times 1024 bytes is 300 KB under the check's integer KB figure.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the only problem says 1000 px and 300 KB.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and pads the PNG to the size limit.
+    """
+    stdout_path, log_path = write_fixture(root)
+    png = root / "docs/images/quickstart-console.png"
+    data = png.read_bytes()
+    if len(data) >= MAX_PNG_BYTES:
+        raise RuntimeError("fixture png is already at the size limit.")
+    png.write_bytes(data + (b"\x00" * (MAX_PNG_BYTES - len(data))))
+    return report_exact(
+        "png too large",
+        check_repository(root, stdout_path, log_path),
+        (
+            "FAIL docs/images/quickstart-console.png: expected 900 to 1400 px "
+            "wide and under 300 KB, found 1000 px, 300 KB. Retake the screenshot "
+            "with a fitting window size; crop only, do not scale or recompress."
+        ),
+    )
+
+
+def case_txt_differs(root: Path) -> int:
+    """A changed console line must name that line and no later line.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the only problem is line 2 with both normalized texts.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and edits one TXT line.
     """
     stdout_path, log_path = write_fixture(root)
     txt = root / "docs/images/quickstart-console.txt"
-    txt.write_text(txt.read_text(encoding="utf-8") + "extra line\n", encoding="utf-8")
-    return report_case(
-        "txt differs",
+    txt.write_text(
+        txt.read_text(encoding="utf-8").replace("Application started", "Application changed", 1),
+        encoding="utf-8",
+    )
+    return report_exact(
+        "txt line differs",
         check_repository(root, stdout_path, log_path),
-        SCREENSHOT_RERECORD,
+        "FAIL docs/images/quickstart-console.txt:2: "
+        'expected "[<timestamp>] [Info] Application changed", '
+        'found "[<timestamp>] [Info] Application started" in the sample output. '
+        "The console output changed, so the screenshot is out of date: "
+        "run dotnet run --project samples/ALog.QuickstartSample, "
+        "retake docs/images/quickstart-console.png as described in the header of "
+        "eng/readme-example-check.py, and commit it together with the new quickstart-console.txt.",
+    )
+
+
+def case_stdout_shorter(root: Path) -> int:
+    """A transcript that ends early must say end of output on that line.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when line 3 expected the error line and found end of output.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and drops the transcript's last line.
+    """
+    stdout_path, log_path = write_fixture(root)
+    parts = stdout_path.read_text(encoding="utf-8").split("\n")
+    if len(parts) < 4:
+        raise RuntimeError("fixture transcript is too short.")
+    stdout_path.write_text(parts[0] + "\n" + parts[1], encoding="utf-8")
+    return report_exact(
+        "stdout shorter",
+        check_repository(root, stdout_path, log_path),
+        "FAIL docs/images/quickstart-console.txt:3: "
+        'expected "[<timestamp>] [Error] Something went wrong", '
+        'found "<end of output>" in the sample output. '
+        "The console output changed, so the screenshot is out of date: "
+        "run dotnet run --project samples/ALog.QuickstartSample, "
+        "retake docs/images/quickstart-console.png as described in the header of "
+        "eng/readme-example-check.py, and commit it together with the new quickstart-console.txt.",
+    )
+
+
+def case_txt_shorter(root: Path) -> int:
+    """A TXT that ends early must say end of file on that line.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when line 3 expected end of file and found the error line.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and drops the TXT's last line.
+    """
+    stdout_path, log_path = write_fixture(root)
+    txt = root / "docs/images/quickstart-console.txt"
+    parts = txt.read_text(encoding="utf-8").split("\n")
+    if len(parts) < 4:
+        raise RuntimeError("fixture console text is too short.")
+    txt.write_text(parts[0] + "\n" + parts[1], encoding="utf-8")
+    return report_exact(
+        "txt shorter",
+        check_repository(root, stdout_path, log_path),
+        "FAIL docs/images/quickstart-console.txt:3: "
+        'expected "<end of file>", '
+        'found "[<timestamp>] [Error] Something went wrong" in the sample output. '
+        "The console output changed, so the screenshot is out of date: "
+        "run dotnet run --project samples/ALog.QuickstartSample, "
+        "retake docs/images/quickstart-console.png as described in the header of "
+        "eng/readme-example-check.py, and commit it together with the new quickstart-console.txt.",
     )
 
 
@@ -1297,10 +1634,21 @@ def case_different_commits(root: Path) -> int:
     if commit_problem is not None:
         raise RuntimeError(commit_problem)
     del committed
-    return report_case(
+    png_sha, png_error = last_commit(root, "docs/images/quickstart-console.png")
+    txt_sha, txt_error = last_commit(root, "docs/images/quickstart-console.txt")
+    if png_error is not None or txt_error is not None or png_sha is None or txt_sha is None:
+        raise RuntimeError(png_error or txt_error or "commit hash missing")
+    if png_sha == txt_sha:
+        raise RuntimeError("fixture commits did not diverge.")
+    return report_exact(
         "png and txt in different commits",
         check_repository(root, stdout_path, log_path),
-        "different commits",
+        (
+            "FAIL docs/images/quickstart-console.png and quickstart-console.txt: "
+            "expected both last changed in the same commit, "
+            f"found png {png_sha[:7]}, txt {txt_sha[:7]}. "
+            "Retake the screenshot from the current output and commit the PNG together with the TXT."
+        ),
     )
 
 
