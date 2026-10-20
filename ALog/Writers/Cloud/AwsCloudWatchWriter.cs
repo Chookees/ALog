@@ -49,6 +49,26 @@ public class AwsCloudWatchWriter : ILogWriter, IFormattableLogWriter
     {
     }
 
+    /// <summary>
+    /// Test seam. The clock is stored by the AWS V4 timeout path.
+    /// </summary>
+    /// <param name="logGroupName">Log group name. Not null.</param>
+    /// <param name="logStreamName">Log stream name. Not null.</param>
+    /// <param name="transport">Transport that receives the put. Not null. Not owned.</param>
+    /// <param name="clock">Clock for the synchronous put timeout. Not null.</param>
+    /// <param name="formatter">Optional formatter. Null sends the plain message.</param>
+    /// <remarks>Does not own <paramref name="transport"/>.</remarks>
+    internal AwsCloudWatchWriter(
+        string logGroupName,
+        string logStreamName,
+        IAwsCloudWatchLogsTransport transport,
+        TimeProvider clock,
+        ILogFormatter? formatter = null)
+        : this(logGroupName, logStreamName, transport, formatter)
+    {
+        ArgumentNullException.ThrowIfNull(clock);
+    }
+
     private AwsCloudWatchWriter(
         string logGroupName,
         string logStreamName,
