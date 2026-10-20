@@ -8,8 +8,10 @@ using Amazon.Runtime;
 
 /// <summary>
 /// CloudWatch Logs transport backed by AWSSDK.CloudWatchLogs.
-/// Each log group and each log stream is created once, including when writers share this transport.
-/// A missing stream is created again and that same batch is sent once.
+/// Each log group and each log stream is created once, including when writers share this transport,
+/// until a put reports the stream missing or the ready sets reach <see cref="MaxReadyPairs"/>.
+/// A missing stream that was already recorded is created again and that slice is sent once.
+/// A missing stream that this batch itself created is not created again.
 /// PutLogEvents limits are applied here: 10,000 events, 1,048,576 bytes, and 24 hours.
 /// </summary>
 public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
@@ -19,11 +21,21 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
     private const int EventOverheadBytes = 26;
     private const long MaxSpanMilliseconds = 86_400_000L;
 
+    /// <summary>
+    /// Most group and stream pairs kept ready on one transport.
+    /// Past this, both ready sets are cleared. Create is idempotent, so a later put records them again.
+    /// </summary>
+    internal const int MaxReadyPairs = 1024;
+
     private readonly IAmazonCloudWatchLogs _client;
     private readonly bool _ownsClient;
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private readonly object _waiterSync = new();
     private readonly HashSet<string> _groups = new(StringComparer.Ordinal);
     private readonly HashSet<ReadyKey> _streams = new();
+    private TaskCompletionSource<bool> _waiterSignal = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int _waiterSignalAt = int.MaxValue;
+    private int _readyGateWaiters;
     private int _disposed;
 
     /// <summary>
@@ -92,7 +104,9 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
     /// <remarks>
     /// Does not sort. Does not set a sequence token. Does not call DescribeLogStreams.
     /// The loop stops after at most <paramref name="events"/> count slices.
-    /// One batch recreates a missing stream at most once and resends the failed slice once.
+    /// A missing stream is re-created once only when it was already recorded before this batch.
+    /// That re-create resends the failed slice once. A second miss in the same batch stops the batch.
+    /// A miss after the create this batch just did is not created again. The batch stops, and the pair is left unready.
     /// A null SDK response is ignored. <see cref="ResourceAlreadyExistsException"/> on create is success.
     /// Any other create failure leaves that resource unready so the next batch tries again.
     /// </remarks>
@@ -105,7 +119,8 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
         if (events is null || events.Count == 0)
             return;
 
-        await EnsureReadyAsync(logGroupName, logStreamName, cancellationToken).ConfigureAwait(false);
+        var createdThisBatch = await EnsureReadyAsync(logGroupName, logStreamName, cancellationToken)
+            .ConfigureAwait(false);
         var start = 0;
         var count = events.Count;
         var recovered = false;
@@ -114,22 +129,29 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
             cancellationToken.ThrowIfCancellationRequested();
             var length = SliceLength(events, start);
             var slice = new PutSlice(logGroupName, logStreamName, events, start, length);
-            recovered = await SendOrRecoverAsync(slice, recovered, cancellationToken).ConfigureAwait(false);
+            recovered = await SendOrRecoverAsync(slice, recovered, createdThisBatch, cancellationToken)
+                .ConfigureAwait(false);
             start += length;
         }
     }
 
     /// <summary>
-    /// Sends one slice. The first missing-stream failure in this batch is created and sent once.
+    /// Sends one slice. A stream that was already recorded can be re-created once in this batch.
     /// </summary>
     /// <param name="slice">Group, stream, and the event range.</param>
     /// <param name="recovered">True when this batch already recreated a missing stream.</param>
+    /// <param name="createdThisBatch">True when this batch's first create recorded the stream.</param>
     /// <param name="cancellationToken">Cancels the put and the re-create.</param>
     /// <returns>True when this batch has used its one re-create.</returns>
-    /// <remarks>A second missing-stream failure in the same batch clears readiness and escapes.</remarks>
+    /// <remarks>
+    /// A not-found result after this batch created the stream is not created again.
+    /// Readiness is cleared and the exception escapes. The writer reports it and drops the batch.
+    /// A second not-found result in the same batch does the same.
+    /// </remarks>
     private async Task<bool> SendOrRecoverAsync(
         PutSlice slice,
         bool recovered,
+        bool createdThisBatch,
         CancellationToken cancellationToken)
     {
         try
@@ -137,7 +159,7 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
             await SendSliceAsync(slice, cancellationToken).ConfigureAwait(false);
             return recovered;
         }
-        catch (ResourceNotFoundException) when (!recovered)
+        catch (ResourceNotFoundException) when (!recovered && !createdThisBatch)
         {
             await RecreateAndResendAsync(slice, cancellationToken).ConfigureAwait(false);
             return true;
@@ -181,33 +203,23 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
     /// <param name="logGroupName">Log group name. Not null.</param>
     /// <param name="logStreamName">Log stream name. Not null.</param>
     /// <param name="cancellationToken">Cancels the wait for the gate and the create calls.</param>
-    /// <returns>A task that completes when both resources exist.</returns>
+    /// <returns>True when this call created the stream. False when the pair was already recorded.</returns>
     /// <remarks>
     /// <see cref="ResourceAlreadyExistsException"/> counts as success.
     /// A failed group create is not recorded. A failed stream create leaves the group recorded
     /// when that call succeeded, so the next batch retries the stream.
     /// The gate wait has no timeout. Callers on the sync path bound the whole put instead.
     /// </remarks>
-    private async Task EnsureReadyAsync(
+    private async Task<bool> EnsureReadyAsync(
         string logGroupName,
         string logStreamName,
         CancellationToken cancellationToken)
     {
-        await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        await WaitForReadyGateAsync(cancellationToken).ConfigureAwait(false);
         try
         {
-            var key = new ReadyKey(logGroupName, logStreamName);
-            if (_streams.Contains(key))
-                return;
-
-            if (!_groups.Contains(logGroupName))
-            {
-                await CreateGroupAsync(logGroupName, cancellationToken).ConfigureAwait(false);
-                _groups.Add(logGroupName);
-            }
-
-            await CreateStreamAsync(logGroupName, logStreamName, cancellationToken).ConfigureAwait(false);
-            _streams.Add(key);
+            return await CreatePairIfMissingAsync(logGroupName, logStreamName, cancellationToken)
+                .ConfigureAwait(false);
         }
         finally
         {
@@ -216,13 +228,178 @@ public sealed class AwsSdkCloudWatchLogsTransport : IAwsCloudWatchLogsTransport
     }
 
     /// <summary>
-    /// Forgets one group and one stream so the next create runs again.
+    /// Records the pair when it is missing. The caller holds the ready gate.
+    /// </summary>
+    /// <param name="logGroupName">Log group name. Not null.</param>
+    /// <param name="logStreamName">Log stream name. Not null.</param>
+    /// <param name="cancellationToken">Cancels the create calls.</param>
+    /// <returns>True when this call created the stream. False when the pair was already recorded.</returns>
+    /// <remarks>
+    /// Does not take the gate. A full ready set is cleared before the create.
+    /// The clear is safe because create is idempotent.
+    /// </remarks>
+    private async Task<bool> CreatePairIfMissingAsync(
+        string logGroupName,
+        string logStreamName,
+        CancellationToken cancellationToken)
+    {
+        var key = new ReadyKey(logGroupName, logStreamName);
+        if (_streams.Contains(key))
+            return false;
+
+        MakeRoom(logGroupName);
+        if (!_groups.Contains(logGroupName))
+        {
+            await CreateGroupAsync(logGroupName, cancellationToken).ConfigureAwait(false);
+            _groups.Add(logGroupName);
+        }
+
+        await CreateStreamAsync(logGroupName, logStreamName, cancellationToken).ConfigureAwait(false);
+        _streams.Add(key);
+        CheckReadyBound(_groups.Count, _streams.Count);
+        return true;
+    }
+
+    /// <summary>
+    /// Drops both ready sets when recording this pair would pass <see cref="MaxReadyPairs"/>.
+    /// </summary>
+    /// <param name="logGroupName">Group about to be recorded. Not null.</param>
+    /// <remarks>
+    /// Does not call AWS. Create is idempotent, so a group or stream that still exists is success next time.
+    /// The caller holds the ready gate.
+    /// </remarks>
+    private void MakeRoom(string logGroupName)
+    {
+        var addingGroup = !_groups.Contains(logGroupName);
+        if (_streams.Count >= MaxReadyPairs || (addingGroup && _groups.Count >= MaxReadyPairs))
+        {
+            _groups.Clear();
+            _streams.Clear();
+        }
+    }
+
+    /// <summary>
+    /// Throws when either ready set is above <see cref="MaxReadyPairs"/>.
+    /// </summary>
+    /// <param name="groups">Recorded groups after the add.</param>
+    /// <param name="streams">Recorded pairs after the add.</param>
+    /// <exception cref="System.InvalidOperationException">A ready set passed the cap.</exception>
+    /// <remarks>Stays in Release builds. The cap clear runs before the add, so a correct set never throws.</remarks>
+    internal static void CheckReadyBound(int groups, int streams)
+    {
+        if (groups > MaxReadyPairs || streams > MaxReadyPairs)
+            throw new System.InvalidOperationException("Ready set exceeded the fixed cap.");
+    }
+
+    /// <summary>
+    /// Waits until this caller holds the ready gate.
+    /// A caller that has to wait is counted until the wait finishes.
+    /// </summary>
+    /// <param name="cancellationToken">Cancels the wait. A cancelled wait does not take the gate.</param>
+    /// <returns>A task that completes when this caller holds the gate.</returns>
+    /// <remarks>
+    /// The wait has no timeout. An immediate acquire is not a waiter.
+    /// The count is how the eight-writer test sees the other writers blocked on this gate.
+    /// </remarks>
+    private async Task WaitForReadyGateAsync(CancellationToken cancellationToken)
+    {
+        var pending = _gate.WaitAsync(cancellationToken);
+        var blocked = !pending.IsCompleted;
+        if (blocked)
+            NoteBlockedWaiter();
+
+        try
+        {
+            await pending.ConfigureAwait(false);
+        }
+        finally
+        {
+            if (blocked)
+                NoteWaitFinished();
+        }
+    }
+
+    /// <summary>
+    /// Records one caller blocked on the ready gate and completes a waiting signal at its target.
+    /// </summary>
+    /// <remarks>Does not take the ready gate. The signal is armed by <see cref="SignalWhenReadyGateWaitersReach"/>.</remarks>
+    private void NoteBlockedWaiter()
+    {
+        TaskCompletionSource<bool> signal;
+        int waiting;
+        int target;
+        lock (_waiterSync)
+        {
+            waiting = ++_readyGateWaiters;
+            signal = _waiterSignal;
+            target = _waiterSignalAt;
+        }
+
+        if (waiting >= target)
+            signal.TrySetResult(true);
+    }
+
+    /// <summary>
+    /// Records that a blocked caller now holds the gate or that its wait ended.
+    /// </summary>
+    /// <remarks>Does not take the ready gate. Pairs with <see cref="NoteBlockedWaiter"/>.</remarks>
+    private void NoteWaitFinished()
+    {
+        lock (_waiterSync)
+            _readyGateWaiters--;
+    }
+
+    /// <summary>
+    /// Completes when <paramref name="count"/> callers are blocked on the ready gate.
+    /// </summary>
+    /// <param name="count">Waiter count that completes the returned task. A count already reached completes immediately.</param>
+    /// <returns>A task that completes once that many callers are blocked, including when they already are.</returns>
+    /// <remarks>
+    /// Does not take the ready gate. A later call replaces the signal. The previous task is left as it was.
+    /// Tests release a held create when the other writers are blocked here.
+    /// </remarks>
+    internal Task SignalWhenReadyGateWaitersReach(int count)
+    {
+        lock (_waiterSync)
+        {
+            var signal = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _waiterSignal = signal;
+            _waiterSignalAt = count;
+            if (_readyGateWaiters >= count)
+                signal.TrySetResult(true);
+
+            return signal.Task;
+        }
+    }
+
+    /// <summary>How many callers are blocked on the ready gate. Zero when nobody is waiting.</summary>
+    internal int ReadyGateWaiters
+    {
+        get
+        {
+            lock (_waiterSync)
+                return _readyGateWaiters;
+        }
+    }
+
+    /// <summary>How many groups are recorded ready. The cap is <see cref="MaxReadyPairs"/>.</summary>
+    internal int ReadyGroupCount => _groups.Count;
+
+    /// <summary>How many group and stream pairs are recorded ready. The cap is <see cref="MaxReadyPairs"/>.</summary>
+    internal int ReadyStreamCount => _streams.Count;
+
+    /// <summary>
+    /// Forgets the group entry and one stream so the next create runs again.
     /// </summary>
     /// <param name="logGroupName">Log group name. Not null.</param>
     /// <param name="logStreamName">Log stream name. Not null.</param>
     /// <param name="cancellationToken">Cancels the wait for the gate.</param>
-    /// <returns>A task that completes after the pair is removed.</returns>
-    /// <remarks>Does not call AWS. Other streams of the same group are forgotten with the group.</remarks>
+    /// <returns>A task that completes after those two entries are removed.</returns>
+    /// <remarks>
+    /// Does not call AWS. Other streams of the same group stay recorded.
+    /// The group entry is removed too because the group may have been deleted.
+    /// The next create is idempotent: a group or stream that still exists counts as success.
+    /// </remarks>
     private async Task ForgetAsync(
         string logGroupName,
         string logStreamName,
