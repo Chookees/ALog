@@ -853,8 +853,8 @@ public sealed class MasterBugTests : IDisposable
     {
         await Task.CompletedTask;
         var value = new DistinctFormattable();
-        var master = value.ToString(null, System.Globalization.CultureInfo.CurrentCulture);
-        Assert.NotEqual(value.ToString(), master);
+        var expected = value.ToString(null, System.Globalization.CultureInfo.CurrentCulture);
+        Assert.NotEqual(value.ToString(), expected);
 
         var text = new PlainTextFormatter().Format(new LogEvent(
             CoverageClock.UtcNow,
@@ -864,7 +864,7 @@ public sealed class MasterBugTests : IDisposable
             null,
             new Dictionary<string, object> { ["P"] = value }));
 
-        Assert.Contains("P=" + master, text, StringComparison.Ordinal);
+        Assert.Contains("P=" + expected, text, StringComparison.Ordinal);
         Assert.DoesNotContain("P=" + value.ToString(), text, StringComparison.Ordinal);
     }
 
@@ -1597,8 +1597,8 @@ public sealed class MasterBugTests : IDisposable
         /// <returns><c>plain-tostring</c>.</returns>
         public override string ToString() => "plain-tostring";
 
-        /// <summary>The culture-formatted text master wrote for this value.</summary>
-        /// <param name="format">Ignored. Master passes null.</param>
+        /// <summary>The culture-formatted text ALog writes for this value.</summary>
+        /// <param name="format">Ignored. ALog passes null.</param>
         /// <param name="formatProvider">Must be <see cref="System.Globalization.CultureInfo.CurrentCulture"/>.</param>
         /// <returns><c>iformattable-current</c> for the current culture. Otherwise <c>wrong-provider</c>.</returns>
         public string ToString(string? format, IFormatProvider? formatProvider)
