@@ -62,6 +62,8 @@ CONSOLE_TXT = "docs/images/quickstart-console.txt"
 HEADER_SCRIPT = "eng/readme-example-check.py"
 END_OF_OUTPUT = "<end of output>"
 END_OF_FILE = "<end of file>"
+END_OF_BLOCK = "<end of block>"
+SAMPLE_PROGRAM = "samples/ALog.QuickstartSample/Program.cs"
 MAX_COMPARE_LINES = MAX_TEXT_BYTES
 
 
@@ -345,16 +347,41 @@ def png_problem(path: Path) -> str | None:
     return None
 
 
-def fenced_csharp(text: str, heading: str) -> tuple[str | None, str | None]:
-    """Return the first csharp fence under one README heading.
+def line_at(text: str, offset: int) -> int:
+    """Return the 1-based line number that contains one character offset.
 
     Args:
-        text: README text with LF line endings.
-        heading: Heading line, including the leading ``###``.
+        text: The file text. Line breaks are ``\\n``.
+        offset: Character index. Values outside the text use the nearest end.
 
     Returns:
-        ``(body, None)`` including the newline after the last code line, or
-        ``(None, problem)`` when the heading or the fence is missing.
+        The line number. Offset 0 is line 1.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if offset < 0:
+        offset = 0
+    if offset > len(text):
+        offset = len(text)
+    return text.count("\n", 0, offset) + 1
+
+
+def heading_region(text: str, heading: str) -> tuple[int, str]:
+    """Return one README heading and the text before the next heading.
+
+    A missing heading is an empty region. Callers then report zero code
+    blocks with the U-DOC-07 count, instead of a separate missing-heading sentence.
+
+    Args:
+        text: Normalized README text.
+        heading: Full heading line, including the leading ``###``.
+
+    Returns:
+        The heading's offset and its section, not including the next heading.
 
     Raises:
         None.
@@ -364,29 +391,26 @@ def fenced_csharp(text: str, heading: str) -> tuple[str | None, str | None]:
     """
     start = text.find(heading)
     if start < 0:
-        return None, f"README is missing {heading}."
+        return 0, ""
     next_heading = text.find("\n### ", start + len(heading))
-    region = text[start:] if next_heading < 0 else text[start:next_heading]
-    opener = "```csharp\n"
-    open_at = region.find(opener)
-    if open_at < 0:
-        return None, f"README is missing a csharp block under {heading}."
-    body_at = open_at + len(opener)
-    close_at = region.find("\n```", body_at)
-    if close_at < 0:
-        return None, f"README csharp block under {heading} is not closed."
-    return region[body_at : close_at + 1], None
+    if next_heading < 0:
+        return start, text[start:]
+    return start, text[start:next_heading]
 
 
-def marked_region(text: str, name: str) -> tuple[str | None, str | None]:
-    """Return the sample text between one pair of README markers.
+def fenced_blocks(region: str, language: str) -> list[tuple[int, str]]:
+    """Return every closed fence of one language inside a heading section.
+
+    An opener without a closing fence is not counted. The walk stops at 20
+    blocks so a repeated fence cannot run without a bound.
 
     Args:
-        text: ``Program.cs`` with LF line endings.
-        name: ``step1`` or ``step2``.
+        region: Heading section from ``heading_region``.
+        language: ``csharp`` or ``json``, without the fence marks.
 
     Returns:
-        ``(body, None)`` or ``(None, problem)`` when a marker is missing.
+        Pairs of body offset within ``region`` and body text. The body
+        includes the newline that precedes the closing fence.
 
     Raises:
         None.
@@ -394,30 +418,338 @@ def marked_region(text: str, name: str) -> tuple[str | None, str | None]:
     Side effects:
         None.
     """
-    if name not in ("step1", "step2"):
-        return None, "marker name must be step1 or step2."
-    begin = f"// readme:{name}:begin\n"
-    end = f"// readme:{name}:end"
-    start = text.find(begin)
+    opener = "```" + language + "\n"
+    blocks: list[tuple[int, str]] = []
+    search = 0
+    while search < len(region) and len(blocks) < 20:
+        open_at = region.find(opener, search)
+        if open_at < 0:
+            break
+        body_at = open_at + len(opener)
+        close_at = region.find("\n```", body_at)
+        if close_at < 0:
+            break
+        blocks.append((body_at, region[body_at : close_at + 1]))
+        search = close_at + len("\n```")
+    return blocks
+
+
+def count_token(text: str, token: str) -> int:
+    """Count non-overlapping copies of one marker, at most 100.
+
+    Args:
+        text: ``Program.cs`` text.
+        token: The marker text, such as ``// readme:step1:begin``.
+
+    Returns:
+        The count, capped at 100.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    count = 0
+    start = 0
+    while count < 100:
+        found = text.find(token, start)
+        if found < 0:
+            return count
+        count += 1
+        start = found + len(token)
+    return count
+
+
+def marker_status(program: str, step: int) -> tuple[int, int, bool]:
+    """Count one step's begin and end markers and record reversed order.
+
+    ``end before begin`` is true only when both markers exist and the first
+    end appears earlier in the file than the first begin.
+
+    Args:
+        program: Normalized ``Program.cs`` text.
+        step: 1 or 2.
+
+    Returns:
+        Begin count, end count, and whether end comes before begin.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    begin = f"// readme:step{step}:begin"
+    end = f"// readme:step{step}:end"
+    begin_at = program.find(begin)
+    end_at = program.find(end)
+    end_before = begin_at >= 0 and end_at >= 0 and end_at < begin_at
+    return count_token(program, begin), count_token(program, end), end_before
+
+
+def marker_body(program: str, step: int) -> tuple[int, str] | None:
+    """Return the sample text between one step's first begin and first end.
+
+    Args:
+        program: Normalized ``Program.cs`` text.
+        step: 1 or 2. The caller has already required one begin and one end
+            in the right order.
+
+    Returns:
+        The body's offset and text, or None when the pair cannot be sliced.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    begin = f"// readme:step{step}:begin"
+    end = f"// readme:step{step}:end"
+    start = program.find(begin)
     if start < 0:
-        return None, f"Program.cs is missing {begin.strip()}."
+        return None
     body_at = start + len(begin)
-    finish = text.find(end, body_at)
+    if body_at < len(program) and program[body_at] == "\n":
+        body_at += 1
+    finish = program.find(end, body_at)
     if finish < 0:
-        return None, f"Program.cs is missing {end}."
-    return text[body_at:finish], None
+        return None
+    return body_at, program[body_at:finish]
+
+
+def marker_message(step: int, begins: int, ends: int, end_before: bool) -> str:
+    """Return the U-DOC-07 line for a missing or reversed step marker.
+
+    Args:
+        step: 1 or 2.
+        begins: How many begin markers were found, at most 100.
+        ends: How many end markers were found, at most 100.
+        end_before: When true, append ``, end before begin``.
+
+    Returns:
+        The full FAIL line.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    extra = ", end before begin" if end_before else ""
+    return (
+        f"FAIL {SAMPLE_PROGRAM}: expected exactly one // readme:step{step}:begin "
+        f"followed by one // readme:step{step}:end, found {begins} begin, {ends} end{extra}. "
+        f"Put the Step {step} code block from README.md between these two markers."
+    )
+
+
+def readme_block_message(step: int, count: int) -> str:
+    """Return the U-DOC-07 line when a Step heading has not exactly one C# block.
+
+    Args:
+        step: 1 or 2.
+        count: Closed ```csharp fences under that heading, at most 20.
+
+    Returns:
+        The full FAIL line.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        f"FAIL README.md: expected one C# code block under ### Step {step}, found {count}. "
+        f"Restore the Step {step} code block; the sample copies it."
+    )
+
+
+def code_diff_message(
+    readme_line: int,
+    step: int,
+    program_line: int,
+    expected: str,
+    found: str,
+) -> str:
+    """Return the U-DOC-07 line for the first differing code line.
+
+    Args:
+        readme_line: 1-based line in README.md.
+        step: 1 or 2.
+        program_line: 1-based line in ``Program.cs``.
+        expected: The README line, or ``<end of block>`` when the README ended.
+        found: The sample line, or ``<end of block>`` when the sample ended.
+
+    Returns:
+        The full FAIL line.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        f"FAIL README.md:{readme_line}: Step {step} code block differs from "
+        f"{SAMPLE_PROGRAM}:{program_line} "
+        f"(between // readme:step{step}:begin and end): "
+        f'expected "{expected}", found "{found}". '
+        "Change README and sample in the same commit so both blocks match byte for byte."
+    )
+
+
+def content_lines(body: str) -> list[str]:
+    """Split a code block into lines without the fence's trailing break.
+
+    Both blocks normally end with the newline that sits in front of the
+    closing fence or the end marker. Dropping that one empty split item keeps
+    it from looking like a blank line. The walk is capped at the text limit.
+
+    Args:
+        body: Text between the opener and the closer.
+
+    Returns:
+        The lines. An empty body has no lines.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if body == "":
+        return []
+    lines = body.split("\n")
+    if len(lines) > MAX_COMPARE_LINES:
+        lines = lines[:MAX_COMPARE_LINES]
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    return lines
+
+
+def block_line_diff(
+    readme: str,
+    readme_at: int,
+    readme_body: str,
+    program: str,
+    program_at: int,
+    program_body: str,
+    step: int,
+) -> str | None:
+    """Return the first line where one step's README block and sample differ.
+
+    A side that has no line at the difference is ``<end of block>``. The
+    comparison uses the newline-normalized bodies, so a Windows checkout is
+    not a code edit. Only this first line is reported.
+
+    Args:
+        readme: Full README, used for line numbers.
+        readme_at: Offset of the README block body.
+        readme_body: README block body.
+        program: Full ``Program.cs``, used for line numbers.
+        program_at: Offset of the sample block body.
+        program_body: Sample block body.
+        step: 1 or 2.
+
+    Returns:
+        The U-DOC-07 FAIL line, or None when the bodies are the same text.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    expected_lines = content_lines(readme_body)
+    found_lines = content_lines(program_body)
+    readme_line0 = line_at(readme, readme_at)
+    program_line0 = line_at(program, program_at)
+    count = len(expected_lines)
+    if len(found_lines) > count:
+        count = len(found_lines)
+    index = 0
+    while index < count:
+        expected = expected_lines[index] if index < len(expected_lines) else None
+        found = found_lines[index] if index < len(found_lines) else None
+        if expected != found:
+            return code_diff_message(
+                readme_line0 + index,
+                step,
+                program_line0 + index,
+                END_OF_BLOCK if expected is None else expected,
+                END_OF_BLOCK if found is None else found,
+            )
+        index += 1
+    if readme_body == program_body:
+        return None
+    readme_tail = "" if readme_body.endswith("\n") else END_OF_BLOCK
+    program_tail = "" if program_body.endswith("\n") else END_OF_BLOCK
+    return code_diff_message(
+        readme_line0 + len(expected_lines),
+        step,
+        program_line0 + len(found_lines),
+        readme_tail,
+        program_tail,
+    )
+
+
+def one_step_problem(readme: str, program: str, heading: str, step: int) -> str | None:
+    """Check one Quick Start step and return its first U-DOC-07 problem.
+
+    A missing C# block is reported before markers, and markers are reported
+    before a line difference. Later steps are the caller's concern.
+
+    Args:
+        readme: Normalized README text.
+        program: Normalized ``Program.cs`` text.
+        heading: The step heading line.
+        step: 1 or 2.
+
+    Returns:
+        The FAIL line, or None when this step's block matches the sample.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    start, region = heading_region(readme, heading)
+    blocks = fenced_blocks(region, "csharp")
+    if len(blocks) != 1:
+        return readme_block_message(step, len(blocks))
+    begins, ends, end_before = marker_status(program, step)
+    if begins != 1 or ends != 1 or end_before:
+        return marker_message(step, begins, ends, end_before)
+    located = marker_body(program, step)
+    if located is None:
+        return marker_message(step, begins, ends, end_before)
+    program_at, program_body = located
+    body_at, readme_body = blocks[0]
+    return block_line_diff(
+        readme,
+        start + body_at,
+        readme_body,
+        program,
+        program_at,
+        program_body,
+        step,
+    )
 
 
 def code_problems(readme: str, program: str) -> list[str]:
-    """Compare both README csharp blocks with the sample markers.
+    """Compare Step 1 and Step 2 with the sample and return the first mismatch.
 
     Args:
         readme: Normalized README text.
         program: Normalized ``Program.cs`` text.
 
     Returns:
-        One problem per mismatched or missing block. Empty when both blocks
-        are byte-identical to the markers.
+        A one-item list with the first U-DOC-07 code line, or an empty list
+        when both blocks match the markers.
 
     Raises:
         None.
@@ -425,61 +757,14 @@ def code_problems(readme: str, program: str) -> list[str]:
     Side effects:
         None.
     """
-    problems: list[str] = []
     index = 0
     while index < len(STEP_HEADINGS):
-        name, heading = STEP_HEADINGS[index]
-        readme_body, readme_problem = fenced_csharp(readme, heading)
-        sample_body, sample_problem = marked_region(program, name)
-        if readme_problem is not None:
-            problems.append(readme_problem)
-        elif sample_problem is not None:
-            problems.append(sample_problem)
-        elif readme_body != sample_body:
-            problems.append(
-                f"README {name} block is not byte-identical to the sample markers."
-            )
+        _name, heading = STEP_HEADINGS[index]
+        problem = one_step_problem(readme, program, heading, index + 1)
+        if problem is not None:
+            return [problem]
         index += 1
-    return problems
-
-
-def outside_marker_problem(program: str) -> str | None:
-    """Reject a log call that is not inside a README marker.
-
-    The markers already contain Step 1 and Step 2. Anything outside them is
-    only allowed to make that text compile, so another ``Log.`` call would be
-    a second example the README does not show.
-
-    Args:
-        program: Normalized ``Program.cs`` text.
-
-    Returns:
-        A problem when ``Log.`` survives outside the markers, else None.
-
-    Raises:
-        None.
-
-    Side effects:
-        None.
-    """
-    remaining = program
-    index = 0
-    while index < 2:
-        name = STEP_HEADINGS[index][0]
-        begin = f"// readme:{name}:begin"
-        end = f"// readme:{name}:end"
-        start = remaining.find(begin)
-        finish = remaining.find(end, start if start >= 0 else 0)
-        if start < 0 or finish < 0:
-            return "Program.cs markers could not be removed."
-        finish_end = finish + len(end)
-        if finish_end < len(remaining) and remaining[finish_end] == "\n":
-            finish_end += 1
-        remaining = remaining[:start] + remaining[finish_end:]
-        index += 1
-    if "Log." in remaining:
-        return "Program.cs has a log call outside the README markers."
-    return None
+    return []
 
 
 def wording_problem(readme: str) -> str | None:
@@ -515,15 +800,15 @@ def wording_problem(readme: str) -> str | None:
     return None
 
 
-def split_json_values(text: str) -> tuple[list[str], str | None]:
+def split_json_values(text: str) -> tuple[list[tuple[int, str]], bool]:
     """Split concatenated JSON values without reformatting them.
 
     Args:
         text: A README json fence or a ``logs/app.log`` body.
 
     Returns:
-        The raw text of each complete value, in order, or a problem when a
-        value is cut off or there are more than 100.
+        Each complete value as ``(offset, raw text)``, and True when the text
+        ended in the middle of a value or held more than 100 values.
 
     Raises:
         None.
@@ -532,9 +817,9 @@ def split_json_values(text: str) -> tuple[list[str], str | None]:
         None.
     """
     if len(text) > MAX_TEXT_BYTES:
-        return [], "JSON text is larger than the read limit."
+        return [], True
     decoder = json.JSONDecoder()
-    values: list[str] = []
+    values: list[tuple[int, str]] = []
     index = 0
     length = len(text)
     while index < length:
@@ -543,26 +828,30 @@ def split_json_values(text: str) -> tuple[list[str], str | None]:
         if index >= length:
             break
         if len(values) >= MAX_JSON_VALUES:
-            return [], "JSON text has more than 100 values."
+            return values, True
         try:
             _parsed, end = decoder.raw_decode(text, index)
         except json.JSONDecodeError:
-            return [], "JSON text is not a sequence of complete values."
+            return values, True
         if end <= index:
-            return [], "JSON decoder did not advance."
-        values.append(text[index:end])
+            return values, True
+        values.append((index, text[index:end]))
         index = end
-    return values, None
+    return values, False
 
 
-def json_fence(readme: str) -> tuple[str | None, str | None]:
-    """Return the Example output json fence body.
+def entry_quote(text: str) -> str:
+    """Return the first 120 characters of one normalized entry, then an ellipsis.
+
+    The ellipsis is always present, including when the entry is shorter than
+    120 characters. Timestamps must already be replaced.
 
     Args:
-        readme: Normalized README text.
+        text: Normalized JSON text of one entry, or of the fence when no
+            complete entry could be read.
 
     Returns:
-        ``(body, None)`` or ``(None, problem)``.
+        At most 120 characters followed by ``…``.
 
     Raises:
         None.
@@ -570,34 +859,170 @@ def json_fence(readme: str) -> tuple[str | None, str | None]:
     Side effects:
         None.
     """
-    heading = readme.find("### Example output")
-    if heading < 0:
-        return None, "README is missing ### Example output."
-    next_heading = readme.find("\n### ", heading + len("### Example output"))
-    region = readme[heading:] if next_heading < 0 else readme[heading:next_heading]
-    opener = "```json\n"
-    open_at = region.find(opener)
-    if open_at < 0:
-        return None, "README Example output is missing a json block."
-    body_at = open_at + len(opener)
-    close_at = region.find("\n```", body_at)
-    if close_at < 0:
-        return None, "README json block is not closed."
-    return region[body_at:close_at], None
+    return text[:120] + "…"
+
+
+def json_block_message(count: int) -> str:
+    """Return the U-DOC-07 line when Example output has not exactly one json block.
+
+    Args:
+        count: Closed ```json fences under the heading, at most 20.
+
+    Returns:
+        The full FAIL line.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        "FAIL README.md: expected one json code block under ### Example output, "
+        f"found {count}. Restore the excerpt from logs/app.log of a sample run."
+    )
+
+
+def missing_entry_message(line: int, entry: int, quote: str) -> str:
+    """Return the U-DOC-07 line for an excerpt entry the run log does not contain.
+
+    Args:
+        line: 1-based README line where the entry starts.
+        entry: 1-based entry number inside the json block.
+        quote: First 120 normalized characters plus the ellipsis.
+
+    Returns:
+        The full FAIL line.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        f"FAIL README.md:{line}: JSON excerpt entry {entry} not found as a complete "
+        "entry in logs/app.log of the sample run (timestamps normalized): "
+        f'"{quote}". Run dotnet run --project samples/ALog.QuickstartSample and '
+        "copy the first entry and the error entry from logs/app.log unedited, each one whole."
+    )
+
+
+def order_message(line: int, entry: int) -> str:
+    """Return the U-DOC-07 line when an excerpt entry appears too early in the log.
+
+    Args:
+        line: 1-based README line where this entry starts.
+        entry: 1-based entry number. The previous entry is ``entry - 1``.
+
+    Returns:
+        The full FAIL line.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        f"FAIL README.md:{line}: JSON excerpt entry {entry} comes before entry {entry - 1} "
+        "in logs/app.log, expected the order of the log. "
+        "List the entries in the order they appear in logs/app.log."
+    )
+
+
+def find_entry(entries: list[str], wanted: str, start: int) -> int:
+    """Find one normalized log entry at or after a position.
+
+    Args:
+        entries: Normalized log entries. At most 100 are scanned.
+        wanted: Normalized excerpt entry.
+        start: First index that may count. Negative values start at 0.
+
+    Returns:
+        The index, or -1 when no later entry matches.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    index = start
+    if index < 0:
+        index = 0
+    while index < len(entries) and index < MAX_JSON_VALUES:
+        if entries[index] == wanted:
+            return index
+        index += 1
+    return -1
+
+
+def excerpt_mismatch(
+    readme: str,
+    fence_at: int,
+    fence: str,
+    excerpt: list[tuple[int, str]],
+    excerpt_bad: bool,
+    normalized_log: list[str],
+) -> str | None:
+    """Return the first excerpt entry that is missing or out of log order.
+
+    Entries between the chosen ones may be absent. A match is the whole
+    normalized value, so part of an entry does not count. The search continues
+    after the previous match; an earlier hit is the order failure.
+
+    Args:
+        readme: Normalized README, used for line numbers.
+        fence_at: Offset of the json body in ``readme``.
+        fence: Json body, quoted when it holds no complete entry.
+        excerpt: Complete values and their offsets inside ``fence``.
+        excerpt_bad: True when another value was cut off after ``excerpt``.
+        normalized_log: Complete log entries with timestamps replaced.
+
+    Returns:
+        The U-DOC-07 FAIL line, or None when every excerpt entry is an
+        in-order complete log entry.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    position = 0
+    index = 0
+    while index < len(excerpt):
+        offset, raw = excerpt[index]
+        wanted = normalize_timestamps(raw)
+        found_at = find_entry(normalized_log, wanted, position)
+        if found_at >= 0:
+            position = found_at + 1
+            index += 1
+            continue
+        line = line_at(readme, fence_at + offset)
+        entry = index + 1
+        if find_entry(normalized_log, wanted, 0) >= 0:
+            return order_message(line, entry)
+        return missing_entry_message(line, entry, entry_quote(wanted))
+    if excerpt_bad or len(excerpt) < 1:
+        return missing_entry_message(
+            line_at(readme, fence_at),
+            len(excerpt) + 1,
+            entry_quote(normalize_timestamps(fence)),
+        )
+    return None
 
 
 def excerpt_problem(readme: str, log_text: str) -> str | None:
-    """Require every README JSON value to be a full log entry, in order.
-
-    Entries between the chosen ones may be absent. A partial entry, a reorder,
-    or any edit other than the timestamp placeholder is a failure.
+    """Require the Example output json block to be complete log entries, in order.
 
     Args:
         readme: Normalized README text.
         log_text: Exact ``logs/app.log`` text from the run.
 
     Returns:
-        A problem, or None when the excerpt is a subsequence of the log.
+        The first U-DOC-07 excerpt line, or None when the block matches.
 
     Raises:
         None.
@@ -605,58 +1030,22 @@ def excerpt_problem(readme: str, log_text: str) -> str | None:
     Side effects:
         None.
     """
-    fence, fence_problem = json_fence(readme)
-    if fence_problem is not None or fence is None:
-        return fence_problem or "README json block is missing."
-    excerpt, excerpt_error = split_json_values(fence)
-    logged, log_error = split_json_values(log_text)
-    if excerpt_error is not None:
-        return "README JSON excerpt is not a sequence of complete values."
-    if log_error is not None:
-        return "The run log is not a sequence of complete values."
-    if len(excerpt) < 1:
-        return "README JSON excerpt has no entry."
-    normalized_excerpt = [normalize_timestamps(item) for item in excerpt]
-    normalized_log = [normalize_timestamps(item) for item in logged]
-    if not is_subsequence(normalized_excerpt, normalized_log):
-        return (
-            "README JSON excerpt is not a verbatim subsequence of complete "
-            "log entries after timestamp normalization."
-        )
-    return None
-
-
-def is_subsequence(need: list[str], have: list[str]) -> bool:
-    """Return whether every needed entry appears in the log, in order.
-
-    Args:
-        need: Normalized excerpt entries. One to 100.
-        have: Normalized log entries. At most 100.
-
-    Returns:
-        True when ``need`` is an in-order subsequence of ``have``.
-
-    Raises:
-        None.
-
-    Side effects:
-        None.
-    """
-    if len(need) < 1 or len(need) > MAX_JSON_VALUES or len(have) > MAX_JSON_VALUES:
-        return False
-    position = 0
-    for item in need:
-        found = False
-        scan = position
-        while scan < len(have):
-            if have[scan] == item:
-                position = scan + 1
-                found = True
-                break
-            scan += 1
-        if not found:
-            return False
-    return True
+    start, region = heading_region(readme, "### Example output")
+    blocks = fenced_blocks(region, "json")
+    if len(blocks) != 1:
+        return json_block_message(len(blocks))
+    body_at, fence = blocks[0]
+    excerpt, excerpt_bad = split_json_values(fence)
+    logged, _log_bad = split_json_values(log_text)
+    normalized_log = [normalize_timestamps(raw) for _offset, raw in logged]
+    return excerpt_mismatch(
+        readme,
+        start + body_at,
+        fence,
+        excerpt,
+        excerpt_bad,
+        normalized_log,
+    )
 
 
 def stdout_fail_message(line_number: int, expected: str, found: str) -> str:
@@ -751,15 +1140,39 @@ def stdout_problem(stdout_text: str, console_text: str) -> str | None:
     return first_console_mismatch(expected_text, found_text)
 
 
-def tracked_log_problem(root: Path) -> str | None:
-    """Fail when git tracks anything under ``logs/`` or ``Logs/``.
+def tracked_log_message(path: str) -> str:
+    """Return the U-DOC-07 line for one tracked file under ``logs/``.
+
+    Args:
+        path: Path as ``git ls-files`` prints it, using ``/`` separators.
+
+    Returns:
+        The full FAIL line, including the ``git rm --cached`` command.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return (
+        f"FAIL {path}: expected no tracked files under logs/, found this one in git. "
+        f"Remove it with git rm --cached {path}; .gitignore already ignores logs/."
+    )
+
+
+def tracked_log_problems(root: Path) -> list[str]:
+    """List every git-tracked file under ``logs/`` or ``Logs/``.
+
+    One FAIL line is returned per file, in ``git ls-files`` order. The walk
+    stops after 10000 index paths or 20 tracked log files.
 
     Args:
         root: Repository root.
 
     Returns:
-        A problem naming the tracked path, or None when ``git ls-files`` shows
-        no such path.
+        The U-DOC-07 lines. Empty when nothing under ``logs/`` is tracked.
+        A git failure is returned as that command's own problem.
 
     Raises:
         None.
@@ -769,22 +1182,23 @@ def tracked_log_problem(root: Path) -> str | None:
     """
     output, problem = run_git(root, ["ls-files", "-z"])
     if problem is not None or output is None:
-        return problem or "git ls-files failed."
-    paths = output.split("\0")
+        return [problem or "git command failed."]
+    found: list[str] = []
     seen = 0
-    for path in paths:
+    for path in output.split("\0"):
         if path == "":
             continue
         seen += 1
-        if seen > MAX_TRACKED_PATHS:
-            return "git ls-files returned more than 10000 paths."
+        if seen > MAX_TRACKED_PATHS or len(found) >= MAX_PROBLEMS:
+            break
         parts = path.split("/")
         index = 0
         while index < len(parts) - 1 and index < 20:
             if parts[index] in ("logs", "Logs"):
-                return f"A file under logs/ is tracked: {path}"
+                found.append(tracked_log_message(path))
+                break
             index += 1
-    return None
+    return found
 
 
 def same_commit_problem(root: Path) -> str | None:
@@ -878,7 +1292,8 @@ def check_repository(root: Path, stdout_path: Path, log_path: Path) -> list[str]
     append_problem(problems, log_error)
     append_problem(problems, png_problem(root / "docs/images/quickstart-console.png"))
     append_problem(problems, same_commit_problem(root))
-    append_problem(problems, tracked_log_problem(root))
+    for problem in tracked_log_problems(root):
+        append_problem(problems, problem)
     if readme_text is None or program_text is None:
         return problems
     readme = normalize_newlines(readme_text)
@@ -886,7 +1301,6 @@ def check_repository(root: Path, stdout_path: Path, log_path: Path) -> list[str]
     append_problem(problems, wording_problem(readme))
     for problem in code_problems(readme, program):
         append_problem(problems, problem)
-    append_problem(problems, outside_marker_problem(program))
     if log_text is not None:
         append_problem(problems, excerpt_problem(readme, log_text))
     if stdout_text is not None and console_text is not None:
@@ -1238,12 +1652,37 @@ def report_exact(label: str, problems: list[str], expected: str) -> int:
     return 1
 
 
+def report_exact_many(label: str, problems: list[str], expected: list[str]) -> int:
+    """Require one red case to be exactly these U-DOC-07 lines, in order.
+
+    Args:
+        label: Case name.
+        problems: Check output.
+        expected: The full failure lines, with runtime fields already filled.
+
+    Returns:
+        0 when the lists are equal, 1 otherwise.
+
+    Raises:
+        None.
+
+    Side effects:
+        Writes one line to stdout or stderr.
+    """
+    if problems == expected:
+        sys.stdout.write(f"ok {label}\n")
+        return 0
+    sys.stderr.write(f"FAIL {label}: expected exact {expected!r}: {problems!r}\n")
+    return 1
+
+
 def self_test() -> int:
-    """Prove the U-DOC-06 red texts and the unchanged green case.
+    """Prove the U-DOC-06 and U-DOC-07 red texts and the unchanged green case.
 
     Each red case starts from a fresh fixture so one mutation cannot hide
-    another. The green case is that fixture before any mutation. The stdout,
-    commit, PNG, and size cases require the full failure line, not a fragment.
+    another. The green case is that fixture before any mutation. The code,
+    excerpt, tracked-log, stdout, commit, PNG, and size cases require the
+    full failure line, not a fragment.
 
     Returns:
         0 when every case has the required color, 1 otherwise.
@@ -1268,7 +1707,14 @@ def self_test() -> int:
             failures += case_stdout_shorter(tmp / "short-out")
             failures += case_txt_shorter(tmp / "short-txt")
             failures += case_excerpt_edited(tmp / "excerpt")
+            failures += case_excerpt_order(tmp / "order")
+            failures += case_json_missing(tmp / "json")
             failures += case_code_differs(tmp / "code")
+            failures += case_code_shorter(tmp / "code-short")
+            failures += case_marker_missing(tmp / "marker")
+            failures += case_marker_reversed(tmp / "reversed")
+            failures += case_readme_block_missing(tmp / "csharp")
+            failures += case_tracked_logs(tmp / "tracked")
             failures += case_different_commits(tmp / "commits")
     except (OSError, RuntimeError, ValueError) as exc:
         sys.stderr.write(f"FAIL self-test setup: {exc}\n")
@@ -1567,10 +2013,83 @@ def case_excerpt_edited(root: Path) -> int:
         ),
         encoding="utf-8",
     )
-    return report_case(
+    quote = (
+        "{\n"
+        "  \"timestamp\": \"<timestamp>\",\n"
+        "  \"level\": \"Info\",\n"
+        "  \"message\": \"Application edited\"\n"
+        "}…"
+    )
+    return report_exact(
         "excerpt hand-edited",
         check_repository(root, stdout_path, log_path),
-        "complete log entries",
+        "FAIL README.md:24: JSON excerpt entry 1 not found as a complete entry "
+        "in logs/app.log of the sample run (timestamps normalized): "
+        f'"{quote}". Run dotnet run --project samples/ALog.QuickstartSample and '
+        "copy the first entry and the error entry from logs/app.log unedited, each one whole.",
+    )
+
+
+def case_excerpt_order(root: Path) -> int:
+    """An excerpt that reverses two log entries must name that order.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the only problem says entry 2 comes before entry 1.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and swaps the two README JSON entries.
+    """
+    stdout_path, log_path = write_fixture(root)
+    readme = root / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    first = fixture_entry("2026-10-20T20:55:19.4758886Z", "Info", "Application started")
+    error = fixture_entry("2026-10-20T20:55:19.5318101Z", "Error", "Something went wrong")
+    swapped = text.replace(first + "\n" + error, error + "\n" + first, 1)
+    if swapped == text:
+        raise RuntimeError("fixture excerpt could not be reversed.")
+    readme.write_text(swapped, encoding="utf-8")
+    return report_exact(
+        "excerpt order",
+        check_repository(root, stdout_path, log_path),
+        "FAIL README.md:29: JSON excerpt entry 2 comes before entry 1 in logs/app.log, "
+        "expected the order of the log. List the entries in the order they appear in logs/app.log.",
+    )
+
+
+def case_json_missing(root: Path) -> int:
+    """Example output with no json fence must use the missing-block line.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the only problem says zero json blocks were found.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and deletes the json fence.
+    """
+    stdout_path, log_path = write_fixture(root)
+    readme = root / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    start = text.find("```json\n")
+    finish = text.find("\n```", start)
+    if start < 0 or finish < 0:
+        raise RuntimeError("fixture json fence is missing.")
+    readme.write_text(text[:start] + text[finish + len("\n```") :], encoding="utf-8")
+    return report_exact(
+        "json block missing",
+        check_repository(root, stdout_path, log_path),
+        "FAIL README.md: expected one json code block under ### Example output, found 0. "
+        "Restore the excerpt from logs/app.log of a sample run.",
     )
 
 
@@ -1595,10 +2114,174 @@ def case_code_differs(root: Path) -> int:
         program.read_text(encoding="utf-8").replace("var ready = 1;", "var ready = 9;", 1),
         encoding="utf-8",
     )
-    return report_case(
+    return report_exact(
         "readme code differs",
         check_repository(root, stdout_path, log_path),
-        "not byte-identical",
+        "FAIL README.md:6: Step 1 code block differs from "
+        "samples/ALog.QuickstartSample/Program.cs:4 "
+        "(between // readme:step1:begin and end): "
+        'expected "var ready = 1;", found "var ready = 9;". '
+        "Change README and sample in the same commit so both blocks match byte for byte.",
+    )
+
+
+def case_code_shorter(root: Path) -> int:
+    """A sample block that ends early must say end of block on that line.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when line 6 of the README is missing from the sample block.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and drops one sample line.
+    """
+    stdout_path, log_path = write_fixture(root)
+    program = root / "samples/ALog.QuickstartSample/Program.cs"
+    text = program.read_text(encoding="utf-8")
+    shorter = text.replace("var ready = 1;\n", "", 1)
+    if shorter == text:
+        raise RuntimeError("fixture sample line could not be removed.")
+    program.write_text(shorter, encoding="utf-8")
+    return report_exact(
+        "code shorter",
+        check_repository(root, stdout_path, log_path),
+        "FAIL README.md:6: Step 1 code block differs from "
+        "samples/ALog.QuickstartSample/Program.cs:4 "
+        "(between // readme:step1:begin and end): "
+        'expected "var ready = 1;", found "<end of block>". '
+        "Change README and sample in the same commit so both blocks match byte for byte.",
+    )
+
+
+def case_marker_missing(root: Path) -> int:
+    """A step with no begin marker must use the marker-count line.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the only problem says Step 1 has 0 begin and 1 end.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and deletes the Step 1 begin marker.
+    """
+    stdout_path, log_path = write_fixture(root)
+    program = root / "samples/ALog.QuickstartSample/Program.cs"
+    text = program.read_text(encoding="utf-8")
+    program.write_text(text.replace("// readme:step1:begin\n", "", 1), encoding="utf-8")
+    return report_exact(
+        "marker missing",
+        check_repository(root, stdout_path, log_path),
+        "FAIL samples/ALog.QuickstartSample/Program.cs: expected exactly one "
+        "// readme:step1:begin followed by one // readme:step1:end, found 0 begin, 1 end. "
+        "Put the Step 1 code block from README.md between these two markers.",
+    )
+
+
+def case_marker_reversed(root: Path) -> int:
+    """An end marker placed before begin must append the order clause.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the only problem says end comes before begin.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and swaps the Step 1 markers.
+    """
+    stdout_path, log_path = write_fixture(root)
+    program = root / "samples/ALog.QuickstartSample/Program.cs"
+    text = program.read_text(encoding="utf-8")
+    swapped = text.replace("// readme:step1:begin", "// readme:step1:END", 1)
+    swapped = swapped.replace("// readme:step1:end", "// readme:step1:begin", 1)
+    swapped = swapped.replace("// readme:step1:END", "// readme:step1:end", 1)
+    program.write_text(swapped, encoding="utf-8")
+    return report_exact(
+        "end before begin",
+        check_repository(root, stdout_path, log_path),
+        "FAIL samples/ALog.QuickstartSample/Program.cs: expected exactly one "
+        "// readme:step1:begin followed by one // readme:step1:end, "
+        "found 1 begin, 1 end, end before begin. "
+        "Put the Step 1 code block from README.md between these two markers.",
+    )
+
+
+def case_readme_block_missing(root: Path) -> int:
+    """A Step heading with no C# fence must use the missing-block line.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the only problem says Step 1 has zero C# blocks.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and deletes the Step 1 fence.
+    """
+    stdout_path, log_path = write_fixture(root)
+    readme = root / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    start = text.find("```csharp\n")
+    finish = text.find("\n```", start)
+    if start < 0 or finish < 0:
+        raise RuntimeError("fixture csharp fence is missing.")
+    readme.write_text(text[:start] + text[finish + len("\n```") :], encoding="utf-8")
+    return report_exact(
+        "readme block missing",
+        check_repository(root, stdout_path, log_path),
+        "FAIL README.md: expected one C# code block under ### Step 1, found 0. "
+        "Restore the Step 1 code block; the sample copies it.",
+    )
+
+
+def case_tracked_logs(root: Path) -> int:
+    """Two tracked files under logs/ must produce two exact lines.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the check lists both paths and no other problem.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture or ``git add`` failed.
+
+    Side effects:
+        Writes a temporary repository and stages two files under ``logs/``.
+    """
+    stdout_path, log_path = write_fixture(root)
+    logged = root / "logs"
+    logged.mkdir()
+    (logged / "app.log").write_text("one\n", encoding="utf-8")
+    (logged / "other.log").write_text("two\n", encoding="utf-8")
+    added, add_problem = run_git(root, ["add", "logs/app.log", "logs/other.log"])
+    if add_problem is not None:
+        raise RuntimeError(add_problem)
+    del added
+    return report_exact_many(
+        "tracked logs",
+        check_repository(root, stdout_path, log_path),
+        [
+            "FAIL logs/app.log: expected no tracked files under logs/, found this one in git. "
+            "Remove it with git rm --cached logs/app.log; .gitignore already ignores logs/.",
+            "FAIL logs/other.log: expected no tracked files under logs/, found this one in git. "
+            "Remove it with git rm --cached logs/other.log; .gitignore already ignores logs/.",
+        ],
     )
 
 
