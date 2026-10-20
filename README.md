@@ -153,6 +153,8 @@ var config = new LoggerConfig()
 Log.Init(config);
 ```
 
+`AwsCloudWatchWriter` uses the AWS SDK for .NET V4 (`AWSSDK.CloudWatchLogs` 4.0.106). If your app references other `AWSSDK.*` packages, use their V4 versions too. Mixing V3 and V4 either stops restore with NU1107 (version conflict on `AWSSDK.Core`) or restores with warning NU1608 and then throws `MissingMethodException` at runtime.
+
 ---
 
 ## Limitations
@@ -262,6 +264,10 @@ using (Log.BeginScope("sessionId", "abc123"))
 ### C2-Console
 
 - Breaking (behavior): ALog writes to the console only when `ALog:Console:Enabled` is `true`. Before, `AddALog` added its own console output next to the Microsoft console provider, so every line appeared twice.
+
+### AWS SDK V4
+
+- Breaking (dependency): `AWSSDK.CloudWatchLogs` moves from 3.7.509.3 (AWS SDK for .NET V3, end of support since 2026-06-01) to 4.0.106 (V4). If your app references other `AWSSDK.*` packages, upgrade all of them to V4 together. Mixing V3 and V4 either stops restore with NU1107 (version conflict on `AWSSDK.Core`) or restores with warning NU1608 and then throws `MissingMethodException` at runtime.
 
 ---
 

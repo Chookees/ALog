@@ -255,20 +255,29 @@ public sealed class SyncWriteContractTests
     /// A synchronous CloudWatch put that never finishes is reported when the wait expires.
     /// </summary>
     /// <remarks>
-    /// The production wait is 100 seconds. This test shortens that private field, checks the
-    /// timeout path, and restores the field before returning. The transport never completes.
+    /// The production wait is 100 seconds. This test shortens that field to 200 milliseconds
+    /// on a fake clock, advances that clock, and restores the field. The message still says
+    /// 100 seconds. The transport never completes.
     /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task AwsWrite_Timeout_IsReported()
     {
-        await Task.CompletedTask;
         var original = AwsCloudWatchWriter.SyncPutTimeout;
+        var clock = new SignalingFakeTimeProvider();
         var transport = new NeverCompletingAwsTransport();
-        using var writer = new AwsCloudWatchWriter("group", "stream", transport);
+        using var writer = new AwsCloudWatchWriter("group", "stream", transport, clock);
         try
         {
             AwsCloudWatchWriter.SyncPutTimeout = TimeSpan.FromMilliseconds(200);
-            var error = CaptureError(() => writer.Write(Event("aws-timeout")));
+            string error = string.Empty;
+            var write = Task.Run(() =>
+            {
+                error = CaptureError(() => writer.Write(Event("aws-timeout")));
+            });
+            Assert.True(clock.TimersArmed.Wait(TimeSpan.FromSeconds(20)));
+            clock.Advance(TimeSpan.FromMilliseconds(200));
+            var finished = await Task.WhenAny(write, Task.Delay(TimeSpan.FromSeconds(20)));
+            Assert.Same(write, finished);
             Assert.Contains("[AwsCloudWatchWriter]", error, StringComparison.Ordinal);
             Assert.Contains("100 second", error, StringComparison.Ordinal);
         }

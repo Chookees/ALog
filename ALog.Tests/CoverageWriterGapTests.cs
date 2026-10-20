@@ -264,8 +264,8 @@ public sealed class CoverageWriterGapTests
     }
 
     /// <summary>
-    /// The SDK transport creates the group and stream, retries a bad sequence token,
-    /// and stores the next token.
+    /// A bad sequence token is not retried and is not stored.
+    /// The service ignores sequence tokens, so the exception leaves the transport.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task AwsTransport_RetriesInvalidSequence_AndRemembersNextToken()
@@ -274,21 +274,20 @@ public sealed class CoverageWriterGapTests
         stub.PutMode = "invalid-then-ok";
         using (var transport = new AwsSdkCloudWatchLogsTransport(stub.Client, ownsClient: true))
         {
-            await transport.PutLogEventAsync("group", "stream-1", "hello", 1_577_936_645_000);
-            stub.PutMode = "ok";
-            await transport.PutLogEventAsync("group", "stream-1", "again", 1_577_936_645_000);
-            Assert.Equal(3, stub.Puts);
+            var thrown = await Record.ExceptionAsync(() =>
+                transport.PutLogEventAsync("group", "stream-1", "hello", 1_577_936_645_000));
+            Assert.IsType<InvalidSequenceTokenException>(thrown);
+            Assert.Equal(1, stub.Puts);
             Assert.Null(stub.SeenTokens[0]);
-            Assert.Equal("expected-1", stub.SeenTokens[1]);
-            Assert.Equal("next-2", stub.SeenTokens[2]);
+            Assert.Equal(0, stub.Describes);
         }
 
         Assert.True(stub.Disposed);
     }
 
     /// <summary>
-    /// An existing group and stream refresh the upload token. A missing token and a
-    /// mismatched stream name leave the sequence empty. Data already accepted updates it.
+    /// An existing group and stream are not described. The put carries no sequence token.
+    /// <see cref="DataAlreadyAcceptedException"/> leaves the transport.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task AwsTransport_ExistingStream_TokenMismatchAndAlreadyAccepted()
@@ -300,7 +299,8 @@ public sealed class CoverageWriterGapTests
         using (var transport = new AwsSdkCloudWatchLogsTransport(ready.Client))
         {
             await transport.PutLogEventAsync("group", "stream-1", "hello", 1_577_936_645_000);
-            Assert.Equal("upload-1", ready.SeenTokens[0]);
+            Assert.Null(ready.SeenTokens[0]);
+            Assert.Equal(0, ready.Describes);
         }
 
         Assert.False(ready.Disposed);
@@ -309,6 +309,7 @@ public sealed class CoverageWriterGapTests
         using (var transport = new AwsSdkCloudWatchLogsTransport(missing.Client))
             await transport.PutLogEventAsync("group", "stream-1", "hello", 1_577_936_645_000);
         Assert.Null(missing.SeenTokens[0]);
+        Assert.Equal(0, missing.Describes);
 
         var mismatch = CloudWatchStub.Create();
         mismatch.StreamExists = true;
@@ -317,13 +318,17 @@ public sealed class CoverageWriterGapTests
         using (var transport = new AwsSdkCloudWatchLogsTransport(mismatch.Client))
             await transport.PutLogEventAsync("group", "stream-1", "hello", 1_577_936_645_000);
         Assert.Null(mismatch.SeenTokens[0]);
+        Assert.Equal(0, mismatch.Describes);
 
         var accepted = CloudWatchStub.Create();
         accepted.PutMode = "accepted";
         using var acceptedTransport = new AwsSdkCloudWatchLogsTransport(accepted.Client);
-        await acceptedTransport.PutLogEventAsync("group", "stream-1", "hello", 1_577_936_645_000);
-        await acceptedTransport.PutLogEventAsync("group", "stream-1", "next", 1_577_936_645_000);
-        Assert.Equal("expected-2", accepted.SeenTokens[1]);
+        var thrown = await Record.ExceptionAsync(() =>
+            acceptedTransport.PutLogEventAsync("group", "stream-1", "hello", 1_577_936_645_000));
+        Assert.IsType<DataAlreadyAcceptedException>(thrown);
+        Assert.Single(accepted.SeenTokens);
+        Assert.Null(accepted.SeenTokens[0]);
+        Assert.Equal(0, accepted.Describes);
     }
 
     /// <summary>
@@ -472,8 +477,11 @@ public class CloudWatchStub : DispatchProxy
     /// <summary><c>ok</c>, <c>invalid-then-ok</c>, or <c>accepted</c>.</summary>
     public string PutMode { get; set; } = "ok";
 
-    /// <summary>How many put calls the stub saw, including the retry.</summary>
+    /// <summary>How many put calls the stub saw.</summary>
     public int Puts { get; private set; }
+
+    /// <summary>How many describe calls the stub saw. The V4 transport does not describe.</summary>
+    public int Describes { get; private set; }
 
     /// <summary>Sequence tokens presented by the transport, in call order.</summary>
     public List<string?> SeenTokens { get; } = [];
@@ -513,7 +521,10 @@ public class CloudWatchStub : DispatchProxy
         }
 
         if (name == "DescribeLogStreamsAsync")
+        {
+            Describes++;
             return Task.FromResult(Describe(args));
+        }
 
         if (name == "PutLogEventsAsync")
             return Task.FromResult(Put(args));

@@ -46,6 +46,15 @@ public sealed class MasterBugTests : IDisposable
     private const string FixedLine =
         "- Fixed: `ConsoleLogWriter` and `FileLogWriter` write the line even when the `ToString()` of a property or scope value throws. That value shows `[capture failed: ExceptionType]`.";
 
+    private const string AwsBreakingLine =
+        "- Breaking (dependency): `AWSSDK.CloudWatchLogs` moves from 3.7.509.3 (AWS SDK for .NET V3, end of support since 2026-06-01) to 4.0.106 (V4). If your app references other `AWSSDK.*` packages, upgrade all of them to V4 together. Mixing V3 and V4 either stops restore with NU1107 (version conflict on `AWSSDK.Core`) or restores with warning NU1608 and then throws `MissingMethodException` at runtime.";
+
+    private const string AwsFixedLine =
+        "- Fixed: `AwsCloudWatchWriter` now sends the message-template properties and the context with each event, not only the rendered message.";
+
+    private const string AwsSdkParagraph =
+        "`AwsCloudWatchWriter` uses the AWS SDK for .NET V4 (`AWSSDK.CloudWatchLogs` 4.0.106). If your app references other `AWSSDK.*` packages, use their V4 versions too. Mixing V3 and V4 either stops restore with NU1107 (version conflict on `AWSSDK.Core`) or restores with warning NU1608 and then throws `MissingMethodException` at runtime.";
+
     private const string ConsoleSingleValueMessage =
         "Invalid ALog configuration at 'ALog:Console': expected a section with settings, but found a single value. Put the settings inside the section, as shown in the README.";
 
@@ -890,8 +899,9 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
-    /// Locks the M1 sentences: writer remarks, install lines without a version,
-    /// the two changelog bullets, the skip hint, and the startup sentence under the JSON example.
+    /// Locks the M1 sentences: writer remarks, install lines without a version flag,
+    /// the M1 changelog bullets, the AWS V4 changelog and README sentences, the skip hint,
+    /// and the startup sentence under the JSON example.
     /// <c>only levels reload at runtime</c> is absent.
     /// </summary>
     [Fact(Timeout = 30000)]
@@ -915,6 +925,12 @@ public sealed class MasterBugTests : IDisposable
         Assert.Contains("dotnet add package ALog.Extensions.Logging", readme, StringComparison.Ordinal);
         Assert.DoesNotContain("--version", readme, StringComparison.Ordinal);
         Assert.DoesNotContain("--version", packageReadme, StringComparison.Ordinal);
+        Assert.Equal(1, CountOf(readme, AwsBreakingLine));
+        Assert.Equal(1, CountOf(readme, AwsSdkParagraph));
+        var shipping = Slice(readme, "### Step 4: Shipping Writers", "## Limitations");
+        Assert.Contains(AwsSdkParagraph, shipping, StringComparison.Ordinal);
+        var migrating = Slice(readme, "### AWS SDK V4", "## Contributing");
+        Assert.Contains(AwsBreakingLine, migrating, StringComparison.Ordinal);
 
         var notes = ReadRepoFile("ALog/Config/ALogOptions.cs");
         Assert.Equal(2, CountOf(notes, "<remarks>" + Remarks + "</remarks>"));
@@ -923,9 +939,11 @@ public sealed class MasterBugTests : IDisposable
         var lines = NonEmptyLines(changelog);
         Assert.True(lines.Count >= 3, "0.2.1 section is too short.");
         Assert.StartsWith("- Breaking (dependency): `Microsoft.Data.SqlClient`", lines[0], StringComparison.Ordinal);
-        Assert.StartsWith("- Fixed: with the background queue,", lines[lines.Count - 3], StringComparison.Ordinal);
-        Assert.Equal(BreakingLine, lines[lines.Count - 2]);
-        Assert.Equal(FixedLine, lines[lines.Count - 1]);
+        Assert.StartsWith("- Fixed: with the background queue,", lines[lines.Count - 5], StringComparison.Ordinal);
+        Assert.Equal(BreakingLine, lines[lines.Count - 4]);
+        Assert.Equal(FixedLine, lines[lines.Count - 3]);
+        Assert.Equal(AwsBreakingLine, lines[lines.Count - 2]);
+        Assert.Equal(AwsFixedLine, lines[lines.Count - 1]);
 
         var project = ReadRepoFile("ALog/ALog.csproj");
         Assert.Contains("GHSA-846f-f764-76mx", project, StringComparison.Ordinal);

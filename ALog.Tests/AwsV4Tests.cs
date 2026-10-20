@@ -425,7 +425,9 @@ public sealed class AwsV4Tests
         Assert.Null(second);
 
         var error = CaptureError(() => writer.Write(Plain("late")));
+        var asyncError = await CaptureErrorAsync(() => writer.WriteAsync(Plain("late-async")));
         Assert.Contains("[AwsCloudWatchWriter]", error, StringComparison.Ordinal);
+        Assert.Contains("[AwsCloudWatchWriter]", asyncError, StringComparison.Ordinal);
         Assert.Equal(0, client.Puts);
         Assert.Equal(0, client.CreateGroups);
     }
@@ -476,14 +478,15 @@ public sealed class AwsV4Tests
             }
         });
 
-        Assert.True(clock.TimerCreated.Wait(TimeSpan.FromSeconds(30)));
+        Assert.True(transport.Entered.Wait(TimeSpan.FromSeconds(20)));
+        Assert.True(clock.TimersArmed.Wait(TimeSpan.FromSeconds(20)));
         clock.Advance(TimeSpan.FromSeconds(100) - TimeSpan.FromTicks(1));
         Assert.False(write.IsCompleted);
         Assert.False(transport.Cancelled);
 
         clock.Advance(TimeSpan.FromTicks(1));
-        Assert.True(write.Wait(TimeSpan.FromSeconds(30)));
-        await Task.CompletedTask;
+        var finished = await Task.WhenAny(write, Task.Delay(TimeSpan.FromSeconds(20)));
+        Assert.Same(write, finished);
         Assert.Null(thrown);
         Assert.True(transport.Cancelled);
         Assert.Contains("[AwsCloudWatchWriter]", error, StringComparison.Ordinal);
@@ -494,7 +497,7 @@ public sealed class AwsV4Tests
     /// Builds a writer that owns a transport around the counting client.
     /// </summary>
     /// <param name="client">The fake CloudWatch client. Not null.</param>
-    /// <returns>A writer the caller disposes. Dispose also disposes the transport, not the proxy.</returns>
+    /// <returns>A writer the caller disposes. The writer does not own the transport.</returns>
     /// <remarks>The proxy has no network resources. The transport does not own the client.</remarks>
     private static AwsCloudWatchWriter OwnedWriter(CountingCloudWatch client)
     {
@@ -692,6 +695,9 @@ internal class CountingCloudWatch : DispatchProxy
         if (NullResponses)
             return null;
 
+        if (Puts == 1)
+            return new PutLogEventsResponse { NextSequenceToken = null };
+
         return new PutLogEventsResponse
         {
             NextSequenceToken = null,
@@ -732,6 +738,9 @@ internal sealed class GateAwsTransport : IAwsCloudWatchLogsTransport
 {
     private int _cancelled;
 
+    /// <summary>Set when a put has registered its cancellation callback.</summary>
+    internal ManualResetEventSlim Entered { get; } = new(false);
+
     /// <summary>True after the token passed to the put is cancelled.</summary>
     internal bool Cancelled => Volatile.Read(ref _cancelled) == 1;
 
@@ -753,6 +762,7 @@ internal sealed class GateAwsTransport : IAwsCloudWatchLogsTransport
         CancellationToken cancellationToken = default)
     {
         cancellationToken.Register(() => Volatile.Write(ref _cancelled, 1));
+        Entered.Set();
         return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
     }
 
@@ -768,22 +778,25 @@ internal sealed class GateAwsTransport : IAwsCloudWatchLogsTransport
 /// </summary>
 internal sealed class SignalingFakeTimeProvider : FakeTimeProvider
 {
-    /// <summary>Set when <see cref="CreateTimer"/> runs. The timeout test waits on this.</summary>
-    internal ManualResetEventSlim TimerCreated { get; } = new(false);
+    private int _timers;
+
+    /// <summary>Set after two timers exist: the cancellation source and the wait.</summary>
+    internal ManualResetEventSlim TimersArmed { get; } = new(false);
 
     /// <summary>
-    /// Creates the inner timer and signals <see cref="TimerCreated"/>.
+    /// Creates the inner timer and signals <see cref="TimersArmed"/> once both waits exist.
     /// </summary>
     /// <param name="callback">Timer callback from the wait. Not null.</param>
     /// <param name="state">State passed back to the callback.</param>
     /// <param name="dueTime">Delay until the first tick.</param>
     /// <param name="period">Repeat interval. The timeout uses a one-shot timer.</param>
     /// <returns>The timer the base provider created.</returns>
-    /// <remarks>The signal lets the test advance the clock only after the wait is armed.</remarks>
+    /// <remarks>The signal lets the test advance the clock only after both waits are armed.</remarks>
     public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
     {
         var timer = base.CreateTimer(callback, state, dueTime, period);
-        TimerCreated.Set();
+        if (Interlocked.Increment(ref _timers) >= 2)
+            TimersArmed.Set();
         return timer;
     }
 }
