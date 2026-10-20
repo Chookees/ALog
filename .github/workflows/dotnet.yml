@@ -89,7 +89,7 @@ jobs:
         mkdir -p "$out"
         dotnet pack ALog/ALog.csproj -c Release --no-restore -o "$out" --nologo
         dotnet pack ALog.Extensions.Logging/ALog.Extensions.Logging.csproj -c Release --no-restore -o "$out" --nologo
-        bash eng/test_nupkg_license.sh "$out/ALog.0.2.1.nupkg" "$out/ALog.Extensions.Logging.0.2.1.nupkg"
+        bash eng/test_nupkg_license.sh --dir "$out"
 
     - name: RS0030 justification
       run: python3 eng/rs0030-justification-check.py --sarif "${{ runner.temp }}/ALog.sarif" --sarif "${{ runner.temp }}/ALog.Extensions.Logging.sarif"

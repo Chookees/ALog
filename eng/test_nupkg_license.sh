@@ -206,6 +206,123 @@ require_both_packages() {
   return 1
 }
 
+resolve_seen=0
+resolve_paths=()
+
+# Records one file hit while choosing the nupkg for a version-independent glob.
+# A pack directory must contain one ALog nupkg and one Extensions nupkg. A
+# second hit is an ambiguous pack, and a .snupkg is not a package consumers
+# install. Args: path, pattern label, directory. Returns 1 on a symbol package
+# or when more than 8 hits would be stored. Updates resolve_seen and resolve_paths.
+note_nupkg_match() {
+  local path="$1"
+  local label="$2"
+  local dir="$3"
+  if [ -z "${path}" ] || [ -z "${label}" ] || [ -z "${dir}" ]; then
+    echo "FAIL nupkg match needs a path, a pattern, and a directory" >&2
+    return 1
+  fi
+  case "${path}" in
+    *.snupkg)
+      echo "FAIL pattern ${label} in ${dir} matched a symbol package: ${path}" >&2
+      return 1
+      ;;
+  esac
+  if [ "${resolve_seen}" -ge 8 ]; then
+    echo "FAIL pattern ${label} in ${dir}: more than one" >&2
+    return 1
+  fi
+  resolve_paths[${resolve_seen}]="${path}"
+  resolve_seen=$((resolve_seen + 1))
+  return 0
+}
+
+# Prints the paths recorded for a glob, at most eight.
+# The failure text has to name every match so a duplicate package version is
+# visible in CI. Args: none. Returns 0. Reads resolve_seen and resolve_paths.
+print_resolved_matches() {
+  local index=0
+  while [ "${index}" -lt "${resolve_seen}" ] && [ "${index}" -lt 8 ]; do
+    printf '%s\n' "${resolve_paths[${index}]}" >&2
+    index=$((index + 1))
+  done
+  return 0
+}
+
+# Selects exactly one nupkg for the core package or the Extensions package.
+# ALog.[0-9]*.nupkg requires a digit after "ALog.", so it does not match
+# ALog.Extensions.Logging.*.nupkg. Both patterns end in .nupkg, so a .snupkg
+# is not a match. Zero files or several files means this directory is not the
+# single pack CI just produced. Args: directory, pattern label, kind (core or
+# ext). Prints the one path. Returns 1 when the count is not exactly one, and
+# the message names the pattern and, when there are several, the matches.
+resolve_one_nupkg() {
+  local dir="$1"
+  local label="$2"
+  local kind="$3"
+  local path
+  local had_nullglob=0
+  local status=0
+  if [ -z "${dir}" ] || [ ! -d "${dir}" ] || [ -z "${label}" ] || [ -z "${kind}" ]; then
+    echo "FAIL nupkg resolve needs a directory, a pattern, and a kind" >&2
+    return 1
+  fi
+  if [ "${kind}" != "core" ] && [ "${kind}" != "ext" ]; then
+    echo "FAIL nupkg resolve kind must be core or ext, found ${kind}" >&2
+    return 1
+  fi
+  resolve_seen=0
+  resolve_paths=()
+  if shopt -q nullglob; then
+    had_nullglob=1
+  fi
+  shopt -s nullglob
+  if [ "${kind}" = "core" ]; then
+    for path in "${dir}"/ALog.[0-9]*.nupkg; do
+      note_nupkg_match "${path}" "${label}" "${dir}" || status=1
+      if [ "${status}" -ne 0 ]; then
+        break
+      fi
+    done
+  else
+    for path in "${dir}"/ALog.Extensions.Logging.[0-9]*.nupkg; do
+      note_nupkg_match "${path}" "${label}" "${dir}" || status=1
+      if [ "${status}" -ne 0 ]; then
+        break
+      fi
+    done
+  fi
+  if [ "${had_nullglob}" -eq 0 ]; then
+    shopt -u nullglob
+  fi
+  if [ "${status}" -ne 0 ]; then
+    print_resolved_matches
+    return 1
+  fi
+  if [ "${resolve_seen}" -eq 0 ]; then
+    echo "FAIL pattern ${label} in ${dir}: none" >&2
+    return 1
+  fi
+  if [ "${resolve_seen}" -ne 1 ]; then
+    echo "FAIL pattern ${label} in ${dir}: more than one" >&2
+    print_resolved_matches
+    return 1
+  fi
+  printf '%s\n' "${resolve_paths[0]}"
+  return 0
+}
+
+if [ "${1:-}" = "--dir" ]; then
+  if [ "$#" -ne 2 ]; then
+    echo "FAIL usage: eng/test_nupkg_license.sh --dir <pack-directory>" >&2
+    exit 1
+  fi
+  pack_dir="$2"
+  core_nupkg=$(resolve_one_nupkg "${pack_dir}" 'ALog.[0-9]*.nupkg' core) || exit 1
+  ext_nupkg=$(resolve_one_nupkg "${pack_dir}" 'ALog.Extensions.Logging.[0-9]*.nupkg' ext) || exit 1
+  set -- "${core_nupkg}" "${ext_nupkg}"
+fi
+
 require_nupkg_count "$#"
 work=$(mktemp -d)
 count="$#"
