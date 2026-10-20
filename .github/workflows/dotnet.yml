@@ -83,6 +83,14 @@ jobs:
         dotnet build ALog.Extensions.Logging/ALog.Extensions.Logging.csproj -c Release --no-restore -p:ErrorLog='"${{ runner.temp }}/ALog.Extensions.Logging.sarif,version=2.1"'
         dotnet build ALog.sln -c Release --no-restore
 
+    - name: Pack license check
+      run: |
+        out="${{ runner.temp }}/license-nupkgs"
+        mkdir -p "$out"
+        dotnet pack ALog/ALog.csproj -c Release --no-restore -o "$out" --nologo
+        dotnet pack ALog.Extensions.Logging/ALog.Extensions.Logging.csproj -c Release --no-restore -o "$out" --nologo
+        bash eng/test_nupkg_license.sh --dir "$out"
+
     - name: RS0030 justification
       run: python3 eng/rs0030-justification-check.py --sarif "${{ runner.temp }}/ALog.sarif" --sarif "${{ runner.temp }}/ALog.Extensions.Logging.sarif"
 
