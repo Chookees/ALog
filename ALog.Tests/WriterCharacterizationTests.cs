@@ -156,11 +156,11 @@ public sealed class WriterCharacterizationTests
     }
 
     /// <summary>
-    /// AWS default sends only the rendered message. Context and the template bag are absent.
-    /// JsonFormatter sends both inside the formatted message.
+    /// Without a formatter, AWS sends the rendered message, the template property, and the context.
+    /// JsonFormatter sends both inside the formatted message and nothing is appended after it.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task Aws_DefaultSendsRenderedMessageOnly_JsonKeepsProperties()
+    public async Task Aws_DefaultSendsPropertiesAndContext_JsonKeepsFormatterOutput()
     {
         var plain = new RecordingAwsTransport();
         using (var writer = new AwsCloudWatchWriter("group", "stream", plain))
@@ -172,10 +172,9 @@ public sealed class WriterCharacterizationTests
         Assert.Equal(2, plain.Calls.Count);
         Assert.All(plain.Calls, call =>
         {
-            Assert.Equal("hello alpha", call.Message);
-            // Ist-Verhalten 3a113bf, Befund an DC gemeldet
-            Assert.DoesNotContain("ada", call.Message, StringComparison.Ordinal);
-            Assert.DoesNotContain("A=", call.Message, StringComparison.Ordinal);
+            Assert.Contains("hello alpha", call.Message, StringComparison.Ordinal);
+            Assert.Contains("ada", call.Message, StringComparison.Ordinal);
+            Assert.Contains("A=", call.Message, StringComparison.Ordinal);
         });
 
         var json = new RecordingAwsTransport();

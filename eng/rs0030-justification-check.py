@@ -3,7 +3,7 @@
 
 CI builds each product project with ``-p:ErrorLog=<file>.sarif,version=2.1``.
 This script reads every RS0030 result, including suppressed ones, and requires
-an in-source suppression whose justification is one of the five allowlist texts
+an in-source suppression whose justification is one of the four allowlist texts
 on that file and member. NoWarn and WarningsNotAsErrors come from
 ``dotnet msbuild -getProperty``. When no SARIF path is passed, the script
 builds both product projects with ``--no-incremental`` so a later run on the
@@ -27,10 +27,10 @@ PRAGMA = (
 )
 NO_JUST = "RS0030 exception has no Justification. Say why the wall clock is needed here."
 NOT_MEMBER = (
-    "RS0030 exception is not one of the five allowed members."
-    " Remove the suppression and use the TimeProvider from the options; the allowlist is fixed at five entries."
+    "RS0030 exception is not one of the four allowed members."
+    " Remove the suppression and use the TimeProvider from the options; the allowlist is fixed at four entries."
 )
-BLOCK = "RS0030 exception member must be one expression. Only PutWithinTransportTimeout may have a block body."
+BLOCK = "RS0030 exception member must be one expression."
 UNCONDITIONAL = "RS0030 exception must be [SuppressMessage] on an allowed member, not UnconditionalSuppressMessage."
 NOWARN = "RS0030 must not be listed in NoWarn or WarningsNotAsErrors."
 SEVERITY = "RS0030 severity must stay an error."
@@ -58,7 +58,7 @@ SKIP_DIRS = {"bin", "obj", ".git"}
 
 
 class Allowed:
-    """One of the five RS0030 exceptions."""
+    """One of the four RS0030 exceptions."""
 
     def __init__(self, file: str, member: str, justification: str, block: bool) -> None:
         self.file = file
@@ -91,12 +91,6 @@ ALLOWED = [
         False,
     ),
     Allowed(
-        "ALog/Writers/Cloud/AwsCloudWatchWriter.cs",
-        "PutWithinTransportTimeout",
-        "CloudWatch put uses a 100 s transport timeout, not a shutdown or flush deadline; removed in AWS V4.",
-        True,
-    ),
-    Allowed(
         "ALog/Writers/File/FileLogWriter.cs",
         "RotationStamp",
         "Rotation file name, not a shutdown or flush deadline; removed in P1.",
@@ -109,6 +103,40 @@ ALLOWED = [
         False,
     ),
 ]
+
+
+def allowlist_word_matches() -> bool:
+    """True when the rejection sentence names the same count as the allowlist.
+
+    The count is a number word from zero through ten. Both phrases in
+    ``NOT_MEMBER`` must use that word. A later edit that grows or shrinks
+    ``ALLOWED`` and leaves the old sentence fails this check.
+
+    Returns:
+        False when the list is longer than ten or either phrase disagrees.
+    """
+    words = (
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+    )
+    count = len(ALLOWED)
+    if count >= len(words):
+        return False
+    word = words[count]
+    if "one of the " + word + " allowed members" not in NOT_MEMBER:
+        return False
+    if "fixed at " + word + " entries" not in NOT_MEMBER:
+        return False
+    return True
 
 
 def main(argv: list[str]) -> int:
@@ -146,6 +174,9 @@ def main(argv: list[str]) -> int:
         index += 1
 
     repo = find_repo()
+    if not allowlist_word_matches():
+        print("rs0030-justification: allowlist count word does not match", file=sys.stderr)
+        return 2
     rows = case_results(repo)
     if not cases_match(rows):
         print("rs0030-justification: self-check failed", file=sys.stderr)
@@ -695,7 +726,7 @@ def load_composition(repo: Path) -> set[str]:
 
 
 def allow_for(path: str, member: str | None) -> Allowed | None:
-    """Return the allowlist row for this file and member. None when it is not one of the five."""
+    """Return the allowlist row for this file and member. None when it is not one of the four."""
     norm = path.replace("\\", "/")
     for row in ALLOWED:
         if member == row.member and (norm == row.file or norm.endswith("/" + row.file)):
@@ -1225,17 +1256,17 @@ class C
         )),
         ("allow-aws", "ALog/Writers/Cloud/AwsCloudWatchWriter.cs", allow_member(
             "class AwsCloudWatchWriter { [System.Diagnostics.CodeAnalysis.SuppressMessage(\"ApiDesign\", \"RS0030\", Justification = \""
-            + ALLOWED[2].justification
+            + "CloudWatch put uses a 100 s transport timeout, not a shutdown or flush deadline; removed in AWS V4."
             + "\")] private void PutWithinTransportTimeout() { var first = DateTime.UtcNow; var second = first; } }\n",
         )),
         ("allow-file", "ALog/Writers/File/FileLogWriter.cs", allow_member(
             "class FileLogWriter { [System.Diagnostics.CodeAnalysis.SuppressMessage(\"ApiDesign\", \"RS0030\", Justification = \""
-            + ALLOWED[3].justification
+            + ALLOWED[2].justification
             + "\")] private static object RotationStamp() => DateTime.UtcNow; }\n",
         )),
         ("allow-sql", "ALog/Writers/Sql/SqlLogWriter.cs", allow_member(
             "class SqlLogWriter { [System.Diagnostics.CodeAnalysis.SuppressMessage(\"ApiDesign\", \"RS0030\", Justification = \""
-            + ALLOWED[4].justification
+            + ALLOWED[3].justification
             + "\")] private static object CreatedAtStamp() => DateTime.UtcNow; }\n",
         )),
     ]
@@ -1326,6 +1357,7 @@ def cases_match(rows: list[tuple[str, list[str]]]) -> bool:
         "nested-editorconfig": SEVERITY,
         "globalconfig": SEVERITY,
         "linked-file": NOT_MEMBER,
+        "allow-aws": NOT_MEMBER,
         "default-elsewhere": DEFAULT,
         "derive": DERIVE,
     }
@@ -1335,7 +1367,6 @@ def cases_match(rows: list[tuple[str, list[str]]]) -> bool:
         "other-id",
         "allow-default",
         "allow-event",
-        "allow-aws",
         "allow-file",
         "allow-sql",
         "product-editorconfig",

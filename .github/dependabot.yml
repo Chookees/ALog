@@ -1,5 +1,4 @@
 # Weekly grouped updates. The SQL image digest is not a package Dependabot can see.
-# AWS major bumps stay ignored until the AWS V4 step removes this ignore.
 version: 2
 updates:
   - package-ecosystem: nuget
@@ -28,9 +27,6 @@ updates:
           - "Microsoft.CodeAnalysis.*"
           - "SSH.NET"
     ignore:
-      - dependency-name: "AWSSDK.*"
-        update-types:
-          - "version-update:semver-major"
       # bis v3/MTP
       - dependency-name: "coverlet.*"
         update-types:

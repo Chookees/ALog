@@ -1,3 +1,4 @@
 # Code references to ProductionClock.Default. Each file has one public constructor initializer.
 ALog/Core/LoggerEngine.cs
 ALog/Core/BackgroundLogQueue.cs
+ALog/Writers/Cloud/AwsCloudWatchWriter.cs
