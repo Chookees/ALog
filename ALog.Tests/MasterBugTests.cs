@@ -1598,7 +1598,7 @@ public sealed class MasterBugTests : IDisposable
         public override string ToString() => "plain-tostring";
 
         /// <summary>The culture-formatted text ALog writes for this value.</summary>
-        /// <param name="format">Ignored. ALog passes null.</param>
+        /// <param name="format">Ignored. Master passes null.</param>
         /// <param name="formatProvider">Must be <see cref="System.Globalization.CultureInfo.CurrentCulture"/>.</param>
         /// <returns><c>iformattable-current</c> for the current culture. Otherwise <c>wrong-provider</c>.</returns>
         public string ToString(string? format, IFormatProvider? formatProvider)
