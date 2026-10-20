@@ -95,6 +95,40 @@ await Log.FlushAsync();
 Log.Shutdown();
 ```
 
+### Example output
+
+Step 1 and Step 2 together are a complete program: [`samples/ALog.QuickstartSample`](samples/ALog.QuickstartSample). Running it prints this to the console:
+
+![Console output of the Quick Start sample from Step 1 and Step 2](https://raw.githubusercontent.com/Chookees/ALog/master/docs/images/quickstart-console.png)
+
+The first entry and the error entry from `logs/app.log` of the same run:
+
+```json
+{
+  "timestamp": "2026-10-20T20:55:19.4758886Z",
+  "level": "Info",
+  "message": "Application started",
+  "properties": {},
+  "context": {}
+}
+{
+  "timestamp": "2026-10-20T20:55:19.5318101Z",
+  "level": "Error",
+  "message": "Something went wrong",
+  "exception": {
+    "type": "System.Exception",
+    "message": "Test failure"
+  },
+  "properties": {},
+  "context": {
+    "feature": "Login",
+    "userId": 42
+  }
+}
+```
+
+Both come from a real run of the sample, unedited.
+
 ### Step 3: Background Queue (Optional)
 
 For high-performance scenarios, enable the background queue:

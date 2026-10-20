@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <!-- DC-Z2: samples opt out of TreatWarningsAsErrors. Libraries and tests keep the CI gate. -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!--
+      The solution build uses the project reference. eng/consumer-smoke.sh readme
+      sets ALogSmokeFromFeed so this sample restores the packed nupkgs instead.
+      Both packages are referenced so the same SHA-512 feed proof used by the
+      file and console modes can read this project's assets file.
+      The assembly is outside the coverage Include in coverage.runsettings.
+    -->
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(ALogSmokeFromFeed)' == 'true'">
+    <PackageReference Include="ALog" Version="0.2.1" />
+    <PackageReference Include="ALog.Extensions.Logging" Version="0.2.1" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(ALogSmokeFromFeed)' != 'true'">
+    <ProjectReference Include="..\..\ALog\ALog.csproj" />
+  </ItemGroup>
+
+</Project>

@@ -61,7 +61,7 @@ check_property() {
 }
 
 # Projects that keep TreatWarningsAsErrors when CI=true.
-# DemoApp, the sample, and the benchmarks are the DC-Z2 opt-out and are not listed here.
+# DemoApp, the samples, and the benchmarks are the DC-Z2 opt-out and are not listed here.
 gated='ALog/ALog.csproj
 ALog.Extensions.Logging/ALog.Extensions.Logging.csproj
 ALog.Tests/ALog.Tests.csproj
@@ -97,6 +97,7 @@ ALog.Tests/ALog.Tests.csproj
 eng/consumer-smoke/console/ALog.ConsumerSmoke.csproj
 DemoApp/DemoApp.csproj
 samples/ALog.AspNetSample/ALog.AspNetSample.csproj
+samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj
 ALog.Benchmarks/ALog.Benchmarks.csproj
 EOF
 
