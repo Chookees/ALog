@@ -3,7 +3,6 @@
 using System;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
-using System.Linq;
 using System.Threading.Tasks;
 using ALog.Core;
 using ALog.Public.Interfaces;
@@ -89,10 +88,7 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
             baseLine += $" | EX: {logEvent.Exception.GetType().Name}: {logEvent.Exception.Message}";
 
         if (logEvent.Context is not null && logEvent.Context.Count > 0)
-        {
-            var context = string.Join(", ", logEvent.Context.Select(kv => $"{kv.Key}={kv.Value}"));
-            baseLine += $" | ctx: {context}";
-        }
+            baseLine += " | ctx: " + CaptureText.Join(logEvent.Context);
 
         return baseLine;
     }

@@ -24,8 +24,8 @@ It is designed to be simple to use, highly configurable, and ready for modern de
 ## Installation
 
 ```bash
-dotnet add package ALog --version 0.2.0
-dotnet add package ALog.Extensions.Logging --version 0.2.0
+dotnet add package ALog
+dotnet add package ALog.Extensions.Logging
 ```
 
 Source: https://github.com/Chookees/ALog · Optional future sink split: [`docs/PACKAGE_SPLIT.md`](docs/PACKAGE_SPLIT.md)
@@ -43,6 +43,8 @@ Turn on ALog's console in `appsettings.json`:
 ```json
 { "ALog": { "Console": { "Enabled": true } } }
 ```
+
+ALog reads its settings, including MinimumLevel, once at startup. Changes while the app runs have no effect; restart the app.
 
 See `samples/ALog.AspNetSample`.
 
@@ -266,6 +268,8 @@ using (Log.BeginScope("sessionId", "abc123"))
 ## Contributing
 
 Contributions welcome! Fork the repository and submit a PR.
+
+To see why a test was skipped, run `dotnet test --logger "console;verbosity=normal"`.
 
 For ideas like new formatters or writers, feel free to open a discussion first.
 

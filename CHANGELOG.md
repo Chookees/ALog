@@ -24,6 +24,8 @@
 - Fixed: `AddALog` no longer throws into the application when a log message cannot be formatted. ALog writes the event with its message template and reports ALOG0022.
 - Fixed: `AddALog` stores `{@Order}` and `{$Order}` as the property `Order`, and keeps the property values when a message has no `{OriginalFormat}`.
 - Fixed: with the background queue, a full queue no longer blocks the caller for 5 seconds and then drops events silently, and shutdown no longer loses queued events silently or writes to a disposed writer. Dropped and unwritten events are counted and reported (ALOG0070, ALOG0071).
+- Breaking (behavior): a single value or a list where ALog expects a section (for example `"ALog": { "Console": true }`) now stops startup with an error that names the path. Before, ALog ignored it and wrote nothing.
+- Fixed: `ConsoleLogWriter` and `FileLogWriter` write the line even when the `ToString()` of a property or scope value throws. That value shows `[capture failed: ExceptionType]`.
 
 ## 0.2.0
 

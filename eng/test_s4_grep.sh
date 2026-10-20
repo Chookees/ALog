@@ -13,6 +13,16 @@ cd "$root"
 
 failures=0
 
+# Empty runs the repository sweep. Set when --m1-fail-lines names one file.
+m1_fail_lines_file=""
+if [ "${1:-}" = "--m1-fail-lines" ]; then
+  if [ "$#" -ne 2 ]; then
+    echo "FAIL M1-02 --m1-fail-lines needs one file" >&2
+    exit 2
+  fi
+  m1_fail_lines_file="$2"
+fi
+
 # Prints a passing check name. Args: label. Returns 0.
 pass() {
   printf 'ok %s\n' "$1"
@@ -73,6 +83,9 @@ password=$(printf '%s%s%s' 'Your_' 'strong_' 'Password123')
 moving_tag=$(printf '%s%s' ':2022-' 'latest')
 secret_assignment=$(printf '%s%s' 'MSSQL_SA_PASSWORD' ':')
 retired_comment=$(printf '%s%s' '# bis A2a-65 ' '(2a-2)')
+
+# The line-number mode prints pins for one file and does not sweep the repo.
+if [ -z "$m1_fail_lines_file" ]; then
 
 require_absent "saved SQL password" "$password"
 require_absent "moving SQL tag" "$moving_tag"
@@ -860,6 +873,311 @@ check_readmes()
 PY
 python3 eng/test_badge_workflow.py
 pass "B1 badge job and README badges"
+
+fi
+
+# M1-02. Reports which install pin a line uses.
+# Args: one line. Prints --version, -v, PackageReference, or VersionOverride
+# when the line names ALog in any case and pins a version. Prints nothing otherwise.
+# Returns 0. A verbosity -v that is not followed by a digit is not a pin.
+# --prerelease is not --version. VersionOverride is its own form.
+# Include accepts either quote, spaces around =, and ALog in any case.
+m1_readme_version_hit() {
+  local line="$1"
+  if ! printf '%s\n' "$line" | grep -Eiq 'alog'; then
+    return 0
+  fi
+  if printf '%s\n' "$line" | grep -Eiq -- '--version[[:space:]]+[0-9]'; then
+    printf '%s\n' '--version'
+    return 0
+  fi
+  if printf '%s\n' "$line" | grep -Eiq -- '--version=[[:space:]]*[0-9]'; then
+    printf '%s\n' '--version'
+    return 0
+  fi
+  if printf '%s\n' "$line" | grep -Eiq -- '--version[[:space:]]+\[[[:space:]]*[0-9]'; then
+    printf '%s\n' '--version'
+    return 0
+  fi
+  if printf '%s\n' "$line" | grep -Eq 'dotnet add package' \
+      && printf '%s\n' "$line" | grep -Eq '(^|[[:space:]])-v[[:space:]]+[0-9]'; then
+    printf '%s\n' '-v'
+    return 0
+  fi
+  if printf '%s\n' "$line" | grep -Eq 'Install-Package' \
+      && printf '%s\n' "$line" | grep -Eiq -- '(^|[[:space:]])-version[[:space:]]+[0-9]'; then
+    printf '%s\n' 'Install-Package'
+    return 0
+  fi
+  if printf '%s\n' "$line" | grep -Eq '<PackageReference([[:space:]]|>)' \
+      && printf '%s\n' "$line" | grep -Eq 'Include[[:space:]]*=[[:space:]]*['"'"'"][Aa][Ll][Oo][Gg][^'"'"'"]*' \
+      && printf '%s\n' "$line" | grep -Eq 'Version[[:space:]]*=[[:space:]]*["'"'"'][0-9]'; then
+    printf '%s\n' 'PackageReference'
+    return 0
+  fi
+  if printf '%s\n' "$line" | grep -Eq 'VersionOverride[[:space:]]*=[[:space:]]*["'"'"'][0-9]'; then
+    printf '%s\n' 'VersionOverride'
+    return 0
+  fi
+  return 0
+}
+
+# M1-02. Scans one README for install pins.
+# Args: path. Prints one "reason<TAB>line" per hit, at most 2000 lines.
+# Returns 0. A file past the cap is a failure and the rest of that file is skipped.
+m1_scan_readme() {
+  local file="$1"
+  local number=0
+  local line reason
+  while IFS= read -r line || [ -n "$line" ]; do
+    number=$((number + 1))
+    if [ "$number" -gt 2000 ]; then
+      fail "M1-02 ${file} has more than 2000 lines"
+      return 0
+    fi
+    reason=$(m1_readme_version_hit "$line")
+    if [ -n "$reason" ]; then
+      printf '%s\t%s\n' "$reason" "$line"
+    fi
+  done < "$file"
+}
+
+# M1-02. Prints one fail line per pin: file, line number, then the line text.
+# Args: path. Prints "FAIL M1-02 pin in <file>:<number>: <text>" to stdout.
+# Returns 0 when the file has no pin, 1 when it has a pin or passes 2000 lines.
+# The 2000 cap stops the loop. The line text is not split again.
+# A trailing CR from a CRLF README is not part of the reported text.
+m1_print_fail_lines() {
+  local file="$1"
+  local number=0
+  local line reason text
+  local found=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    number=$((number + 1))
+    if [ "$number" -gt 2000 ]; then
+      echo "FAIL M1-02 ${file} has more than 2000 lines" >&2
+      return 1
+    fi
+    reason=$(m1_readme_version_hit "$line")
+    if [ -n "$reason" ]; then
+      text="${line%$'\r'}"
+      printf 'FAIL M1-02 pin in %s:%s: %s\n' "$file" "$number" "$text"
+      found=1
+    fi
+  done < "$file"
+  if [ "$found" -eq 0 ]; then
+    return 0
+  fi
+  return 1
+}
+
+# M1-02. Counts hits of one reason in scan output.
+# Args: scan output, reason. Prints a number. Returns 0.
+m1_reason_count() {
+  local hits="$1"
+  local reason="$2"
+  printf '%s\n' "$hits" | grep -c "^${reason}"$'\t' || true
+}
+
+# M1-02. Requires the three injected install lines to be detected, and a
+# verbosity -v on an ALog line to be left alone.
+# Returns 0.
+m1_expect_injected_versions() {
+  local dir file hits version_count short_count package_count
+  dir=$(mktemp -d)
+  file="${dir}/README.md"
+  printf '%s\n' \
+    'dotnet add package ALog --version 1.0.0' \
+    'dotnet add package ALog.Extensions.Logging -v 0.2.0' \
+    '<PackageReference Include="ALog" Version="0.2.0" />' \
+    'Run ALog tests with dotnet test -v n' \
+    > "$file"
+  hits=$(m1_scan_readme "$file")
+  rm -rf "$dir"
+  version_count=$(m1_reason_count "$hits" '--version')
+  short_count=$(m1_reason_count "$hits" '-v')
+  package_count=$(m1_reason_count "$hits" 'PackageReference')
+  if [ "$version_count" -ne 1 ] || [ "$short_count" -ne 1 ] || [ "$package_count" -ne 1 ]; then
+    fail "M1-02 negative forms --version=${version_count} -v=${short_count} PackageReference=${package_count}"
+    printf '%s\n' "$hits" >&2
+    return 0
+  fi
+  if printf '%s\n' "$hits" | grep -F 'dotnet test -v n' >/dev/null; then
+    fail "M1-02 treats dotnet test -v as an install pin"
+    return 0
+  fi
+  pass "M1-02 negative --version, -v, and PackageReference"
+}
+
+# M1-02. Legacy pins still fire. The four control lines do not.
+# Attribute order, a tab, a double space, the extensions package, and an
+# ALog.csproj line are pins. Returns 0.
+m1_expect_legacy_and_controls() {
+  local dir file hits count
+  dir=$(mktemp -d)
+  file="${dir}/README.md"
+  {
+    printf '%s\n' '<PackageReference Version="0.2.0" Include="ALog" />'
+    printf '%s\n' '<PackageReference Include="ALog.Extensions.Logging" Version="0.2.0" />'
+    printf '%s\n' '<PackageReference Include="ALog"  Version="0.2.0" />'
+    printf '<PackageReference Include="ALog"\tVersion="0.2.0" />\n'
+    printf '%s\n' 'dotnet add ALog.csproj package Foo --version 1.0.0'
+  } > "$file"
+  hits=$(m1_scan_readme "$file")
+  rm -rf "$dir"
+  count=$(printf '%s\n' "$hits" | grep -c . || true)
+  if [ "$count" -ne 5 ]; then
+    fail "M1-02 legacy pins count ${count}"
+    printf '%s\n' "$hits" >&2
+    return 0
+  fi
+  dir=$(mktemp -d)
+  file="${dir}/README.md"
+  printf '%s\n' \
+    'dotnet add package ALog --prerelease' \
+    'dotnet build ALog.sln -v q' \
+    'dotnet test ALog.Tests -v n' \
+    '<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0" />' \
+    > "$file"
+  hits=$(m1_scan_readme "$file")
+  rm -rf "$dir"
+  if [ -n "$hits" ]; then
+    fail "M1-02 control line was pinned"
+    printf '%s\n' "$hits" >&2
+    return 0
+  fi
+  pass "M1-02 legacy pins and control lines"
+}
+
+# M1-02. Each G10 form fails on line 2 and the fail line names that number.
+# Eight forms. The loop stops at 8. Returns 0.
+m1_expect_g10_line_numbers() {
+  local dir file output status line expected i
+  local forms=(
+    "dotnet add package ALog --version=0.2.0"
+    "dotnet add package ALog --Version 0.2.0"
+    "dotnet add package ALog --version [0.2.0]"
+    "<PackageReference Include=\"ALog\" Version='0.2.0' />"
+    "<PackageReference Include=\"ALog\" Version = \"0.2.0\" />"
+    "<PackageReference Include=\"ALog\" VersionOverride=\"0.2.0\" />"
+    "dotnet add package alog --version 0.2.0"
+    "Install-Package ALog -Version 0.2.0"
+  )
+  if [ "${#forms[@]}" -ne 8 ]; then
+    fail "M1-02 G10 form count ${#forms[@]}"
+    return 0
+  fi
+  dir=$(mktemp -d)
+  i=0
+  for line in "${forms[@]}"; do
+    i=$((i + 1))
+    if [ "$i" -gt 8 ]; then
+      fail "M1-02 G10 loop passed 8"
+      rm -rf "$dir"
+      return 0
+    fi
+    file="${dir}/README.md"
+    printf 'header\n%s\n' "$line" > "$file"
+    status=0
+    output=$(m1_print_fail_lines "$file") || status=$?
+    expected="FAIL M1-02 pin in ${file}:2: ${line}"
+    if [ "$status" -ne 1 ] || [ "$output" != "$expected" ]; then
+      fail "M1-02 G10 form ${i} line number"
+      printf 'expected %s\nactual %s\nstatus %s\n' "$expected" "$output" "$status" >&2
+      rm -rf "$dir"
+      return 0
+    fi
+  done
+  rm -rf "$dir"
+  pass "M1-02 G10 eight forms name line 2"
+}
+
+# M1-32-05. Each flexible Include pin fails on line 2. Five lines. The loop stops at 5.
+# Returns 0. A case-sensitive double-quoted Include misses these lines.
+m1_expect_include_forms() {
+  local dir file output status line expected i
+  local forms=(
+    "<PackageReference Include='ALog' Version='0.2.0' />"
+    "<PackageReference Include = \"ALog\" Version = \"0.2.0\" />"
+    "<PackageReference Include=\"alog\" Version=\"0.2.0\" />"
+    "<PackageReference Include=\"ALOG\" Version=\"0.2.0\" />"
+    "<PackageReference Include='ALog' Version=\"0.2.0\" />"
+  )
+  if [ "${#forms[@]}" -ne 5 ]; then
+    fail "M1-02 Include form count ${#forms[@]}"
+    return 0
+  fi
+  dir=$(mktemp -d)
+  i=0
+  for line in "${forms[@]}"; do
+    i=$((i + 1))
+    if [ "$i" -gt 5 ]; then
+      fail "M1-02 Include loop passed 5"
+      rm -rf "$dir"
+      return 0
+    fi
+    file="${dir}/README.md"
+    printf 'header\n%s\n' "$line" > "$file"
+    status=0
+    output=$(m1_print_fail_lines "$file") || status=$?
+    expected="FAIL M1-02 pin in ${file}:2: ${line}"
+    if [ "$status" -ne 1 ] || [ "$output" != "$expected" ]; then
+      fail "M1-02 Include form ${i} line number"
+      printf 'expected %s\nactual %s\nstatus %s\n' "$expected" "$output" "$status" >&2
+      rm -rf "$dir"
+      return 0
+    fi
+  done
+  rm -rf "$dir"
+  pass "M1-02 Include quotes, spaces, and case name line 2"
+}
+
+# M1-02. Every README*.md outside build output must be free of install pins.
+# At most 20 files are accepted. Returns 0.
+# A pin prints "FAIL M1-02 pin in <file>:<number>: <text>" on stderr.
+m1_check_readme_versions() {
+  local files=()
+  local file found=0
+  while IFS= read -r file; do
+    files+=("$file")
+  done < <(find . -type f -name 'README*.md' \
+    -not -path './.git/*' \
+    -not -path '*/bin/*' \
+    -not -path '*/obj/*' \
+    -not -path '*/TestResults/*' | sort)
+  if [ "${#files[@]}" -eq 0 ] || [ "${#files[@]}" -gt 20 ]; then
+    fail "M1-02 README count ${#files[@]} is outside 1..20"
+    return 0
+  fi
+  for file in "${files[@]}"; do
+    if m1_print_fail_lines "$file" >&2; then
+      continue
+    fi
+    failures=$((failures + 1))
+    found=1
+  done
+  if [ "$found" -eq 0 ]; then
+    pass "M1-02 README install snippets name no ALog version"
+  fi
+  m1_expect_injected_versions
+  m1_expect_legacy_and_controls
+  m1_expect_g10_line_numbers
+  m1_expect_include_forms
+}
+
+# Line-number mode: one file, then exit. The repository sweep is skipped above.
+if [ -n "$m1_fail_lines_file" ]; then
+  if [ ! -f "$m1_fail_lines_file" ]; then
+    echo "FAIL M1-02 missing ${m1_fail_lines_file}" >&2
+    exit 2
+  fi
+  if m1_print_fail_lines "$m1_fail_lines_file"; then
+    exit 0
+  fi
+  exit 1
+fi
+
+m1_check_readme_versions
 
 if [ "$failures" -ne 0 ]; then
   echo "${failures} s4 grep tests failed" >&2
