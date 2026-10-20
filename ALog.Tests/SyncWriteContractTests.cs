@@ -274,10 +274,9 @@ public sealed class SyncWriteContractTests
             {
                 error = CaptureError(() => writer.Write(Event("aws-timeout")));
             });
-            Assert.True(clock.TimersArmed.Wait(TimeSpan.FromSeconds(20)));
+            await clock.TimersArmed;
             clock.Advance(TimeSpan.FromMilliseconds(200));
-            var finished = await Task.WhenAny(write, Task.Delay(TimeSpan.FromSeconds(20)));
-            Assert.Same(write, finished);
+            await write;
             Assert.Contains("[AwsCloudWatchWriter]", error, StringComparison.Ordinal);
             Assert.Contains("100 second", error, StringComparison.Ordinal);
         }

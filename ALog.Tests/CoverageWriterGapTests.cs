@@ -268,7 +268,7 @@ public sealed class CoverageWriterGapTests
     /// The service ignores sequence tokens, so the exception leaves the transport.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task AwsTransport_RetriesInvalidSequence_AndRemembersNextToken()
+    public async Task AwsTransport_InvalidSequenceLeavesTransport_WithoutRetryOrStoredToken()
     {
         var stub = CloudWatchStub.Create();
         stub.PutMode = "invalid-then-ok";
@@ -290,7 +290,7 @@ public sealed class CoverageWriterGapTests
     /// <see cref="DataAlreadyAcceptedException"/> leaves the transport.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task AwsTransport_ExistingStream_TokenMismatchAndAlreadyAccepted()
+    public async Task AwsTransport_ExistingStream_PutsWithoutToken_AlreadyAcceptedLeavesTransport()
     {
         var ready = CloudWatchStub.Create();
         ready.GroupExists = true;

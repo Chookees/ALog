@@ -451,11 +451,27 @@ public sealed class AwsV4Tests
     }
 
     /// <summary>
+    /// Sequence-token failures stay inside the writer. The caller sees no exception.
+    /// </summary>
+    /// <returns>A task that finishes after both exception types are checked.</returns>
+    /// <remarks>
+    /// <see cref="InvalidSequenceTokenException"/> and <see cref="DataAlreadyAcceptedException"/>
+    /// leave the transport. Write and WriteAsync report them on the error stream.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task SequenceTokenExceptions_AreReportedAndDoNotReachTheCaller()
+    {
+        await AssertFaultIsReported(() => new InvalidSequenceTokenException("bad"));
+        await AssertFaultIsReported(() => new DataAlreadyAcceptedException("accepted"));
+    }
+
+    /// <summary>
     /// The synchronous put stays open until the injected clock reaches the 100 second timeout.
     /// One tick earlier it is still running. At the timeout it is cancelled, reported, and not thrown.
     /// </summary>
     /// <remarks>
-    /// The hang guards are 30 seconds. The product deadline moves only when the fake clock advances.
+    /// <see cref="FactAttribute.Timeout"/> is the only wall-clock hang net.
+    /// The product deadline moves only when the fake clock advances.
     /// Fails while the wait uses the wall clock, because advancing the fake clock does not cancel it.
     /// </remarks>
     [Fact(Timeout = 60000)]
@@ -478,19 +494,47 @@ public sealed class AwsV4Tests
             }
         });
 
-        Assert.True(transport.Entered.Wait(TimeSpan.FromSeconds(20)));
-        Assert.True(clock.TimersArmed.Wait(TimeSpan.FromSeconds(20)));
+        await Task.WhenAll(transport.Entered, clock.TimersArmed);
         clock.Advance(TimeSpan.FromSeconds(100) - TimeSpan.FromTicks(1));
         Assert.False(write.IsCompleted);
         Assert.False(transport.Cancelled);
 
         clock.Advance(TimeSpan.FromTicks(1));
-        var finished = await Task.WhenAny(write, Task.Delay(TimeSpan.FromSeconds(20)));
-        Assert.Same(write, finished);
+        await write;
         Assert.Null(thrown);
         Assert.True(transport.Cancelled);
         Assert.Contains("[AwsCloudWatchWriter]", error, StringComparison.Ordinal);
         Assert.Contains("100 second", error, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// One synchronous write and one async write must report the fault and return.
+    /// </summary>
+    /// <param name="fault">Builds a fresh exception for each put. Not null.</param>
+    /// <returns>A task that finishes after both writes have been checked.</returns>
+    /// <remarks>The transport throws. The writer must not.</remarks>
+    private static async Task AssertFaultIsReported(Func<Exception> fault)
+    {
+        var name = fault().GetType().Name;
+        var transport = new FaultingAwsTransport(fault);
+        using var writer = new AwsCloudWatchWriter("group", "stream", transport);
+        string syncError = string.Empty;
+        var syncThrown = Record.Exception(() =>
+        {
+            syncError = CaptureError(() => writer.Write(Plain("seq")));
+        });
+        Assert.Null(syncThrown);
+        Assert.Contains("[AwsCloudWatchWriter]", syncError, StringComparison.Ordinal);
+        Assert.Contains(name, syncError, StringComparison.Ordinal);
+
+        var asyncError = string.Empty;
+        var asyncThrown = await Record.ExceptionAsync(async () =>
+        {
+            asyncError = await CaptureErrorAsync(() => writer.WriteAsync(Plain("seq-async")));
+        });
+        Assert.Null(asyncThrown);
+        Assert.Contains("[AwsCloudWatchWriter]", asyncError, StringComparison.Ordinal);
+        Assert.Contains(name, asyncError, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -738,8 +782,10 @@ internal sealed class GateAwsTransport : IAwsCloudWatchLogsTransport
 {
     private int _cancelled;
 
-    /// <summary>Set when a put has registered its cancellation callback.</summary>
-    internal ManualResetEventSlim Entered { get; } = new(false);
+    private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Completes when a put has registered its cancellation callback.</summary>
+    internal Task Entered => _entered.Task;
 
     /// <summary>True after the token passed to the put is cancelled.</summary>
     internal bool Cancelled => Volatile.Read(ref _cancelled) == 1;
@@ -762,7 +808,7 @@ internal sealed class GateAwsTransport : IAwsCloudWatchLogsTransport
         CancellationToken cancellationToken = default)
     {
         cancellationToken.Register(() => Volatile.Write(ref _cancelled, 1));
-        Entered.Set();
+        _entered.TrySetResult();
         return new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously).Task;
     }
 
@@ -779,9 +825,10 @@ internal sealed class GateAwsTransport : IAwsCloudWatchLogsTransport
 internal sealed class SignalingFakeTimeProvider : FakeTimeProvider
 {
     private int _timers;
+    private readonly TaskCompletionSource _timersArmed = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    /// <summary>Set after two timers exist: the cancellation source and the wait.</summary>
-    internal ManualResetEventSlim TimersArmed { get; } = new(false);
+    /// <summary>Completes after two timers exist: the cancellation source and the wait.</summary>
+    internal Task TimersArmed => _timersArmed.Task;
 
     /// <summary>
     /// Creates the inner timer and signals <see cref="TimersArmed"/> once both waits exist.
@@ -796,7 +843,43 @@ internal sealed class SignalingFakeTimeProvider : FakeTimeProvider
     {
         var timer = base.CreateTimer(callback, state, dueTime, period);
         if (Interlocked.Increment(ref _timers) >= 2)
-            TimersArmed.Set();
+            _timersArmed.TrySetResult();
         return timer;
+    }
+}
+
+/// <summary>
+/// Transport that faults every put with a caller-built exception.
+/// </summary>
+internal sealed class FaultingAwsTransport : IAwsCloudWatchLogsTransport
+{
+    private readonly Func<Exception> _fault;
+
+    /// <summary>
+    /// Stores the factory used for each put.
+    /// </summary>
+    /// <param name="fault">Builds a new exception per call. Not null.</param>
+    internal FaultingAwsTransport(Func<Exception> fault) => _fault = fault;
+
+    /// <summary>
+    /// Returns a faulted task. The writer must catch it.
+    /// </summary>
+    /// <param name="logGroupName">Ignored.</param>
+    /// <param name="logStreamName">Ignored.</param>
+    /// <param name="message">Ignored.</param>
+    /// <param name="timestampUnixMs">Ignored.</param>
+    /// <param name="cancellationToken">Ignored.</param>
+    /// <returns>A faulted task whose exception comes from the factory.</returns>
+    public Task PutLogEventAsync(
+        string logGroupName,
+        string logStreamName,
+        string message,
+        long timestampUnixMs,
+        CancellationToken cancellationToken = default)
+        => Task.FromException(_fault());
+
+    /// <summary>No resources to release.</summary>
+    public void Dispose()
+    {
     }
 }

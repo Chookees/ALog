@@ -160,7 +160,7 @@ public sealed class WriterCharacterizationTests
     /// JsonFormatter sends both inside the formatted message and nothing is appended after it.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task Aws_DefaultSendsRenderedMessageOnly_JsonKeepsProperties()
+    public async Task Aws_DefaultSendsPropertiesAndContext_JsonKeepsFormatterOutput()
     {
         var plain = new RecordingAwsTransport();
         using (var writer = new AwsCloudWatchWriter("group", "stream", plain))

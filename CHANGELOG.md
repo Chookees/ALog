@@ -26,7 +26,7 @@
 - Fixed: with the background queue, a full queue no longer blocks the caller for 5 seconds and then drops events silently, and shutdown no longer loses queued events silently or writes to a disposed writer. Dropped and unwritten events are counted and reported (ALOG0070, ALOG0071).
 - Breaking (behavior): a single value or a list where ALog expects a section (for example `"ALog": { "Console": true }`) now stops startup with an error that names the path. Before, ALog ignored it and wrote nothing.
 - Fixed: `ConsoleLogWriter` and `FileLogWriter` write the line even when the `ToString()` of a property or scope value throws. That value shows `[capture failed: ExceptionType]`.
-- Breaking (dependency): `AWSSDK.CloudWatchLogs` moves from 3.7.509.3 (AWS SDK for .NET V3, end of support since 2026-06-01) to 4.0.106 (V4). If your app references other `AWSSDK.*` packages, upgrade all of them to V4 together. Mixing V3 and V4 either stops restore with NU1107 (version conflict on `AWSSDK.Core`) or restores with warning NU1608 and then throws `MissingMethodException` at runtime.
+- Breaking (dependency): `AWSSDK.CloudWatchLogs` moves from 3.7.509.3 (AWS SDK for .NET V3, end of support since 2026-06-01) to 4.0.106 (V4). If your app references other `AWSSDK.*` packages, upgrade all of them to V4 together; otherwise restore fails with NU1107 (version conflict on `AWSSDK.Core`), or it succeeds with warning NU1608 and the app throws `MissingMethodException` at runtime.
 - Fixed: `AwsCloudWatchWriter` now sends the message-template properties and the context with each event, not only the rendered message.
 
 ## 0.2.0
