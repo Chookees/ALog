@@ -9,6 +9,8 @@
 The sample, the screenshot text, and the JSON excerpt are allowed to change
 only together. This script is the CI check for that rule. It does not start
 the sample: the caller passes the run's stdout transcript and ``logs/app.log``.
+Line comparison ignores one trailing LF or CRLF. Each FAIL line is a single
+line. A quoted JSON excerpt collapses newline runs, then keeps 120 characters.
 """
 
 from __future__ import annotations
@@ -37,6 +39,8 @@ MAX_PROBLEMS = 20
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 ISO_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z")
 CLOCK_TIMESTAMP = re.compile(r"\d{2}:\d{2}:\d{2}")
+# A newline plus the indent after it. Used only when quoting an excerpt.
+EXCERPT_BREAK = re.compile(r"(?:\r\n|\r|\n)[ \t\f\v\r\n]*")
 TIMESTAMP_TOKEN = "<timestamp>"
 # Absolute tree URL: nuget.org renders this README and does not resolve a relative link.
 EXAMPLE_INTRO = (
@@ -601,12 +605,86 @@ def code_diff_message(
     )
 
 
-def content_lines(body: str) -> list[str]:
-    """Split a code block into lines without the fence's trailing break.
+def strip_one_terminator(text: str) -> str:
+    """Remove one trailing LF or CRLF.
 
-    Both blocks normally end with the newline that sits in front of the
-    closing fence or the end marker. Dropping that one empty split item keeps
-    it from looking like a blank line. The walk is capped at the text limit.
+    ``split("\\n")`` turns that terminator into a phantom empty line. A bare
+    CR is not a terminator. Only one break is removed, so a real blank line
+    at the end of the file remains.
+
+    Args:
+        text: File or block text.
+
+    Returns:
+        The text without that one terminator.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if text.endswith("\r\n"):
+        return text[:-2]
+    if text.endswith("\n"):
+        return text[:-1]
+    return text
+
+
+def compare_lines(text: str) -> list[str]:
+    """Split text into lines after removing one trailing terminator.
+
+    An empty result means that side has no line, which callers show as an
+    end marker. The walk is capped at the text limit.
+
+    Args:
+        text: Console text or one code block body.
+
+    Returns:
+        The lines. Empty after the strip means there are no lines.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    stripped = strip_one_terminator(text)
+    if stripped == "":
+        return []
+    lines = stripped.split("\n")
+    if len(lines) > MAX_COMPARE_LINES:
+        return lines[:MAX_COMPARE_LINES]
+    return lines
+
+
+def quote_visible(line: str) -> str:
+    """Return one compared line with CR removed.
+
+    The comparison still sees CR. The FAIL line must not, or the message
+    would contain a raw carriage return.
+
+    Args:
+        line: One line from the comparison, or an end marker.
+
+    Returns:
+        The line with every CR deleted.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return line.replace("\r", "")
+
+
+def content_lines(body: str) -> list[str]:
+    """Split a code block into lines after one trailing terminator.
+
+    Both blocks normally end with the newline in front of the closing fence
+    or the end marker. Removing that one break keeps it from looking like a
+    blank line. A second trailing break is a real empty line.
 
     Args:
         body: Text between the opener and the closer.
@@ -620,14 +698,7 @@ def content_lines(body: str) -> list[str]:
     Side effects:
         None.
     """
-    if body == "":
-        return []
-    lines = body.split("\n")
-    if len(lines) > MAX_COMPARE_LINES:
-        lines = lines[:MAX_COMPARE_LINES]
-    if lines and lines[-1] == "":
-        lines = lines[:-1]
-    return lines
+    return compare_lines(body)
 
 
 def block_line_diff(
@@ -641,9 +712,10 @@ def block_line_diff(
 ) -> str | None:
     """Return the first line where one step's README block and sample differ.
 
-    A side that has no line at the difference is ``<end of block>``. The
-    comparison uses the newline-normalized bodies, so a Windows checkout is
-    not a code edit. Only this first line is reported.
+    A side that has no line at the difference is ``<end of block>``. One
+    trailing LF or CRLF is not a difference. The comparison uses the
+    newline-normalized bodies, so a Windows checkout is not a code edit.
+    Only this first line is reported. CR is removed from the quoted line.
 
     Args:
         readme: Full README, used for line numbers.
@@ -679,21 +751,11 @@ def block_line_diff(
                 readme_line0 + index,
                 step,
                 program_line0 + index,
-                END_OF_BLOCK if expected is None else expected,
-                END_OF_BLOCK if found is None else found,
+                END_OF_BLOCK if expected is None else quote_visible(expected),
+                END_OF_BLOCK if found is None else quote_visible(found),
             )
         index += 1
-    if readme_body == program_body:
-        return None
-    readme_tail = "" if readme_body.endswith("\n") else END_OF_BLOCK
-    program_tail = "" if program_body.endswith("\n") else END_OF_BLOCK
-    return code_diff_message(
-        readme_line0 + len(expected_lines),
-        step,
-        program_line0 + len(found_lines),
-        readme_tail,
-        program_tail,
-    )
+    return None
 
 
 def one_step_problem(readme: str, program: str, heading: str, step: int) -> str | None:
@@ -840,18 +902,19 @@ def split_json_values(text: str) -> tuple[list[tuple[int, str]], bool]:
     return values, False
 
 
-def entry_quote(text: str) -> str:
-    """Return the first 120 characters of one normalized entry, then an ellipsis.
+def collapse_excerpt(text: str) -> str:
+    """Turn each newline-and-whitespace run into one space.
 
-    The ellipsis is always present, including when the entry is shorter than
-    120 characters. Timestamps must already be replaced.
+    A run starts at a CR or LF and continues through following spaces, tabs,
+    and line breaks. Spaces that are not part of that run stay. This is only
+    for the quoted excerpt in a FAIL line. The JSON comparison does not use
+    it and still normalizes timestamps alone.
 
     Args:
-        text: Normalized JSON text of one entry, or of the fence when no
-            complete entry could be read.
+        text: Timestamp-normalized entry or fence text.
 
     Returns:
-        At most 120 characters followed by ``…``.
+        The same characters on one line, with no raw CR or LF.
 
     Raises:
         None.
@@ -859,7 +922,30 @@ def entry_quote(text: str) -> str:
     Side effects:
         None.
     """
-    return text[:120] + "…"
+    return EXCERPT_BREAK.sub(" ", text)
+
+
+def entry_quote(text: str) -> str:
+    """Return one collapsed excerpt, cut at 120 characters, then an ellipsis.
+
+    Newline-and-indent runs become a single space before the cut. The
+    ellipsis is always present, including when the collapsed text is shorter
+    than 120 characters. Timestamps must already be replaced.
+
+    Args:
+        text: Normalized JSON text of one entry, or of the fence when no
+            complete entry could be read.
+
+    Returns:
+        At most 120 characters followed by ``…``, with no raw CR or LF.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return collapse_excerpt(text)[:120] + "…"
 
 
 def json_block_message(count: int) -> str:
@@ -889,7 +975,7 @@ def missing_entry_message(line: int, entry: int, quote: str) -> str:
     Args:
         line: 1-based README line where the entry starts.
         entry: 1-based entry number inside the json block.
-        quote: First 120 normalized characters plus the ellipsis.
+        quote: Collapsed excerpt, at most 120 characters, plus the ellipsis.
 
     Returns:
         The full FAIL line.
@@ -1075,19 +1161,20 @@ def stdout_fail_message(line_number: int, expected: str, found: str) -> str:
     )
 
 
-def first_console_mismatch(expected_text: str, found_text: str) -> str:
-    """Name the first LF line that differs after timestamp replacement.
+def first_console_mismatch(expected_text: str, found_text: str) -> str | None:
+    """Name the first line that differs after one trailing terminator is removed.
 
     The walk stops at the first difference. A side with no line at that
-    index is the end marker, not an empty string. No other character is
-    changed. The loop is capped at the text read limit.
+    index is the end marker, not an empty string. CR stays in the compared
+    line and is removed only from the quoted message. The loop is capped at
+    the text read limit.
 
     Args:
         expected_text: Normalized ``quickstart-console.txt``.
-        found_text: Normalized sample transcript. Known to differ.
+        found_text: Normalized sample transcript.
 
     Returns:
-        The U-DOC-06 FAIL line for that first difference.
+        The U-DOC-06 FAIL line, or None when the stripped lines match.
 
     Raises:
         None.
@@ -1095,12 +1182,8 @@ def first_console_mismatch(expected_text: str, found_text: str) -> str:
     Side effects:
         None.
     """
-    expected_lines = expected_text.split("\n")
-    found_lines = found_text.split("\n")
-    if len(expected_lines) > MAX_COMPARE_LINES:
-        expected_lines = expected_lines[:MAX_COMPARE_LINES]
-    if len(found_lines) > MAX_COMPARE_LINES:
-        found_lines = found_lines[:MAX_COMPARE_LINES]
+    expected_lines = compare_lines(expected_text)
+    found_lines = compare_lines(found_text)
     count = len(expected_lines)
     if len(found_lines) > count:
         count = len(found_lines)
@@ -1109,23 +1192,26 @@ def first_console_mismatch(expected_text: str, found_text: str) -> str:
         expected_line = expected_lines[index] if index < len(expected_lines) else None
         found_line = found_lines[index] if index < len(found_lines) else None
         if expected_line != found_line:
-            shown_expected = END_OF_FILE if expected_line is None else expected_line
-            shown_found = END_OF_OUTPUT if found_line is None else found_line
+            shown_expected = END_OF_FILE if expected_line is None else quote_visible(expected_line)
+            shown_found = END_OF_OUTPUT if found_line is None else quote_visible(found_line)
             return stdout_fail_message(index + 1, shown_expected, shown_found)
         index += 1
-    return stdout_fail_message(1, END_OF_FILE, END_OF_OUTPUT)
+    return None
 
 
 def stdout_problem(stdout_text: str, console_text: str) -> str | None:
     """Compare the run transcript with the committed console text.
+
+    Timestamps are replaced. One trailing LF or CRLF is not a difference.
+    No other character is normalized.
 
     Args:
         stdout_text: Prompt, command, and process stdout from the run.
         console_text: ``docs/images/quickstart-console.txt``.
 
     Returns:
-        None when the texts match after timestamp replacement. Otherwise the
-        U-DOC-06 line for the first differing line.
+        None when the stripped lines match. Otherwise the U-DOC-06 line for
+        the first differing line.
 
     Raises:
         None.
@@ -1135,8 +1221,6 @@ def stdout_problem(stdout_text: str, console_text: str) -> str | None:
     """
     expected_text = normalize_timestamps(console_text)
     found_text = normalize_timestamps(stdout_text)
-    if expected_text == found_text:
-        return None
     return first_console_mismatch(expected_text, found_text)
 
 
@@ -1596,6 +1680,58 @@ def write_fixture(root: Path) -> tuple[Path, Path]:
     return stdout_path, log_path
 
 
+def finding_is_one_line(problem: str) -> bool:
+    """Return whether one finding is a single FAIL line.
+
+    Every failure is one line. A CR or LF would split the CI log. One
+    tracked file under ``logs/`` is one finding, so each list item is one line.
+
+    Args:
+        problem: One check result.
+
+    Returns:
+        True when the text starts with ``FAIL`` and contains no CR or LF.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if "\n" in problem or "\r" in problem:
+        return False
+    return problem.startswith("FAIL ")
+
+
+def reject_multiline(label: str, problems: list[str]) -> bool:
+    """Return True when a finding is not exactly one FAIL line.
+
+    Empty output is a green case and is not an error here.
+
+    Args:
+        label: Case name.
+        problems: Check output.
+
+    Returns:
+        True when the caller must fail the case.
+
+    Raises:
+        None.
+
+    Side effects:
+        Writes to stderr when a finding is not one line.
+    """
+    index = 0
+    while index < len(problems):
+        if not finding_is_one_line(problems[index]):
+            sys.stderr.write(
+                f"FAIL {label}: finding is not one FAIL line: {problems[index]!r}\n"
+            )
+            return True
+        index += 1
+    return False
+
+
 def report_case(label: str, problems: list[str], phrase: str) -> int:
     """Print one self-test result.
 
@@ -1614,6 +1750,8 @@ def report_case(label: str, problems: list[str], phrase: str) -> int:
     Side effects:
         Writes one line to stdout or stderr.
     """
+    if reject_multiline(label, problems):
+        return 1
     text = "\n".join(problems)
     if phrase == "":
         if problems:
@@ -1645,6 +1783,8 @@ def report_exact(label: str, problems: list[str], expected: str) -> int:
     Side effects:
         Writes one line to stdout or stderr.
     """
+    if reject_multiline(label, problems):
+        return 1
     if problems == [expected]:
         sys.stdout.write(f"ok {label}\n")
         return 0
@@ -1669,6 +1809,8 @@ def report_exact_many(label: str, problems: list[str], expected: list[str]) -> i
     Side effects:
         Writes one line to stdout or stderr.
     """
+    if reject_multiline(label, problems):
+        return 1
     if problems == expected:
         sys.stdout.write(f"ok {label}\n")
         return 0
@@ -1677,12 +1819,12 @@ def report_exact_many(label: str, problems: list[str], expected: list[str]) -> i
 
 
 def self_test() -> int:
-    """Prove the U-DOC-06 and U-DOC-07 red texts and the unchanged green case.
+    """Prove the red texts, the end markers, and the unchanged green case.
 
     Each red case starts from a fresh fixture so one mutation cannot hide
     another. The green case is that fixture before any mutation. The code,
     excerpt, tracked-log, stdout, commit, PNG, and size cases require the
-    full failure line, not a fragment.
+    full failure line, not a fragment. Every finding must be one FAIL line.
 
     Returns:
         0 when every case has the required color, 1 otherwise.
@@ -1705,12 +1847,17 @@ def self_test() -> int:
             failures += case_png_too_large(tmp / "large")
             failures += case_txt_differs(tmp / "txt")
             failures += case_stdout_shorter(tmp / "short-out")
+            failures += case_stdout_longer(tmp / "long-out")
             failures += case_txt_shorter(tmp / "short-txt")
+            failures += case_txt_extra_blank(tmp / "blank-txt")
+            failures += case_console_cr(tmp / "cr")
             failures += case_excerpt_edited(tmp / "excerpt")
+            failures += case_excerpt_indent(tmp / "indent")
             failures += case_excerpt_order(tmp / "order")
             failures += case_json_missing(tmp / "json")
             failures += case_code_differs(tmp / "code")
             failures += case_code_shorter(tmp / "code-short")
+            failures += case_readme_shorter(tmp / "readme-short")
             failures += case_marker_missing(tmp / "marker")
             failures += case_marker_reversed(tmp / "reversed")
             failures += case_readme_block_missing(tmp / "csharp")
@@ -1922,7 +2069,10 @@ def case_txt_differs(root: Path) -> int:
 
 
 def case_stdout_shorter(root: Path) -> int:
-    """A transcript that ends early must say end of output on that line.
+    """A transcript missing its last line must say end of output.
+
+    The shortened transcript still ends with a newline. That terminator is
+    not an empty line, so the message must not quote ``""``.
 
     Args:
         root: Directory for this case.
@@ -1937,25 +2087,59 @@ def case_stdout_shorter(root: Path) -> int:
         Writes a temporary repository and drops the transcript's last line.
     """
     stdout_path, log_path = write_fixture(root)
-    parts = stdout_path.read_text(encoding="utf-8").split("\n")
-    if len(parts) < 4:
-        raise RuntimeError("fixture transcript is too short.")
-    stdout_path.write_text(parts[0] + "\n" + parts[1], encoding="utf-8")
+    text = stdout_path.read_text(encoding="utf-8")
+    parts = text.split("\n")
+    if len(parts) < 4 or parts[-1] != "" or not text.endswith("\n"):
+        raise RuntimeError("fixture transcript does not end with a newline.")
+    written = parts[0] + "\n" + parts[1] + "\n"
+    if "Something went wrong" in written:
+        raise RuntimeError("shorter transcript still has its last line.")
+    stdout_path.write_text(written, encoding="utf-8")
     return report_exact(
         "stdout shorter",
         check_repository(root, stdout_path, log_path),
-        "FAIL docs/images/quickstart-console.txt:3: "
-        'expected "[<timestamp>] [Error] Something went wrong", '
-        'found "<end of output>" in the sample output. '
-        "The console output changed, so the screenshot is out of date: "
-        "run dotnet run --project samples/ALog.QuickstartSample, "
-        "retake docs/images/quickstart-console.png as described in the header of "
-        "eng/readme-example-check.py, and commit it together with the new quickstart-console.txt.",
+        stdout_fail_message(
+            3,
+            "[<timestamp>] [Error] Something went wrong",
+            END_OF_OUTPUT,
+        ),
+    )
+
+
+def case_stdout_longer(root: Path) -> int:
+    """A transcript with one extra line must say end of file on that line.
+
+    The fixture and the extra line both end with a newline.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when line 4 expected end of file and found the extra line.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and appends one transcript line.
+    """
+    stdout_path, log_path = write_fixture(root)
+    text = stdout_path.read_text(encoding="utf-8")
+    if not text.endswith("\n"):
+        raise RuntimeError("fixture transcript does not end with a newline.")
+    stdout_path.write_text(text + "extra line\n", encoding="utf-8")
+    return report_exact(
+        "stdout longer",
+        check_repository(root, stdout_path, log_path),
+        stdout_fail_message(4, END_OF_FILE, "extra line"),
     )
 
 
 def case_txt_shorter(root: Path) -> int:
-    """A TXT that ends early must say end of file on that line.
+    """A TXT missing its last line must say end of file.
+
+    The shortened TXT still ends with a newline. That terminator is not an
+    empty line, so the message must not quote ``""``.
 
     Args:
         root: Directory for this case.
@@ -1971,31 +2155,104 @@ def case_txt_shorter(root: Path) -> int:
     """
     stdout_path, log_path = write_fixture(root)
     txt = root / "docs/images/quickstart-console.txt"
-    parts = txt.read_text(encoding="utf-8").split("\n")
-    if len(parts) < 4:
-        raise RuntimeError("fixture console text is too short.")
-    txt.write_text(parts[0] + "\n" + parts[1], encoding="utf-8")
+    text = txt.read_text(encoding="utf-8")
+    parts = text.split("\n")
+    if len(parts) < 4 or parts[-1] != "" or not text.endswith("\n"):
+        raise RuntimeError("fixture console text does not end with a newline.")
+    written = parts[0] + "\n" + parts[1] + "\n"
+    if "Something went wrong" in written:
+        raise RuntimeError("shorter console text still has its last line.")
+    txt.write_text(written, encoding="utf-8")
     return report_exact(
         "txt shorter",
         check_repository(root, stdout_path, log_path),
-        "FAIL docs/images/quickstart-console.txt:3: "
-        'expected "<end of file>", '
-        'found "[<timestamp>] [Error] Something went wrong" in the sample output. '
-        "The console output changed, so the screenshot is out of date: "
-        "run dotnet run --project samples/ALog.QuickstartSample, "
-        "retake docs/images/quickstart-console.png as described in the header of "
-        "eng/readme-example-check.py, and commit it together with the new quickstart-console.txt.",
+        stdout_fail_message(
+            3,
+            END_OF_FILE,
+            "[<timestamp>] [Error] Something went wrong",
+        ),
     )
 
 
-def case_excerpt_edited(root: Path) -> int:
-    """A hand-edited JSON excerpt must be red.
+def case_txt_extra_blank(root: Path) -> int:
+    """An extra trailing empty line must be reported on its own number.
+
+    The fixture has three content lines and already ends with one newline.
+    The added newline is line 4. Counting the terminator as its own line
+    would report line 5.
 
     Args:
         root: Directory for this case.
 
     Returns:
-        0 when the check rejects the excerpt.
+        0 when line 4 expected an empty line and found end of output.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and appends one newline to the TXT.
+    """
+    stdout_path, log_path = write_fixture(root)
+    txt = root / "docs/images/quickstart-console.txt"
+    text = txt.read_text(encoding="utf-8")
+    if not text.endswith("\n") or text.endswith("\n\n"):
+        raise RuntimeError("fixture console text needs one trailing newline.")
+    txt.write_text(text + "\n", encoding="utf-8")
+    return report_exact(
+        "txt extra blank",
+        check_repository(root, stdout_path, log_path),
+        stdout_fail_message(4, "", END_OF_OUTPUT),
+    )
+
+
+def case_console_cr(root: Path) -> int:
+    """A CR on a console line must stay a difference and leave the message.
+
+    The comparison is not whitespace-collapsed, so the CR still fails the
+    line. The quoted line deletes it.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when line 2 quotes both sides without a CR.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and inserts a CR before one newline.
+    """
+    stdout_path, log_path = write_fixture(root)
+    txt = root / "docs/images/quickstart-console.txt"
+    text = txt.read_text(encoding="utf-8")
+    if not text.endswith("\n"):
+        raise RuntimeError("fixture console text does not end with a newline.")
+    changed = text.replace("Application started\n", "Application started\r\n", 1)
+    if changed == text or "\r" not in changed:
+        raise RuntimeError("fixture console line was not given a CR.")
+    txt.write_text(changed, encoding="utf-8")
+    line = "[<timestamp>] [Info] Application started"
+    return report_exact(
+        "quoted cr",
+        check_repository(root, stdout_path, log_path),
+        stdout_fail_message(2, line, line),
+    )
+
+
+def case_excerpt_edited(root: Path) -> int:
+    """A hand-edited JSON excerpt must be one line with a collapsed quote.
+
+    Newlines and the indent after them become one space, then the quote is
+    cut at 120 characters and an ellipsis is added. The message is long
+    enough that the cut lands inside it.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the only problem is that one exact line.
 
     Raises:
         OSError, RuntimeError, ValueError: The fixture could not be created.
@@ -2008,20 +2265,62 @@ def case_excerpt_edited(root: Path) -> int:
     readme.write_text(
         readme.read_text(encoding="utf-8").replace(
             "Application started",
-            "Application edited",
+            "Application edited and then described in much more detail than the log",
             1,
         ),
         encoding="utf-8",
     )
     quote = (
-        "{\n"
-        "  \"timestamp\": \"<timestamp>\",\n"
-        "  \"level\": \"Info\",\n"
-        "  \"message\": \"Application edited\"\n"
-        "}…"
+        '{ "timestamp": "<timestamp>", "level": "Info", "message": '
+        '"Application edited and then described in much more detail tha…'
     )
     return report_exact(
         "excerpt hand-edited",
+        check_repository(root, stdout_path, log_path),
+        "FAIL README.md:24: JSON excerpt entry 1 not found as a complete entry "
+        "in logs/app.log of the sample run (timestamps normalized): "
+        f'"{quote}". Run dotnet run --project samples/ALog.QuickstartSample and '
+        "copy the first entry and the error entry from logs/app.log unedited, each one whole.",
+    )
+
+
+def case_excerpt_indent(root: Path) -> int:
+    """Indentation that is otherwise the same entry must stay red.
+
+    The quote collapses the new indent, so it looks like the log entry.
+    The comparison does not, and the case is still a missing entry.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when entry 1 is rejected on one line.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and reindents the first JSON entry.
+    """
+    stdout_path, log_path = write_fixture(root)
+    readme = root / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    first = fixture_entry(
+        "2026-10-20T20:55:19.4758886Z", "Info", "Application started"
+    )
+    indented = first.replace("\n  ", "\n    ")
+    if indented == first:
+        raise RuntimeError("fixture indent did not change.")
+    replaced = text.replace(first, indented, 1)
+    if replaced == text:
+        raise RuntimeError("fixture excerpt was not found.")
+    readme.write_text(replaced, encoding="utf-8")
+    quote = (
+        '{ "timestamp": "<timestamp>", "level": "Info", '
+        '"message": "Application started" }…'
+    )
+    return report_exact(
+        "excerpt indent",
         check_repository(root, stdout_path, log_path),
         "FAIL README.md:24: JSON excerpt entry 1 not found as a complete entry "
         "in logs/app.log of the sample run (timestamps normalized): "
@@ -2128,6 +2427,8 @@ def case_code_differs(root: Path) -> int:
 def case_code_shorter(root: Path) -> int:
     """A sample block that ends early must say end of block on that line.
 
+    The sample file still ends with a newline after the line is removed.
+
     Args:
         root: Directory for this case.
 
@@ -2144,7 +2445,7 @@ def case_code_shorter(root: Path) -> int:
     program = root / "samples/ALog.QuickstartSample/Program.cs"
     text = program.read_text(encoding="utf-8")
     shorter = text.replace("var ready = 1;\n", "", 1)
-    if shorter == text:
+    if shorter == text or not shorter.endswith("\n"):
         raise RuntimeError("fixture sample line could not be removed.")
     program.write_text(shorter, encoding="utf-8")
     return report_exact(
@@ -2154,6 +2455,44 @@ def case_code_shorter(root: Path) -> int:
         "samples/ALog.QuickstartSample/Program.cs:4 "
         "(between // readme:step1:begin and end): "
         'expected "var ready = 1;", found "<end of block>". '
+        "Change README and sample in the same commit so both blocks match byte for byte.",
+    )
+
+
+def case_readme_shorter(root: Path) -> int:
+    """A README block that ends early must say end of block on that line.
+
+    The README still ends with a newline. The missing line is the sample's
+    ``var ready = 1;``, not an empty string from the closing fence.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the README block ends before the sample's last line.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and drops one README line.
+    """
+    stdout_path, log_path = write_fixture(root)
+    readme = root / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    if not text.endswith("\n"):
+        raise RuntimeError("fixture README does not end with a newline.")
+    shorter = text.replace("var ready = 1;\n", "", 1)
+    if shorter == text or not shorter.endswith("\n"):
+        raise RuntimeError("fixture README line could not be removed.")
+    readme.write_text(shorter, encoding="utf-8")
+    return report_exact(
+        "readme block shorter",
+        check_repository(root, stdout_path, log_path),
+        "FAIL README.md:6: Step 1 code block differs from "
+        "samples/ALog.QuickstartSample/Program.cs:4 "
+        "(between // readme:step1:begin and end): "
+        'expected "<end of block>", found "var ready = 1;". '
         "Change README and sample in the same commit so both blocks match byte for byte.",
     )
 
