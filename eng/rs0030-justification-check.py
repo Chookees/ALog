@@ -30,7 +30,7 @@ NOT_MEMBER = (
     "RS0030 exception is not one of the four allowed members."
     " Remove the suppression and use the TimeProvider from the options; the allowlist is fixed at four entries."
 )
-BLOCK = "RS0030 exception member must be one expression. Only PutWithinTransportTimeout may have a block body."
+BLOCK = "RS0030 exception member must be one expression."
 UNCONDITIONAL = "RS0030 exception must be [SuppressMessage] on an allowed member, not UnconditionalSuppressMessage."
 NOWARN = "RS0030 must not be listed in NoWarn or WarningsNotAsErrors."
 SEVERITY = "RS0030 severity must stay an error."
