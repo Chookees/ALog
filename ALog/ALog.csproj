@@ -7,6 +7,7 @@
     <PackageReleaseNotes>0.2.1: throwing filters drop the event; non-KVP scopes are kept; level gate before work; factory activity scopes are captured at emit; SelfLog.Enable/Disable and LogContext.Push/PushScope.</PackageReleaseNotes>
     <Title>ALog</Title>
     <Authors>Artur Bobb</Authors>
+    <Copyright>Copyright 2026 Artur Bobb</Copyright>
     <Description>ALog is a powerful and extensible logging framework built for .NET 10+.
 It is designed to be simple to use, highly configurable, and ready for modern development across platforms including Windows, Linux, and iOS.</Description>
     <PackageReadmeFile>README.md</PackageReadmeFile>

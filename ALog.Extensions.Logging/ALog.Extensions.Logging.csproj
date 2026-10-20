@@ -6,6 +6,7 @@
     <Version>0.2.1</Version>
     <Title>ALog.Extensions.Logging</Title>
     <Authors>Artur Bobb</Authors>
+    <Copyright>Copyright 2026 Artur Bobb</Copyright>
     <Description>Microsoft.Extensions.Logging provider and configuration binding for ALog.</Description>
     <PackageProjectUrl>https://github.com/Chookees/ALog</PackageProjectUrl>
     <RepositoryUrl>https://github.com/Chookees/ALog</RepositoryUrl>
