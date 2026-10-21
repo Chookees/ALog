@@ -1,17 +1,12 @@
 # Exception-format benchmarks. Not a required check.
-# workflow_dispatch works after this file is on the default branch.
-# While eng/RUN_FORMAT_BENCH is in the pull request diff, one synchronize runs the same job.
-# Deleting that file stops later pull-request runs. Required jobs stay in dotnet.yml.
+# workflow_dispatch only. It does not run on pull requests.
+# The one-shot pull_request trigger was removed after run 39687087817.
+# Required jobs stay in dotnet.yml.
 
 name: Benchmarks
 
 on:
   workflow_dispatch:
-  pull_request:
-    types: [synchronize]
-    branches: [ "master" ]
-    paths:
-      - 'eng/RUN_FORMAT_BENCH'
 
 concurrency:
   group: format-bench-${{ github.event.pull_request.number || github.ref }}
