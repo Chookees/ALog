@@ -54,6 +54,14 @@ See `samples/ALog.AspNetSample`.
 
 ALog writes to the console only when `ALog:Console:Enabled` is `true`. With `AddALog`, choose one console: keep the Microsoft console provider and leave ALog's console off, or call `builder.Logging.ClearProviders()` and set `ALog:Console:Enabled` to `true` (as in `samples/ALog.AspNetSample`). With both, every line appears twice.
 
+An exception shares that line. The form is `Type: Message`, then inner exceptions, then the source frame. There is no `EX:` label. Types in `System.*` use the short name; every other type keeps its namespace. A thrown exception names the application frame:
+
+```
+[20:55:19] [Error] Payment failed | InvalidOperationException: Card declined | at CheckoutService.Pay in CheckoutService.cs:42 | ctx: orderId=17
+```
+
+`|` and `-->` inside an exception message or a context value are escaped as `\|` and `--\>`, so those separators stay unambiguous. `PlainTextFormatter(includeStackTrace: true)` appends the full stack trace indented by four spaces. The default is off.
+
 ---
 
 ## Quick Start
@@ -221,8 +229,8 @@ If you pass your own `HttpClient` to `HttpLogWriter` or `AzureLogWriter`, its ha
 
 | Formatter           | Description                                                |
 |---------------------|------------------------------------------------------------|
-| `PlainTextFormatter`| Developer-friendly, single-line format (customizable time)|
-| `JsonFormatter`     | Structured JSON output, ideal for logs ingestion tools     |
+| `PlainTextFormatter`| One line (customizable time). Exceptions read `Type: Message`, with inner exceptions and `at Class.Method in File.cs:42`. `includeStackTrace: true` appends the full stack. |
+| `JsonFormatter`     | Structured JSON. `exception` keeps `type`, `message`, and `stackTrace`, and adds `source` (`method`, `file`, `line`) and `inner` (up to 16). |
 
 Namespace: `ALog.Formatters`. Config-level `SetFormatter` applies only to writers that do not already have a formatter (single format pass).
 

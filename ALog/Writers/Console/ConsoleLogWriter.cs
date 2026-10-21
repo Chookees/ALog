@@ -1,7 +1,6 @@
 ﻿namespace ALog.Writers.Console;
 
 using System;
-using System.Linq;
 using System.Threading.Tasks;
 using ALog.Core;
 using ALog.Public.Interfaces;
@@ -56,20 +55,24 @@ public class ConsoleLogWriter : ILogWriter, IFormattableLogWriter
         _ => ConsoleColor.Gray
     };
 
+    /// <summary>
+    /// Renders the line used when no formatter was attached.
+    /// The exception segment comes from <see cref="ExceptionReport"/>, the same helper the other text sinks use.
+    /// </summary>
+    /// <param name="logEvent">Event to render. Not null.</param>
+    /// <returns>One line, without a trailing newline.</returns>
+    /// <remarks>
+    /// Does not throw. Category and template properties stay off this fallback; the configured
+    /// <see cref="PlainTextFormatter"/> is what prints them. Context values are escaped.
+    /// A blank message is omitted so the line does not gain a double space.
+    /// </remarks>
     private static string FormatFallback(LogEvent logEvent)
     {
-        var parts = new[]
-        {
-            $"[{logEvent.Timestamp:yyyy-MM-dd HH:mm:ss}]",
-            $"[{logEvent.Level}]",
-            logEvent.Message,
-            logEvent.Exception != null ? $"EX: {logEvent.Exception.GetType().Name}: {logEvent.Exception.Message}" : null,
-            logEvent.Context != null && logEvent.Context.Count > 0
-                ? "ctx: " + CaptureText.Join(logEvent.Context)
-                : null
-        };
-
-        return string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
+        var head = "[" + logEvent.Timestamp.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + logEvent.Level + "]";
+        if (!string.IsNullOrWhiteSpace(logEvent.Message))
+            head += " " + logEvent.Message;
+        var exception = logEvent.Exception == null ? null : ExceptionReport.FormatText(logEvent.Exception);
+        return ExceptionReport.JoinLine(head, exception, props: null, ExceptionReport.FormatContext(logEvent.Context));
     }
 
     public void Dispose()

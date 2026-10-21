@@ -30,6 +30,15 @@
 - Breaking (dependency): `AWSSDK.CloudWatchLogs` moves from 3.7.509.3 (AWS SDK for .NET V3, end of support since 2026-06-01) to 4.0.106 (V4). If your app references other `AWSSDK.*` packages, upgrade all of them to V4 together; otherwise restore fails with NU1107 (version conflict on `AWSSDK.Core`), or it succeeds with warning NU1608 and the app throws `MissingMethodException` at runtime.
 - Fixed: `AwsCloudWatchWriter` now sends the message-template properties and the context with each event, not only the rendered message.
 
+### Breaking (output)
+
+- Plain text, console, and file output write exceptions as "Type: Message", followed by inner exceptions and the source line ("at Class.Method in File.cs:42"). The "EX:" label is gone; update log parsers that match it. "|" and "-->" inside messages are escaped as "\|" and "--\>".
+
+### Added
+
+- JSON and HTTP exception output add "source" (method, file, line) and "inner" (type, message, and source of each inner exception, up to 16).
+- PlainTextFormatter(includeStackTrace: true) appends the full stack trace.
+
 ## 0.2.0
 
 - Message templates (`Log.Write(LogLevel, template, args...)`) and `LogEvent.Properties`

@@ -193,7 +193,8 @@ public sealed class SyncWriteContractTests
             });
             Assert.Contains("[FileLogWriter]", error, StringComparison.Ordinal);
             var text = File.ReadAllText(path);
-            Assert.Contains("EX:", text, StringComparison.Ordinal);
+            Assert.Contains("InvalidOperationException: boom", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("EX:", text, StringComparison.Ordinal);
             Assert.Contains("User=ada", text, StringComparison.Ordinal);
         }
         finally
