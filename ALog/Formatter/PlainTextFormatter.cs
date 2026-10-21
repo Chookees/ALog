@@ -89,7 +89,8 @@ public class PlainTextFormatter : ILogFormatter
     /// <remarks>
     /// Does not call SelfLog and does not replace the property object on the event.
     /// Every property and context pair is rendered. The property loop is bounded by that collection.
-    /// Context values and <c>props:</c> values are escaped so <c>|</c> and <c>--&gt;</c> cannot look like separators.
+    /// The category, the message, context, and <c>props:</c> are escaped so <c>|</c> and <c>--&gt;</c> cannot look like separators.
+    /// A backslash in those fields is doubled only when it would read as an escape.
     /// <see cref="Exception.ToString"/> runs only when this formatter was constructed with
     /// <c>includeStackTrace: true</c>. A throw from that call becomes a capture placeholder
     /// and the line above it is kept.
@@ -118,7 +119,8 @@ public class PlainTextFormatter : ILogFormatter
     /// <returns>The head of the line, before the first <c> | </c>.</returns>
     /// <remarks>
     /// Does not throw. The time format is the one given to the constructor. At most four pieces are joined.
-    /// The message is escaped with the same rules as an exception message, and it is not cut to 500 characters.
+    /// The category and the message are escaped with the same rules as an exception message.
+    /// Neither is cut to 500 characters.
     /// </remarks>
     private string FormatHead(LogEvent logEvent)
     {
@@ -126,7 +128,7 @@ public class PlainTextFormatter : ILogFormatter
         parts.Add("[" + logEvent.Timestamp.ToString(_dateTimeFormat) + "]");
         parts.Add("[" + logEvent.Level + "]");
         if (!string.IsNullOrEmpty(logEvent.Category))
-            parts.Add("[" + logEvent.Category + "]");
+            parts.Add("[" + ExceptionReport.EscapeLine(logEvent.Category) + "]");
         if (!string.IsNullOrWhiteSpace(logEvent.Message))
             parts.Add(ExceptionReport.EscapeLine(logEvent.Message));
         return string.Join(" ", parts);
@@ -140,7 +142,7 @@ public class PlainTextFormatter : ILogFormatter
     /// <returns>The line, without a trailing newline.</returns>
     /// <remarks>
     /// Does not throw. Does not call <see cref="Exception.ToString"/>.
-    /// The message, keys, and values are escaped. The message is not cut to 500 characters.
+    /// The category, the message, keys, and values are escaped. The category and the message are not cut to 500 characters.
     /// The array has seven slots, including the empty exception slot, and the filter drops blank slots.
     /// </remarks>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
@@ -150,7 +152,7 @@ public class PlainTextFormatter : ILogFormatter
         {
             $"[{logEvent.Timestamp.ToString(_dateTimeFormat)}]",
             $"[{logEvent.Level}]",
-            string.IsNullOrEmpty(logEvent.Category) ? null : $"[{logEvent.Category}]",
+            string.IsNullOrEmpty(logEvent.Category) ? null : "[" + ExceptionReport.EscapeLine(logEvent.Category) + "]",
             string.IsNullOrWhiteSpace(logEvent.Message) ? null : ExceptionReport.EscapeLine(logEvent.Message),
             null,
             ExceptionReport.FormatProps(logEvent.Properties, leadingPipe: true),

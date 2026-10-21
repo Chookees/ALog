@@ -62,14 +62,16 @@ public class ConsoleLogWriter : ILogWriter, IFormattableLogWriter
     /// <param name="logEvent">Event to render. Not null.</param>
     /// <returns>One line, without a trailing newline.</returns>
     /// <remarks>
-    /// Does not throw. Category and template properties stay off this fallback; the configured
+    /// Does not throw. Template properties stay off this fallback; the configured
     /// <see cref="PlainTextFormatter"/> is what prints them. Context values are escaped.
     /// A blank message is omitted so the line does not gain a double space.
-    /// The message and context keys are escaped, so a line break in either cannot open a second line.
+    /// The category, the message, and context keys are escaped, so a line break in any of them cannot open a second line.
     /// </remarks>
     private static string FormatFallback(LogEvent logEvent)
     {
         var head = "[" + logEvent.Timestamp.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + logEvent.Level + "]";
+        if (!string.IsNullOrEmpty(logEvent.Category))
+            head += " [" + ExceptionReport.EscapeLine(logEvent.Category) + "]";
         if (!string.IsNullOrWhiteSpace(logEvent.Message))
             head += " " + ExceptionReport.EscapeLine(logEvent.Message);
         var exception = logEvent.Exception == null ? null : ExceptionReport.FormatText(logEvent.Exception);

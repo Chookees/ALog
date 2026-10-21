@@ -21,10 +21,10 @@ public sealed class ExceptionFormatTests
         "Payment failed | InvalidOperationException: Card declined | at CheckoutService.Pay in CheckoutService.cs:42 | ctx: orderId=17";
 
     private const string BreakingBullet =
-        "- Plain text, console, and file output write exceptions as \"Type: Message\", followed by inner exceptions and the source line (\"at Class.Method in File.cs:42\"). The \"EX:\" label is gone; update log parsers that match it. \"\\\", \"|\", and \"-->\" in the message and in context or property names and values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\", so each event stays one line.";
+        "- Plain text, console, and file output write exceptions as \"Type: Message\", followed by inner exceptions and the source line (\"at Class.Method in File.cs:42\"). The \"EX:\" label is gone; update log parsers that match it. \"|\" and \"-->\" in the message, the category, and context or property names and values are escaped as \"\\|\" and \"--\\>\", line breaks as \"\\r\" and \"\\n\", and a backslash is doubled only where it would otherwise read as one of these escapes (\"C:\\temp\" stays as is), so each event stays one line.";
 
     private const string ReadmeEscapeSentence =
-        "\"\\\", \"|\", and \"-->\" in the message and in context or property names and values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\", so each event stays one line.";
+        "\"|\" and \"-->\" in the message, the category, and context or property names and values are escaped as \"\\|\" and \"--\\>\", line breaks as \"\\r\" and \"\\n\", and a backslash is doubled only where it would otherwise read as one of these escapes (\"C:\\temp\" stays as is), so each event stays one line.";
 
     private const string AddedSourceBullet =
         "- JSON and HTTP exception output add \"source\" (method, file, line) and \"inner\" (type, message, and source of each inner exception, up to 16).";
@@ -149,17 +149,17 @@ public sealed class ExceptionFormatTests
     }
 
     /// <summary>
-    /// Backslash is escaped before pipe and arrow, so the backslash those escapes insert is not doubled.
-    /// Swapping that order changes these expected strings.
+    /// A backslash is doubled only when the next raw character would read as an escape.
+    /// A backslash before a dash stays single, and the arrow that follows is still escaped.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task EscapeOrder_BackslashBeforePipeAndArrow()
     {
         await Task.CompletedTask;
         Assert.Equal("\\|", ExceptionReport.Escape("|", messageLimit: true));
-        Assert.Equal("\\\\", ExceptionReport.Escape("\\", messageLimit: true));
+        Assert.Same("\\", ExceptionReport.Escape("\\", messageLimit: true));
         Assert.Equal("--\\>", ExceptionReport.Escape("-->", messageLimit: true));
-        Assert.Equal("\\\\--\\>", ExceptionReport.Escape("\\-->", messageLimit: true));
+        Assert.Equal("\\--\\>", ExceptionReport.Escape("\\-->", messageLimit: true));
         Assert.Equal("\\r\\n", ExceptionReport.Escape("\r\n", messageLimit: true));
         Assert.Equal("a \\| b --\\> c", ExceptionReport.Escape("a | b --> c", messageLimit: true));
         Assert.DoesNotContain("-->", ExceptionReport.Escape("-->", messageLimit: true), StringComparison.Ordinal);
@@ -203,7 +203,7 @@ public sealed class ExceptionFormatTests
             new Dictionary<string, object> { ["k"] = "x | y --> z" },
             new Dictionary<string, object> { ["p"] = "a|b" });
         var line = new PlainTextFormatter().Format(evt);
-        Assert.Contains("a \\| b | InvalidOperationException: a \\| b --\\> c\\\\d | props: p=a\\|b | ctx: k=x \\| y --\\> z", line, StringComparison.Ordinal);
+        Assert.Contains("a \\| b | InvalidOperationException: a \\| b --\\> c\\d | props: p=a\\|b | ctx: k=x \\| y --\\> z", line, StringComparison.Ordinal);
         var segments = SplitSegments(line);
         Assert.Contains(segments, segment => segment.Contains("InvalidOperationException:", StringComparison.Ordinal));
         var exceptionSegment = segments.First(segment => segment.StartsWith("InvalidOperationException:", StringComparison.Ordinal));
@@ -212,6 +212,142 @@ public sealed class ExceptionFormatTests
         Assert.Equal("x | y --> z", Unescape(ctx.Substring("ctx: k=".Length)));
         var props = segments.First(segment => segment.StartsWith("props:", StringComparison.Ordinal));
         Assert.Equal("a|b", Unescape(props.Substring("props: p=".Length)));
+    }
+
+    /// <summary>
+    /// A backslash is doubled only when the next raw character would read as an escape.
+    /// Plain text, the console fallback, and the file fallback apply that rule to the category,
+    /// the message, and context or property names and values. JSON keeps those characters raw.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Escape_BackslashDoublesOnlyWhereNeeded()
+    {
+        const string windows = "C:\\temp\\file.txt";
+        const string newPath = "C:\\new";
+        const string newReadme = "C:\\new\\readme";
+        Assert.Same(windows, ExceptionReport.EscapeLine(windows));
+        Assert.Equal("C:\\\\new", ExceptionReport.EscapeLine(newPath));
+        Assert.Equal("C:\\\\new\\\\readme", ExceptionReport.EscapeLine(newReadme));
+        Assert.Equal(windows, Unescape(ExceptionReport.EscapeLine(windows)));
+        Assert.Equal(newPath, Unescape(ExceptionReport.EscapeLine(newPath)));
+        Assert.Equal(newReadme, Unescape(ExceptionReport.EscapeLine(newReadme)));
+
+        Assert.Equal("--\\\\>", ExceptionReport.EscapeLine("--\\>"));
+        Assert.Equal("\\\\>", ExceptionReport.EscapeLine("\\>"));
+        Assert.Equal("--\\>", Unescape(ExceptionReport.EscapeLine("--\\>")));
+        Assert.Equal("\\>", Unescape(ExceptionReport.EscapeLine("\\>")));
+
+        Assert.Equal("\\\\\\n", ExceptionReport.EscapeLine("\\\n"));
+        Assert.Equal("\\\\\\r", ExceptionReport.EscapeLine("\\\r"));
+        Assert.Equal("\\\n", Unescape(ExceptionReport.EscapeLine("\\\n")));
+        Assert.Equal("\\\r", Unescape(ExceptionReport.EscapeLine("\\\r")));
+        Assert.Equal("\\\\\\|", ExceptionReport.EscapeLine("\\|"));
+        Assert.Equal("\\|", Unescape(ExceptionReport.EscapeLine("\\|")));
+        Assert.Equal("\\|C:\\temp\\", ExceptionReport.EscapeLine("|C:\\temp\\"));
+        Assert.Equal("|C:\\temp\\", Unescape(ExceptionReport.EscapeLine("|C:\\temp\\")));
+
+        var time = new DateTime(2026, 10, 21, 20, 55, 19);
+        var trailing = new LogEvent(time, LogLevel.Error, "pay\\", null, new Dictionary<string, object> { ["k"] = "v" });
+        var trailingLine = new PlainTextFormatter("yyyy-MM-dd HH:mm:ss").Format(trailing);
+        Assert.Equal("[2026-10-21 20:55:19] [Error] pay\\ | ctx: k=v", trailingLine);
+        Assert.Equal("pay\\", Unescape(SplitSegments(trailingLine)[0].Substring("[2026-10-21 20:55:19] [Error] ".Length)));
+
+        var exact = new string('x', 498) + "\\n";
+        Assert.Equal(500, exact.Length);
+        var exactEscaped = ExceptionReport.Escape(exact, messageLimit: true);
+        Assert.Equal(new string('x', 498) + "\\\\n", exactEscaped);
+        Assert.DoesNotContain("[truncated]", exactEscaped, StringComparison.Ordinal);
+        Assert.Equal(exact, Unescape(exactEscaped));
+
+        var boundary = new string('x', 498) + "\\ny";
+        var boundaryEscaped = ExceptionReport.Escape(boundary, messageLimit: true);
+        Assert.Equal(new string('x', 498) + "\\\\n [truncated]", boundaryEscaped);
+        Assert.Equal(new string('x', 498) + "\\n", Unescape(boundaryEscaped.Substring(0, boundaryEscaped.Length - " [truncated]".Length)));
+
+        var endSlash = new string('x', 499) + "\\|";
+        var endEscaped = ExceptionReport.Escape(endSlash, messageLimit: true);
+        Assert.Equal(new string('x', 499) + "\\ [truncated]", endEscaped);
+        Assert.Equal(new string('x', 499) + "\\", Unescape(endEscaped.Substring(0, endEscaped.Length - " [truncated]".Length)));
+
+        const string category = "C:\\new | forged\n";
+        var forged = new LogEvent(
+            time,
+            LogLevel.Error,
+            windows,
+            new InvalidOperationException("boom"),
+            new Dictionary<string, object> { ["k"] = newPath },
+            new Dictionary<string, object> { [newReadme] = "--\\>" },
+            Category: category);
+        const string plainLine =
+            "[2026-10-21 20:55:19] [Error] [C:\\\\new \\| forged\\n] C:\\temp\\file.txt | InvalidOperationException: boom | props: C:\\\\new\\\\readme=--\\\\> | ctx: k=C:\\\\new";
+        var plain = new PlainTextFormatter("yyyy-MM-dd HH:mm:ss").Format(forged);
+        Assert.Equal(plainLine, plain);
+        Assert.DoesNotContain("\n", plain, StringComparison.Ordinal);
+        Assert.DoesNotContain(" | forged", plain, StringComparison.Ordinal);
+        var categoryAt = plain.IndexOf("] [Error] [", StringComparison.Ordinal) + "] [Error] [".Length;
+        var categoryEnd = plain.IndexOf("] ", categoryAt, StringComparison.Ordinal);
+        Assert.Equal(category, Unescape(plain.Substring(categoryAt, categoryEnd - categoryAt)));
+        Assert.Equal(newPath, Unescape(plain.Substring(plain.IndexOf("ctx: k=", StringComparison.Ordinal) + "ctx: k=".Length)));
+
+        var noException = forged with { Exception = null, Context = null, Properties = null, Message = newPath };
+        Assert.Equal(
+            "[2026-10-21 20:55:19] [Error] [C:\\\\new \\| forged\\n] C:\\\\new",
+            new PlainTextFormatter("yyyy-MM-dd HH:mm:ss").Format(noException));
+
+        const string fallback =
+            "[2026-10-21 20:55:19] [Error] [C:\\\\new \\| forged\\n] C:\\temp\\file.txt | InvalidOperationException: boom | ctx: k=C:\\\\new";
+        var previous = Console.Out;
+        var buffer = new StringWriter();
+        Console.SetOut(buffer);
+        try
+        {
+            using var console = new ConsoleLogWriter(useColors: false);
+            console.Write(forged);
+        }
+        finally
+        {
+            Console.SetOut(previous);
+        }
+
+        Assert.Equal(fallback + Environment.NewLine, buffer.ToString());
+        Assert.DoesNotContain("props:", buffer.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("\n-->", buffer.ToString(), StringComparison.Ordinal);
+
+        var directory = Path.Combine(Path.GetTempPath(), "alog-exf-slash-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            using (var file = new FileLogWriter(path))
+                file.Write(forged);
+            Assert.Equal(fallback + Environment.NewLine, await File.ReadAllTextAsync(path));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+
+        buffer = new StringWriter();
+        Console.SetOut(buffer);
+        try
+        {
+            using var console = new ConsoleLogWriter(useColors: false, formatter: new PlainTextFormatter("yyyy-MM-dd HH:mm:ss"));
+            console.Write(forged);
+        }
+        finally
+        {
+            Console.SetOut(previous);
+        }
+
+        Assert.Equal(plainLine + Environment.NewLine, buffer.ToString());
+
+        using var document = JsonDocument.Parse(new JsonFormatter().Format(forged));
+        Assert.Equal(category, document.RootElement.GetProperty("category").GetString());
+        Assert.Equal(windows, document.RootElement.GetProperty("message").GetString());
+        Assert.Equal(newPath, document.RootElement.GetProperty("context").GetProperty("k").GetString());
+        Assert.Equal("--\\>", document.RootElement.GetProperty("properties").GetProperty(newReadme).GetString());
+
+        AssertEscapeAlphabet();
     }
 
     /// <summary>
@@ -1441,10 +1577,7 @@ public sealed class ExceptionFormatTests
             "a self-referencing exception built via reflection can overflow inside that call.",
             console,
             StringComparison.Ordinal);
-        Assert.Contains(
-            "\"\\\", \"|\", and \"-->\" in the message and in context or property names and values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\", so each event stays one line.",
-            changelog,
-            StringComparison.Ordinal);
+        Assert.Contains(ReadmeEscapeSentence, changelog, StringComparison.Ordinal);
         Assert.Contains("### Added", changelog, StringComparison.Ordinal);
         Assert.Contains(AddedSourceBullet, changelog, StringComparison.Ordinal);
         Assert.Contains(AddedStackBullet, changelog, StringComparison.Ordinal);
@@ -1569,6 +1702,46 @@ public sealed class ExceptionFormatTests
         }
 
         throw new InvalidOperationException("The task completed without throwing.");
+    }
+
+    /// <summary>
+    /// Encodes every string of length 0 through 6 on the escape alphabet and decodes it.
+    /// The alphabet is backslash, pipe, <c>r</c>, <c>n</c>, <c>&gt;</c>, dash, <c>x</c>, CR, and LF.
+    /// </summary>
+    private static void AssertEscapeAlphabet()
+    {
+        var alphabet = new[] { '\\', '|', 'r', 'n', '>', '-', 'x', '\r', '\n' };
+        var buffer = new char[6];
+        AssertRoundTrip(string.Empty);
+        for (var length = 1; length <= buffer.Length; length++)
+        {
+            var remaining = 1;
+            for (var n = 0; n < length; n++)
+                remaining *= alphabet.Length;
+            for (var step = 0; step < remaining; step++)
+            {
+                var value = step;
+                for (var i = length - 1; i >= 0; i--)
+                {
+                    buffer[i] = alphabet[value % alphabet.Length];
+                    value /= alphabet.Length;
+                }
+
+                AssertRoundTrip(new string(buffer, 0, length));
+            }
+        }
+    }
+
+    /// <summary>Encodes one string and checks that decoding returns it, with no raw line break left in the encoding.</summary>
+    /// <param name="raw">Original text. Not null. At most 6 characters in the alphabet walk.</param>
+    private static void AssertRoundTrip(string raw)
+    {
+        var escaped = ExceptionReport.EscapeLine(raw);
+        var decoded = Unescape(escaped);
+        if (!string.Equals(raw, decoded, StringComparison.Ordinal))
+            Assert.Equal(raw, decoded);
+        if (escaped.IndexOf('\r') >= 0 || escaped.IndexOf('\n') >= 0 || escaped.Contains("-->", StringComparison.Ordinal))
+            Assert.Fail("encoded text is still ambiguous: " + raw);
     }
 
     /// <summary>Reverses <see cref="ExceptionReport.Escape"/> so a round trip can prove the separators.</summary>

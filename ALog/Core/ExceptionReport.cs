@@ -269,7 +269,8 @@ internal static class ExceptionReport
 
     /// <summary>
     /// Escapes separators in text that is placed on a plain line.
-    /// The order is backslash, pipe, arrow, CR, then LF, so an inserted backslash is not escaped again.
+    /// A backslash is doubled only when the next raw character would make it read as an escape.
+    /// Pipe, arrow, CR, and LF are replaced after that, and inserted characters are not scanned again.
     /// </summary>
     /// <param name="text">Raw text. Not null. An exception message, a context value, or a property value.</param>
     /// <param name="messageLimit">
@@ -278,10 +279,12 @@ internal static class ExceptionReport
     /// </param>
     /// <returns>
     /// Escaped text. When the raw text was longer than the cap, <c> [truncated]</c> follows the escaped prefix.
+    /// The same instance when the kept text needed no change.
     /// </returns>
     /// <remarks>
     /// Does not throw. The marker is outside the raw cap, and the escaped prefix is not cut,
     /// so an escape sequence introduced by the replacement is never split.
+    /// <c>C:\temp</c> stays as written. <c>C:\new</c> doubles the backslash because <c>\n</c> is a line break.
     /// Does not change any other character, including Unicode.
     /// </remarks>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
@@ -307,12 +310,16 @@ internal static class ExceptionReport
     }
 
     /// <summary>
-    /// Escapes a log message or a key that is placed on a plain line.
+    /// Escapes a log message, a category, or a key that is placed on a plain line.
     /// There is no length cap; the scan stops at the end of <paramref name="text"/>.
     /// </summary>
-    /// <param name="text">Raw message or key. Null is treated as empty.</param>
+    /// <param name="text">Raw message, category, or key. Null is treated as empty.</param>
     /// <returns>The escaped text. The same instance when nothing had to change.</returns>
-    /// <remarks>Does not throw. A line break becomes the two characters <c>\n</c> or <c>\r</c>, so the event stays one line.</remarks>
+    /// <remarks>
+    /// Does not throw. A line break becomes the two characters <c>\n</c> or <c>\r</c>, so the event stays one line.
+    /// A backslash stays a single backslash unless the next raw character is <c>\</c>, <c>|</c>, <c>r</c>, <c>n</c>,
+    /// <c>&gt;</c>, CR, or LF.
+    /// </remarks>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal static string EscapeLine(string? text)
     {
@@ -1573,12 +1580,18 @@ internal static class ExceptionReport
     }
 
     /// <summary>
-    /// Applies the five escapes in one left-to-right pass.
-    /// Inserted backslashes are not scanned again, which matches backslash, then pipe, then arrow, then CR, then LF.
+    /// Applies the escapes in one left-to-right pass.
+    /// A raw backslash is doubled only when <see cref="DoublesBackslash"/> is true for the next character.
+    /// Inserted backslashes are not scanned again.
     /// </summary>
     /// <param name="text">Raw text. Not null. The caller already applied any length cap.</param>
     /// <returns>The escaped text, or <paramref name="text"/> itself when nothing had to change.</returns>
-    /// <remarks>Does not throw. The loop stops at <paramref name="text"/>.Length.</remarks>
+    /// <remarks>
+    /// Does not throw. The loop stops at <paramref name="text"/>.Length.
+    /// The scan stays a single comparison per character unless a backslash, pipe, line break, or arrow appears.
+    /// <c>\\</c>, <c>\|</c>, <c>\r</c>, <c>\n</c>, and <c>--\&gt;</c> are the only sequences a decoder treats as escapes.
+    /// Any other backslash stands for itself, so <c>C:\temp</c> is returned unchanged.
+    /// </remarks>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static string ApplyEscapes(string text)
     {
@@ -1593,39 +1606,109 @@ internal static class ExceptionReport
         return text;
     }
 
+    /// <summary>
+    /// True when a raw backslash must be doubled so the next character is not read as an escape.
+    /// </summary>
+    /// <param name="next">The raw character immediately after the backslash.</param>
+    /// <returns>
+    /// True for <c>\</c>, <c>|</c>, <c>r</c>, <c>n</c>, <c>&gt;</c>, CR, and LF.
+    /// False for every other character.
+    /// </returns>
+    /// <remarks>
+    /// Does not throw. CR and LF are included because those characters become <c>\r</c> and <c>\n</c>.
+    /// A raw backslash followed by LF must come out as <c>\\\n</c>, not <c>\\n</c>.
+    /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static bool DoublesBackslash(char next)
+    {
+        switch (next)
+        {
+            case '\\':
+            case '|':
+            case 'r':
+            case 'n':
+            case '>':
+            case '\r':
+            case '\n':
+                return true;
+            default:
+                return false;
+        }
+    }
+
     /// <summary>Writes the escaped form once a special character has been found.</summary>
     /// <param name="text">Raw text. Not null.</param>
-    /// <param name="found">Index of the first character that must be escaped. In range.</param>
-    /// <returns>The escaped copy. Never <paramref name="text"/>.</returns>
+    /// <param name="found">Index of the first character that might need escaping. In range.</param>
+    /// <returns>
+    /// The escaped copy, or <paramref name="text"/> itself when every backslash can stay a single backslash
+    /// and no separator or line break remains.
+    /// </returns>
     /// <remarks>
     /// Does not throw. The loop stops at <paramref name="text"/>.Length.
-    /// Characters before <paramref name="found"/> are copied unchanged.
+    /// Characters before the first real change are copied once. A backslash at the end of <paramref name="text"/> is copied once.
     /// </remarks>
     private static string ApplyEscapesSlow(string text, int found)
     {
-        var builder = new StringBuilder(text.Length + 8);
-        builder.Append(text, 0, found);
+        StringBuilder? builder = null;
         for (var i = found; i < text.Length; i++)
         {
             var ch = text[i];
             if (ch == '\\')
-                builder.Append("\\\\");
+            {
+                if (i + 1 < text.Length && DoublesBackslash(text[i + 1]))
+                {
+                    builder = EnsureBuilder(builder, text, i);
+                    builder.Append('\\');
+                    builder.Append('\\');
+                }
+                else if (builder != null)
+                {
+                    builder.Append('\\');
+                }
+            }
             else if (ch == '|')
+            {
+                builder = EnsureBuilder(builder, text, i);
                 builder.Append("\\|");
+            }
             else if (ch == '\r')
+            {
+                builder = EnsureBuilder(builder, text, i);
                 builder.Append("\\r");
+            }
             else if (ch == '\n')
+            {
+                builder = EnsureBuilder(builder, text, i);
                 builder.Append("\\n");
+            }
             else if (ch == '-' && i + 2 < text.Length && text[i + 1] == '-' && text[i + 2] == '>')
             {
+                builder = EnsureBuilder(builder, text, i);
                 builder.Append("--\\>");
                 i += 2;
             }
-            else
+            else if (builder != null)
+            {
                 builder.Append(ch);
+            }
         }
 
-        return builder.ToString();
+        return builder == null ? text : builder.ToString();
+    }
+
+    /// <summary>Starts the escaped copy at the first character that actually changes.</summary>
+    /// <param name="builder">The copy in progress, or null when every earlier character can stay.</param>
+    /// <param name="text">Raw text. Not null.</param>
+    /// <param name="index">Index of the character that must be written in escaped form.</param>
+    /// <returns>The builder, after the unchanged prefix has been copied.</returns>
+    /// <remarks>Does not throw. The prefix length is <paramref name="index"/>, which is at most <paramref name="text"/>.Length.</remarks>
+    private static StringBuilder EnsureBuilder(StringBuilder? builder, string text, int index)
+    {
+        if (builder != null)
+            return builder;
+        builder = new StringBuilder(text.Length + 8);
+        builder.Append(text, 0, index);
+        return builder;
     }
 
     /// <summary>
