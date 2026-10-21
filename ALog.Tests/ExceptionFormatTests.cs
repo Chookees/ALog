@@ -628,7 +628,7 @@ public sealed class ExceptionFormatTests
 
     /// <summary>
     /// <see cref="AggregateException"/> drops its own message, flattens nested aggregates, and counts that flat list.
-    /// The order matches <see cref="AggregateException.Flatten"/>.
+    /// The nested pair is finished before the siblings that follow it.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task Aggregate_FlattensAndCountsFlattenedList()
@@ -649,15 +649,50 @@ public sealed class ExceptionFormatTests
 
         var nested = new AggregateException(new InvalidOperationException("a"), new TimeoutException("b"));
         var outer = new AggregateException(nested, new IOException("c"), new InvalidOperationException("d"));
-        var flat = outer.Flatten().InnerExceptions;
-        Assert.Equal(4, flat.Count);
-        var expected = "AggregateException --> "
-            + flat[0].GetType().Name + ": " + flat[0].Message + "; "
-            + flat[1].GetType().Name + ": " + flat[1].Message + "; "
-            + flat[2].GetType().Name + ": " + flat[2].Message
-            + " (+1 more)";
-        Assert.Equal(expected, ExceptionReport.FormatText(outer));
-        Assert.DoesNotContain(flat[3].Message, ExceptionReport.FormatText(outer), StringComparison.Ordinal);
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: a; TimeoutException: b; IOException: c (+1 more)",
+            ExceptionReport.FormatText(outer));
+        Assert.DoesNotContain(": d", ExceptionReport.FormatText(outer), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Nested aggregates are depth-first in original order in the text and in JSON <c>inner</c>.
+    /// A left-to-right push reverses these lines.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_NestedOrderIsDepthFirst()
+    {
+        await Task.CompletedTask;
+        var pair = new AggregateException(
+            new AggregateException(new InvalidOperationException("first")),
+            new AggregateException(new InvalidOperationException("second")));
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: first; InvalidOperationException: second",
+            ExceptionReport.FormatText(pair));
+        AssertInnerMessages(pair, "first", "second");
+
+        var three = new AggregateException(
+            new AggregateException(
+                new AggregateException(new InvalidOperationException("1")),
+                new InvalidOperationException("2")),
+            new InvalidOperationException("3"));
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: 1; InvalidOperationException: 2; InvalidOperationException: 3",
+            ExceptionReport.FormatText(three));
+        AssertInnerMessages(three, "1", "2", "3");
+
+        var wide = new AggregateException(
+            new AggregateException(new InvalidOperationException("a"), new InvalidOperationException("b")),
+            new InvalidOperationException("c"),
+            new AggregateException(
+                new InvalidOperationException("d"),
+                new AggregateException(new InvalidOperationException("e"))));
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: a; InvalidOperationException: b; InvalidOperationException: c (+2 more)",
+            ExceptionReport.FormatText(wide));
+        Assert.DoesNotContain(": d", ExceptionReport.FormatText(wide), StringComparison.Ordinal);
+        Assert.DoesNotContain(": e", ExceptionReport.FormatText(wide), StringComparison.Ordinal);
+        AssertInnerMessages(wide, "a", "b", "c", "d", "e");
     }
 
     /// <summary>
@@ -1045,6 +1080,25 @@ public sealed class ExceptionFormatTests
         if (result is Task task)
             await task;
         Assert.NotNull(ExfTopLevel.TopLevelCapture.Awaited);
+    }
+
+    /// <summary>JSON <c>inner</c> messages, in walk order, match <paramref name="messages"/>.</summary>
+    /// <param name="exception">Exception whose body is read. Not null.</param>
+    /// <param name="messages">Expected messages. Not null.</param>
+    private static void AssertInnerMessages(Exception exception, params string[] messages)
+    {
+        var body = ExceptionReport.CreateBody(exception);
+        Assert.NotNull(body.Inner);
+        Assert.Equal(messages.Length, body.Inner.Count);
+        for (var i = 0; i < messages.Length; i++)
+            Assert.Equal(messages[i], body.Inner[i].Message);
+
+        var json = new JsonFormatter().Format(new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", exception));
+        using var doc = JsonDocument.Parse(json);
+        var inner = doc.RootElement.GetProperty("exception").GetProperty("inner");
+        Assert.Equal(messages.Length, inner.GetArrayLength());
+        for (var i = 0; i < messages.Length; i++)
+            Assert.Equal(messages[i], inner[i].GetProperty("message").GetString());
     }
 
     /// <summary>The event behind the README example, including the thrown card exception and one context value.</summary>

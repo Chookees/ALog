@@ -769,7 +769,7 @@ internal static class ExceptionReport
     /// <summary>Pushes flattened entries in reverse so the first entry is visited first.</summary>
     /// <param name="aggregate">Aggregate to expand. Not null.</param>
     /// <param name="pending">Explicit stack. Not null. Stops accepting entries at 64.</param>
-    /// <remarks>Uses <see cref="Flatten"/> so nested aggregates disappear in the same order as <see cref="AggregateException.Flatten"/>.</remarks>
+    /// <remarks>Uses <see cref="Flatten"/>, so JSON <c>inner</c> follows the same depth-first order as the text.</remarks>
     private static void EnqueueFlattened(AggregateException aggregate, List<Exception> pending)
     {
         var flat = Flatten(aggregate);
@@ -778,47 +778,47 @@ internal static class ExceptionReport
     }
 
     /// <summary>
-    /// Flattens nested aggregates with the same stack order as <see cref="AggregateException.Flatten"/>.
+    /// Flattens nested aggregates depth-first in original order.
     /// Non-aggregate entries are kept. The root aggregate is not an entry.
     /// </summary>
     /// <param name="root">Aggregate to flatten. Not null.</param>
     /// <returns>The flattened entries, at most 64.</returns>
     /// <remarks>
-    /// The loop is iterative and capped. A repeated aggregate instance is skipped so a cycle cannot spin.
-    /// Sibling non-aggregate exceptions are recorded before a nested aggregate that was seen earlier in the same list,
-    /// which is the order <see cref="AggregateException.Flatten"/> produces.
+    /// The leftmost child is visited before the next sibling, including when that child is itself an aggregate.
+    /// Children are pushed right to left so the explicit stack pops the left child first. A left-to-right push reverses the list.
+    /// The loop is iterative. It visits at most 64 aggregates and keeps at most 64 entries. A repeated aggregate instance is skipped.
     /// </remarks>
     private static List<Exception> Flatten(AggregateException root)
     {
         var result = new List<Exception>(8);
-        var stack = new List<AggregateException>(8);
+        var stack = new List<Exception>(8);
         var seen = new List<Exception>(8);
         stack.Add(root);
         var steps = 0;
-        while (stack.Count > 0 && result.Count < MaxFlatten && steps < MaxFlatten)
+        while (stack.Count > 0 && result.Count < MaxFlatten)
         {
-            steps++;
             var index = stack.Count - 1;
             var current = stack[index];
+            if (current is AggregateException && steps >= MaxFlatten)
+                break;
             stack.RemoveAt(index);
-            if (Contains(seen, current))
-                continue;
-            if (seen.Count < MaxFlatten)
-                seen.Add(current);
-            var inners = CopyInners(current);
-            var count = inners.Count;
-            for (var i = 0; i < count && result.Count < MaxFlatten; i++)
+            if (current is AggregateException aggregate)
             {
-                var inner = inners[i];
-                if (inner is AggregateException nested)
-                {
-                    if (stack.Count < MaxFlatten)
-                        stack.Add(nested);
-                }
-                else
-                {
-                    result.Add(inner);
-                }
+                steps++;
+                if (Contains(seen, aggregate))
+                    continue;
+                if (seen.Count < MaxFlatten)
+                    seen.Add(aggregate);
+                var inners = CopyInners(aggregate);
+                var room = MaxFlatten - stack.Count;
+                if (room > inners.Count)
+                    room = inners.Count;
+                for (var i = room - 1; i >= 0; i--)
+                    stack.Add(inners[i]);
+            }
+            else
+            {
+                result.Add(current);
             }
         }
 
