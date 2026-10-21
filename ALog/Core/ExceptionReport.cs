@@ -537,7 +537,7 @@ internal static class ExceptionReport
                 seen.Add(current);
             total++;
             if (parts.Count < MaxTextSegments)
-                parts.Add(current is AggregateException aggregate ? RenderAggregate(aggregate) : RenderOne(current));
+                parts.Add(current is AggregateException aggregate ? RenderAggregate(aggregate, seen) : RenderOne(current));
             if (current is AggregateException)
             {
                 current = null;
@@ -614,19 +614,21 @@ internal static class ExceptionReport
 
     /// <summary>
     /// Renders an aggregate without its own message.
-    /// Entries are depth-first, at most three, then <c>(+N more)</c> or <c>(+N+ more)</c>.
+    /// Entries follow <see cref="Flatten"/>, at most three, then <c>(+N more)</c> or <c>(+N+ more)</c>.
     /// An entry is rendered alone. Its inner exception is not part of the text.
+    /// An instance already on <paramref name="seen"/> is not repeated.
     /// </summary>
     /// <param name="exception">Aggregate on the chain. Not null.</param>
-    /// <returns>The aggregate node, including its entries.</returns>
+    /// <param name="seen">Instances already visited by this walk, including <paramref name="exception"/>. Not null.</param>
+    /// <returns>The aggregate node, including its new entries.</returns>
     /// <remarks>
     /// The aggregate's message is omitted because the runtime repeats the inner messages there.
     /// <c>N</c> is the number of flattened entries that were not shown.
     /// The extra plus means the flatten walk stopped at its cap with entries still unread.
     /// </remarks>
-    private static string RenderAggregate(AggregateException exception)
+    private static string RenderAggregate(AggregateException exception, List<Exception> seen)
     {
-        var flat = Flatten(exception);
+        var flat = Flatten(exception, seen);
         var type = DisplayName(exception);
         if (flat.Entries.Count == 0)
             return type;
@@ -973,16 +975,23 @@ internal static class ExceptionReport
         return "[" + new string(',', rank - 1) + "]";
     }
 
-    /// <summary>Full type name for JSON, which does not shorten <c>System.*</c>.</summary>
+    /// <summary>
+    /// JSON and HTTP <c>type</c>, the runtime <see cref="Type.FullName"/>.
+    /// Nested types keep <c>+</c>. Generic types keep the backtick form and the argument assemblies.
+    /// </summary>
     /// <param name="exception">Exception being described. Not null.</param>
-    /// <returns>The readable full name, without assembly qualification.</returns>
+    /// <returns>The full name, or the short name when <see cref="Type.FullName"/> is null.</returns>
     /// <remarks>
-    /// Does not throw. Nested types use a dot. Generic arguments follow the text rule:
-    /// <c>System</c> arguments are short, and every other argument keeps its namespace.
+    /// Does not throw. This is the string the formatter wrote before readable names.
+    /// Text output uses <see cref="DisplayName"/>. <c>source.method</c> uses <see cref="FrameTypeName"/>.
     /// </remarks>
     private static string SafeTypeName(Exception exception)
     {
-        return FormatTypeName(exception.GetType(), withNamespace: true, depth: 0);
+        var type = exception.GetType();
+        var full = type.FullName;
+        if (!string.IsNullOrEmpty(full))
+            return full;
+        return type.Name;
     }
 
     /// <summary>One JSON inner entry. Source comes from that entry's own stack, not from its children.</summary>
@@ -1099,7 +1108,7 @@ internal static class ExceptionReport
         var seen = new List<Exception>(MaxChain);
         seen.Add(root);
         var pending = new List<Exception>(MaxFlatten);
-        EnqueueChildren(root, pending);
+        EnqueueChildren(root, pending, seen);
         var steps = 0;
         while (pending.Count > 0 && result.Count < MaxChain && steps < MaxChain)
         {
@@ -1113,7 +1122,15 @@ internal static class ExceptionReport
                 seen.Add(current);
             if (current is AggregateException aggregate)
             {
-                EnqueueFlattened(aggregate, pending);
+                var flat = Flatten(aggregate, seen);
+                if (flat.Entries.Count == 0 && ChildrenAreAlreadyVisited(aggregate, seen))
+                    result.Add(aggregate);
+                else
+                {
+                    for (var i = flat.Entries.Count - 1; i >= 0 && pending.Count < MaxFlatten; i--)
+                        pending.Add(flat.Entries[i]);
+                }
+
                 continue;
             }
 
@@ -1128,12 +1145,13 @@ internal static class ExceptionReport
     /// <summary>Pushes the first level of children of the outermost exception.</summary>
     /// <param name="exception">Outermost exception. Not null.</param>
     /// <param name="pending">Explicit stack. Not null.</param>
+    /// <param name="seen">Instances already visited, including <paramref name="exception"/>. Not null.</param>
     /// <remarks>A root aggregate pushes flattened entries so the wrapper is not also an inner entry.</remarks>
-    private static void EnqueueChildren(Exception exception, List<Exception> pending)
+    private static void EnqueueChildren(Exception exception, List<Exception> pending, List<Exception> seen)
     {
         if (exception is AggregateException aggregate)
         {
-            EnqueueFlattened(aggregate, pending);
+            EnqueueFlattened(aggregate, pending, seen);
             return;
         }
 
@@ -1144,68 +1162,110 @@ internal static class ExceptionReport
     /// <summary>Pushes flattened entries in reverse so the first entry is visited first.</summary>
     /// <param name="aggregate">Aggregate to expand. Not null.</param>
     /// <param name="pending">Explicit stack. Not null. Stops accepting entries at 64.</param>
-    /// <remarks>Uses <see cref="Flatten"/>, so JSON <c>inner</c> follows the same depth-first order as the text.</remarks>
-    private static void EnqueueFlattened(AggregateException aggregate, List<Exception> pending)
+    /// <param name="seen">Instances already visited by the outer walk. Not null.</param>
+    /// <remarks>Uses <see cref="Flatten"/>, so JSON <c>inner</c> follows the same order as the text.</remarks>
+    private static void EnqueueFlattened(AggregateException aggregate, List<Exception> pending, List<Exception> seen)
     {
-        var flat = Flatten(aggregate);
+        var flat = Flatten(aggregate, seen);
         for (var i = flat.Entries.Count - 1; i >= 0 && pending.Count < MaxFlatten; i--)
             pending.Add(flat.Entries[i]);
     }
 
     /// <summary>
-    /// Flattens nested aggregates depth-first in original order.
+    /// True when every direct child is already in <paramref name="seen"/>.
+    /// An empty aggregate and a truncated child list are false.
+    /// </summary>
+    /// <param name="aggregate">Aggregate whose children are checked. Not null.</param>
+    /// <param name="seen">Instances already visited. Not null.</param>
+    /// <returns>True when each readable child is the same instance as one already visited.</returns>
+    /// <remarks>Does not throw. The child loop stops at 64. A null child was not copied and does not count.</remarks>
+    private static bool ChildrenAreAlreadyVisited(AggregateException aggregate, List<Exception> seen)
+    {
+        var inners = CopyInners(aggregate, out var truncated);
+        if (truncated || inners.Count == 0)
+            return false;
+        for (var i = 0; i < inners.Count; i++)
+        {
+            if (!Contains(seen, inners[i]))
+                return false;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Flattens nested aggregates in the same order as <see cref="AggregateException.Flatten"/>.
     /// Non-aggregate entries are kept. The root aggregate is not an entry.
     /// </summary>
     /// <param name="root">Aggregate to flatten. Not null.</param>
+    /// <param name="externalSeen">
+    /// Instances already visited by the caller. A child in this list is not emitted again.
+    /// Not null. The root is still processed when it appears here.
+    /// </param>
     /// <returns>The flattened entries, at most 64, and whether the walk stopped with nodes still unread.</returns>
     /// <remarks>
-    /// The leftmost child is visited before the next sibling, including when that child is itself an aggregate.
-    /// Children are pushed right to left so the explicit stack pops the left child first. A left-to-right push reverses the list.
-    /// The loop is iterative. It visits at most 16 aggregates and keeps at most 64 entries.
+    /// Each aggregate appends its non-aggregate children immediately, in order, and appends nested
+    /// aggregates to the end of the work list. <c>Agg(x, Agg(y), z)</c> is <c>x, z, y</c>.
+    /// The method does not call <see cref="AggregateException.Flatten"/>, because that loops on a reflective cycle.
+    /// The loop visits at most 16 aggregates and keeps at most 64 entries.
     /// A repeated aggregate instance is skipped by <see cref="object.ReferenceEquals"/> and does not mark the walk incomplete.
     /// </remarks>
-    private static (List<Exception> Entries, bool Incomplete) Flatten(AggregateException root)
+    private static (List<Exception> Entries, bool Incomplete) Flatten(AggregateException root, List<Exception> externalSeen)
     {
         var result = new List<Exception>(8);
-        var stack = new List<Exception>(8);
+        var work = new List<AggregateException>(8);
         var seen = new List<Exception>(8);
-        stack.Add(root);
-        var steps = 0;
+        work.Add(root);
+        var read = 0;
         var incomplete = false;
-        while (stack.Count > 0 && result.Count < MaxFlatten)
+        while (read < work.Count && result.Count < MaxFlatten)
         {
-            var index = stack.Count - 1;
-            var current = stack[index];
-            stack.RemoveAt(index);
-            if (current is not AggregateException aggregate)
-            {
-                result.Add(current);
-                continue;
-            }
-
+            var aggregate = work[read];
+            read++;
             if (Contains(seen, aggregate))
                 continue;
-            if (steps >= MaxChain || seen.Count >= MaxChain)
+            if (seen.Count >= MaxChain)
             {
                 incomplete = true;
                 continue;
             }
 
-            steps++;
             seen.Add(aggregate);
             var inners = CopyInners(aggregate, out var truncated);
             if (truncated)
                 incomplete = true;
-            var room = MaxFlatten - stack.Count;
-            if (room > inners.Count)
-                room = inners.Count;
-            if (room < inners.Count)
-                incomplete = true;
-            for (var i = room - 1; i >= 0; i--)
-                stack.Add(inners[i]);
+            for (var i = 0; i < inners.Count; i++)
+            {
+                var child = inners[i];
+                if (child is AggregateException nested)
+                {
+                    if (Contains(seen, nested) || Contains(externalSeen, nested))
+                        continue;
+                    if (work.Count >= MaxFlatten)
+                    {
+                        incomplete = true;
+                        continue;
+                    }
+
+                    work.Add(nested);
+                }
+                else if (Contains(externalSeen, child))
+                {
+                    continue;
+                }
+                else if (result.Count >= MaxFlatten)
+                {
+                    incomplete = true;
+                    break;
+                }
+                else
+                {
+                    result.Add(child);
+                }
+            }
         }
 
-        if (stack.Count > 0)
+        if (read < work.Count)
             incomplete = true;
         return (result, incomplete);
     }

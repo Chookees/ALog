@@ -62,6 +62,9 @@ public sealed class ExceptionFormatTests
             ExceptionReport.FormatText(new Microsoft.Data.Demo.DemoException("no")));
         Assert.Equal("System.IO.File", ExceptionReport.FrameTypeName(typeof(File)));
         Assert.Equal("CheckoutService", ExceptionReport.FrameTypeName(typeof(ALog.QuickstartSample.CheckoutService)));
+        Assert.Equal(
+            "SystemsCorp.FooException: bill",
+            ExceptionReport.FormatText(new SystemsCorp.FooException("bill")));
     }
 
     /// <summary>
@@ -78,7 +81,7 @@ public sealed class ExceptionFormatTests
         Assert.Equal("ALog.Tests.ExceptionFormatTests.NullMessage", ExceptionReport.FormatText(new NullMessage()));
         Assert.Equal("ALog.Tests.ExceptionFormatTests.WhitespaceMessage", ExceptionReport.FormatText(new WhitespaceMessage()));
         Assert.DoesNotContain("+", ExceptionReport.FormatText(new SilentException()), StringComparison.Ordinal);
-        Assert.Equal("ALog.Tests.ExceptionFormatTests.SilentException", ExceptionReport.CreateBody(new SilentException()).Type);
+        Assert.Equal(typeof(SilentException).FullName, ExceptionReport.CreateBody(new SilentException()).Type);
         Assert.Equal("InvalidOperationException:   hi  ", ExceptionReport.FormatText(new InvalidOperationException("  hi  ")));
         Assert.Equal(
             "Exception: Exception of type 'X' was thrown. extra",
@@ -802,7 +805,7 @@ public sealed class ExceptionFormatTests
 
     /// <summary>
     /// <see cref="AggregateException"/> drops its own message, flattens nested aggregates, and counts that flat list.
-    /// The nested pair is finished before the siblings that follow it.
+    /// Non-aggregate siblings are emitted before a nested aggregate is opened.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task Aggregate_FlattensAndCountsFlattenedList()
@@ -824,36 +827,28 @@ public sealed class ExceptionFormatTests
         var nested = new AggregateException(new InvalidOperationException("a"), new TimeoutException("b"));
         var outer = new AggregateException(nested, new IOException("c"), new InvalidOperationException("d"));
         Assert.Equal(
-            "AggregateException --> InvalidOperationException: a; TimeoutException: b; IOException: c (+1 more)",
+            "AggregateException --> IOException: c; InvalidOperationException: d; InvalidOperationException: a (+1 more)",
             ExceptionReport.FormatText(outer));
-        Assert.DoesNotContain(": d", ExceptionReport.FormatText(outer), StringComparison.Ordinal);
+        Assert.DoesNotContain(": b", ExceptionReport.FormatText(outer), StringComparison.Ordinal);
     }
 
     /// <summary>
-    /// Nested aggregates are depth-first in original order in the text and in JSON <c>inner</c>.
-    /// A left-to-right push reverses these lines.
+    /// Nested aggregates follow <see cref="AggregateException.Flatten"/>: non-aggregate siblings first,
+    /// nested aggregates later. Text and JSON <c>inner</c> use that order.
+    /// One thousand random acyclic trees, from a fixed seed, match <c>Flatten().InnerExceptions</c>.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task Aggregate_NestedOrderIsDepthFirst()
+    public async Task Aggregate_OrderMatchesFlatten()
     {
         await Task.CompletedTask;
-        var pair = new AggregateException(
-            new AggregateException(new InvalidOperationException("first")),
-            new AggregateException(new InvalidOperationException("second")));
+        var x = new InvalidOperationException("x");
+        var y = new InvalidOperationException("y");
+        var z = new InvalidOperationException("z");
+        var first = new AggregateException(x, new AggregateException(y), z);
         Assert.Equal(
-            "AggregateException --> InvalidOperationException: first; InvalidOperationException: second",
-            ExceptionReport.FormatText(pair));
-        AssertInnerMessages(pair, "first", "second");
-
-        var three = new AggregateException(
-            new AggregateException(
-                new AggregateException(new InvalidOperationException("1")),
-                new InvalidOperationException("2")),
-            new InvalidOperationException("3"));
-        Assert.Equal(
-            "AggregateException --> InvalidOperationException: 1; InvalidOperationException: 2; InvalidOperationException: 3",
-            ExceptionReport.FormatText(three));
-        AssertInnerMessages(three, "1", "2", "3");
+            "AggregateException --> InvalidOperationException: x; InvalidOperationException: z; InvalidOperationException: y",
+            ExceptionReport.FormatText(first));
+        AssertSameOrder(first, first.Flatten().InnerExceptions);
 
         var wide = new AggregateException(
             new AggregateException(new InvalidOperationException("a"), new InvalidOperationException("b")),
@@ -861,12 +856,25 @@ public sealed class ExceptionFormatTests
             new AggregateException(
                 new InvalidOperationException("d"),
                 new AggregateException(new InvalidOperationException("e"))));
+        var wideText = ExceptionReport.FormatText(wide);
         Assert.Equal(
-            "AggregateException --> InvalidOperationException: a; InvalidOperationException: b; InvalidOperationException: c (+2 more)",
-            ExceptionReport.FormatText(wide));
-        Assert.DoesNotContain(": d", ExceptionReport.FormatText(wide), StringComparison.Ordinal);
-        Assert.DoesNotContain(": e", ExceptionReport.FormatText(wide), StringComparison.Ordinal);
-        AssertInnerMessages(wide, "a", "b", "c", "d", "e");
+            "AggregateException --> InvalidOperationException: c; InvalidOperationException: a; InvalidOperationException: b (+2 more)",
+            wideText);
+        Assert.DoesNotContain(": d", wideText, StringComparison.Ordinal);
+        Assert.DoesNotContain(": e", wideText, StringComparison.Ordinal);
+        Assert.Contains("(+2 more)", wideText, StringComparison.Ordinal);
+        Assert.DoesNotContain("(+2+ more)", wideText, StringComparison.Ordinal);
+        AssertSameOrder(wide, wide.Flatten().InnerExceptions);
+
+        var random = new Random(20261021);
+        for (var trial = 0; trial < 1000; trial++)
+        {
+            var nextId = 0;
+            var leavesLeft = 12;
+            var aggsLeft = 5;
+            var root = RandomAggregate(random, ref nextId, ref leavesLeft, ref aggsLeft, 0);
+            AssertSameOrder(root, root.Flatten().InnerExceptions);
+        }
     }
 
     /// <summary>
@@ -1121,6 +1129,9 @@ public sealed class ExceptionFormatTests
         var boundaryText = ExceptionReport.Escape(boundary, messageLimit: true);
         Assert.Equal(new string('x', 499) + "\\|", boundaryText);
         Assert.DoesNotContain("[truncated]", boundaryText, StringComparison.Ordinal);
+        Assert.Equal(
+            "InvalidOperationException: " + new string('x', 499) + "\\|",
+            ExceptionReport.FormatText(new InvalidOperationException(boundary)));
 
         var over = ExceptionReport.Escape(new string('x', 500) + "|", messageLimit: true);
         Assert.Equal(new string('x', 500) + " [truncated]", over);
@@ -1226,6 +1237,76 @@ public sealed class ExceptionFormatTests
     }
 
     /// <summary>
+    /// A wrap whose inner aggregate points back at the wrap is one shared walk.
+    /// Text and JSON list the same instances, and the wrap is not repeated inside the aggregate.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Robustness_CycleThroughAggregateEntryIsShared()
+    {
+        await Task.CompletedTask;
+        var wrap = new InvalidOperationException("wrap");
+        var aggregate = new AggregateException(wrap);
+        var field = typeof(Exception).GetField("_innerException", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        field.SetValue(wrap, aggregate);
+
+        var text = ExceptionReport.FormatText(wrap);
+        Assert.Equal("InvalidOperationException: wrap --> AggregateException", text);
+        var again = text.IndexOf("InvalidOperationException: wrap", StringComparison.Ordinal);
+        Assert.True(again >= 0);
+        Assert.Equal(-1, text.IndexOf("InvalidOperationException: wrap", again + 1, StringComparison.Ordinal));
+
+        var body = ExceptionReport.CreateBody(wrap);
+        Assert.Equal(wrap.GetType().FullName, body.Type);
+        Assert.NotNull(body.Inner);
+        Assert.Single(body.Inner);
+        Assert.Equal(aggregate.GetType().FullName, body.Inner[0].Type);
+
+        var json = new JsonFormatter().Format(new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", wrap));
+        using var doc = JsonDocument.Parse(json);
+        var node = doc.RootElement.GetProperty("exception");
+        Assert.Equal(body.Type, node.GetProperty("type").GetString());
+        var jsonInner = node.GetProperty("inner");
+        Assert.Equal(1, jsonInner.GetArrayLength());
+        Assert.Equal(body.Inner[0].Type, jsonInner[0].GetProperty("type").GetString());
+        Assert.Equal(body.Inner[0].Message, jsonInner[0].GetProperty("message").GetString());
+    }
+
+    /// <summary>
+    /// JSON and HTTP <c>type</c> stay <see cref="Type.FullName"/> for a nested type and a generic type.
+    /// Text keeps the readable name, and <c>inner[].type</c> uses the same raw full name.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Json_TypeMatchesRuntimeFullName()
+    {
+        await Task.CompletedTask;
+        var nested = new Outer.NestedEx("boom");
+        var generic = new GenEx<int>("n");
+        Assert.Equal("ALog.Tests.Naming.Outer.NestedEx: boom", ExceptionReport.FormatText(nested));
+        Assert.DoesNotContain("+", ExceptionReport.FormatText(nested), StringComparison.Ordinal);
+        Assert.Equal(nested.GetType().FullName, ExceptionReport.CreateBody(nested).Type);
+        Assert.Contains("+", nested.GetType().FullName, StringComparison.Ordinal);
+        Assert.Equal(generic.GetType().FullName, ExceptionReport.CreateBody(generic).Type);
+        Assert.Contains("`", generic.GetType().FullName, StringComparison.Ordinal);
+
+        var wrapped = new InvalidOperationException("outer", nested);
+        var wrappedBody = ExceptionReport.CreateBody(wrapped);
+        Assert.NotNull(wrappedBody.Inner);
+        Assert.Equal(nested.GetType().FullName, wrappedBody.Inner[0].Type);
+
+        var evt = new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", generic);
+        var json = new JsonFormatter().Format(evt);
+        using var document = JsonDocument.Parse(json);
+        Assert.Equal(generic.GetType().FullName, document.RootElement.GetProperty("exception").GetProperty("type").GetString());
+
+        var handler = new CapturingHttpHandler();
+        using var client = new HttpClient(handler);
+        using var http = new HttpLogWriter("https://example.test/logs", httpClient: client);
+        http.Write(evt);
+        AssertEqualException(json, handler.Requests[0].Body);
+    }
+
+    /// <summary>
     /// Generic and nested types use C# syntax, frames use that same form, and text omits an aggregate entry's inner exception.
     /// JSON keeps the entry and that inner exception, in that order.
     /// </summary>
@@ -1236,12 +1317,18 @@ public sealed class ExceptionFormatTests
         Assert.Equal(
             "ALog.Tests.Naming.GenEx<Int32>: n",
             ExceptionReport.FormatText(new GenEx<int>("n")));
-        Assert.Equal(
-            "ALog.Tests.Naming.GenEx<Int32>",
-            ExceptionReport.CreateBody(new GenEx<int>("n")).Type);
-        var genericJson = new JsonFormatter().Format(new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", new GenEx<int>("n")));
-        Assert.DoesNotContain("PublicKeyToken", genericJson, StringComparison.Ordinal);
-        Assert.DoesNotContain("`", genericJson, StringComparison.Ordinal);
+        var genericEx = new GenEx<int>("n");
+        Assert.Equal(genericEx.GetType().FullName, ExceptionReport.CreateBody(genericEx).Type);
+        var genericJson = new JsonFormatter().Format(new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", genericEx));
+        using (var genericDoc = JsonDocument.Parse(genericJson))
+        {
+            var genericType = genericDoc.RootElement.GetProperty("exception").GetProperty("type").GetString();
+            Assert.Equal(genericEx.GetType().FullName, genericType);
+            Assert.Contains("`", genericType, StringComparison.Ordinal);
+            Assert.Contains("PublicKeyToken", genericType, StringComparison.Ordinal);
+        }
+
+        Assert.DoesNotContain("GenEx<Int32>", genericJson, StringComparison.Ordinal);
         Assert.Equal(
             "ALog.Tests.Naming.GenEx<List<Int32>>: n",
             ExceptionReport.FormatText(new GenEx<List<int>>("n")));
@@ -1332,8 +1419,8 @@ public sealed class ExceptionFormatTests
         for (var i = 0; i < crowded.Length; i++)
             crowded[i] = new InvalidOperationException("p" + i.ToString(System.Globalization.CultureInfo.InvariantCulture));
         var crowdedText = ExceptionReport.FormatText(new AggregateException(new AggregateException(crowded), new InvalidOperationException("side")));
-        Assert.Contains("(+61+ more)", crowdedText, StringComparison.Ordinal);
-        Assert.DoesNotContain("side", crowdedText, StringComparison.Ordinal);
+        Assert.Contains("InvalidOperationException: side; InvalidOperationException: p0; InvalidOperationException: p1 (+61+ more)", crowdedText, StringComparison.Ordinal);
+        Assert.DoesNotContain("p63", crowdedText, StringComparison.Ordinal);
 
         var left = new Exception[40];
         var right = new Exception[40];
@@ -1613,6 +1700,66 @@ public sealed class ExceptionFormatTests
         if (result is Task task)
             await task;
         Assert.NotNull(ExfTopLevel.TopLevelCapture.Awaited);
+    }
+
+    /// <summary>
+    /// JSON <c>inner</c> messages equal <paramref name="expected"/>, which is a real <c>Flatten()</c> list.
+    /// </summary>
+    /// <param name="exception">Aggregate under test. Not null. Acyclic.</param>
+    /// <param name="expected">Entries from <see cref="AggregateException.Flatten"/>. Not null.</param>
+    private static void AssertSameOrder(AggregateException exception, System.Collections.ObjectModel.ReadOnlyCollection<Exception> expected)
+    {
+        var body = ExceptionReport.CreateBody(exception);
+        var actual = new List<string>(expected.Count);
+        if (body.Inner != null)
+        {
+            for (var i = 0; i < body.Inner.Count; i++)
+                actual.Add(body.Inner[i].Message ?? string.Empty);
+        }
+
+        var wanted = new List<string>(expected.Count);
+        var limit = expected.Count;
+        if (limit > 16)
+            limit = 16;
+        for (var i = 0; i < limit; i++)
+            wanted.Add(expected[i].Message);
+        Assert.Equal(wanted, actual);
+    }
+
+    /// <summary>Builds one acyclic aggregate. The budgets keep the leaf count inside the JSON cap.</summary>
+    /// <param name="random">Fixed-seed generator. Not null.</param>
+    /// <param name="nextId">Next leaf id. Updated.</param>
+    /// <param name="leavesLeft">Leaves still allowed. Updated.</param>
+    /// <param name="aggsLeft">Nested aggregates still allowed. Updated.</param>
+    /// <param name="depth">Current depth. The walk stops nesting at 4.</param>
+    /// <returns>A new aggregate. Not null.</returns>
+    private static AggregateException RandomAggregate(Random random, ref int nextId, ref int leavesLeft, ref int aggsLeft, int depth)
+    {
+        var width = 1 + random.Next(3);
+        var children = new List<Exception>(width);
+        for (var i = 0; i < width; i++)
+        {
+            var nest = depth < 3 && aggsLeft > 0 && leavesLeft > 1 && random.Next(0, 2) == 0;
+            if (nest)
+            {
+                aggsLeft--;
+                children.Add(RandomAggregate(random, ref nextId, ref leavesLeft, ref aggsLeft, depth + 1));
+            }
+            else if (leavesLeft > 0)
+            {
+                leavesLeft--;
+                children.Add(new InvalidOperationException("n" + nextId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                nextId++;
+            }
+        }
+
+        if (children.Count == 0)
+        {
+            children.Add(new InvalidOperationException("n" + nextId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            nextId++;
+        }
+
+        return new AggregateException(children.ToArray());
     }
 
     /// <summary>JSON <c>inner</c> messages, in walk order, match <paramref name="messages"/>.</summary>
