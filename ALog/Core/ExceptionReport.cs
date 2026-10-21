@@ -1,5 +1,6 @@
 namespace ALog.Core;
 
+using System.Buffers;
 using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
@@ -57,6 +58,9 @@ internal static class ExceptionReport
     /// <summary>Stored message field. Reading it does not walk inner exceptions.</summary>
     private static readonly FieldInfo? ExceptionMessageField =
         typeof(Exception).GetField("_message", BindingFlags.Instance | BindingFlags.NonPublic);
+
+    /// <summary>Characters that can start an escape. A hyphen is included because <c>--&gt;</c> starts with one.</summary>
+    private static readonly SearchValues<char> EscapeChars = SearchValues.Create("\\|\r\n-");
 
     /// <summary>
     /// Renders one exception as the plain-text segment shared by every text sink.
@@ -580,21 +584,22 @@ internal static class ExceptionReport
     /// <remarks>The message is the raw getter result. The stack string is the raw <see cref="Exception.StackTrace"/>.</remarks>
     private static ExceptionBody CreateBodyCore(Exception exception)
     {
+        var stacks = new Dictionary<Exception, string?>(8);
         var inners = CollectInners(exception);
         List<ExceptionInner>? inner = null;
         if (inners.Count > 0)
         {
             inner = new List<ExceptionInner>(inners.Count);
             for (var i = 0; i < inners.Count; i++)
-                inner.Add(ToInner(inners[i]));
+                inner.Add(ToInner(inners[i], stacks));
         }
 
         return new ExceptionBody
         {
             Type = SafeTypeName(exception),
             Message = RawMessage(exception),
-            StackTrace = ReadStackProperty(exception),
-            Source = SourceOf(FindOrigin(exception)),
+            StackTrace = ReadStackCached(exception, stacks),
+            Source = SourceOf(FindOrigin(exception, stacks)),
             Inner = inner
         };
     }
@@ -996,15 +1001,16 @@ internal static class ExceptionReport
 
     /// <summary>One JSON inner entry. Source comes from that entry's own stack, not from its children.</summary>
     /// <param name="exception">An inner exception. Not null.</param>
+    /// <param name="stacks">Stack strings already read for this build. Not null. Shared with the origin walk.</param>
     /// <returns>The entry. Source is null when this exception has no readable stack.</returns>
-    /// <remarks>Does not throw.</remarks>
-    private static ExceptionInner ToInner(Exception exception)
+    /// <remarks>Does not throw. The stack string is read at most once for this instance.</remarks>
+    private static ExceptionInner ToInner(Exception exception, Dictionary<Exception, string?> stacks)
     {
         return new ExceptionInner
         {
             Type = SafeTypeName(exception),
             Message = RawMessage(exception),
-            Source = SourceOf(HasStack(exception) ? exception : null)
+            Source = SourceOf(HasStack(exception, stacks) ? exception : null)
         };
     }
 
@@ -1034,12 +1040,16 @@ internal static class ExceptionReport
 
     /// <summary>Innermost exception that has a stack, or null when none do.</summary>
     /// <param name="exception">Outermost exception. Not null.</param>
+    /// <param name="stacks">
+    /// Stack strings already read for this build, or null when each exception is read once.
+    /// A JSON build passes the same map the inner entries used.
+    /// </param>
     /// <returns>The deepest exception whose stack string is non-empty.</returns>
     /// <remarks>
     /// Depth follows <see cref="Exception.InnerException"/> and each aggregate child.
     /// The walk stops at 16 levels and 64 nodes, and a repeated instance is a cycle.
     /// </remarks>
-    private static Exception? FindOrigin(Exception exception)
+    private static Exception? FindOrigin(Exception exception, Dictionary<Exception, string?>? stacks = null)
     {
         Exception? best = null;
         var bestDepth = -1;
@@ -1059,7 +1069,7 @@ internal static class ExceptionReport
                 continue;
             if (seen.Count < MaxFlatten)
                 seen.Add(item.Exception);
-            if (HasStack(item.Exception) && item.Depth > bestDepth)
+            if (HasStack(item.Exception, stacks) && item.Depth > bestDepth)
             {
                 best = item.Exception;
                 bestDepth = item.Depth;
@@ -1327,11 +1337,32 @@ internal static class ExceptionReport
 
     /// <summary>True when the stack string can be read and is not empty.</summary>
     /// <param name="exception">Exception to test. Not null.</param>
+    /// <param name="stacks">Cache of stack strings for this build, or null to read the getter every time.</param>
     /// <returns>False when the getter throws or returns blank text.</returns>
     /// <remarks>Does not throw. A throw is treated as "no stack" so the caller can pick another exception or omit <c>at</c>.</remarks>
-    private static bool HasStack(Exception exception)
+    private static bool HasStack(Exception exception, Dictionary<Exception, string?>? stacks = null)
     {
-        return !string.IsNullOrWhiteSpace(ReadStackProperty(exception));
+        return !string.IsNullOrWhiteSpace(ReadStackCached(exception, stacks));
+    }
+
+    /// <summary>
+    /// Reads <see cref="Exception.StackTrace"/> once per exception during a single JSON build.
+    /// The runtime allocates a new string on every get, so a repeated instance returns the stored string.
+    /// </summary>
+    /// <param name="exception">Exception whose stack string is needed. Not null.</param>
+    /// <param name="stacks">
+    /// Cache for this build, or null when the caller reads each exception once.
+    /// Not retained after the build returns.
+    /// </param>
+    /// <returns>The raw stack string, or null when it is missing or the getter throws.</returns>
+    /// <remarks>Does not throw. A null cache always reads the getter.</remarks>
+    private static string? ReadStackCached(Exception exception, Dictionary<Exception, string?>? stacks)
+    {
+        if (stacks != null && stacks.TryGetValue(exception, out var cached))
+            return cached;
+        var text = ReadStackProperty(exception);
+        stacks?.Add(exception, text);
+        return text;
     }
 
     /// <summary>Reads <see cref="Exception.StackTrace"/> for the JSON field and for <see cref="HasStack"/>.</summary>
@@ -1647,22 +1678,17 @@ internal static class ExceptionReport
     /// <param name="text">Raw text. Not null. The caller already applied any length cap.</param>
     /// <returns>The escaped text, or <paramref name="text"/> itself when nothing had to change.</returns>
     /// <remarks>
-    /// Does not throw. The loop stops at <paramref name="text"/>.Length.
-    /// The scan stays a single comparison per character unless a backslash, pipe, line break, or arrow appears.
+    /// Does not throw. The fast path stops at the first backslash, pipe, line break, or hyphen.
+    /// When none of those characters appear, the original string is returned and nothing is allocated.
     /// <c>\\</c>, <c>\|</c>, <c>\r</c>, <c>\n</c>, and <c>--\&gt;</c> are the only sequences a decoder treats as escapes.
     /// Any other backslash stands for itself, so <c>C:\temp</c> is returned unchanged.
     /// </remarks>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static string ApplyEscapes(string text)
     {
-        for (var i = 0; i < text.Length; i++)
-        {
-            var ch = text[i];
-            if (ch == '\\' || ch == '|' || ch == '\r' || ch == '\n'
-                || (ch == '-' && i + 2 < text.Length && text[i + 1] == '-' && text[i + 2] == '>'))
-                return ApplyEscapesSlow(text, i);
-        }
-
+        var found = text.AsSpan().IndexOfAny(EscapeChars);
+        if (found >= 0)
+            return ApplyEscapesSlow(text, found);
         return text;
     }
 
@@ -1707,6 +1733,7 @@ internal static class ExceptionReport
     /// Does not throw. The loop stops at <paramref name="text"/>.Length.
     /// Characters before the first real change are copied once. A backslash at the end of <paramref name="text"/> is copied once.
     /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static string ApplyEscapesSlow(string text, int found)
     {
         StringBuilder? builder = null;
