@@ -1,3 +1,7 @@
+using ALog;
+using ALog.Core;
+using ALog.Writers.Console;
+
 try
 {
     await Task.Yield();
@@ -14,6 +18,17 @@ ExfTopLevel.TopLevelCapture.Lambda = CatchLambda();
 ExfTopLevel.TopLevelCapture.Local = CatchLocal();
 ExfTopLevel.TopLevelCapture.AsyncLambda = await CatchAsyncLambda();
 ExfTopLevel.TopLevelCapture.AsyncLocal = await CatchAsyncLocal();
+
+if (Environment.GetEnvironmentVariable("EXF_TOPLEVEL_PRINT") == "1"
+    && ExfTopLevel.TopLevelCapture.Awaited is { } awaited)
+{
+    using var writer = new ConsoleLogWriter(useColors: false);
+    writer.Write(new LogEvent(
+        new DateTime(2026, 10, 21, 20, 55, 19),
+        LogLevel.Error,
+        "Payment failed",
+        awaited));
+}
 
 static Exception CatchLambda()
 {

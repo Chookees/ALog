@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Text;
@@ -398,6 +399,45 @@ public sealed class ExceptionFormatTests
         var deep = new string('<', 9) + "X" + new string('>', 9) + "d__1";
         Assert.Equal("MoveNext", ExceptionReport.RenameCompilerMethod(deep, "MoveNext"));
         Assert.Equal("MoveNext", ExceptionReport.RenameCompilerMethod(new string('a', 513), "MoveNext"));
+    }
+
+    /// <summary>
+    /// Starts the top-level probe as its own process so <c>&lt;Main&gt;$</c> is the real entry point.
+    /// A test library cannot host top-level statements, and reflecting the method is a different call.
+    /// The child prints one console line. The origin is <c>at Program.Main in Program.cs:10</c>.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Origin_TopLevelProcessPrintsMain()
+    {
+        var exeName = OperatingSystem.IsWindows() ? "ExfTopLevel.exe" : "ExfTopLevel";
+        var exe = Path.Combine(AppContext.BaseDirectory, exeName);
+        Assert.True(File.Exists(exe), exe);
+
+        using var process = new Process();
+        process.StartInfo = new ProcessStartInfo
+        {
+            FileName = exe,
+            WorkingDirectory = AppContext.BaseDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        process.StartInfo.Environment["EXF_TOPLEVEL_PRINT"] = "1";
+        process.StartInfo.Environment["DOTNET_SYSTEM_GLOBALIZATION_INVARIANT"] = "1";
+        Assert.True(process.Start());
+        var stdoutTask = process.StandardOutput.ReadToEndAsync();
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        var exited = process.WaitForExit(20000);
+        var stdout = await stdoutTask;
+        var stderr = await stderrTask;
+        if (!exited)
+            process.Kill(entireProcessTree: true);
+        Assert.True(exited, stderr);
+        Assert.Equal(0, process.ExitCode);
+        Assert.Equal(
+            "[2026-10-21 20:55:19] [Error] Payment failed | InvalidOperationException: Card declined | at Program.Main in Program.cs:10" + Environment.NewLine,
+            stdout);
+        Assert.Equal(string.Empty, stderr);
     }
 
     /// <summary>
