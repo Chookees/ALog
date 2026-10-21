@@ -1,6 +1,5 @@
 namespace ALog.Core;
 
-using System.Buffers;
 using System.Diagnostics;
 using System.Globalization;
 using System.Reflection;
@@ -58,9 +57,6 @@ internal static class ExceptionReport
     /// <summary>Stored message field. Reading it does not walk inner exceptions.</summary>
     private static readonly FieldInfo? ExceptionMessageField =
         typeof(Exception).GetField("_message", BindingFlags.Instance | BindingFlags.NonPublic);
-
-    /// <summary>Characters that can start an escape. A hyphen is included because <c>--&gt;</c> starts with one.</summary>
-    private static readonly SearchValues<char> EscapeChars = SearchValues.Create("\\|\r\n-");
 
     /// <summary>
     /// Renders one exception as the plain-text segment shared by every text sink.
@@ -1678,17 +1674,22 @@ internal static class ExceptionReport
     /// <param name="text">Raw text. Not null. The caller already applied any length cap.</param>
     /// <returns>The escaped text, or <paramref name="text"/> itself when nothing had to change.</returns>
     /// <remarks>
-    /// Does not throw. The fast path stops at the first backslash, pipe, line break, or hyphen.
-    /// When none of those characters appear, the original string is returned and nothing is allocated.
+    /// Does not throw. The loop stops at <paramref name="text"/>.Length.
+    /// The scan stays a single comparison per character unless a backslash, pipe, line break, or arrow appears.
     /// <c>\\</c>, <c>\|</c>, <c>\r</c>, <c>\n</c>, and <c>--\&gt;</c> are the only sequences a decoder treats as escapes.
     /// Any other backslash stands for itself, so <c>C:\temp</c> is returned unchanged.
     /// </remarks>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static string ApplyEscapes(string text)
     {
-        var found = text.AsSpan().IndexOfAny(EscapeChars);
-        if (found >= 0)
-            return ApplyEscapesSlow(text, found);
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '\\' || ch == '|' || ch == '\r' || ch == '\n'
+                || (ch == '-' && i + 2 < text.Length && text[i + 1] == '-' && text[i + 2] == '>'))
+                return ApplyEscapesSlow(text, i);
+        }
+
         return text;
     }
 
@@ -1733,7 +1734,6 @@ internal static class ExceptionReport
     /// Does not throw. The loop stops at <paramref name="text"/>.Length.
     /// Characters before the first real change are copied once. A backslash at the end of <paramref name="text"/> is copied once.
     /// </remarks>
-    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     private static string ApplyEscapesSlow(string text, int found)
     {
         StringBuilder? builder = null;

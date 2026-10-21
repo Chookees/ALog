@@ -143,22 +143,26 @@ public class PlainTextFormatter : ILogFormatter
     /// <remarks>
     /// Does not throw. Does not call <see cref="Exception.ToString"/>.
     /// The category, the message, keys, and values are escaped. The category and the message are not cut to 500 characters.
-    /// The array has seven slots, including the empty exception slot, and the filter drops blank slots.
+    /// Blank slots are left out of the join. The present pieces are copied into one array, then joined once.
     /// </remarks>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private string FormatWithoutException(LogEvent logEvent)
     {
-        var parts = new string?[]
-        {
-            $"[{logEvent.Timestamp.ToString(_dateTimeFormat)}]",
-            $"[{logEvent.Level}]",
-            string.IsNullOrEmpty(logEvent.Category) ? null : "[" + ExceptionReport.EscapeLine(logEvent.Category) + "]",
-            string.IsNullOrWhiteSpace(logEvent.Message) ? null : ExceptionReport.EscapeLine(logEvent.Message),
-            null,
-            ExceptionReport.FormatProps(logEvent.Properties, leadingPipe: true),
-            ExceptionReport.FormatContext(logEvent.Context, leadingPipe: true)
-        };
-        return string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
+        var parts = new string[6];
+        var count = 0;
+        parts[count++] = "[" + logEvent.Timestamp.ToString(_dateTimeFormat) + "]";
+        parts[count++] = "[" + logEvent.Level + "]";
+        if (!string.IsNullOrEmpty(logEvent.Category))
+            parts[count++] = "[" + ExceptionReport.EscapeLine(logEvent.Category) + "]";
+        if (!string.IsNullOrWhiteSpace(logEvent.Message))
+            parts[count++] = ExceptionReport.EscapeLine(logEvent.Message);
+        var props = ExceptionReport.FormatProps(logEvent.Properties, leadingPipe: true);
+        if (!string.IsNullOrWhiteSpace(props))
+            parts[count++] = props;
+        var context = ExceptionReport.FormatContext(logEvent.Context, leadingPipe: true);
+        if (!string.IsNullOrWhiteSpace(context))
+            parts[count++] = context;
+        return string.Join(" ", parts.AsSpan(0, count));
     }
 
     /// <summary>Renders template properties as <c>props: name=value</c>. Values are escaped like context values.</summary>
