@@ -470,7 +470,7 @@ public sealed class ExceptionFormatTests
         Assert.False(ExceptionReport.IsSkipped("ALog.Extensions.Logging.Extra", "Contoso"));
         Assert.True(ExceptionReport.IsSkipped("System.Private.CoreLib", null));
         Assert.True(ExceptionReport.IsSkipped("System.Private.CoreLib", string.Empty));
-        Assert.False(ExceptionReport.IsSkipped("System.Private.CoreLib.Extra", null));
+        Assert.True(ExceptionReport.IsSkipped("System.Private.CoreLib.Extra", null));
         Assert.Equal(-1, ExceptionReport.SelectFrame(Array.Empty<FrameView>()));
 
         var thrown = Catch(() => _ = new FileLogWriter(null!));
@@ -503,6 +503,68 @@ public sealed class ExceptionFormatTests
             ExceptionReport.FormatText(io));
         Assert.DoesNotContain("Interop", ExceptionReport.FormatText(io), StringComparison.Ordinal);
         Assert.DoesNotContain("ThrowExceptionForIoErrno", ExceptionReport.FormatText(io), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A runtime assembly is framework even when the type has no namespace.
+    /// <c>System</c>, <c>System.*</c>, <c>Microsoft.*</c>, <c>mscorlib</c>, and <c>netstandard</c> are skipped.
+    /// <c>SystemsCorp</c> and <c>Microsofty</c> are not, and the real IO failure still names <c>ReadIo</c>.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Origin_FrameworkAssembliesSkipToUserFrame()
+    {
+        await Task.CompletedTask;
+        var frames = new[]
+        {
+            new FrameView("System.Private.CoreLib", null, "Interop", "ThrowExceptionForIoErrno", null, 0),
+            new FrameView("mscorlib", null, "Legacy", "Throw", null, 0),
+            new FrameView("netstandard", null, "NetStd", "Throw", null, 0),
+            new FrameView("System", null, "SystemHelper", "Throw", null, 0),
+            new FrameView("Microsoft.Win32.Primitives", null, "Native", "Throw", null, 0),
+            new FrameView("SystemsCorp", "SystemsCorp", "CheckoutService", "ReadIo", "Cls.cs", 7)
+        };
+        Assert.Equal("at CheckoutService.ReadIo in Cls.cs:7", ExceptionReport.FormatAt(frames));
+
+        var microsofty = new[]
+        {
+            new FrameView("Microsoft.Extensions.Logging", null, "Logger", "Log", null, 0),
+            new FrameView("Microsofty", "Microsofty", "App", "Run", "App.cs", 4)
+        };
+        Assert.Equal("at App.Run in App.cs:4", ExceptionReport.FormatAt(microsofty));
+
+        Assert.True(ExceptionReport.IsFrameworkAssembly("System"));
+        Assert.True(ExceptionReport.IsFrameworkAssembly("System.Runtime"));
+        Assert.True(ExceptionReport.IsFrameworkAssembly("System.Private.CoreLib"));
+        Assert.True(ExceptionReport.IsFrameworkAssembly("System.Private.CoreLib.Extra"));
+        Assert.True(ExceptionReport.IsFrameworkAssembly("Microsoft.Extensions.Logging"));
+        Assert.True(ExceptionReport.IsFrameworkAssembly("mscorlib"));
+        Assert.True(ExceptionReport.IsFrameworkAssembly("netstandard"));
+        Assert.False(ExceptionReport.IsFrameworkAssembly("SystemsCorp"));
+        Assert.False(ExceptionReport.IsFrameworkAssembly("SystemExtra"));
+        Assert.False(ExceptionReport.IsFrameworkAssembly("Microsofty"));
+        Assert.False(ExceptionReport.IsFrameworkAssembly("Microsoft"));
+        Assert.False(ExceptionReport.IsFrameworkAssembly("ALog.QuickstartSample"));
+        Assert.False(ExceptionReport.IsFrameworkAssembly("ALogSample"));
+        Assert.False(ExceptionReport.IsFrameworkAssembly(null));
+        Assert.False(ExceptionReport.IsFrameworkAssembly(string.Empty));
+
+        Assert.True(ExceptionReport.IsSkipped("System", null));
+        Assert.True(ExceptionReport.IsSkipped("System.Runtime", "Contoso"));
+        Assert.True(ExceptionReport.IsSkipped("Microsoft.X", null));
+        Assert.True(ExceptionReport.IsSkipped("mscorlib", null));
+        Assert.True(ExceptionReport.IsSkipped("netstandard", null));
+        Assert.False(ExceptionReport.IsSkipped("SystemsCorp", "SystemsCorp"));
+        Assert.False(ExceptionReport.IsSkipped("SystemExtra", null));
+        Assert.False(ExceptionReport.IsSkipped("Microsofty", "Microsofty"));
+        Assert.False(ExceptionReport.IsSkipped("Microsoft", null));
+        Assert.False(ExceptionReport.IsSkipped("ALog.QuickstartSample", "ALog.QuickstartSample"));
+        Assert.False(ExceptionReport.IsSkipped("ALogSample", "ALogSample"));
+        Assert.False(ExceptionReport.IsSkipped(null, null));
+
+        var io = Catch(() => ALog.QuickstartSample.CheckoutService.ReadIo());
+        Assert.Equal(
+            "DirectoryNotFoundException: Could not find a part of the path '/nope/y'. | at CheckoutService.ReadIo in Cls.cs:7",
+            ExceptionReport.FormatText(io));
     }
 
     /// <summary>A normal chain shows three nodes and then <c>(+n more)</c>. The fourth message is absent.</summary>

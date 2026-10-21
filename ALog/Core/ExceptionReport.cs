@@ -221,22 +221,24 @@ internal static class ExceptionReport
 
     /// <summary>
     /// True when a frame belongs to ALog or to the runtime libraries we do not want as the origin.
-    /// Assembly names match exactly. Namespaces match a whole segment, so <c>SystemsCorp</c> stays.
-    /// <c>System.Private.CoreLib</c> is also skipped: types such as <c>Interop</c> have no namespace,
-    /// so the segment rule would otherwise treat <c>ThrowExceptionForIoErrno</c> as user code.
+    /// ALog matches the assembly names <c>ALog</c> and <c>ALog.Extensions.Logging</c> exactly.
+    /// A runtime assembly matches <see cref="IsFrameworkAssembly"/>. A runtime namespace matches
+    /// <see cref="IsFrameworkNamespace"/> by segment, so <c>SystemsCorp</c> stays.
     /// </summary>
     /// <param name="assemblyName">Simple assembly name. Null when the frame has none.</param>
     /// <param name="typeNamespace">Namespace of the frame's declaring type. Null for the global namespace.</param>
     /// <returns>True when the frame should be skipped in favor of a later application frame.</returns>
     /// <remarks>
     /// Does not throw. Does not look at the file path or the method name.
-    /// <c>ALog.QuickstartSample</c>, <c>ALogSample</c>, and <c>SystemsCorp</c> are not these assembly names, so they stay.
+    /// Either the assembly rule or the namespace rule is enough. <c>Interop</c> has no namespace and lives in
+    /// <c>System.Private.CoreLib</c>, which the assembly prefix covers.
+    /// <c>ALog.QuickstartSample</c>, <c>ALogSample</c>, <c>SystemsCorp</c>, and <c>Microsofty</c> stay.
     /// </remarks>
     internal static bool IsSkipped(string? assemblyName, string? typeNamespace)
     {
-        if (assemblyName == "ALog"
-            || assemblyName == "ALog.Extensions.Logging"
-            || assemblyName == "System.Private.CoreLib")
+        if (assemblyName == "ALog" || assemblyName == "ALog.Extensions.Logging")
+            return true;
+        if (IsFrameworkAssembly(assemblyName))
             return true;
         return IsFrameworkNamespace(typeNamespace);
     }
@@ -350,6 +352,31 @@ internal static class ExceptionReport
         if (typeNamespace.StartsWith("System.", StringComparison.Ordinal))
             return true;
         if (typeNamespace.StartsWith("Microsoft.", StringComparison.Ordinal))
+            return true;
+        return false;
+    }
+
+    /// <summary>
+    /// True when the declaring assembly is a runtime library.
+    /// <c>System</c>, <c>mscorlib</c>, and <c>netstandard</c> match the whole name.
+    /// <c>System.</c> and <c>Microsoft.</c> match only as a prefix that includes the dot,
+    /// so <c>SystemsCorp</c> and <c>Microsofty</c> stay application assemblies.
+    /// </summary>
+    /// <param name="assemblyName">Simple assembly name. Null when the frame has none.</param>
+    /// <returns>True when frames from this assembly are framework frames.</returns>
+    /// <remarks>
+    /// Does not throw. Comparison is ordinal. A missing name is not a runtime assembly.
+    /// The namespace rule is separate: this method does not look at the type.
+    /// </remarks>
+    internal static bool IsFrameworkAssembly(string? assemblyName)
+    {
+        if (string.IsNullOrEmpty(assemblyName))
+            return false;
+        if (assemblyName == "System" || assemblyName == "mscorlib" || assemblyName == "netstandard")
+            return true;
+        if (assemblyName.StartsWith("System.", StringComparison.Ordinal))
+            return true;
+        if (assemblyName.StartsWith("Microsoft.", StringComparison.Ordinal))
             return true;
         return false;
     }
