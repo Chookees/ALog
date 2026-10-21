@@ -33,6 +33,8 @@
 ### Breaking (output)
 
 - Plain text, console, and file output write exceptions as "Type: Message", followed by inner exceptions and the source line ("at Class.Method in File.cs:42"). The "EX:" label is gone; update log parsers that match it. "\", "|", and "-->" inside exception messages and context values are escaped as "\\", "\|", and "--\>", and line breaks as "\r" and "\n".
+- Plain text, console, and file output also escape the event message, context keys, and property keys with those same rules. An exception message longer than 500 characters is cut before escaping, and then " [truncated]" is appended. When a chain or a flattened aggregate stops at the walk limit, the suffix is "(+N+ more)". "(+N more)" means every node was counted.
+- Exception type names use C# syntax: nested types use a dot, generic types use angle brackets, and assembly qualification is omitted. Plain text lists aggregate entries only. JSON still includes each entry's inner exception.
 
 ### Added
 

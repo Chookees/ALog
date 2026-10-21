@@ -62,6 +62,8 @@ An exception shares that line. The form is `Type: Message`, then inner exception
 
 `\`, `|`, and `-->` inside an exception message or a context value are escaped as `\\`, `\|`, and `--\>`, and line breaks as `\r` and `\n`, so each event stays one line and the separators stay unambiguous. `PlainTextFormatter(includeStackTrace: true)` appends the full stack trace indented by four spaces. The default is off.
 
+`PlainTextFormatter(includeStackTrace: true)` calls .NET's `Exception.ToString()`, and a self-referencing exception built via reflection can overflow inside that call.
+
 ---
 
 ## Quick Start

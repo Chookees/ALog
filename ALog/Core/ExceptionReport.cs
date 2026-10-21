@@ -2,6 +2,8 @@ namespace ALog.Core;
 
 using System.Diagnostics;
 using System.Globalization;
+using System.Reflection;
+using System.Text;
 using System.Text.Json.Serialization;
 
 /// <summary>
@@ -18,12 +20,12 @@ internal static class ExceptionReport
     /// <summary>Plain text shows at most this many exception segments.</summary>
     private const int MaxTextSegments = 3;
 
-    /// <summary>Exception messages in text are cut here, after escaping.</summary>
+    /// <summary>Exception messages in text are cut here, before escaping.</summary>
     private const int MaxMessageChars = 500;
 
     /// <summary>
-    /// Context values are escaped in full up to this many characters.
-    /// The cap is the loop bound; a longer value keeps this prefix.
+    /// Context and property values are cut here, before escaping.
+    /// The cap is the loop bound; a longer raw value keeps this prefix.
     /// </summary>
     private const int MaxContextChars = 8192;
 
@@ -52,10 +54,14 @@ internal static class ExceptionReport
     /// <summary>Closing half of <see cref="DefaultPrefix"/>.</summary>
     private const string DefaultSuffix = "' was thrown.";
 
+    /// <summary>Stored message field. Reading it does not walk inner exceptions.</summary>
+    private static readonly FieldInfo? ExceptionMessageField =
+        typeof(Exception).GetField("_message", BindingFlags.Instance | BindingFlags.NonPublic);
+
     /// <summary>
     /// Renders one exception as the plain-text segment shared by every text sink.
     /// The segment is <c>Type: Message</c>, then at most three chain nodes joined by
-    /// <c> --&gt; </c>, then <c> (+n more)</c>, then <c>at Type.Method in File.cs:line</c>
+    /// <c> --&gt; </c>, then <c> (+n more)</c> or <c> (+n+ more)</c>, then <c>at Type.Method in File.cs:line</c>
     /// when a stack exists. <see cref="AggregateException"/> drops its own message and
     /// lists flattened entries with <c>; </c>.
     /// </summary>
@@ -134,56 +140,131 @@ internal static class ExceptionReport
     }
 
     /// <summary>
-    /// Renders context as <c>ctx: name=value</c> with values escaped the same way as exception messages.
-    /// Keys are logger names, not free text, and are copied as stored.
+    /// Renders context as <c>ctx: name=value</c>.
+    /// Keys and values are escaped the same way as exception messages, so a key cannot forge a separator.
     /// </summary>
     /// <param name="context">Scope values. Null or empty yields null so the segment is omitted.</param>
+    /// <param name="leadingPipe">
+    /// When true, the segment starts with <c>| </c> so a space join can separate it from the head.
+    /// When false, the segment starts with <c>ctx:</c> for <see cref="JoinLine"/>.
+    /// </param>
     /// <returns>The <c>ctx:</c> segment, or null when there is nothing to write.</returns>
     /// <remarks>
     /// Does not throw. A throwing value becomes the capture placeholder from <see cref="CaptureText"/>,
     /// then that placeholder is escaped. The loop stops at 4096 pairs.
-    /// Values longer than 8192 characters keep an escaped prefix and <c> [truncated]</c>.
+    /// Values longer than 8192 raw characters are cut before escaping, then <c> [truncated]</c> is appended.
     /// </remarks>
-    internal static string? FormatContext(IReadOnlyDictionary<string, object>? context)
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static string? FormatContext(IReadOnlyDictionary<string, object>? context, bool leadingPipe = false)
     {
         if (context == null || context.Count == 0)
             return null;
 
         var parts = new List<string>(context.Count < 8 ? context.Count : 8);
+        if (context is Dictionary<string, object> concrete)
+            CollectContext(parts, concrete);
+        else
+            CollectContext(parts, context);
+
+        return FinishBag("ctx: ", parts, leadingPipe);
+    }
+
+    /// <summary>
+    /// Renders template properties as <c>props: name=value</c>.
+    /// Keys and values are escaped with the same order as context values.
+    /// Values use the same raw cap as context values.
+    /// </summary>
+    /// <param name="properties">Template properties. Null or empty yields null so the segment is omitted.</param>
+    /// <param name="leadingPipe">
+    /// When true, the segment starts with <c>| </c> so a space join can separate it from the head.
+    /// When false, the segment starts with <c>props:</c> for <see cref="JoinLine"/>.
+    /// </param>
+    /// <returns>The <c>props:</c> segment, or null when there is nothing to write.</returns>
+    /// <remarks>
+    /// Does not throw. A throwing value becomes the capture placeholder from <see cref="CaptureText"/>,
+    /// then that placeholder is escaped. Every pair in the bag is written; the loop is bounded by that bag.
+    /// JSON and HTTP do not use this segment. They keep the property keys and values structured.
+    /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static string? FormatProps(IReadOnlyDictionary<string, object>? properties, bool leadingPipe = false)
+    {
+        if (properties == null || properties.Count == 0)
+            return null;
+
+        var parts = new List<string>(properties.Count < 8 ? properties.Count : 8);
+        if (properties is Dictionary<string, object> concrete)
+            CollectProps(parts, concrete);
+        else
+            CollectProps(parts, properties);
+
+        return FinishBag("props: ", parts, leadingPipe);
+    }
+
+    /// <summary>Appends context pairs from a concrete dictionary, up to 4096.</summary>
+    /// <param name="parts">Destination. Not null.</param>
+    /// <param name="context">Scope values. Not null.</param>
+    /// <remarks>Does not throw. A concrete dictionary avoids boxing the enumerator.</remarks>
+    private static void CollectContext(List<string> parts, Dictionary<string, object> context)
+    {
         var seen = 0;
         foreach (var pair in context)
         {
             if (seen == MaxContextPairs)
                 break;
             seen++;
-            parts.Add(pair.Key + "=" + Escape(CaptureText.Read(pair.Value), messageLimit: false));
+            parts.Add(EscapeLine(pair.Key) + "=" + Escape(CaptureText.Read(pair.Value), messageLimit: false));
         }
-
-        return "ctx: " + string.Join(", ", parts);
     }
 
-    /// <summary>
-    /// Renders template properties as <c>props: name=value</c>.
-    /// Values are escaped with the same order and the same cap as context values.
-    /// Keys are copied as stored, the same way context keys are.
-    /// </summary>
-    /// <param name="properties">Template properties. Null or empty yields null so the segment is omitted.</param>
-    /// <returns>The <c>props:</c> segment, or null when there is nothing to write.</returns>
-    /// <remarks>
-    /// Does not throw. A throwing value becomes the capture placeholder from <see cref="CaptureText"/>,
-    /// then that placeholder is escaped. Every pair in the bag is written; the loop is bounded by that bag.
-    /// JSON and HTTP do not use this segment. They keep the property values structured.
-    /// </remarks>
-    internal static string? FormatProps(IReadOnlyDictionary<string, object>? properties)
+    /// <summary>Appends context pairs from any dictionary, up to 4096.</summary>
+    /// <param name="parts">Destination. Not null.</param>
+    /// <param name="context">Scope values. Not null.</param>
+    /// <remarks>Does not throw. The interface enumerator is boxed. The loop stops at 4096 pairs.</remarks>
+    private static void CollectContext(List<string> parts, IReadOnlyDictionary<string, object> context)
     {
-        if (properties == null || properties.Count == 0)
-            return null;
+        var seen = 0;
+        foreach (var pair in context)
+        {
+            if (seen == MaxContextPairs)
+                break;
+            seen++;
+            parts.Add(EscapeLine(pair.Key) + "=" + Escape(CaptureText.Read(pair.Value), messageLimit: false));
+        }
+    }
 
-        var parts = new List<string>(properties.Count < 8 ? properties.Count : 8);
+    /// <summary>Appends every property pair from a concrete dictionary.</summary>
+    /// <param name="parts">Destination. Not null.</param>
+    /// <param name="properties">Template properties. Not null.</param>
+    /// <remarks>Does not throw. The loop is bounded by the dictionary. A concrete dictionary avoids boxing the enumerator.</remarks>
+    private static void CollectProps(List<string> parts, Dictionary<string, object> properties)
+    {
         foreach (var pair in properties)
-            parts.Add(pair.Key + "=" + Escape(CaptureText.Read(pair.Value), messageLimit: false));
+            parts.Add(EscapeLine(pair.Key) + "=" + Escape(CaptureText.Read(pair.Value), messageLimit: false));
+    }
 
-        return "props: " + string.Join(", ", parts);
+    /// <summary>Appends every property pair from any dictionary.</summary>
+    /// <param name="parts">Destination. Not null.</param>
+    /// <param name="properties">Template properties. Not null.</param>
+    /// <remarks>Does not throw. The interface enumerator is boxed. The loop is bounded by the dictionary.</remarks>
+    private static void CollectProps(List<string> parts, IReadOnlyDictionary<string, object> properties)
+    {
+        foreach (var pair in properties)
+            parts.Add(EscapeLine(pair.Key) + "=" + Escape(CaptureText.Read(pair.Value), messageLimit: false));
+    }
+
+    /// <summary>Joins escaped pairs and prefixes the bag label.</summary>
+    /// <param name="label"><c>props: </c> or <c>ctx: </c>. Not null.</param>
+    /// <param name="parts">Escaped <c>name=value</c> pairs. Not null. Not empty.</param>
+    /// <param name="leadingPipe">When true, <c>| </c> is part of the same string as the label.</param>
+    /// <returns>The segment. One string, so the prefix is not a second copy of the bag.</returns>
+    /// <remarks>Does not throw. The pair list is bounded by the caller.</remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static string FinishBag(string label, List<string> parts, bool leadingPipe)
+    {
+        var joined = string.Join(", ", parts);
+        if (!leadingPipe)
+            return string.Concat(label, joined);
+        return string.Concat("| ", label, joined);
     }
 
     /// <summary>
@@ -192,31 +273,52 @@ internal static class ExceptionReport
     /// </summary>
     /// <param name="text">Raw text. Not null. An exception message, a context value, or a property value.</param>
     /// <param name="messageLimit">
-    /// True cuts the escaped text at 500 characters. False uses the context cap of 8192.
+    /// True cuts the raw text at 500 characters. False uses the context cap of 8192.
+    /// The cut happens before escaping, and a surrogate pair is not split.
     /// </param>
     /// <returns>
-    /// Escaped text. When the escaped form does not fit the cap, the prefix plus <c> [truncated]</c>.
-    /// A surrogate pair is not split.
+    /// Escaped text. When the raw text was longer than the cap, <c> [truncated]</c> follows the escaped prefix.
     /// </returns>
     /// <remarks>
-    /// Does not throw. Reads at most the cap's number of input characters because escaping never shrinks text,
-    /// so the kept prefix matches the fully escaped string. Does not change any other character, including Unicode.
+    /// Does not throw. The marker is outside the raw cap, and the escaped prefix is not cut,
+    /// so an escape sequence introduced by the replacement is never split.
+    /// Does not change any other character, including Unicode.
     /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     internal static string Escape(string text, bool messageLimit)
     {
         var limit = messageLimit ? MaxMessageChars : MaxContextChars;
         if (text.Length == 0)
             return text;
 
-        var scan = text.Length;
-        if (scan > limit)
-            scan = limit;
-        var slice = scan == text.Length ? text : text.Substring(0, scan);
+        var cut = text.Length;
+        var truncated = false;
+        if (cut > limit)
+        {
+            cut = RawCut(text, limit);
+            truncated = true;
+        }
+
+        var slice = cut == text.Length ? text : text.Substring(0, cut);
         var escaped = ApplyEscapes(slice);
-        var truncated = text.Length > scan || escaped.Length > limit;
         if (!truncated)
             return escaped;
-        return Cut(escaped, limit);
+        return escaped + " [truncated]";
+    }
+
+    /// <summary>
+    /// Escapes a log message or a key that is placed on a plain line.
+    /// There is no length cap; the scan stops at the end of <paramref name="text"/>.
+    /// </summary>
+    /// <param name="text">Raw message or key. Null is treated as empty.</param>
+    /// <returns>The escaped text. The same instance when nothing had to change.</returns>
+    /// <remarks>Does not throw. A line break becomes the two characters <c>\n</c> or <c>\r</c>, so the event stays one line.</remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    internal static string EscapeLine(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return text ?? string.Empty;
+        return ApplyEscapes(text);
     }
 
     /// <summary>
@@ -384,23 +486,30 @@ internal static class ExceptionReport
     /// <summary>
     /// Display name of a frame's type. Framework types keep the namespace so a fallback frame
     /// reads <c>System.IO.File</c>. Application types keep the short class name.
+    /// Nested types use a dot, and generic types use C# angle brackets, as in <c>Outer.Inner2&lt;T&gt;</c>.
     /// </summary>
     /// <param name="type">Declaring type after compiler wrappers are removed. Null when the frame has no type.</param>
     /// <returns>The type text placed before the method. Empty when <paramref name="type"/> is null.</returns>
-    /// <remarks>Does not throw. Nested framework names use a dot where the runtime full name uses <c>+</c>.</remarks>
+    /// <remarks>
+    /// Does not throw. A <c>System</c> type argument uses its short name. Any other argument keeps its namespace.
+    /// The walk is capped at 16 nested types and 16 generic arguments.
+    /// </remarks>
     internal static string FrameTypeName(Type? type)
     {
         if (type == null)
             return string.Empty;
-        if (IsFrameworkNamespace(type.Namespace) && !string.IsNullOrEmpty(type.FullName))
-            return type.FullName.Replace('+', '.');
-        return type.Name;
+        return FormatTypeName(type, withNamespace: IsFrameworkNamespace(type.Namespace), depth: 0);
     }
 
     /// <summary>Builds the text segment, including the origin when a stack can be read.</summary>
     /// <param name="exception">Exception on the event. Not null.</param>
     /// <returns>The segment without a newline.</returns>
-    /// <remarks>The chain loop stops at 16. Aggregate nodes stop the chain because their entries are inside the node.</remarks>
+    /// <remarks>
+    /// The chain loop stops at 16. A repeated instance is a cycle and stops the walk.
+    /// Aggregate nodes stop the chain because their entries are inside the node; an entry's own inner exception is not text.
+    /// When the walk stops because of the cap and a further node remains, the suffix is <c>(+N+ more)</c>.
+    /// When every node was counted, the suffix is <c>(+N more)</c>.
+    /// </remarks>
     private static string FormatTextCore(Exception exception)
     {
         var parts = new List<string>(MaxTextSegments);
@@ -412,21 +521,30 @@ internal static class ExceptionReport
         {
             steps++;
             if (Contains(seen, current))
+            {
+                current = null;
                 break;
+            }
+
             if (seen.Count < MaxChain)
                 seen.Add(current);
             total++;
             if (parts.Count < MaxTextSegments)
                 parts.Add(current is AggregateException aggregate ? RenderAggregate(aggregate) : RenderOne(current));
             if (current is AggregateException)
+            {
+                current = null;
                 break;
+            }
+
             if (!TryInner(current, out current))
                 break;
         }
 
+        var capped = current != null;
         var text = string.Join(" --> ", parts);
         if (total > MaxTextSegments)
-            text += " (+" + (total - MaxTextSegments).ToString(CultureInfo.InvariantCulture) + " more)";
+            text += MoreSuffix(total - MaxTextSegments, capped);
         var origin = FindOrigin(exception);
         if (origin == null)
             return text;
@@ -434,6 +552,19 @@ internal static class ExceptionReport
         if (at == null)
             return text;
         return text + " | " + at;
+    }
+
+    /// <summary>The <c>(+N more)</c> suffix, with an extra plus when the walk stopped at its cap.</summary>
+    /// <param name="hidden">Counted nodes that were not shown. Greater than zero.</param>
+    /// <param name="capped">True when a further node exists beyond the walk cap.</param>
+    /// <returns><c>(+N more)</c> or <c>(+N+ more)</c>.</returns>
+    /// <remarks>Does not throw. The extra plus is the only sign that the remainder is a lower bound.</remarks>
+    private static string MoreSuffix(int hidden, bool capped)
+    {
+        var n = hidden.ToString(CultureInfo.InvariantCulture);
+        if (capped)
+            return " (+" + n + "+ more)";
+        return " (+" + n + " more)";
     }
 
     /// <summary>Builds the JSON body from the same walks the text segment uses.</summary>
@@ -476,28 +607,30 @@ internal static class ExceptionReport
 
     /// <summary>
     /// Renders an aggregate without its own message.
-    /// Entries are <see cref="Flatten"/> order, at most three, then <c> (+n more)</c> for the rest of that list.
+    /// Entries are depth-first, at most three, then <c>(+N more)</c> or <c>(+N+ more)</c>.
+    /// An entry is rendered alone. Its inner exception is not part of the text.
     /// </summary>
     /// <param name="exception">Aggregate on the chain. Not null.</param>
     /// <returns>The aggregate node, including its entries.</returns>
     /// <remarks>
     /// The aggregate's message is omitted because the runtime repeats the inner messages there.
-    /// <c>n</c> is the number of flattened entries that were not shown, not the nesting depth.
+    /// <c>N</c> is the number of flattened entries that were not shown.
+    /// The extra plus means the flatten walk stopped at its cap with entries still unread.
     /// </remarks>
     private static string RenderAggregate(AggregateException exception)
     {
         var flat = Flatten(exception);
         var type = DisplayName(exception);
-        if (flat.Count == 0)
+        if (flat.Entries.Count == 0)
             return type;
 
-        var shown = flat.Count < MaxTextSegments ? flat.Count : MaxTextSegments;
+        var shown = flat.Entries.Count < MaxTextSegments ? flat.Entries.Count : MaxTextSegments;
         var pieces = new string[shown];
         for (var i = 0; i < shown; i++)
-            pieces[i] = RenderOne(flat[i]);
+            pieces[i] = RenderOne(flat.Entries[i]);
         var text = type + " --> " + string.Join("; ", pieces);
-        if (flat.Count > MaxTextSegments)
-            text += " (+" + (flat.Count - MaxTextSegments).ToString(CultureInfo.InvariantCulture) + " more)";
+        if (flat.Entries.Count > MaxTextSegments)
+            text += MoreSuffix(flat.Entries.Count - MaxTextSegments, flat.Incomplete);
         return text;
     }
 
@@ -534,11 +667,71 @@ internal static class ExceptionReport
     {
         try
         {
+            if (exception is AggregateException aggregate && !AggregateMessageIsSafe(aggregate))
+                return StoredMessage(aggregate);
             return exception.Message;
         }
         catch (Exception failure)
         {
             return Capture(failure);
+        }
+    }
+
+    /// <summary>
+    /// True when <see cref="AggregateException.Message"/> can be read without walking a cycle.
+    /// That getter calls <see cref="Exception.Message"/> on every child, so a self-reference overflows.
+    /// </summary>
+    /// <param name="root">Aggregate whose message is about to be read. Not null.</param>
+    /// <returns>False when an aggregate repeats or the walk reaches 16 aggregates.</returns>
+    /// <remarks>Does not throw. Does not call <see cref="Exception.Message"/>. The loop is capped at 16 aggregates and 64 children.</remarks>
+    private static bool AggregateMessageIsSafe(AggregateException root)
+    {
+        var seen = new List<Exception>(8);
+        var stack = new List<Exception>(8);
+        stack.Add(root);
+        var steps = 0;
+        while (stack.Count > 0)
+        {
+            if (steps >= MaxChain)
+                return false;
+            var index = stack.Count - 1;
+            var current = stack[index];
+            stack.RemoveAt(index);
+            if (current is not AggregateException aggregate)
+                continue;
+            if (Contains(seen, aggregate))
+                return false;
+            if (seen.Count >= MaxChain)
+                return false;
+            seen.Add(aggregate);
+            steps++;
+            var inners = CopyInners(aggregate, out var truncated);
+            if (truncated)
+                return false;
+            for (var i = 0; i < inners.Count; i++)
+            {
+                if (stack.Count >= MaxFlatten)
+                    return false;
+                stack.Add(inners[i]);
+            }
+        }
+
+        return true;
+    }
+
+    /// <summary>The message stored on the exception, without calling <see cref="Exception.Message"/>.</summary>
+    /// <param name="exception">Exception whose field is read. Not null.</param>
+    /// <returns>The stored text, or null when the field is unset or cannot be read.</returns>
+    /// <remarks>Does not throw. Used when the public getter would walk a cycle.</remarks>
+    private static string? StoredMessage(Exception exception)
+    {
+        try
+        {
+            return ExceptionMessageField?.GetValue(exception) as string;
+        }
+        catch
+        {
+            return null;
         }
     }
 
@@ -578,13 +771,13 @@ internal static class ExceptionReport
     /// <remarks>
     /// Own exceptions keep the namespace so the line shows where the type was declared.
     /// <c>Microsoft.*</c> stays in full. The frame filter skips those namespaces, but the type label does not shorten them.
+    /// Nested types use a dot. Generic types use C# angle brackets and do not include assembly info.
+    /// A <c>System</c> type argument uses its short name. Any other argument keeps its namespace.
     /// </remarks>
     private static string DisplayName(Exception exception)
     {
         var type = exception.GetType();
-        if (IsSystemNamespace(type.Namespace))
-            return type.Name;
-        return type.FullName ?? type.Name;
+        return FormatTypeName(type, withNamespace: !IsSystemNamespace(type.Namespace), depth: 0);
     }
 
     /// <summary>True for the <c>System</c> namespace and its children, by segment.</summary>
@@ -603,14 +796,186 @@ internal static class ExceptionReport
         return typeNamespace.StartsWith("System.", StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// Formats a type in C# syntax, without assembly qualification.
+    /// Nested types use a dot. Generic types use angle brackets, as in <c>GenEx&lt;Int32&gt;</c>.
+    /// </summary>
+    /// <param name="type">Type to format. Not null.</param>
+    /// <param name="withNamespace">True prepends the namespace of the outermost declaring type.</param>
+    /// <param name="depth">Recursion depth. The walk stops at 16.</param>
+    /// <returns>The readable name. A generic parameter is its name, such as <c>T</c>.</returns>
+    /// <remarks>
+    /// Does not throw. A <c>System</c> type argument uses its short name. Any other argument keeps its namespace.
+    /// The declaring-type loop and the generic-argument loop each stop at 16.
+    /// </remarks>
+    private static string FormatTypeName(Type type, bool withNamespace, int depth)
+    {
+        if (type.IsGenericParameter)
+            return type.Name;
+        if (depth >= MaxChain)
+            return type.Name;
+        if (type.IsArray)
+        {
+            var element = type.GetElementType();
+            if (element == null)
+                return type.Name;
+            return FormatTypeName(element, ShowArgumentNamespace(element), depth + 1) + RankSuffix(type);
+        }
+
+        if (type.IsPointer || type.IsByRef)
+        {
+            var element = type.GetElementType();
+            if (element == null)
+                return type.Name;
+            var mark = type.IsPointer ? "*" : "&";
+            return FormatTypeName(element, withNamespace, depth + 1) + mark;
+        }
+
+        var chain = new Type[MaxChain];
+        var count = 0;
+        for (var current = type; current != null && count < MaxChain; current = current.DeclaringType)
+            chain[count++] = current;
+
+        var builder = new StringBuilder();
+        if (withNamespace)
+        {
+            var ns = chain[count - 1].Namespace;
+            if (!string.IsNullOrEmpty(ns))
+            {
+                builder.Append(ns);
+                builder.Append('.');
+            }
+        }
+
+        var supplied = type.IsGenericType ? type.GetGenericArguments() : Type.EmptyTypes;
+        var cursor = 0;
+        for (var i = count - 1; i >= 0; i--)
+        {
+            if (i != count - 1)
+                builder.Append('.');
+            var arity = ReadArity(chain[i].Name, out _);
+            var room = supplied.Length - cursor;
+            if (arity > room)
+                arity = room;
+            if (arity < 0)
+                arity = 0;
+            AppendSimple(builder, chain[i], supplied, cursor, arity, depth);
+            cursor += arity;
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>Appends one type's own name and the arguments that belong to it, not the enclosing type.</summary>
+    /// <param name="builder">Buffer already holding the namespace or the outer type. Not null.</param>
+    /// <param name="type">Type whose simple name is appended. Not null.</param>
+    /// <param name="supplied">Arguments of the original type, outer arguments first. Not null.</param>
+    /// <param name="cursor">Index of this type's first argument in <paramref name="supplied"/>.</param>
+    /// <param name="arity">How many arguments belong to this type. Already capped by the remaining arguments.</param>
+    /// <param name="depth">Depth of <paramref name="type"/>. Arguments are formatted one level deeper.</param>
+    /// <remarks>
+    /// Does not throw. A nested constructed type's declaring type is often the open definition, so the arguments
+    /// come from the original type rather than from <paramref name="type"/> itself.
+    /// </remarks>
+    private static void AppendSimple(StringBuilder builder, Type type, Type[] supplied, int cursor, int arity, int depth)
+    {
+        var name = type.Name;
+        var tick = name.IndexOf('`');
+        if (arity > 0 && tick > 0)
+            builder.Append(name, 0, tick);
+        else
+            builder.Append(name);
+        if (arity == 0)
+            return;
+
+        builder.Append('<');
+        var count = arity;
+        if (count > MaxChain)
+            count = MaxChain;
+        for (var i = 0; i < count; i++)
+        {
+            if (i > 0)
+                builder.Append(", ");
+            var index = cursor + i;
+            if (index < 0 || index >= supplied.Length)
+                break;
+            var arg = supplied[index];
+            builder.Append(FormatTypeName(arg, ShowArgumentNamespace(arg), depth + 1));
+        }
+
+        builder.Append('>');
+    }
+
+    /// <summary>True when a type argument keeps its namespace. <c>System</c> arguments do not.</summary>
+    /// <param name="type">Type argument. Not null. Arrays use the element type.</param>
+    /// <returns>False for a generic parameter and for <c>System</c> or <c>System.*</c>.</returns>
+    /// <remarks>Does not throw. The element walk stops at 16.</remarks>
+    private static bool ShowArgumentNamespace(Type type)
+    {
+        var current = type;
+        for (var i = 0; i < MaxChain; i++)
+        {
+            if (current.IsGenericParameter)
+                return false;
+            if (!current.HasElementType)
+                return !IsSystemNamespace(current.Namespace);
+            var next = current.GetElementType();
+            if (next == null)
+                return false;
+            current = next;
+        }
+
+        return false;
+    }
+
+    /// <summary>Reads the <c>`N</c> arity suffix. Zero when the name is not generic.</summary>
+    /// <param name="name">Runtime type name. Not null.</param>
+    /// <param name="tick">Index of <c>`</c>, or -1 when there is none.</param>
+    /// <returns>The arity, capped at 16.</returns>
+    /// <remarks>Does not throw. A non-digit after the tick yields zero so the raw name stays visible.</remarks>
+    private static int ReadArity(string name, out int tick)
+    {
+        tick = name.IndexOf('`');
+        if (tick < 0 || tick + 1 >= name.Length)
+            return 0;
+        var arity = 0;
+        for (var i = tick + 1; i < name.Length; i++)
+        {
+            var ch = name[i];
+            if (ch < '0' || ch > '9')
+                return 0;
+            arity = (arity * 10) + (ch - '0');
+            if (arity > MaxChain)
+                return MaxChain;
+        }
+
+        return arity;
+    }
+
+    /// <summary>Array rank suffix, such as <c>[]</c> or <c>[,]</c>.</summary>
+    /// <param name="type">An array type. Not null.</param>
+    /// <returns>The brackets. Rank above 16 is cut to 16.</returns>
+    /// <remarks>Does not throw.</remarks>
+    private static string RankSuffix(Type type)
+    {
+        var rank = type.GetArrayRank();
+        if (rank <= 1)
+            return "[]";
+        if (rank > MaxChain)
+            rank = MaxChain;
+        return "[" + new string(',', rank - 1) + "]";
+    }
+
     /// <summary>Full type name for JSON, which does not shorten <c>System.*</c>.</summary>
     /// <param name="exception">Exception being described. Not null.</param>
-    /// <returns>The full name, or the short name when the runtime has no full name.</returns>
-    /// <remarks>Does not throw.</remarks>
+    /// <returns>The readable full name, without assembly qualification.</returns>
+    /// <remarks>
+    /// Does not throw. Nested types use a dot. Generic arguments follow the text rule:
+    /// <c>System</c> arguments are short, and every other argument keeps its namespace.
+    /// </remarks>
     private static string SafeTypeName(Exception exception)
     {
-        var type = exception.GetType();
-        return type.FullName ?? type.Name;
+        return FormatTypeName(exception.GetType(), withNamespace: true, depth: 0);
     }
 
     /// <summary>One JSON inner entry. Source comes from that entry's own stack, not from its children.</summary>
@@ -701,7 +1066,7 @@ internal static class ExceptionReport
             return;
         if (exception is AggregateException aggregate)
         {
-            var inners = CopyInners(aggregate);
+            var inners = CopyInners(aggregate, out _);
             for (var i = inners.Count - 1; i >= 0 && pending.Count < MaxFlatten; i--)
                 pending.Add(new Walk(inners[i], depth));
             return;
@@ -717,16 +1082,19 @@ internal static class ExceptionReport
     /// </summary>
     /// <param name="root">Outermost exception. It is not included in the result. Not null.</param>
     /// <returns>The inner entries in walk order. Empty when there are none.</returns>
-    /// <remarks>The loop stops at 64 steps even when a broken chain points at itself.</remarks>
+    /// <remarks>
+    /// The loop stops at 16 steps. A repeated instance is skipped by <see cref="object.ReferenceEquals"/>,
+    /// including when an aggregate entry's inner exception points back at an aggregate already visited.
+    /// </remarks>
     private static List<Exception> CollectInners(Exception root)
     {
         var result = new List<Exception>(8);
-        var seen = new List<Exception>(MaxFlatten);
+        var seen = new List<Exception>(MaxChain);
         seen.Add(root);
         var pending = new List<Exception>(MaxFlatten);
         EnqueueChildren(root, pending);
         var steps = 0;
-        while (pending.Count > 0 && result.Count < MaxChain && steps < MaxFlatten)
+        while (pending.Count > 0 && result.Count < MaxChain && steps < MaxChain)
         {
             steps++;
             var last = pending.Count - 1;
@@ -734,7 +1102,7 @@ internal static class ExceptionReport
             pending.RemoveAt(last);
             if (Contains(seen, current))
                 continue;
-            if (seen.Count < MaxFlatten)
+            if (seen.Count < MaxChain)
                 seen.Add(current);
             if (current is AggregateException aggregate)
             {
@@ -773,8 +1141,8 @@ internal static class ExceptionReport
     private static void EnqueueFlattened(AggregateException aggregate, List<Exception> pending)
     {
         var flat = Flatten(aggregate);
-        for (var i = flat.Count - 1; i >= 0 && pending.Count < MaxFlatten; i--)
-            pending.Add(flat[i]);
+        for (var i = flat.Entries.Count - 1; i >= 0 && pending.Count < MaxFlatten; i--)
+            pending.Add(flat.Entries[i]);
     }
 
     /// <summary>
@@ -782,55 +1150,67 @@ internal static class ExceptionReport
     /// Non-aggregate entries are kept. The root aggregate is not an entry.
     /// </summary>
     /// <param name="root">Aggregate to flatten. Not null.</param>
-    /// <returns>The flattened entries, at most 64.</returns>
+    /// <returns>The flattened entries, at most 64, and whether the walk stopped with nodes still unread.</returns>
     /// <remarks>
     /// The leftmost child is visited before the next sibling, including when that child is itself an aggregate.
     /// Children are pushed right to left so the explicit stack pops the left child first. A left-to-right push reverses the list.
-    /// The loop is iterative. It visits at most 64 aggregates and keeps at most 64 entries. A repeated aggregate instance is skipped.
+    /// The loop is iterative. It visits at most 16 aggregates and keeps at most 64 entries.
+    /// A repeated aggregate instance is skipped by <see cref="object.ReferenceEquals"/> and does not mark the walk incomplete.
     /// </remarks>
-    private static List<Exception> Flatten(AggregateException root)
+    private static (List<Exception> Entries, bool Incomplete) Flatten(AggregateException root)
     {
         var result = new List<Exception>(8);
         var stack = new List<Exception>(8);
         var seen = new List<Exception>(8);
         stack.Add(root);
         var steps = 0;
+        var incomplete = false;
         while (stack.Count > 0 && result.Count < MaxFlatten)
         {
             var index = stack.Count - 1;
             var current = stack[index];
-            if (current is AggregateException && steps >= MaxFlatten)
-                break;
             stack.RemoveAt(index);
-            if (current is AggregateException aggregate)
-            {
-                steps++;
-                if (Contains(seen, aggregate))
-                    continue;
-                if (seen.Count < MaxFlatten)
-                    seen.Add(aggregate);
-                var inners = CopyInners(aggregate);
-                var room = MaxFlatten - stack.Count;
-                if (room > inners.Count)
-                    room = inners.Count;
-                for (var i = room - 1; i >= 0; i--)
-                    stack.Add(inners[i]);
-            }
-            else
+            if (current is not AggregateException aggregate)
             {
                 result.Add(current);
+                continue;
             }
+
+            if (Contains(seen, aggregate))
+                continue;
+            if (steps >= MaxChain || seen.Count >= MaxChain)
+            {
+                incomplete = true;
+                continue;
+            }
+
+            steps++;
+            seen.Add(aggregate);
+            var inners = CopyInners(aggregate, out var truncated);
+            if (truncated)
+                incomplete = true;
+            var room = MaxFlatten - stack.Count;
+            if (room > inners.Count)
+                room = inners.Count;
+            if (room < inners.Count)
+                incomplete = true;
+            for (var i = room - 1; i >= 0; i--)
+                stack.Add(inners[i]);
         }
 
-        return result;
+        if (stack.Count > 0)
+            incomplete = true;
+        return (result, incomplete);
     }
 
     /// <summary>Copies at most 64 direct inner exceptions. A throwing getter yields an empty list.</summary>
     /// <param name="aggregate">Aggregate whose children are copied. Not null.</param>
+    /// <param name="truncated">True when the collection still had an entry after the 64th.</param>
     /// <returns>The children that could be read. Never null.</returns>
-    /// <remarks>Does not throw. Null slots are skipped.</remarks>
-    private static List<Exception> CopyInners(AggregateException aggregate)
+    /// <remarks>Does not throw. Null slots are skipped. The loop stops at 64.</remarks>
+    private static List<Exception> CopyInners(AggregateException aggregate, out bool truncated)
     {
+        truncated = false;
         var copy = new List<Exception>(8);
         try
         {
@@ -841,7 +1221,11 @@ internal static class ExceptionReport
             foreach (var inner in inners)
             {
                 if (seen == MaxFlatten)
+                {
+                    truncated = true;
                     break;
+                }
+
                 seen++;
                 if (inner != null)
                     copy.Add(inner);
@@ -1188,34 +1572,76 @@ internal static class ExceptionReport
         return text;
     }
 
-    /// <summary>Applies the five escapes in the required order without rescanning inserted backslashes.</summary>
-    /// <param name="text">A bounded slice of the raw text. Not null.</param>
-    /// <returns>The escaped slice. May be longer than the input.</returns>
-    /// <remarks>
-    /// Backslash runs first so a later replacement's backslash stays a single escape.
-    /// Arrow runs after pipe so <c>--&gt;</c> is still visible as three characters.
-    /// </remarks>
+    /// <summary>
+    /// Applies the five escapes in one left-to-right pass.
+    /// Inserted backslashes are not scanned again, which matches backslash, then pipe, then arrow, then CR, then LF.
+    /// </summary>
+    /// <param name="text">Raw text. Not null. The caller already applied any length cap.</param>
+    /// <returns>The escaped text, or <paramref name="text"/> itself when nothing had to change.</returns>
+    /// <remarks>Does not throw. The loop stops at <paramref name="text"/>.Length.</remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
     private static string ApplyEscapes(string text)
     {
-        var step = text.Replace("\\", "\\\\", StringComparison.Ordinal);
-        step = step.Replace("|", "\\|", StringComparison.Ordinal);
-        step = step.Replace("-->", "--\\>", StringComparison.Ordinal);
-        step = step.Replace("\r", "\\r", StringComparison.Ordinal);
-        step = step.Replace("\n", "\\n", StringComparison.Ordinal);
-        return step;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '\\' || ch == '|' || ch == '\r' || ch == '\n'
+                || (ch == '-' && i + 2 < text.Length && text[i + 1] == '-' && text[i + 2] == '>'))
+                return ApplyEscapesSlow(text, i);
+        }
+
+        return text;
     }
 
-    /// <summary>Keeps at most <paramref name="limit"/> characters and marks the cut.</summary>
-    /// <param name="text">Escaped text. Not null.</param>
-    /// <param name="limit">500 for a message, 8192 for a context value.</param>
-    /// <returns>The prefix plus <c> [truncated]</c>. A high surrogate at the cut is left off.</returns>
-    /// <remarks>Does not throw. The marker is outside the counted characters.</remarks>
-    private static string Cut(string text, int limit)
+    /// <summary>Writes the escaped form once a special character has been found.</summary>
+    /// <param name="text">Raw text. Not null.</param>
+    /// <param name="found">Index of the first character that must be escaped. In range.</param>
+    /// <returns>The escaped copy. Never <paramref name="text"/>.</returns>
+    /// <remarks>
+    /// Does not throw. The loop stops at <paramref name="text"/>.Length.
+    /// Characters before <paramref name="found"/> are copied unchanged.
+    /// </remarks>
+    private static string ApplyEscapesSlow(string text, int found)
+    {
+        var builder = new StringBuilder(text.Length + 8);
+        builder.Append(text, 0, found);
+        for (var i = found; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '\\')
+                builder.Append("\\\\");
+            else if (ch == '|')
+                builder.Append("\\|");
+            else if (ch == '\r')
+                builder.Append("\\r");
+            else if (ch == '\n')
+                builder.Append("\\n");
+            else if (ch == '-' && i + 2 < text.Length && text[i + 1] == '-' && text[i + 2] == '>')
+            {
+                builder.Append("--\\>");
+                i += 2;
+            }
+            else
+                builder.Append(ch);
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Exclusive end index of a raw prefix of at most <paramref name="limit"/> characters.
+    /// A high surrogate at the cut is left off so a pair is not split.
+    /// </summary>
+    /// <param name="text">Raw text. Not null.</param>
+    /// <param name="limit">500 for a message, 8192 for a context or property value.</param>
+    /// <returns>The end index. The truncated marker is not included.</returns>
+    /// <remarks>Does not throw. Does not allocate.</remarks>
+    private static int RawCut(string text, int limit)
     {
         var cut = text.Length < limit ? text.Length : limit;
         if (cut > 0 && char.IsHighSurrogate(text[cut - 1]))
             cut--;
-        return string.Concat(text.AsSpan(0, cut), " [truncated]".AsSpan());
+        return cut;
     }
 
     /// <summary>True when the list already holds this instance.</summary>
@@ -1292,7 +1718,7 @@ internal static class ExceptionReport
 /// </summary>
 internal sealed class ExceptionBody
 {
-    /// <summary>Runtime full name. Always set.</summary>
+    /// <summary>Readable full name, without assembly qualification. Always set.</summary>
     public string? Type { get; init; }
 
     /// <summary>Raw message, the capture placeholder, or null when the getter returned null.</summary>
@@ -1313,7 +1739,7 @@ internal sealed class ExceptionBody
 /// <summary>One inner exception in the JSON array.</summary>
 internal sealed class ExceptionInner
 {
-    /// <summary>Runtime full name of this inner exception.</summary>
+    /// <summary>Readable full name of this inner exception, without assembly qualification.</summary>
     public string? Type { get; init; }
 
     /// <summary>Raw message of this inner exception.</summary>

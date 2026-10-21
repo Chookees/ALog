@@ -4,7 +4,10 @@ using ALog;
 using ALog.Config;
 using ALog.Writers.Console;
 
-BenchmarkRunner.Run<ALogBenchmarks>();
+if (args.Length == 0)
+    BenchmarkRunner.Run<ALogBenchmarks>();
+else
+    BenchmarkSwitcher.FromAssembly(typeof(ALogBenchmarks).Assembly).Run(args);
 
 [MemoryDiagnoser]
 public class ALogBenchmarks

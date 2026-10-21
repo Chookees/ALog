@@ -88,11 +88,11 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     /// <returns>One line, without a trailing newline.</returns>
     /// <remarks>
     /// Does not throw. The message is always included, including when it is empty, matching the previous file fallback.
-    /// Context values are escaped so a value cannot forge a <c>|</c> separator.
+    /// The message, context keys, and context values are escaped so none of them can forge a <c>|</c> separator or a second line.
     /// </remarks>
     private string FormatFallback(LogEvent logEvent)
     {
-        var head = "[" + logEvent.Timestamp.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + logEvent.Level + "] " + logEvent.Message;
+        var head = "[" + logEvent.Timestamp.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + logEvent.Level + "] " + ExceptionReport.EscapeLine(logEvent.Message);
         var exception = logEvent.Exception == null ? null : ExceptionReport.FormatText(logEvent.Exception);
         return ExceptionReport.JoinLine(head, exception, props: null, ExceptionReport.FormatContext(logEvent.Context));
     }

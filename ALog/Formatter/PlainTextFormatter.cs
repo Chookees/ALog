@@ -97,11 +97,13 @@ public class PlainTextFormatter : ILogFormatter
     /// </remarks>
     public string Format(LogEvent logEvent)
     {
-        var line = ExceptionReport.JoinLine(
-            FormatHead(logEvent),
-            FormatException(logEvent),
-            FormatProps(logEvent.Properties),
-            ExceptionReport.FormatContext(logEvent.Context));
+        var line = logEvent.Exception == null
+            ? FormatWithoutException(logEvent)
+            : ExceptionReport.JoinLine(
+                FormatHead(logEvent),
+                ExceptionReport.FormatText(logEvent.Exception),
+                FormatProps(logEvent.Properties),
+                ExceptionReport.FormatContext(logEvent.Context));
         if (!_includeStackTrace || logEvent.Exception == null)
             return line;
 
@@ -114,7 +116,10 @@ public class PlainTextFormatter : ILogFormatter
     /// <summary>Joins time, level, category, and message with spaces. Blank pieces are left out.</summary>
     /// <param name="logEvent">Event being rendered. Not null.</param>
     /// <returns>The head of the line, before the first <c> | </c>.</returns>
-    /// <remarks>Does not throw. The time format is the one given to the constructor. At most four pieces are joined.</remarks>
+    /// <remarks>
+    /// Does not throw. The time format is the one given to the constructor. At most four pieces are joined.
+    /// The message is escaped with the same rules as an exception message, and it is not cut to 500 characters.
+    /// </remarks>
     private string FormatHead(LogEvent logEvent)
     {
         var parts = new List<string>(4);
@@ -123,19 +128,35 @@ public class PlainTextFormatter : ILogFormatter
         if (!string.IsNullOrEmpty(logEvent.Category))
             parts.Add("[" + logEvent.Category + "]");
         if (!string.IsNullOrWhiteSpace(logEvent.Message))
-            parts.Add(logEvent.Message);
+            parts.Add(ExceptionReport.EscapeLine(logEvent.Message));
         return string.Join(" ", parts);
     }
 
-    /// <summary>The shared exception segment, or null when the event has no exception.</summary>
-    /// <param name="logEvent">Event being rendered. Not null.</param>
-    /// <returns>The segment from <see cref="ExceptionReport.FormatText"/>, or null.</returns>
-    /// <remarks>Does not build the text itself. Does not throw.</remarks>
-    private static string? FormatException(LogEvent logEvent)
+    /// <summary>
+    /// Renders an event that has no exception with one space join, the same shape as a line that has no tail.
+    /// Property and context segments already start with <c>| </c>, so the join still reads as <c> | </c>.
+    /// </summary>
+    /// <param name="logEvent">Event being rendered. Its exception is null.</param>
+    /// <returns>The line, without a trailing newline.</returns>
+    /// <remarks>
+    /// Does not throw. Does not call <see cref="Exception.ToString"/>.
+    /// The message, keys, and values are escaped. The message is not cut to 500 characters.
+    /// The array has seven slots, including the empty exception slot, and the filter drops blank slots.
+    /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private string FormatWithoutException(LogEvent logEvent)
     {
-        if (logEvent.Exception == null)
-            return null;
-        return ExceptionReport.FormatText(logEvent.Exception);
+        var parts = new string?[]
+        {
+            $"[{logEvent.Timestamp.ToString(_dateTimeFormat)}]",
+            $"[{logEvent.Level}]",
+            string.IsNullOrEmpty(logEvent.Category) ? null : $"[{logEvent.Category}]",
+            string.IsNullOrWhiteSpace(logEvent.Message) ? null : ExceptionReport.EscapeLine(logEvent.Message),
+            null,
+            ExceptionReport.FormatProps(logEvent.Properties, leadingPipe: true),
+            ExceptionReport.FormatContext(logEvent.Context, leadingPipe: true)
+        };
+        return string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
     }
 
     /// <summary>Renders template properties as <c>props: name=value</c>. Values are escaped like context values.</summary>
@@ -165,6 +186,7 @@ public class PlainTextFormatter : ILogFormatter
         string? text;
         try
         {
+            // shortcut: Exception.ToString walks inners with no cycle guard. A self-referencing exception built via reflection can overflow inside .NET's ToString().
             text = exception.ToString();
         }
         catch (Exception failure)

@@ -7,6 +7,7 @@ using ALog.Core;
 using ALog.Formatters;
 using ALog.Writers.Console;
 using ALog.Writers.File;
+using ALog.Tests.Naming;
 using ALog.Writers.Http;
 
 namespace ALog.Tests;
@@ -72,10 +73,12 @@ public sealed class ExceptionFormatTests
     {
         await Task.CompletedTask;
         Assert.Equal("Exception", ExceptionReport.FormatText(new Exception()));
-        Assert.Equal(typeof(SilentException).FullName, ExceptionReport.FormatText(new SilentException()));
-        Assert.Equal(typeof(EmptyMessage).FullName, ExceptionReport.FormatText(new EmptyMessage()));
-        Assert.Equal(typeof(NullMessage).FullName, ExceptionReport.FormatText(new NullMessage()));
-        Assert.Equal(typeof(WhitespaceMessage).FullName, ExceptionReport.FormatText(new WhitespaceMessage()));
+        Assert.Equal("ALog.Tests.ExceptionFormatTests.SilentException", ExceptionReport.FormatText(new SilentException()));
+        Assert.Equal("ALog.Tests.ExceptionFormatTests.EmptyMessage", ExceptionReport.FormatText(new EmptyMessage()));
+        Assert.Equal("ALog.Tests.ExceptionFormatTests.NullMessage", ExceptionReport.FormatText(new NullMessage()));
+        Assert.Equal("ALog.Tests.ExceptionFormatTests.WhitespaceMessage", ExceptionReport.FormatText(new WhitespaceMessage()));
+        Assert.DoesNotContain("+", ExceptionReport.FormatText(new SilentException()), StringComparison.Ordinal);
+        Assert.Equal("ALog.Tests.ExceptionFormatTests.SilentException", ExceptionReport.CreateBody(new SilentException()).Type);
         Assert.Equal("InvalidOperationException:   hi  ", ExceptionReport.FormatText(new InvalidOperationException("  hi  ")));
         Assert.Equal(
             "Exception: Exception of type 'X' was thrown. extra",
@@ -94,7 +97,7 @@ public sealed class ExceptionFormatTests
     }
 
     /// <summary>
-    /// Newlines become <c>\r</c> and <c>\n</c>, Unicode stays, and the cut is after escaping.
+    /// Newlines become <c>\r</c> and <c>\n</c>, Unicode stays, and the cut is before escaping.
     /// A surrogate pair on the 500-character boundary is not split.
     /// </summary>
     [Fact(Timeout = 30000)]
@@ -124,8 +127,9 @@ public sealed class ExceptionFormatTests
         Assert.Equal(new string('a', 498) + emoji + " [truncated]", kept);
 
         var pipes = ExceptionReport.Escape(new string('|', 251), messageLimit: true);
-        Assert.Equal(string.Concat(Enumerable.Repeat("\\|", 250)) + " [truncated]", pipes);
-        Assert.Equal(500 + " [truncated]".Length, pipes.Length);
+        Assert.Equal(string.Concat(Enumerable.Repeat("\\|", 251)), pipes);
+        Assert.DoesNotContain("[truncated]", pipes, StringComparison.Ordinal);
+        Assert.Same("plain", ExceptionReport.EscapeLine("plain"));
     }
 
     /// <summary>
@@ -199,7 +203,7 @@ public sealed class ExceptionFormatTests
             new Dictionary<string, object> { ["k"] = "x | y --> z" },
             new Dictionary<string, object> { ["p"] = "a|b" });
         var line = new PlainTextFormatter().Format(evt);
-        Assert.Contains("a | b | InvalidOperationException: a \\| b --\\> c\\\\d | props: p=a\\|b | ctx: k=x \\| y --\\> z", line, StringComparison.Ordinal);
+        Assert.Contains("a \\| b | InvalidOperationException: a \\| b --\\> c\\\\d | props: p=a\\|b | ctx: k=x \\| y --\\> z", line, StringComparison.Ordinal);
         var segments = SplitSegments(line);
         Assert.Contains(segments, segment => segment.Contains("InvalidOperationException:", StringComparison.Ordinal));
         var exceptionSegment = segments.First(segment => segment.StartsWith("InvalidOperationException:", StringComparison.Ordinal));
@@ -262,11 +266,44 @@ public sealed class ExceptionFormatTests
             Directory.Delete(directory, recursive: true);
         }
 
+        var readOnly = evt with
+        {
+            Properties = new System.Collections.ObjectModel.ReadOnlyDictionary<string, object>(
+                new Dictionary<string, object> { ["note"] = raw }),
+            Context = new System.Collections.ObjectModel.ReadOnlyDictionary<string, object>(
+                new Dictionary<string, object> { ["k"] = raw })
+        };
+        Assert.Equal(line, new PlainTextFormatter("yyyy-MM-dd HH:mm:ss").Format(readOnly));
+
+        const string forgeKey = "user=bob | forged\n";
+        const string forgeEscaped = "user=bob \\| forged\\n";
+        var forged = evt with
+        {
+            Properties = new System.Collections.ObjectModel.ReadOnlyDictionary<string, object>(
+                new Dictionary<string, object> { [forgeKey] = "v" }),
+            Context = new System.Collections.ObjectModel.ReadOnlyDictionary<string, object>(
+                new Dictionary<string, object> { [forgeKey] = "v" })
+        };
+        var forgedLine = new PlainTextFormatter("yyyy-MM-dd HH:mm:ss").Format(forged);
+        Assert.Contains("props: " + forgeEscaped + "=v", forgedLine, StringComparison.Ordinal);
+        Assert.Contains("ctx: " + forgeEscaped + "=v", forgedLine, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", forgedLine, StringComparison.Ordinal);
+        Assert.DoesNotContain(" | forged", forgedLine, StringComparison.Ordinal);
+
         var json = new JsonFormatter().Format(evt);
         using var document = JsonDocument.Parse(json);
         Assert.Equal(raw, document.RootElement.GetProperty("properties").GetProperty("note").GetString());
         Assert.Equal(raw, document.RootElement.GetProperty("context").GetProperty("k").GetString());
         Assert.DoesNotContain("--\\>", json, StringComparison.Ordinal);
+
+        var longMessage = new string('m', 501);
+        var longLine = new PlainTextFormatter("yyyy-MM-dd HH:mm:ss").Format(new LogEvent(
+            new DateTime(2026, 10, 21, 20, 55, 19),
+            LogLevel.Error,
+            longMessage,
+            null));
+        Assert.Contains(longMessage, longLine, StringComparison.Ordinal);
+        Assert.DoesNotContain("[truncated]", longLine, StringComparison.Ordinal);
     }
 
     /// <summary>An exception that was never thrown has no <c>at</c> segment and no JSON source.</summary>
@@ -624,6 +661,7 @@ public sealed class ExceptionFormatTests
             "InvalidOperationException: a --> InvalidOperationException: b --> InvalidOperationException: c (+1 more)",
             ExceptionReport.FormatText(four));
         Assert.DoesNotContain(": d", ExceptionReport.FormatText(four), StringComparison.Ordinal);
+        Assert.DoesNotContain("(+1+ more)", ExceptionReport.FormatText(four), StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -744,7 +782,7 @@ public sealed class ExceptionFormatTests
     /// <summary>
     /// JSON keeps at most 16 inner entries. An entry with no stack omits <c>source</c>.
     /// The top-level <c>source</c> is the innermost exception that has a stack, which can differ from an entry's own source.
-    /// A chain longer than 16 also locks the text walk: 18 nodes show <c>(+13 more)</c>, not the true remainder.
+    /// A chain longer than 16 also locks the text walk: 18 nodes show <c>(+13+ more)</c>, not the true remainder.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task Json_InnerCapAndEntrySource()
@@ -772,7 +810,8 @@ public sealed class ExceptionFormatTests
         for (var i = 16; i >= 0; i--)
             current = new InvalidOperationException("m" + i.ToString(System.Globalization.CultureInfo.InvariantCulture), current);
         var capped = ExceptionReport.FormatText(current);
-        Assert.Contains("InvalidOperationException: m0 --> InvalidOperationException: m1 --> InvalidOperationException: m2 (+13 more)", capped, StringComparison.Ordinal);
+        Assert.Contains("InvalidOperationException: m0 --> InvalidOperationException: m1 --> InvalidOperationException: m2 (+13+ more)", capped, StringComparison.Ordinal);
+        Assert.DoesNotContain("(+13 more)", capped, StringComparison.Ordinal);
         Assert.DoesNotContain(": m3", capped, StringComparison.Ordinal);
         var cappedJson = new JsonFormatter().Format(new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", current));
         using var cappedDoc = JsonDocument.Parse(cappedJson);
@@ -792,7 +831,7 @@ public sealed class ExceptionFormatTests
     {
         await Task.CompletedTask;
         var message = ExceptionReport.FormatText(new ThrowingMessage());
-        Assert.Equal(typeof(ThrowingMessage).FullName + ": [capture failed: InvalidOperationException]", message);
+        Assert.Equal("ALog.Tests.ExceptionFormatTests.ThrowingMessage: [capture failed: InvalidOperationException]", message);
         var body = ExceptionReport.CreateBody(new ThrowingMessage());
         Assert.Equal("[capture failed: InvalidOperationException]", body.Message);
 
@@ -849,6 +888,358 @@ public sealed class ExceptionFormatTests
         Assert.DoesNotContain("-->", text, StringComparison.Ordinal);
         var body = ExceptionReport.CreateBody(ex);
         Assert.True(body.Inner == null || body.Inner.Count == 0);
+
+        var tail = new InvalidOperationException("e");
+        var fourth = new InvalidOperationException("d", tail);
+        var third = new InvalidOperationException("c", fourth);
+        var second = new InvalidOperationException("b", third);
+        var first = new InvalidOperationException("a", second);
+        field.SetValue(tail, first);
+        var counted = ExceptionReport.FormatText(first);
+        Assert.Equal(
+            "InvalidOperationException: a --> InvalidOperationException: b --> InvalidOperationException: c (+2 more)",
+            counted);
+        Assert.DoesNotContain("(+2+ more)", counted, StringComparison.Ordinal);
+        var countedBody = ExceptionReport.CreateBody(first);
+        Assert.NotNull(countedBody.Inner);
+        Assert.Equal(4, countedBody.Inner.Count);
+    }
+
+    /// <summary>
+    /// The event message, a context key, a property key, and a property value are escaped on the text sinks.
+    /// A line feed in any of them stays inside the same line. JSON keeps the raw characters.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Line_EscapesMessageAndKeys()
+    {
+        const string raw = "user=bob | InvalidOperationException: forged | at Fake.M in F.cs:1\n";
+        const string escaped = "user=bob \\| InvalidOperationException: forged \\| at Fake.M in F.cs:1\\n";
+        var evt = new LogEvent(
+            new DateTime(2026, 10, 21, 20, 55, 19),
+            LogLevel.Error,
+            raw,
+            null,
+            new Dictionary<string, object> { [raw] = "v" },
+            new Dictionary<string, object> { [raw] = raw });
+        var plain = "[2026-10-21 20:55:19] [Error] " + escaped
+            + " | props: " + escaped + "=" + escaped
+            + " | ctx: " + escaped + "=v";
+        Assert.Equal(plain, new PlainTextFormatter("yyyy-MM-dd HH:mm:ss").Format(evt));
+        Assert.DoesNotContain("\n", plain, StringComparison.Ordinal);
+        Assert.DoesNotContain("\r", plain, StringComparison.Ordinal);
+        Assert.DoesNotContain(" | InvalidOperationException: forged | ", plain, StringComparison.Ordinal);
+
+        var fallback = "[2026-10-21 20:55:19] [Error] " + escaped + " | ctx: " + escaped + "=v";
+        var previous = Console.Out;
+        var buffer = new StringWriter();
+        Console.SetOut(buffer);
+        try
+        {
+            using var console = new ConsoleLogWriter(useColors: false);
+            console.Write(evt);
+        }
+        finally
+        {
+            Console.SetOut(previous);
+        }
+
+        Assert.Equal(fallback + Environment.NewLine, buffer.ToString());
+        Assert.DoesNotContain("props:", buffer.ToString(), StringComparison.Ordinal);
+
+        var directory = Path.Combine(Path.GetTempPath(), "alog-exf-forge-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            using (var file = new FileLogWriter(path))
+                file.Write(evt);
+            var fileText = await File.ReadAllTextAsync(path);
+            Assert.Equal(fallback + Environment.NewLine, fileText);
+            Assert.DoesNotContain("props:", fileText, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+
+        using var document = JsonDocument.Parse(new JsonFormatter().Format(evt));
+        Assert.Equal(raw, document.RootElement.GetProperty("message").GetString());
+        Assert.Equal(raw, document.RootElement.GetProperty("properties").GetProperty(raw).GetString());
+        Assert.Equal("v", document.RootElement.GetProperty("context").GetProperty(raw).GetString());
+    }
+
+    /// <summary>
+    /// The raw message is cut to 500 characters before escaping, and the marker is appended after that.
+    /// A pipe or an arrow that straddles the cut is not left as a split escape.
+    /// Context values use the same order at 8192.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Message_TruncatesRawThenEscapes()
+    {
+        await Task.CompletedTask;
+        var clean = new string('b', 4);
+        Assert.Same(clean, ExceptionReport.Escape(clean, messageLimit: true));
+
+        var boundary = new string('x', 499) + "|";
+        Assert.Equal(500, boundary.Length);
+        var boundaryText = ExceptionReport.Escape(boundary, messageLimit: true);
+        Assert.Equal(new string('x', 499) + "\\|", boundaryText);
+        Assert.DoesNotContain("[truncated]", boundaryText, StringComparison.Ordinal);
+
+        var over = ExceptionReport.Escape(new string('x', 500) + "|", messageLimit: true);
+        Assert.Equal(new string('x', 500) + " [truncated]", over);
+        Assert.DoesNotContain("|", over, StringComparison.Ordinal);
+        Assert.DoesNotContain("\\", over, StringComparison.Ordinal);
+
+        var arrow = ExceptionReport.Escape(new string('x', 498) + "-->", messageLimit: true);
+        Assert.Equal(new string('x', 498) + "-- [truncated]", arrow);
+        Assert.DoesNotContain("\\", arrow, StringComparison.Ordinal);
+        Assert.DoesNotContain("--\\>", arrow, StringComparison.Ordinal);
+
+        var arrowTail = ExceptionReport.Escape(new string('x', 499) + "-->", messageLimit: true);
+        Assert.Equal(new string('x', 499) + "- [truncated]", arrowTail);
+
+        var ctxBoundary = ExceptionReport.Escape(new string('x', 8191) + "|", messageLimit: false);
+        Assert.Equal(new string('x', 8191) + "\\|", ctxBoundary);
+        Assert.DoesNotContain("[truncated]", ctxBoundary, StringComparison.Ordinal);
+        var ctxPipes = ExceptionReport.Escape(new string('|', 8192), messageLimit: false);
+        Assert.Equal(string.Concat(Enumerable.Repeat("\\|", 8192)), ctxPipes);
+        Assert.DoesNotContain("[truncated]", ctxPipes, StringComparison.Ordinal);
+        var ctxOver = ExceptionReport.Escape(new string('x', 8192) + "|", messageLimit: false);
+        Assert.Equal(new string('x', 8192) + " [truncated]", ctxOver);
+        Assert.DoesNotContain("\\|", ctxOver, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>(+N more)</c> is written only when the walk counted every node.
+    /// A 17-level chain stops at 16 and writes <c>(+13+ more)</c>. An aggregate that still has an unread node does the same.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Chain_SuffixMarksAStoppedWalk()
+    {
+        await Task.CompletedTask;
+        var full = ChainOf(16);
+        var fullText = ExceptionReport.FormatText(full);
+        Assert.Contains("InvalidOperationException: m0 --> InvalidOperationException: m1 --> InvalidOperationException: m2 (+13 more)", fullText, StringComparison.Ordinal);
+        Assert.DoesNotContain("(+13+ more)", fullText, StringComparison.Ordinal);
+
+        var stopped = ChainOf(17);
+        var stoppedText = ExceptionReport.FormatText(stopped);
+        Assert.Contains("InvalidOperationException: m0 --> InvalidOperationException: m1 --> InvalidOperationException: m2 (+13+ more)", stoppedText, StringComparison.Ordinal);
+        Assert.DoesNotContain("(+13 more)", stoppedText, StringComparison.Ordinal);
+
+        var exact = new Exception[64];
+        for (var i = 0; i < exact.Length; i++)
+            exact[i] = new InvalidOperationException("e" + i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var exactText = ExceptionReport.FormatText(new AggregateException(exact));
+        Assert.Contains("(+61 more)", exactText, StringComparison.Ordinal);
+        Assert.DoesNotContain("(+61+ more)", exactText, StringComparison.Ordinal);
+
+        var extra = new Exception[65];
+        for (var i = 0; i < extra.Length; i++)
+            extra[i] = new InvalidOperationException("e" + i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var extraText = ExceptionReport.FormatText(new AggregateException(extra));
+        Assert.Contains("(+61+ more)", extraText, StringComparison.Ordinal);
+        Assert.DoesNotContain("(+61 more)", extraText, StringComparison.Ordinal);
+
+        var hidden = new InvalidOperationException("hidden");
+        var more = new AggregateException(hidden);
+        Exception current = new AggregateException(
+            new InvalidOperationException("e0"),
+            new InvalidOperationException("e1"),
+            new InvalidOperationException("e2"),
+            new InvalidOperationException("e3"),
+            more);
+        for (var i = 0; i < 15; i++)
+            current = new AggregateException(current);
+        var capped = ExceptionReport.FormatText(current);
+        Assert.Contains("InvalidOperationException: e0; InvalidOperationException: e1; InvalidOperationException: e2 (+1+ more)", capped, StringComparison.Ordinal);
+        Assert.DoesNotContain("(+1 more)", capped, StringComparison.Ordinal);
+        Assert.DoesNotContain("hidden", capped, StringComparison.Ordinal);
+        Assert.DoesNotContain(": e3", capped, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An aggregate that contains itself does not spin, in text or JSON.
+    /// A leaf stored beside that cycle is rendered once. Removing the reference check repeats the leaf.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Robustness_AggregateCycleStops()
+    {
+        await Task.CompletedTask;
+        var loop = new AggregateException();
+        SetChildren(loop, new Exception[] { loop });
+        Assert.Equal("AggregateException", ExceptionReport.FormatText(loop));
+        var loopBody = ExceptionReport.CreateBody(loop);
+        Assert.True(loopBody.Inner == null || loopBody.Inner.Count == 0);
+        var loopJson = new JsonFormatter().Format(new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", loop));
+        using (var loopDoc = JsonDocument.Parse(loopJson))
+        {
+            Assert.False(loopDoc.RootElement.GetProperty("exception").TryGetProperty("inner", out _));
+        }
+
+        var leaf = new InvalidOperationException("leaf");
+        var both = new AggregateException();
+        SetChildren(both, new Exception[] { both, leaf });
+        Assert.Equal("AggregateException --> InvalidOperationException: leaf", ExceptionReport.FormatText(both));
+        var bothJson = new JsonFormatter().Format(new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", both));
+        using var bothDoc = JsonDocument.Parse(bothJson);
+        var inner = bothDoc.RootElement.GetProperty("exception").GetProperty("inner");
+        Assert.Equal(1, inner.GetArrayLength());
+        Assert.Equal("leaf", inner[0].GetProperty("message").GetString());
+    }
+
+    /// <summary>
+    /// Generic and nested types use C# syntax, frames use that same form, and text omits an aggregate entry's inner exception.
+    /// JSON keeps the entry and that inner exception, in that order.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Names_GenericNestedFramesAndEntryInners()
+    {
+        await Task.CompletedTask;
+        Assert.Equal(
+            "ALog.Tests.Naming.GenEx<Int32>: n",
+            ExceptionReport.FormatText(new GenEx<int>("n")));
+        Assert.Equal(
+            "ALog.Tests.Naming.GenEx<Int32>",
+            ExceptionReport.CreateBody(new GenEx<int>("n")).Type);
+        var genericJson = new JsonFormatter().Format(new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", new GenEx<int>("n")));
+        Assert.DoesNotContain("PublicKeyToken", genericJson, StringComparison.Ordinal);
+        Assert.DoesNotContain("`", genericJson, StringComparison.Ordinal);
+        Assert.Equal(
+            "ALog.Tests.Naming.GenEx<List<Int32>>: n",
+            ExceptionReport.FormatText(new GenEx<List<int>>("n")));
+        Assert.Equal(
+            "ALog.Tests.Naming.GenEx<Int32[]>: n",
+            ExceptionReport.FormatText(new GenEx<int[]>("n")));
+        Assert.Equal(
+            "ALog.Tests.Naming.GenEx<ALog.QuickstartSample.CardException[]>: n",
+            ExceptionReport.FormatText(new GenEx<ALog.QuickstartSample.CardException[]>("n")));
+        Assert.Equal(
+            "ALog.Tests.Naming.GenEx<Nullable<Int32>>: n",
+            ExceptionReport.FormatText(new GenEx<int?>("n")));
+        Assert.Equal(
+            "ALog.Tests.Naming.Box<ALog.QuickstartSample.CardException>: n",
+            ExceptionReport.FormatText(new Box<ALog.QuickstartSample.CardException>("n")));
+        Assert.Equal(
+            "ALog.Tests.Naming.Box<Microsoft.Data.Demo.DemoException>: n",
+            ExceptionReport.FormatText(new Box<Microsoft.Data.Demo.DemoException>("n")));
+
+        var nested = ExceptionReport.FormatText(new Outer.NestedEx("boom"));
+        Assert.Equal("ALog.Tests.Naming.Outer.NestedEx: boom", nested);
+        Assert.DoesNotContain("+", nested, StringComparison.Ordinal);
+        Assert.Equal(
+            "ALog.Tests.Naming.Holder<Int32>.Inner<ALog.QuickstartSample.CardException>: nest",
+            ExceptionReport.FormatText(new Holder<int>.Inner<ALog.QuickstartSample.CardException>("nest")));
+
+        Assert.Equal("Outer.Inner2<T>", ExceptionReport.FrameTypeName(typeof(Outer.Inner2<>)));
+        Assert.Equal("Outer.Inner2<Int32>", ExceptionReport.FrameTypeName(typeof(Outer.Inner2<int>)));
+        Assert.Equal("System.Collections.Generic.List<Int32>", ExceptionReport.FrameTypeName(typeof(List<int>)));
+        Assert.Equal("System.Collections.Generic.List<T>", ExceptionReport.FrameTypeName(typeof(List<>)));
+        Assert.Equal("System.Collections.Generic.Dictionary<Int32, String>", ExceptionReport.FrameTypeName(typeof(Dictionary<int, string>)));
+        Assert.Equal("Int32[,]", ExceptionReport.FrameTypeName(typeof(int[,])));
+        Assert.Equal("System.Collections.Generic.List<Int32>*", ExceptionReport.FrameTypeName(typeof(List<int>).MakePointerType()));
+        Assert.Equal("System.Collections.Generic.List<Int32>&", ExceptionReport.FrameTypeName(typeof(List<int>).MakeByRefType()));
+        Assert.DoesNotContain("`", ExceptionReport.FrameTypeName(typeof(List<int>).MakePointerType()), StringComparison.Ordinal);
+        Assert.Equal(string.Empty, ExceptionReport.FrameTypeName(null));
+
+        var deep = typeof(int);
+        for (var i = 0; i < 20; i++)
+            deep = typeof(List<>).MakeGenericType(deep);
+        var deepName = ExceptionReport.FrameTypeName(deep);
+        Assert.Contains("`", deepName, StringComparison.Ordinal);
+        Assert.DoesNotContain("PublicKeyToken", deepName, StringComparison.Ordinal);
+
+        var thrown = Catch(() => new Outer.Inner2<int>().Go());
+        var frame = ExceptionReport.FormatText(thrown);
+        Assert.Contains("at Outer.Inner2<T>.Go in ExceptionNameSamples.cs:", frame, StringComparison.Ordinal);
+        Assert.DoesNotContain("+", frame, StringComparison.Ordinal);
+        Assert.DoesNotContain("`", frame, StringComparison.Ordinal);
+        Assert.DoesNotContain("ALog.Tests.Naming.Outer.Inner2", frame, StringComparison.Ordinal);
+
+        var entry = new InvalidOperationException("entry", new InvalidOperationException("deep"));
+        var aggregate = new AggregateException(entry);
+        var aggregateText = ExceptionReport.FormatText(aggregate);
+        Assert.Equal("AggregateException --> InvalidOperationException: entry", aggregateText);
+        Assert.DoesNotContain("deep", aggregateText, StringComparison.Ordinal);
+        var aggregateBody = ExceptionReport.CreateBody(aggregate);
+        Assert.NotNull(aggregateBody.Inner);
+        Assert.Collection(
+            aggregateBody.Inner,
+            item => Assert.Equal("entry", item.Message),
+            item => Assert.Equal("deep", item.Message));
+    }
+
+    /// <summary>
+    /// Caps that are not on the happy path still run: message safety, flatten room, arity, rank, and compiler names.
+    /// Each one is a fixed bound, and each one changes the text when it trips.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Bounds_CapsChangeTheText()
+    {
+        await Task.CompletedTask;
+        Assert.Equal(string.Empty, ExceptionReport.EscapeLine(null));
+        Assert.Equal(string.Empty, ExceptionReport.EscapeLine(string.Empty));
+        Assert.Equal("GlobalNameException: g", ExceptionReport.FormatText(new GlobalNameException("g")));
+
+        Exception deep = new AggregateException(new InvalidOperationException("leaf"));
+        for (var i = 0; i < 16; i++)
+            deep = new AggregateException(deep);
+        Assert.DoesNotContain("leaf", ExceptionReport.CreateBody(deep).Message ?? string.Empty, StringComparison.Ordinal);
+
+        var wideKids = new Exception[65];
+        for (var i = 0; i < wideKids.Length; i++)
+            wideKids[i] = new InvalidOperationException("k" + i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Assert.DoesNotContain("k0", ExceptionReport.CreateBody(new AggregateException(wideKids)).Message ?? string.Empty, StringComparison.Ordinal);
+
+        var crowded = new Exception[64];
+        for (var i = 0; i < crowded.Length; i++)
+            crowded[i] = new InvalidOperationException("p" + i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var crowdedText = ExceptionReport.FormatText(new AggregateException(new AggregateException(crowded), new InvalidOperationException("side")));
+        Assert.Contains("(+61+ more)", crowdedText, StringComparison.Ordinal);
+        Assert.DoesNotContain("side", crowdedText, StringComparison.Ordinal);
+
+        var left = new Exception[40];
+        var right = new Exception[40];
+        for (var i = 0; i < left.Length; i++)
+        {
+            left[i] = new InvalidOperationException("L" + i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            right[i] = new InvalidOperationException("R" + i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+
+        var split = ExceptionReport.FormatText(new AggregateException(new AggregateException(left), new AggregateException(right)));
+        Assert.Contains("(+61+ more)", split, StringComparison.Ordinal);
+        Assert.DoesNotContain("R39", split, StringComparison.Ordinal);
+
+        var array = typeof(int);
+        for (var i = 0; i < 20; i++)
+            array = array.MakeArrayType();
+        var arrayName = ExceptionReport.FrameTypeName(array);
+        Assert.Contains("Int32", arrayName, StringComparison.Ordinal);
+        Assert.DoesNotContain("PublicKeyToken", arrayName, StringComparison.Ordinal);
+        Assert.Equal("Int32[" + new string(',', 15) + "]", ExceptionReport.FrameTypeName(typeof(int).MakeArrayType(17)));
+
+        var wideName = ExceptionReport.FormatText(new WideException<int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, string>());
+        Assert.Contains("WideException<Int32", wideName, StringComparison.Ordinal);
+        Assert.DoesNotContain("String", wideName, StringComparison.Ordinal);
+
+        var peeled = "M";
+        for (var i = 0; i < 9; i++)
+            peeled = "<" + peeled + ">b__0_0";
+        var stopped = ExceptionReport.RenameCompilerMethod(string.Empty, peeled);
+        Assert.Contains(">b__0_0", stopped, StringComparison.Ordinal);
+        Assert.NotEqual("M", stopped);
+        Assert.Equal("<NoClose", ExceptionReport.RenameCompilerMethod(string.Empty, "<NoClose"));
+        Assert.Equal("<M>b__1_", ExceptionReport.RenameCompilerMethod(string.Empty, "<M>b__1_"));
+
+        var broken = new AggregateException();
+        var innersField = typeof(AggregateException).GetField("_innerExceptions", BindingFlags.Instance | BindingFlags.NonPublic);
+        var viewField = typeof(AggregateException).GetField("_rocView", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(innersField);
+        Assert.NotNull(viewField);
+        innersField.SetValue(broken, null);
+        viewField.SetValue(broken, null);
+        Assert.Equal("AggregateException", ExceptionReport.FormatText(broken));
     }
 
     /// <summary>
@@ -963,6 +1354,11 @@ public sealed class ExceptionFormatTests
         Assert.NotNull(ctx);
         Assert.Contains("k0=v", ctx, StringComparison.Ordinal);
         Assert.DoesNotContain("k4096=", ctx, StringComparison.Ordinal);
+        var wideReadOnly = new System.Collections.ObjectModel.ReadOnlyDictionary<string, object>(wide);
+        var readOnlyCtx = ExceptionReport.FormatContext(wideReadOnly);
+        Assert.NotNull(readOnlyCtx);
+        Assert.Contains("k0=v", readOnlyCtx, StringComparison.Ordinal);
+        Assert.DoesNotContain("k4096=", readOnlyCtx, StringComparison.Ordinal);
         var eight = new Dictionary<string, object>();
         for (var i = 0; i < 8; i++)
             eight.Add("e" + i.ToString(System.Globalization.CultureInfo.InvariantCulture), i);
@@ -1042,6 +1438,10 @@ public sealed class ExceptionFormatTests
         Assert.Contains(BreakingBullet, changelog, StringComparison.Ordinal);
         Assert.Contains(ReadmeEscapeSentence, console, StringComparison.Ordinal);
         Assert.Contains(
+            "a self-referencing exception built via reflection can overflow inside that call.",
+            console,
+            StringComparison.Ordinal);
+        Assert.Contains(
             "\"\\\", \"|\", and \"-->\" inside exception messages and context values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\".",
             changelog,
             StringComparison.Ordinal);
@@ -1111,6 +1511,30 @@ public sealed class ExceptionFormatTests
             "Payment failed",
             Catch(() => ALog.QuickstartSample.CheckoutService.Pay()),
             new Dictionary<string, object> { ["orderId"] = 17 });
+    }
+
+    /// <summary>Builds a chain of <paramref name="count"/> invalid-operation exceptions, outermost message <c>m0</c>.</summary>
+    /// <param name="count">How many nodes. At least one.</param>
+    /// <returns>The outermost exception.</returns>
+    private static Exception ChainOf(int count)
+    {
+        Exception current = new InvalidOperationException("m" + (count - 1).ToString(System.Globalization.CultureInfo.InvariantCulture));
+        for (var i = count - 2; i >= 0; i--)
+            current = new InvalidOperationException("m" + i.ToString(System.Globalization.CultureInfo.InvariantCulture), current);
+        return current;
+    }
+
+    /// <summary>Replaces an aggregate's children, including a child that is the aggregate itself.</summary>
+    /// <param name="aggregate">Aggregate to rewrite. Not null.</param>
+    /// <param name="children">New children. Not null. May contain <paramref name="aggregate"/>.</param>
+    private static void SetChildren(AggregateException aggregate, Exception[] children)
+    {
+        var inners = typeof(AggregateException).GetField("_innerExceptions", BindingFlags.Instance | BindingFlags.NonPublic);
+        var view = typeof(AggregateException).GetField("_rocView", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(inners);
+        Assert.NotNull(view);
+        inners.SetValue(aggregate, children);
+        view.SetValue(aggregate, new System.Collections.ObjectModel.ReadOnlyCollection<Exception>(children));
     }
 
     /// <summary>Runs an action and returns the exception it threw.</summary>
