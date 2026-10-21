@@ -21,10 +21,10 @@ public sealed class ExceptionFormatTests
         "Payment failed | InvalidOperationException: Card declined | at CheckoutService.Pay in CheckoutService.cs:42 | ctx: orderId=17";
 
     private const string BreakingBullet =
-        "- Plain text, console, and file output write exceptions as \"Type: Message\", followed by inner exceptions and the source line (\"at Class.Method in File.cs:42\"). The \"EX:\" label is gone; update log parsers that match it. \"\\\", \"|\", and \"-->\" inside exception messages and context values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\".";
+        "- Plain text, console, and file output write exceptions as \"Type: Message\", followed by inner exceptions and the source line (\"at Class.Method in File.cs:42\"). The \"EX:\" label is gone; update log parsers that match it. \"\\\", \"|\", and \"-->\" in the message and in context or property names and values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\", so each event stays one line.";
 
     private const string ReadmeEscapeSentence =
-        @"`\`, `|`, and `-->` inside an exception message or a context value are escaped as `\\`, `\|`, and `--\>`, and line breaks as `\r` and `\n`, so each event stays one line and the separators stay unambiguous.";
+        "\"\\\", \"|\", and \"-->\" in the message and in context or property names and values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\", so each event stays one line.";
 
     private const string AddedSourceBullet =
         "- JSON and HTTP exception output add \"source\" (method, file, line) and \"inner\" (type, message, and source of each inner exception, up to 16).";
@@ -1442,7 +1442,7 @@ public sealed class ExceptionFormatTests
             console,
             StringComparison.Ordinal);
         Assert.Contains(
-            "\"\\\", \"|\", and \"-->\" inside exception messages and context values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\".",
+            "\"\\\", \"|\", and \"-->\" in the message and in context or property names and values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\", so each event stays one line.",
             changelog,
             StringComparison.Ordinal);
         Assert.Contains("### Added", changelog, StringComparison.Ordinal);
