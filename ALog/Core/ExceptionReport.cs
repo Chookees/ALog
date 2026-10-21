@@ -37,7 +37,8 @@ internal static class ExceptionReport
 
     /// <summary>
     /// Nodes one flatten, inner, or origin walk may visit.
-    /// The work list and the flattened entry list each stop here.
+    /// A flatten counts nested aggregates and leaves on this one counter.
+    /// The root is the node already being rendered and is not counted again.
     /// Hitting the cap writes <c>(+N+ more)</c>.
     /// </summary>
     private const int MaxFlatten = 64;
@@ -1279,36 +1280,40 @@ internal static class ExceptionReport
     /// Flattens nested aggregates in the same order as <see cref="AggregateException.Flatten"/>.
     /// Non-aggregate entries are kept. The root aggregate is not an entry.
     /// </summary>
-    /// <param name="root">Aggregate to flatten. Not null.</param>
+    /// <param name="root">Aggregate to flatten. Not null. It does not consume a visit.</param>
     /// <param name="ancestors">
     /// Ancestor path of the caller. A child on this path is a cycle and is not emitted.
     /// Not null. The root is still processed when it appears here.
     /// </param>
-    /// <returns>The flattened entries, at most 64, and whether the walk stopped with nodes still unread.</returns>
+    /// <returns>The flattened entries, and whether the walk stopped with nodes still unread.</returns>
     /// <remarks>
     /// Each aggregate appends its non-aggregate children immediately, in order, and appends nested
     /// aggregates to the end of the work list. <c>Agg(x, Agg(y), z)</c> is <c>x, z, y</c>.
     /// The same instance is emitted twice when it is a sibling. It is skipped only when it is an ancestor.
     /// The method does not call <see cref="AggregateException.Flatten"/>, because that loops on a reflective cycle.
-    /// The work list and the entry list each stop at 64 nodes. Hitting either cap marks the walk incomplete.
+    /// Nested aggregates and leaves share one counter of 64. An aggregate copies only as many children as slots remain.
+    /// A child that is an ancestor is not recorded and does not increment the counter.
+    /// Leaving children unread marks the walk incomplete.
+    /// Does not throw.
     /// </remarks>
     private static (List<Exception> Entries, bool Incomplete) Flatten(AggregateException root, List<Exception> ancestors)
     {
         var result = new List<Exception>(8);
         var work = new List<AggregateException>(8);
-        var parent = new int[MaxFlatten];
+        var parent = new int[MaxFlatten + 1];
         work.Add(root);
         parent[0] = -1;
         var read = 0;
+        var visited = 0;
         var incomplete = false;
-        while (read < work.Count && result.Count < MaxFlatten)
+        while (read < work.Count && visited < MaxFlatten)
         {
             var index = read;
             var aggregate = work[index];
             read++;
             if (IsAggregateAncestor(work, parent, parent[index], aggregate))
                 continue;
-            var inners = CopyInners(aggregate, out var truncated);
+            var inners = CopyInners(aggregate, MaxFlatten - visited, out var truncated);
             if (truncated)
                 incomplete = true;
             for (var i = 0; i < inners.Count; i++)
@@ -1318,27 +1323,18 @@ internal static class ExceptionReport
                 {
                     if (IsAggregateAncestor(work, parent, index, nested) || Contains(ancestors, nested))
                         continue;
-                    if (work.Count >= MaxFlatten)
-                    {
-                        incomplete = true;
-                        continue;
-                    }
-
                     parent[work.Count] = index;
                     work.Add(nested);
+                    visited++;
                 }
                 else if (Contains(ancestors, child))
                 {
                     continue;
                 }
-                else if (result.Count >= MaxFlatten)
-                {
-                    incomplete = true;
-                    break;
-                }
                 else
                 {
                     result.Add(child);
+                    visited++;
                 }
             }
         }
@@ -1354,7 +1350,7 @@ internal static class ExceptionReport
     /// <param name="index">Aggregate to start from. -1 means the chain is empty.</param>
     /// <param name="candidate">Exception that might be an ancestor. Not null.</param>
     /// <returns>True when the same instance appears at <paramref name="index"/> or above it.</returns>
-    /// <remarks>Does not throw. The walk stops at 64 steps, which is the work-list cap.</remarks>
+    /// <remarks>Does not throw. The walk stops at 64 steps.</remarks>
     private static bool IsAggregateAncestor(List<AggregateException> work, int[] parent, int index, Exception candidate)
     {
         var guard = 0;
@@ -1376,6 +1372,17 @@ internal static class ExceptionReport
     /// <remarks>Does not throw. Null slots are skipped. The loop stops at 64.</remarks>
     private static List<Exception> CopyInners(AggregateException aggregate, out bool truncated)
     {
+        return CopyInners(aggregate, MaxFlatten, out truncated);
+    }
+
+    /// <summary>Copies at most <paramref name="limit"/> direct inner exceptions. A throwing getter yields an empty list.</summary>
+    /// <param name="aggregate">Aggregate whose children are copied. Not null.</param>
+    /// <param name="limit">How many children may be copied. Zero copies nothing. Not above 64.</param>
+    /// <param name="truncated">True when the collection still had an entry after <paramref name="limit"/>.</param>
+    /// <returns>The children that could be read. Never null.</returns>
+    /// <remarks>Does not throw. Null slots are skipped. The loop stops at <paramref name="limit"/>.</remarks>
+    private static List<Exception> CopyInners(AggregateException aggregate, int limit, out bool truncated)
+    {
         truncated = false;
         var copy = new List<Exception>(8);
         try
@@ -1386,7 +1393,7 @@ internal static class ExceptionReport
             var seen = 0;
             foreach (var inner in inners)
             {
-                if (seen == MaxFlatten)
+                if (seen == limit)
                 {
                     truncated = true;
                     break;

@@ -1002,6 +1002,33 @@ public sealed class ExceptionFormatTests
     }
 
     /// <summary>
+    /// One nested aggregate plus 64 leaves is 65 nodes under the root.
+    /// The root is already rendered, and the nested aggregate and the leaves share one counter of 64,
+    /// so the walk stops before the last leaf and writes <c>(+n+ more)</c>.
+    /// JSON lists the same prefix, at most 16 entries.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_NestedLeavesShareTheNodeCap()
+    {
+        await Task.CompletedTask;
+        var nested = new AggregateException(Enumerable.Range(0, 64).Select(i =>
+            new InvalidOperationException(i.ToString(System.Globalization.CultureInfo.InvariantCulture))).ToArray());
+        var root = new AggregateException(nested);
+        var text = ExceptionReport.FormatText(root);
+        const string suffix = " (+60+ more)";
+        Assert.EndsWith(suffix, text, StringComparison.Ordinal);
+        Assert.Contains("+ more)", text, StringComparison.Ordinal);
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: 0; InvalidOperationException: 1; InvalidOperationException: 2" + suffix,
+            text);
+        Assert.DoesNotContain("(+60 more)", text, StringComparison.Ordinal);
+        Assert.DoesNotContain(": 63", text, StringComparison.Ordinal);
+        AssertInnerMessages(
+            root,
+            Enumerable.Range(0, 16).Select(i => i.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToArray());
+    }
+
+    /// <summary>
     /// JSON keeps <c>type</c>, <c>message</c>, and <c>stackTrace</c> and adds <c>source</c> and <c>inner</c>.
     /// Compact output stays one line. Pretty output stays indented. The message is raw and full.
     /// </summary>
@@ -1363,6 +1390,32 @@ public sealed class ExceptionFormatTests
     }
 
     /// <summary>
+    /// A cycle below the root, root to A to B and back to A, is an ancestor and is not entered again.
+    /// A holds leaf <c>la</c> and B holds leaf <c>lb</c>. Text and JSON list those two leaves once.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Robustness_CycleBelowRootStops()
+    {
+        await Task.CompletedTask;
+        var la = new InvalidOperationException("la");
+        var lb = new InvalidOperationException("lb");
+        var aggregateA = new AggregateException();
+        var aggregateB = new AggregateException();
+        SetChildren(aggregateA, new Exception[] { la, aggregateB });
+        SetChildren(aggregateB, new Exception[] { lb, aggregateA });
+        var root = new AggregateException();
+        SetChildren(root, new Exception[] { aggregateA });
+
+        var text = ExceptionReport.FormatText(root);
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: la; InvalidOperationException: lb",
+            text);
+        Assert.DoesNotContain("la; lb; la", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("+ more)", text, StringComparison.Ordinal);
+        AssertInnerMessages(root, "la", "lb");
+    }
+
+    /// <summary>
     /// A wrap whose inner aggregate points back at the wrap is one shared walk.
     /// Text and JSON list the same instances, and the wrap is not repeated inside the aggregate.
     /// </summary>
@@ -1545,7 +1598,7 @@ public sealed class ExceptionFormatTests
         for (var i = 0; i < crowded.Length; i++)
             crowded[i] = new InvalidOperationException("p" + i.ToString(System.Globalization.CultureInfo.InvariantCulture));
         var crowdedText = ExceptionReport.FormatText(new AggregateException(new AggregateException(crowded), new InvalidOperationException("side")));
-        Assert.Contains("InvalidOperationException: side; InvalidOperationException: p0; InvalidOperationException: p1 (+61+ more)", crowdedText, StringComparison.Ordinal);
+        Assert.Contains("InvalidOperationException: side; InvalidOperationException: p0; InvalidOperationException: p1 (+60+ more)", crowdedText, StringComparison.Ordinal);
         Assert.DoesNotContain("p63", crowdedText, StringComparison.Ordinal);
 
         var left = new Exception[40];
@@ -1557,7 +1610,7 @@ public sealed class ExceptionFormatTests
         }
 
         var split = ExceptionReport.FormatText(new AggregateException(new AggregateException(left), new AggregateException(right)));
-        Assert.Contains("(+61+ more)", split, StringComparison.Ordinal);
+        Assert.Contains("(+59+ more)", split, StringComparison.Ordinal);
         Assert.DoesNotContain("R39", split, StringComparison.Ordinal);
 
         var array = typeof(int);
