@@ -1,0 +1,64 @@
+# Manual exception-format benchmarks. Not part of pull-request CI.
+# Compare no-exception Plain and JSON with master 0dd4a89, and measure a thrown 3-level chain.
+
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 1
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        global-json-file: global.json
+
+    - name: Assert SDK version
+      run: |
+        version=$(dotnet --version)
+        echo "dotnet --version ${version}"
+        test "$version" = "10.0.402"
+
+    - name: Fetch master
+      run: git fetch --no-tags --depth=1 origin 0dd4a8966cbc4d5274829822889b0f814b4ed7c6
+
+    - name: Master pass 1
+      run: bash eng/format-bench.sh master "$GITHUB_WORKSPACE/bench-out/master-1" '*NoException*'
+
+    - name: Branch pass 1
+      run: bash eng/format-bench.sh branch "$GITHUB_WORKSPACE/bench-out/branch-1" '*NoException*|*ThrownChain3*'
+
+    - name: Master pass 2
+      run: bash eng/format-bench.sh master "$GITHUB_WORKSPACE/bench-out/master-2" '*NoException*'
+
+    - name: Branch pass 2
+      run: bash eng/format-bench.sh branch "$GITHUB_WORKSPACE/bench-out/branch-2" '*NoException*'
+
+    - name: Publish summaries
+      run: |
+        for dir in master-1 branch-1 master-2 branch-2; do
+          echo "## ${dir}" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_WORKSPACE/bench-out/${dir}/results/"*-report-github.md >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+        done
+
+    - name: Upload benchmark reports
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: format-benchmarks
+        path: bench-out
+        retention-days: 7
+        if-no-files-found: error

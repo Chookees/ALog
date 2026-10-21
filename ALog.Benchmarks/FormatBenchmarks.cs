@@ -7,9 +7,9 @@ using ALog.Formatters;
 /// <summary>
 /// Formats one event. The no-exception cases are the gate against master.
 /// The chain cases report the exception path. The thrown chain includes the stack walk.
+/// The runner uses BenchmarkDotNet's default job.
 /// </summary>
 [MemoryDiagnoser]
-[ShortRunJob]
 public class FormatBenchmarks
 {
     private readonly PlainTextFormatter _plain = new();
