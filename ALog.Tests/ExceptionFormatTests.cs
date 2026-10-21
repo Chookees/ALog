@@ -299,6 +299,44 @@ public sealed class ExceptionFormatTests
     }
 
     /// <summary>
+    /// A top-level program that awaits names <c>Main</c>, not <c>MoveNext</c>.
+    /// Nested lambda, local, async-lambda, and async-local names peel to the source name.
+    /// The peel stops at eight, so a deeper bracket nest is left unchanged.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Origin_TopLevelAsyncAndNestedNames()
+    {
+        await RunTopLevelAsync();
+        Assert.Equal(
+            "InvalidOperationException: Card declined | at Program.Main in Program.cs:10",
+            ExceptionReport.FormatText(ExfTopLevel.TopLevelCapture.Awaited!));
+        Assert.Equal(
+            "InvalidOperationException: lam | at Program.Main in LambdaTop.cs:4",
+            ExceptionReport.FormatText(ExfTopLevel.TopLevelCapture.Lambda!));
+        Assert.Equal(
+            "InvalidOperationException: loc | at Program.Local in LocalTop.cs:3",
+            ExceptionReport.FormatText(ExfTopLevel.TopLevelCapture.Local!));
+        Assert.Equal(
+            "InvalidOperationException: al | at Program.Main in AsyncLambda.cs:5",
+            ExceptionReport.FormatText(ExfTopLevel.TopLevelCapture.AsyncLambda!));
+        Assert.Equal(
+            "InvalidOperationException: hl | at Program.Helper in AsyncLocal.cs:6",
+            ExceptionReport.FormatText(ExfTopLevel.TopLevelCapture.AsyncLocal!));
+
+        Assert.Equal("Main", ExceptionReport.RenameCompilerMethod("<<Main>$>d__0", "MoveNext"));
+        Assert.Equal("Main", ExceptionReport.RenameCompilerMethod("<>c", "<<Main>$>b__0_5"));
+        Assert.Equal("Local", ExceptionReport.RenameCompilerMethod("Program", "<<Main>$>g__Local|0_1"));
+        Assert.Equal("Main", ExceptionReport.RenameCompilerMethod("<<<Main>$>b__0_11>d", "MoveNext"));
+        Assert.Equal("Helper", ExceptionReport.RenameCompilerMethod("<<<Main>$>g__Helper|0_12>d", "MoveNext"));
+        Assert.DoesNotContain("MoveNext", ExceptionReport.FormatText(ExfTopLevel.TopLevelCapture.Awaited!), StringComparison.Ordinal);
+        Assert.DoesNotContain("<Main>$", ExceptionReport.FormatText(ExfTopLevel.TopLevelCapture.Lambda!), StringComparison.Ordinal);
+
+        var deep = new string('<', 9) + "X" + new string('>', 9) + "d__1";
+        Assert.Equal("MoveNext", ExceptionReport.RenameCompilerMethod(deep, "MoveNext"));
+        Assert.Equal("MoveNext", ExceptionReport.RenameCompilerMethod(new string('a', 513), "MoveNext"));
+    }
+
+    /// <summary>
     /// When every frame is <c>System</c> or <c>Microsoft</c>, the top frame is used and keeps its namespace.
     /// A later <c>SystemExtra</c> or <c>MyMicrosoft</c> frame is user code and wins over a real framework frame.
     /// </summary>
@@ -776,6 +814,38 @@ public sealed class ExceptionFormatTests
         Assert.Contains("### Added", changelog, StringComparison.Ordinal);
         Assert.Contains(AddedSourceBullet, changelog, StringComparison.Ordinal);
         Assert.Contains(AddedStackBullet, changelog, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Runs the top-level probe once so its captured exceptions have real stacks.
+    /// Later calls do nothing, because the entry point is not safe to run twice in one process.
+    /// </summary>
+    /// <returns>A completed task after <c>&lt;Main&gt;$</c> has stored the exceptions.</returns>
+    private static async Task RunTopLevelAsync()
+    {
+        if (ExfTopLevel.TopLevelCapture.Awaited != null)
+            return;
+
+        var program = typeof(ExfTopLevel.TopLevelCapture).Assembly.GetType("Program", throwOnError: true);
+        MethodInfo? entry = null;
+        var methods = program!.GetMethods(BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        for (var i = 0; i < methods.Length; i++)
+        {
+            if (methods[i].Name == "<Main>$")
+            {
+                entry = methods[i];
+                break;
+            }
+        }
+
+        Assert.NotNull(entry);
+        var parameters = entry.GetParameters();
+        object? result = parameters.Length == 0
+            ? entry.Invoke(null, null)
+            : entry.Invoke(null, new object[] { Array.Empty<string>() });
+        if (result is Task task)
+            await task;
+        Assert.NotNull(ExfTopLevel.TopLevelCapture.Awaited);
     }
 
     /// <summary>The event behind the README example, including the thrown card exception and one context value.</summary>

@@ -36,6 +36,16 @@ internal static class ExceptionReport
     /// <summary>Aggregate nodes and flattened entries visited by one walk.</summary>
     private const int MaxFlatten = 64;
 
+    /// <summary>
+    /// Compiler-name unwrapping stops after this many peels.
+    /// A top-level async lambda needs three: the <c>&gt;d</c> state machine, the lambda, then <c>&lt;Main&gt;$</c>.
+    /// Eight covers those nests and still refuses a pathological name.
+    /// </summary>
+    private const int MaxUnwrap = 8;
+
+    /// <summary>Compiler names longer than this are left unchanged. The scan is the loop bound.</summary>
+    private const int MaxNameChars = 512;
+
     /// <summary>English framework sentence used when no message was supplied.</summary>
     private const string DefaultPrefix = "Exception of type '";
 
@@ -240,24 +250,57 @@ internal static class ExceptionReport
 
     /// <summary>
     /// Rewrites a compiler method name to the name a person wrote.
-    /// <c>&lt;Main&gt;$</c> becomes <c>Main</c>, <c>&lt;PayAsync&gt;d__n.MoveNext</c> becomes <c>PayAsync</c>,
-    /// <c>&lt;M&gt;b__0_0</c> becomes <c>M</c>, and <c>&lt;M&gt;g__Local|0_0</c> becomes <c>Local</c>.
+    /// One peel handles <c>&lt;Main&gt;$</c>, <c>&lt;PayAsync&gt;d__n.MoveNext</c>, <c>&lt;M&gt;b__0_0</c>,
+    /// and <c>&lt;M&gt;g__Local|0_0</c>. Nested forms are peeled again, so
+    /// <c>&lt;&lt;Main&gt;$&gt;d__0.MoveNext</c> becomes <c>Main</c>,
+    /// <c>&lt;&lt;Main&gt;$&gt;b__0_5</c> becomes <c>Main</c>, and
+    /// <c>&lt;&lt;Main&gt;$&gt;g__Local|0_1</c> becomes <c>Local</c>.
+    /// A state machine of a lambda (<c>&lt;...&gt;d</c>) and a local function inside an async method
+    /// use the same peel.
     /// </summary>
     /// <param name="declaringTypeName">Name of the method's declaring type. Empty when there is no type.</param>
     /// <param name="methodName">Raw method name from the stack frame. Not null.</param>
     /// <returns>The cleaned method name, or <paramref name="methodName"/> when it is not a compiler shape.</returns>
-    /// <remarks>Does not throw. Used by the frame reader and by tests that lock the rewrite rules.</remarks>
+    /// <remarks>
+    /// Does not throw. The loop stops at <see cref="MaxUnwrap"/> so a nested name cannot spin.
+    /// After the first peel the declaring type is dropped, because the next name is carried in the method text.
+    /// A local-function peel stops at the local name; it does not continue into the outer method.
+    /// </remarks>
     internal static string RenameCompilerMethod(string declaringTypeName, string methodName)
     {
-        if (methodName == "MoveNext" && TryStateMachine(declaringTypeName, out var asyncName))
+        var name = methodName;
+        var typeName = declaringTypeName;
+        for (var step = 0; step < MaxUnwrap; step++)
+        {
+            var next = UnwrapOnce(typeName, name);
+            if (next == null || next == name)
+                return name;
+            name = next;
+            typeName = string.Empty;
+        }
+
+        return name;
+    }
+
+    /// <summary>Peels one compiler wrapper, or returns null when the pair is already a source name.</summary>
+    /// <param name="typeName">Declaring type name. Empty after the first peel. Not null.</param>
+    /// <param name="name">Method name to peel. Not null.</param>
+    /// <returns>The name inside the wrapper, or null when nothing matches.</returns>
+    /// <remarks>
+    /// Does not throw. <c>MoveNext</c> is read only while <paramref name="typeName"/> is still the state-machine type.
+    /// <c>&lt;Main&gt;$</c> is its own shape, not a lambda, so it is matched before the bracket parsers.
+    /// </remarks>
+    private static string? UnwrapOnce(string typeName, string name)
+    {
+        if (name == "MoveNext" && TryStateMachine(typeName, out var asyncName))
             return asyncName;
-        if (methodName == "<Main>$")
+        if (name == "<Main>$")
             return "Main";
-        if (TryLambda(methodName, out var lambdaName))
+        if (TryLambda(name, out var lambdaName))
             return lambdaName;
-        if (TryLocal(methodName, out var localName))
+        if (TryLocal(name, out var localName))
             return localName;
-        return methodName;
+        return null;
     }
 
     /// <summary>
@@ -907,75 +950,148 @@ internal static class ExceptionReport
         return typeName.Length > 0 && typeName[0] == '<';
     }
 
-    /// <summary>Reads the async method name out of <c>&lt;Name&gt;d__digits</c>.</summary>
+    /// <summary>
+    /// Reads the method name out of a state-machine type.
+    /// <c>&lt;Name&gt;d__digits</c> is a method state machine.
+    /// <c>&lt;Name&gt;d</c> is the nested machine Roslyn emits for an async lambda or async local function.
+    /// The brackets match by depth, so <c>&lt;&lt;Main&gt;$&gt;d__0</c> yields <c>&lt;Main&gt;$</c> rather than stopping at the first <c>&gt;</c>.
+    /// </summary>
     /// <param name="typeName">Declaring type name. Not null.</param>
-    /// <param name="name">The name between the brackets when the shape matches.</param>
+    /// <param name="name">The name inside the outermost brackets when the shape matches.</param>
     /// <returns>True when <paramref name="typeName"/> is an async or iterator state machine.</returns>
-    /// <remarks>Does not throw. The digits after <c>d__</c> are required, so a normal type named like a prefix does not match.</remarks>
+    /// <remarks>Does not throw. A suffix of <c>d__</c> without digits does not match, so a partial name stays visible.</remarks>
     private static bool TryStateMachine(string typeName, out string name)
     {
         name = string.Empty;
-        if (typeName.Length < 6 || typeName[0] != '<')
+        if (!TryOuter(typeName, out var inner, out var rest))
             return false;
-        var close = typeName.IndexOf('>');
-        if (close <= 1 || close + 4 >= typeName.Length)
+        if (!IsStateMachineRest(rest))
             return false;
-        if (typeName[close + 1] != 'd' || typeName[close + 2] != '_' || typeName[close + 3] != '_')
-            return false;
-        if (!IsDigits(typeName, close + 4, typeName.Length))
-            return false;
-        name = typeName.Substring(1, close - 1);
-        return name.Length > 0;
+        name = inner;
+        return true;
     }
 
-    /// <summary>Reads the containing method out of <c>&lt;Name&gt;b__digits_digits</c>.</summary>
+    /// <summary>True for the state-machine suffixes <c>d</c> and <c>d__digits</c>.</summary>
+    /// <param name="rest">Text after the closing bracket. Not null.</param>
+    /// <returns>True when the suffix is one of those two shapes and nothing follows it.</returns>
+    /// <remarks>Does not throw. <c>d__a</c> is false so a non-digit tail is not treated as a machine.</remarks>
+    private static bool IsStateMachineRest(string rest)
+    {
+        if (rest == "d")
+            return true;
+        if (rest.Length < 4 || rest[0] != 'd' || rest[1] != '_' || rest[2] != '_')
+            return false;
+        return IsDigits(rest, 3, rest.Length);
+    }
+
+    /// <summary>
+    /// Reads the containing method out of <c>&lt;Name&gt;b__digits_digits</c>.
+    /// Nested brackets are part of <c>Name</c>, so <c>&lt;&lt;Main&gt;$&gt;b__0_5</c> yields <c>&lt;Main&gt;$</c>.
+    /// </summary>
     /// <param name="methodName">Raw method name. Not null.</param>
-    /// <param name="name">The name between the brackets when the shape matches.</param>
+    /// <param name="name">The name inside the outermost brackets when the shape matches.</param>
     /// <returns>True when the method is a lambda generated by the compiler.</returns>
-    /// <remarks>Does not throw.</remarks>
+    /// <remarks>Does not throw. The caller peels <paramref name="name"/> again when it is still a compiler shape.</remarks>
     private static bool TryLambda(string methodName, out string name)
     {
         name = string.Empty;
-        var marker = methodName.IndexOf(">b__", StringComparison.Ordinal);
-        if (methodName.Length < 6 || methodName[0] != '<' || marker <= 1)
+        if (!TryOuter(methodName, out var inner, out var rest))
             return false;
-        var underscore = methodName.IndexOf('_', marker + 4);
-        if (underscore <= marker + 4 || underscore + 1 >= methodName.Length)
+        if (rest.Length < 5 || rest[0] != 'b' || rest[1] != '_' || rest[2] != '_')
             return false;
-        if (!IsDigits(methodName, marker + 4, underscore))
+        var underscore = rest.IndexOf('_', 3);
+        if (underscore <= 3 || underscore + 1 >= rest.Length)
             return false;
-        if (!IsDigits(methodName, underscore + 1, methodName.Length))
+        if (!IsDigits(rest, 3, underscore))
             return false;
-        name = methodName.Substring(1, marker - 1);
-        return name.Length > 0;
+        if (!IsDigits(rest, underscore + 1, rest.Length))
+            return false;
+        name = inner;
+        return true;
     }
 
-    /// <summary>Reads the local-function name out of <c>&lt;Outer&gt;g__Name|digits_digits</c>.</summary>
+    /// <summary>
+    /// Reads the local-function name out of <c>&lt;Outer&gt;g__Name|digits_digits</c>.
+    /// <c>&lt;&lt;Main&gt;$&gt;g__Local|0_1</c> yields <c>Local</c>, not <c>Main</c>.
+    /// </summary>
     /// <param name="methodName">Raw method name. Not null.</param>
     /// <param name="name">The local name when the shape matches.</param>
     /// <returns>True when the method is a local function.</returns>
     /// <remarks>
-    /// Does not throw. The spec names async, lambda, and <c>&lt;Main&gt;$</c>.
-    /// Local functions use the same cleanup so the origin is the name in source.
+    /// Does not throw. The local name is the name in source, so the caller does not peel it further.
+    /// An empty local name does not match.
     /// </remarks>
     private static bool TryLocal(string methodName, out string name)
     {
         name = string.Empty;
-        var marker = methodName.IndexOf(">g__", StringComparison.Ordinal);
-        if (methodName.Length < 6 || methodName[0] != '<' || marker <= 1)
+        if (!TryOuter(methodName, out _, out var rest))
             return false;
-        var bar = methodName.IndexOf('|', marker + 4);
-        if (bar <= marker + 4)
+        if (rest.Length < 6 || rest[0] != 'g' || rest[1] != '_' || rest[2] != '_')
             return false;
-        var underscore = methodName.IndexOf('_', bar + 1);
-        if (underscore <= bar + 1 || underscore + 1 >= methodName.Length)
+        var bar = rest.IndexOf('|');
+        if (bar <= 3)
             return false;
-        if (!IsDigits(methodName, bar + 1, underscore))
+        var underscore = rest.IndexOf('_', bar + 1);
+        if (underscore <= bar + 1 || underscore + 1 >= rest.Length)
             return false;
-        if (!IsDigits(methodName, underscore + 1, methodName.Length))
+        if (!IsDigits(rest, bar + 1, underscore))
             return false;
-        name = methodName.Substring(marker + 4, bar - (marker + 4));
+        if (!IsDigits(rest, underscore + 1, rest.Length))
+            return false;
+        name = rest.Substring(3, bar - 3);
         return name.Length > 0;
+    }
+
+    /// <summary>
+    /// Splits a compiler name at the bracket that closes its first character.
+    /// Inner brackets stay inside the name, which is what nested <c>&lt;Main&gt;$</c> forms need.
+    /// </summary>
+    /// <param name="text">Candidate compiler name. Not null.</param>
+    /// <param name="inner">Text between the outermost brackets. Empty when the method returns false.</param>
+    /// <param name="rest">Text after the closing bracket. Empty when the method returns false.</param>
+    /// <returns>True when <paramref name="text"/> starts with <c>&lt;</c> and has a matching <c>&gt;</c>.</returns>
+    /// <remarks>
+    /// Does not throw. Names longer than 512 characters, or nested more than eight brackets deep, return false
+    /// so the scan has a fixed bound. An empty inside, as in <c>&lt;&gt;c</c>, returns false.
+    /// </remarks>
+    private static bool TryOuter(string text, out string inner, out string rest)
+    {
+        inner = string.Empty;
+        rest = string.Empty;
+        if (text.Length < 2 || text.Length > MaxNameChars || text[0] != '<')
+            return false;
+        var depth = 0;
+        var close = -1;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch == '<')
+            {
+                depth++;
+                if (depth > MaxUnwrap)
+                    return false;
+            }
+            else if (ch == '>')
+            {
+                depth--;
+                if (depth == 0)
+                {
+                    close = i;
+                    break;
+                }
+
+                if (depth < 0)
+                    return false;
+            }
+        }
+
+        if (close <= 0)
+            return false;
+        inner = text.Substring(1, close - 1);
+        if (inner.Length == 0)
+            return false;
+        rest = text.Substring(close + 1);
+        return true;
     }
 
     /// <summary>True when every character in the span is an ASCII digit and the span is not empty.</summary>
