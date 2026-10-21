@@ -404,6 +404,9 @@ public sealed class ExceptionFormatTests
         Assert.False(ExceptionReport.IsSkipped("ALog.QuickstartSample", "ALog.QuickstartSample"));
         Assert.False(ExceptionReport.IsSkipped("ALogSample", "ALogSample"));
         Assert.False(ExceptionReport.IsSkipped("ALog.Extensions.Logging.Extra", "Contoso"));
+        Assert.True(ExceptionReport.IsSkipped("System.Private.CoreLib", null));
+        Assert.True(ExceptionReport.IsSkipped("System.Private.CoreLib", string.Empty));
+        Assert.False(ExceptionReport.IsSkipped("System.Private.CoreLib.Extra", null));
         Assert.Equal(-1, ExceptionReport.SelectFrame(Array.Empty<FrameView>()));
 
         var thrown = Catch(() => _ = new FileLogWriter(null!));
@@ -411,6 +414,31 @@ public sealed class ExceptionFormatTests
         Assert.Contains("ArgumentNullException:", text, StringComparison.Ordinal);
         Assert.DoesNotContain("FileLogWriter", text, StringComparison.Ordinal);
         Assert.Contains(nameof(Origin_SkipsALogAssemblyAndFrameworkNamespace), text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// <c>File.ReadAllText</c> fails inside <c>Interop</c>, which has no namespace.
+    /// That frame is still runtime code because its assembly is <c>System.Private.CoreLib</c>,
+    /// so the line names <c>CheckoutService.ReadIo</c>.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Origin_CoreLibInteropUsesUserFrame()
+    {
+        await Task.CompletedTask;
+        var frames = new[]
+        {
+            new FrameView("System.Private.CoreLib", null, "Interop", "ThrowExceptionForIoErrno", null, 0),
+            new FrameView("System.Private.CoreLib", null, "OtherHelper", "Boom", null, 0),
+            new FrameView("ALog.Tests", "ALog.QuickstartSample", "CheckoutService", "ReadIo", "Cls.cs", 7)
+        };
+        Assert.Equal("at CheckoutService.ReadIo in Cls.cs:7", ExceptionReport.FormatAt(frames));
+
+        var io = Catch(() => ALog.QuickstartSample.CheckoutService.ReadIo());
+        Assert.Equal(
+            "DirectoryNotFoundException: Could not find a part of the path '/nope/y'. | at CheckoutService.ReadIo in Cls.cs:7",
+            ExceptionReport.FormatText(io));
+        Assert.DoesNotContain("Interop", ExceptionReport.FormatText(io), StringComparison.Ordinal);
+        Assert.DoesNotContain("ThrowExceptionForIoErrno", ExceptionReport.FormatText(io), StringComparison.Ordinal);
     }
 
     /// <summary>A normal chain shows three nodes and then <c>(+n more)</c>. The fourth message is absent.</summary>

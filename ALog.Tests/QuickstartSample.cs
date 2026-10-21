@@ -14,6 +14,17 @@ public sealed class CardException : Exception
 /// <summary>Stand-in for the checkout sample. Each method throws from a fixed file and line.</summary>
 public static class CheckoutService
 {
+    /// <summary>
+    /// Reads a path that does not exist, so the first frames are <c>System.Private.CoreLib</c>.
+    /// The origin must still be this method at line 7 of <c>Cls.cs</c>.
+    /// </summary>
+    public static void ReadIo()
+    {
+#line 7 "Cls.cs"
+        File.ReadAllText("/nope/y");
+#line default
+    }
+
     /// <summary>Throws the card exception from line 42 of <c>CheckoutService.cs</c>.</summary>
     public static void Pay()
     {

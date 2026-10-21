@@ -198,14 +198,21 @@ internal static class ExceptionReport
     /// <summary>
     /// True when a frame belongs to ALog or to the runtime libraries we do not want as the origin.
     /// Assembly names match exactly. Namespaces match a whole segment, so <c>SystemsCorp</c> stays.
+    /// <c>System.Private.CoreLib</c> is also skipped: types such as <c>Interop</c> have no namespace,
+    /// so the segment rule would otherwise treat <c>ThrowExceptionForIoErrno</c> as user code.
     /// </summary>
     /// <param name="assemblyName">Simple assembly name. Null when the frame has none.</param>
     /// <param name="typeNamespace">Namespace of the frame's declaring type. Null for the global namespace.</param>
     /// <returns>True when the frame should be skipped in favor of a later application frame.</returns>
-    /// <remarks>Does not throw. Does not look at the file path or the method name.</remarks>
+    /// <remarks>
+    /// Does not throw. Does not look at the file path or the method name.
+    /// <c>ALog.QuickstartSample</c>, <c>ALogSample</c>, and <c>SystemsCorp</c> are not these assembly names, so they stay.
+    /// </remarks>
     internal static bool IsSkipped(string? assemblyName, string? typeNamespace)
     {
-        if (assemblyName == "ALog" || assemblyName == "ALog.Extensions.Logging")
+        if (assemblyName == "ALog"
+            || assemblyName == "ALog.Extensions.Logging"
+            || assemblyName == "System.Private.CoreLib")
             return true;
         return IsFrameworkNamespace(typeNamespace);
     }
