@@ -11,6 +11,7 @@ only together. This script is the CI check for that rule. It does not start
 the sample: the caller passes the run's stdout transcript and ``logs/app.log``.
 Line comparison ignores one trailing LF or CRLF. Each FAIL line is a single
 line. A quoted JSON excerpt collapses newline runs, then keeps 120 characters.
+A carriage return inside a quote is written as the two characters ``\\r``.
 """
 
 from __future__ import annotations
@@ -39,8 +40,8 @@ MAX_PROBLEMS = 20
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 ISO_TIMESTAMP = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z")
 CLOCK_TIMESTAMP = re.compile(r"\d{2}:\d{2}:\d{2}")
-# A newline plus the indent after it. Used only when quoting an excerpt.
-EXCERPT_BREAK = re.compile(r"(?:\r\n|\r|\n)[ \t\f\v\r\n]*")
+# A LF or CRLF plus the indent after it. A bare CR is not a newline.
+EXCERPT_BREAK = re.compile(r"(?:\r\n|\n)[ \t\f\v\n]*")
 TIMESTAMP_TOKEN = "<timestamp>"
 # Absolute tree URL: nuget.org renders this README and does not resolve a relative link.
 EXAMPLE_INTRO = (
@@ -121,6 +122,32 @@ def normalize_timestamps(text: str) -> str:
     return CLOCK_TIMESTAMP.sub(TIMESTAMP_TOKEN, without_iso)
 
 
+def missing_file_message(path: Path) -> str:
+    """Return the FAIL line for a path that is not a file.
+
+    The last path component alone is not enough. A missing file whose name is
+    ``null`` used to be reported as ``null is missing.``, which names no
+    location. The path as given is the file this check was asked to read.
+
+    Args:
+        path: The path passed to the check. It is not opened here.
+
+    Returns:
+        One FAIL line. A CR in the path is written as two visible characters.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    shown = path.as_posix().replace("\r", "\\r").replace("\n", " ")
+    return (
+        f"FAIL {shown}: expected the file, found it missing. "
+        "Pass the path of the README, sample, console text, transcript, or run log."
+    )
+
+
 def read_exact(path: Path, limit: int) -> tuple[str | None, str | None]:
     """Read one UTF-8 file without translating line endings.
 
@@ -141,7 +168,7 @@ def read_exact(path: Path, limit: int) -> tuple[str | None, str | None]:
     if limit < 1:
         return None, "read limit must be positive."
     if not path.is_file():
-        return None, f"{path.name} is missing."
+        return None, missing_file_message(path)
     size = path.stat().st_size
     if size > limit:
         return None, f"{path.name} is larger than {limit} bytes."
@@ -659,16 +686,16 @@ def compare_lines(text: str) -> list[str]:
 
 
 def quote_visible(line: str) -> str:
-    """Return one compared line with CR removed.
+    """Return one compared line with CR written as two visible characters.
 
-    The comparison still sees CR. The FAIL line must not, or the message
-    would contain a raw carriage return.
+    The comparison still sees the CR character. Messages (a) and (e) show
+    it as ``\\r`` so the FAIL line stays one line.
 
     Args:
         line: One line from the comparison, or an end marker.
 
     Returns:
-        The line with every CR deleted.
+        The line with every CR replaced by a backslash and ``r``.
 
     Raises:
         None.
@@ -676,7 +703,7 @@ def quote_visible(line: str) -> str:
     Side effects:
         None.
     """
-    return line.replace("\r", "")
+    return line.replace("\r", "\\r")
 
 
 def content_lines(body: str) -> list[str]:
@@ -905,10 +932,11 @@ def split_json_values(text: str) -> tuple[list[tuple[int, str]], bool]:
 def collapse_excerpt(text: str) -> str:
     """Turn each newline-and-whitespace run into one space.
 
-    A run starts at a CR or LF and continues through following spaces, tabs,
-    and line breaks. Spaces that are not part of that run stay. This is only
-    for the quoted excerpt in a FAIL line. The JSON comparison does not use
-    it and still normalizes timestamps alone.
+    A run starts at LF or CRLF and continues through following spaces, tabs,
+    and line breaks. A CR that is not part of CRLF stays, then is written as
+    the two characters ``\\r``. Spaces that are not part of a newline run
+    stay. This is only for the quoted excerpt in a FAIL line. The JSON
+    comparison does not use it and still normalizes timestamps alone.
 
     Args:
         text: Timestamp-normalized entry or fence text.
@@ -922,7 +950,8 @@ def collapse_excerpt(text: str) -> str:
     Side effects:
         None.
     """
-    return EXCERPT_BREAK.sub(" ", text)
+    flat = EXCERPT_BREAK.sub(" ", text)
+    return flat.replace("\r", "\\r")
 
 
 def entry_quote(text: str) -> str:
@@ -1851,6 +1880,7 @@ def self_test() -> int:
             failures += case_txt_shorter(tmp / "short-txt")
             failures += case_txt_extra_blank(tmp / "blank-txt")
             failures += case_console_cr(tmp / "cr")
+            failures += case_missing_null_path(tmp / "null-path")
             failures += case_excerpt_edited(tmp / "excerpt")
             failures += case_excerpt_indent(tmp / "indent")
             failures += case_excerpt_order(tmp / "order")
@@ -2207,16 +2237,16 @@ def case_txt_extra_blank(root: Path) -> int:
 
 
 def case_console_cr(root: Path) -> int:
-    """A CR on a console line must stay a difference and leave the message.
+    """A CR on a console line must stay a difference and be shown as ``\\r``.
 
     The comparison is not whitespace-collapsed, so the CR still fails the
-    line. The quoted line deletes it.
+    line. The quoted line writes that character as a backslash and ``r``.
 
     Args:
         root: Directory for this case.
 
     Returns:
-        0 when line 2 quotes both sides without a CR.
+        0 when line 2 quotes the TXT with ``\\r`` and the transcript without it.
 
     Raises:
         OSError, RuntimeError, ValueError: The fixture could not be created.
@@ -2233,11 +2263,45 @@ def case_console_cr(root: Path) -> int:
     if changed == text or "\r" not in changed:
         raise RuntimeError("fixture console line was not given a CR.")
     txt.write_text(changed, encoding="utf-8")
-    line = "[<timestamp>] [Info] Application started"
+    expected = "[<timestamp>] [Info] Application started\\r"
+    found = "[<timestamp>] [Info] Application started"
     return report_exact(
         "quoted cr",
         check_repository(root, stdout_path, log_path),
-        stdout_fail_message(2, line, line),
+        stdout_fail_message(2, expected, found),
+    )
+
+
+def case_missing_null_path(root: Path) -> int:
+    """A missing path whose last component is ``null`` must name the whole path.
+
+    ``path.name`` alone produced ``null is missing.`` The directory in front
+    of that name is the location.
+
+    Args:
+        root: Directory for this case.
+
+    Returns:
+        0 when the only problem is the FAIL line for that path.
+
+    Raises:
+        OSError, RuntimeError, ValueError: The fixture could not be created.
+
+    Side effects:
+        Writes a temporary repository and checks a path that is not created.
+    """
+    stdout_path, _log_path = write_fixture(root)
+    missing = root / "missing-log" / "null"
+    shown = missing.as_posix()
+    if not shown.endswith("/missing-log/null"):
+        raise RuntimeError("missing path does not keep its directory.")
+    return report_exact(
+        "missing null path",
+        check_repository(root, stdout_path, missing),
+        "FAIL "
+        + shown
+        + ": expected the file, found it missing. "
+        "Pass the path of the README, sample, console text, transcript, or run log.",
     )
 
 
