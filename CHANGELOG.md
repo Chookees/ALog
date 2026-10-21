@@ -32,7 +32,7 @@
 
 ### Breaking (output)
 
-- Plain text, console, and file output write exceptions as "Type: Message", followed by inner exceptions and the source line ("at Class.Method in File.cs:42"). The "EX:" label is gone; update log parsers that match it. "|" and "-->" inside messages are escaped as "\|" and "--\>".
+- Plain text, console, and file output write exceptions as "Type: Message", followed by inner exceptions and the source line ("at Class.Method in File.cs:42"). The "EX:" label is gone; update log parsers that match it. "\", "|", and "-->" inside exception messages and context values are escaped as "\\", "\|", and "--\>", and line breaks as "\r" and "\n".
 
 ### Added
 

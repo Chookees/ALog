@@ -60,7 +60,7 @@ An exception shares that line. The form is `Type: Message`, then inner exception
 [20:55:19] [Error] Payment failed | InvalidOperationException: Card declined | at CheckoutService.Pay in CheckoutService.cs:42 | ctx: orderId=17
 ```
 
-`|` and `-->` inside an exception message or a context value are escaped as `\|` and `--\>`, so those separators stay unambiguous. `PlainTextFormatter(includeStackTrace: true)` appends the full stack trace indented by four spaces. The default is off.
+`\`, `|`, and `-->` inside an exception message or a context value are escaped as `\\`, `\|`, and `--\>`, and line breaks as `\r` and `\n`, so each event stays one line and the separators stay unambiguous. `PlainTextFormatter(includeStackTrace: true)` appends the full stack trace indented by four spaces. The default is off.
 
 ---
 

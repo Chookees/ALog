@@ -163,10 +163,34 @@ internal static class ExceptionReport
     }
 
     /// <summary>
+    /// Renders template properties as <c>props: name=value</c>.
+    /// Values are escaped with the same order and the same cap as context values.
+    /// Keys are copied as stored, the same way context keys are.
+    /// </summary>
+    /// <param name="properties">Template properties. Null or empty yields null so the segment is omitted.</param>
+    /// <returns>The <c>props:</c> segment, or null when there is nothing to write.</returns>
+    /// <remarks>
+    /// Does not throw. A throwing value becomes the capture placeholder from <see cref="CaptureText"/>,
+    /// then that placeholder is escaped. Every pair in the bag is written; the loop is bounded by that bag.
+    /// JSON and HTTP do not use this segment. They keep the property values structured.
+    /// </remarks>
+    internal static string? FormatProps(IReadOnlyDictionary<string, object>? properties)
+    {
+        if (properties == null || properties.Count == 0)
+            return null;
+
+        var parts = new List<string>(properties.Count < 8 ? properties.Count : 8);
+        foreach (var pair in properties)
+            parts.Add(pair.Key + "=" + Escape(CaptureText.Read(pair.Value), messageLimit: false));
+
+        return "props: " + string.Join(", ", parts);
+    }
+
+    /// <summary>
     /// Escapes separators in text that is placed on a plain line.
     /// The order is backslash, pipe, arrow, CR, then LF, so an inserted backslash is not escaped again.
     /// </summary>
-    /// <param name="text">Raw text. Not null. Exception message or one context value.</param>
+    /// <param name="text">Raw text. Not null. An exception message, a context value, or a property value.</param>
     /// <param name="messageLimit">
     /// True cuts the escaped text at 500 characters. False uses the context cap of 8192.
     /// </param>

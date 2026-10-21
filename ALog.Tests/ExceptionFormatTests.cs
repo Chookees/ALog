@@ -19,7 +19,10 @@ public sealed class ExceptionFormatTests
         "Payment failed | InvalidOperationException: Card declined | at CheckoutService.Pay in CheckoutService.cs:42 | ctx: orderId=17";
 
     private const string BreakingBullet =
-        "- Plain text, console, and file output write exceptions as \"Type: Message\", followed by inner exceptions and the source line (\"at Class.Method in File.cs:42\"). The \"EX:\" label is gone; update log parsers that match it. \"|\" and \"-->\" inside messages are escaped as \"\\|\" and \"--\\>\".";
+        "- Plain text, console, and file output write exceptions as \"Type: Message\", followed by inner exceptions and the source line (\"at Class.Method in File.cs:42\"). The \"EX:\" label is gone; update log parsers that match it. \"\\\", \"|\", and \"-->\" inside exception messages and context values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\".";
+
+    private const string ReadmeEscapeSentence =
+        @"`\`, `|`, and `-->` inside an exception message or a context value are escaped as `\\`, `\|`, and `--\>`, and line breaks as `\r` and `\n`, so each event stays one line and the separators stay unambiguous.";
 
     private const string AddedSourceBullet =
         "- JSON and HTTP exception output add \"source\" (method, file, line) and \"inner\" (type, message, and source of each inner exception, up to 16).";
@@ -195,13 +198,74 @@ public sealed class ExceptionFormatTests
             new Dictionary<string, object> { ["k"] = "x | y --> z" },
             new Dictionary<string, object> { ["p"] = "a|b" });
         var line = new PlainTextFormatter().Format(evt);
-        Assert.Contains("a | b | InvalidOperationException: a \\| b --\\> c\\\\d | props: p=a|b | ctx: k=x \\| y --\\> z", line, StringComparison.Ordinal);
+        Assert.Contains("a | b | InvalidOperationException: a \\| b --\\> c\\\\d | props: p=a\\|b | ctx: k=x \\| y --\\> z", line, StringComparison.Ordinal);
         var segments = SplitSegments(line);
         Assert.Contains(segments, segment => segment.Contains("InvalidOperationException:", StringComparison.Ordinal));
         var exceptionSegment = segments.First(segment => segment.StartsWith("InvalidOperationException:", StringComparison.Ordinal));
         Assert.Equal("a | b --> c\\d", Unescape(exceptionSegment.Substring("InvalidOperationException: ".Length)));
         var ctx = segments.First(segment => segment.StartsWith("ctx:", StringComparison.Ordinal));
         Assert.Equal("x | y --> z", Unescape(ctx.Substring("ctx: k=".Length)));
+        var props = segments.First(segment => segment.StartsWith("props:", StringComparison.Ordinal));
+        Assert.Equal("a|b", Unescape(props.Substring("props: p=".Length)));
+    }
+
+    /// <summary>
+    /// A <c>props:</c> value is escaped in the same order as a context value.
+    /// Plain text, the console writer, and the file writer share that line. JSON keeps the raw value.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Props_ValuesEscapeLikeContext()
+    {
+        await Task.CompletedTask;
+        Assert.Null(ExceptionReport.FormatProps(null));
+        Assert.Null(ExceptionReport.FormatProps(new Dictionary<string, object>()));
+        const string raw = "a \\| b --> c\r\n";
+        var evt = new LogEvent(
+            new DateTime(2026, 10, 21, 20, 55, 19),
+            LogLevel.Error,
+            "pay",
+            null,
+            new Dictionary<string, object> { ["k"] = raw },
+            new Dictionary<string, object> { ["note"] = raw });
+        const string line =
+            "[2026-10-21 20:55:19] [Error] pay | props: note=a \\\\\\| b --\\> c\\r\\n | ctx: k=a \\\\\\| b --\\> c\\r\\n";
+        Assert.Equal(line, new PlainTextFormatter("yyyy-MM-dd HH:mm:ss").Format(evt));
+        Assert.Equal(raw, Unescape(line.Substring(line.IndexOf("note=", StringComparison.Ordinal) + "note=".Length).Split(" | ", 2)[0]));
+
+        var previous = Console.Out;
+        var buffer = new StringWriter();
+        Console.SetOut(buffer);
+        try
+        {
+            using var console = new ConsoleLogWriter(useColors: false, formatter: new PlainTextFormatter("yyyy-MM-dd HH:mm:ss"));
+            console.Write(evt);
+        }
+        finally
+        {
+            Console.SetOut(previous);
+        }
+
+        Assert.Equal(line + Environment.NewLine, buffer.ToString());
+
+        var directory = Path.Combine(Path.GetTempPath(), "alog-exf-props-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            using (var file = new FileLogWriter(path, new PlainTextFormatter("yyyy-MM-dd HH:mm:ss")))
+                file.Write(evt);
+            Assert.Equal(line + Environment.NewLine, File.ReadAllText(path));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+
+        var json = new JsonFormatter().Format(evt);
+        using var document = JsonDocument.Parse(json);
+        Assert.Equal(raw, document.RootElement.GetProperty("properties").GetProperty("note").GetString());
+        Assert.Equal(raw, document.RootElement.GetProperty("context").GetProperty("k").GetString());
+        Assert.DoesNotContain("--\\>", json, StringComparison.Ordinal);
     }
 
     /// <summary>An exception that was never thrown has no <c>at</c> segment and no JSON source.</summary>
@@ -839,6 +903,11 @@ public sealed class ExceptionFormatTests
         Assert.Contains("new PlainTextFormatter(\"HH:mm:ss\")", readme, StringComparison.Ordinal);
         Assert.Contains("### Breaking (output)", changelog, StringComparison.Ordinal);
         Assert.Contains(BreakingBullet, changelog, StringComparison.Ordinal);
+        Assert.Contains(ReadmeEscapeSentence, console, StringComparison.Ordinal);
+        Assert.Contains(
+            "\"\\\", \"|\", and \"-->\" inside exception messages and context values are escaped as \"\\\\\", \"\\|\", and \"--\\>\", and line breaks as \"\\r\" and \"\\n\".",
+            changelog,
+            StringComparison.Ordinal);
         Assert.Contains("### Added", changelog, StringComparison.Ordinal);
         Assert.Contains(AddedSourceBullet, changelog, StringComparison.Ordinal);
         Assert.Contains(AddedStackBullet, changelog, StringComparison.Ordinal);

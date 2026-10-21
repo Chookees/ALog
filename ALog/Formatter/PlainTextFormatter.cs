@@ -89,7 +89,7 @@ public class PlainTextFormatter : ILogFormatter
     /// <remarks>
     /// Does not call SelfLog and does not replace the property object on the event.
     /// Every property and context pair is rendered. The property loop is bounded by that collection.
-    /// Context values are escaped so <c>|</c> and <c>--&gt;</c> cannot look like separators.
+    /// Context values and <c>props:</c> values are escaped so <c>|</c> and <c>--&gt;</c> cannot look like separators.
     /// <see cref="Exception.ToString"/> runs only when this formatter was constructed with
     /// <c>includeStackTrace: true</c>. A throw from that call becomes a capture placeholder
     /// and the line above it is kept.
@@ -138,18 +138,16 @@ public class PlainTextFormatter : ILogFormatter
         return ExceptionReport.FormatText(logEvent.Exception);
     }
 
-    /// <summary>Renders template properties as <c>props: name=value</c>. Values are not separator-escaped.</summary>
+    /// <summary>Renders template properties as <c>props: name=value</c>. Values are escaped like context values.</summary>
     /// <param name="properties">Property bag. Null or empty omits the segment.</param>
     /// <returns>The props segment, or null.</returns>
     /// <remarks>
-    /// A throwing value uses <see cref="CaptureText"/>. The loop is bounded by the bag.
-    /// Separator escaping is reserved for exception messages and context values.
+    /// The text comes from <see cref="ExceptionReport.FormatProps"/>, the same helper the line uses for context.
+    /// JSON output does not call this method. The loop is bounded by the bag.
     /// </remarks>
     private static string? FormatProps(IReadOnlyDictionary<string, object>? properties)
     {
-        if (properties == null || properties.Count == 0)
-            return null;
-        return "props: " + CaptureText.Join(properties);
+        return ExceptionReport.FormatProps(properties);
     }
 
     /// <summary>
