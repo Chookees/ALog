@@ -1,8 +1,11 @@
 using System.Diagnostics;
+using System.Net;
+using System.Net.Sockets;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using ALog.Core;
 using ALog.Formatters;
 using ALog.Writers.Console;
@@ -219,8 +222,9 @@ public sealed class ExceptionFormatTests
 
     /// <summary>
     /// A backslash is doubled only when the next raw character would read as an escape.
-    /// Plain text, the console fallback, and the file fallback apply that rule to the category,
-    /// the message, and context or property names and values. JSON keeps those characters raw.
+    /// Plain text applies that rule to the category, the message, and context or property names and values.
+    /// The console and file fallbacks escape the message and context and do not write the category.
+    /// JSON keeps those characters raw.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task Escape_BackslashDoublesOnlyWhereNeeded()
@@ -298,7 +302,7 @@ public sealed class ExceptionFormatTests
             new PlainTextFormatter("yyyy-MM-dd HH:mm:ss").Format(noException));
 
         const string fallback =
-            "[2026-10-21 20:55:19] [Error] [C:\\\\new \\| forged\\n] C:\\temp\\file.txt | InvalidOperationException: boom | ctx: k=C:\\\\new";
+            "[2026-10-21 20:55:19] [Error] C:\\temp\\file.txt | InvalidOperationException: boom | ctx: k=C:\\\\new";
         var previous = Console.Out;
         var buffer = new StringWriter();
         Console.SetOut(buffer);
@@ -314,6 +318,7 @@ public sealed class ExceptionFormatTests
 
         Assert.Equal(fallback + Environment.NewLine, buffer.ToString());
         Assert.DoesNotContain("props:", buffer.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("[C:\\\\new", buffer.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain("\n-->", buffer.ToString(), StringComparison.Ordinal);
 
         var directory = Path.Combine(Path.GetTempPath(), "alog-exf-slash-" + Guid.NewGuid().ToString("N"));
@@ -722,6 +727,58 @@ public sealed class ExceptionFormatTests
     }
 
     /// <summary>
+    /// An <see cref="HttpClient"/> call to a closed local port throws <see cref="HttpRequestException"/>
+    /// whose inner <see cref="SocketException"/> has only framework frames.
+    /// The origin walks outward to the user method. The port is chosen by binding and releasing it.
+    /// </summary>
+    [Fact(Timeout = 60000)]
+    public async Task Origin_ClosedPortUsesOuterUserFrame()
+    {
+        await Task.CompletedTask;
+        var thrown = CallClosedPort();
+        var text = ExceptionReport.FormatText(thrown);
+        Assert.Contains("at ExceptionFormatTests.CallClosedPort in ExceptionFormatTests.cs:", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("ThrowException", text, StringComparison.Ordinal);
+
+        var body = ExceptionReport.CreateBody(thrown);
+        Assert.NotNull(body.Source);
+        Assert.Equal("ExceptionFormatTests.CallClosedPort", body.Source.Method);
+        Assert.DoesNotContain("ThrowException", body.Source.Method, StringComparison.Ordinal);
+        var json = new JsonFormatter().Format(new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", thrown));
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal(
+            "ExceptionFormatTests.CallClosedPort",
+            doc.RootElement.GetProperty("exception").GetProperty("source").GetProperty("method").GetString());
+    }
+
+    /// <summary>
+    /// Calls <see cref="HttpClient.GetAsync(string)"/> on a port that was bound and then released.
+    /// </summary>
+    /// <returns>The <see cref="HttpRequestException"/> from the refused connection.</returns>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static Exception CallClosedPort()
+    {
+        for (var attempt = 0; attempt < 4; attempt++)
+        {
+            using var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+            listener.Stop();
+            using var client = new HttpClient();
+            try
+            {
+                client.GetAsync("http://127.0.0.1:" + port.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/").GetAwaiter().GetResult();
+            }
+            catch (HttpRequestException ex)
+            {
+                return ex;
+            }
+        }
+
+        throw new InvalidOperationException("The closed port accepted the request.");
+    }
+
+    /// <summary>
     /// A runtime assembly is framework even when the type has no namespace.
     /// <c>System</c>, <c>System.*</c>, <c>Microsoft.*</c>, <c>mscorlib</c>, and <c>netstandard</c> are skipped.
     /// <c>SystemsCorp</c> and <c>Microsofty</c> are not, and the real IO failure still names <c>ReadIo</c>.
@@ -835,6 +892,7 @@ public sealed class ExceptionFormatTests
     /// <summary>
     /// Nested aggregates follow <see cref="AggregateException.Flatten"/>: non-aggregate siblings first,
     /// nested aggregates later. Text and JSON <c>inner</c> use that order.
+    /// Duplicate instances are kept. The trees are acyclic, because <c>Flatten()</c> has no cycle guard.
     /// One thousand random acyclic trees, from a fixed seed, match <c>Flatten().InnerExceptions</c>.
     /// </summary>
     [Fact(Timeout = 30000)]
@@ -866,14 +924,80 @@ public sealed class ExceptionFormatTests
         Assert.DoesNotContain("(+2+ more)", wideText, StringComparison.Ordinal);
         AssertSameOrder(wide, wide.Flatten().InnerExceptions);
 
+        var sharedLeaf = new InvalidOperationException("x");
+        var duplicated = new AggregateException(sharedLeaf, sharedLeaf);
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: x; InvalidOperationException: x",
+            ExceptionReport.FormatText(duplicated));
+        AssertSameOrder(duplicated, duplicated.Flatten().InnerExceptions);
+
+        var sharedAggregate = new AggregateException(new InvalidOperationException("a"), new InvalidOperationException("b"));
+        var sharedTree = new AggregateException(sharedAggregate, new InvalidOperationException("c"), sharedAggregate);
+        AssertSameOrder(sharedTree, sharedTree.Flatten().InnerExceptions);
+        var sharedBody = ExceptionReport.CreateBody(sharedTree);
+        Assert.NotNull(sharedBody.Inner);
+        Assert.Equal(5, sharedBody.Inner.Count);
+        Assert.Equal(
+            new[] { "c", "a", "b", "a", "b" },
+            sharedBody.Inner.Select(item => item.Message).ToArray());
+
         var random = new Random(20261021);
         for (var trial = 0; trial < 1000; trial++)
         {
             var nextId = 0;
             var leavesLeft = 12;
             var aggsLeft = 5;
-            var root = RandomAggregate(random, ref nextId, ref leavesLeft, ref aggsLeft, 0);
+            var finished = new List<Exception>();
+            var root = RandomAggregate(random, ref nextId, ref leavesLeft, ref aggsLeft, 0, finished);
             AssertSameOrder(root, root.Flatten().InnerExceptions);
+        }
+    }
+
+    /// <summary>
+    /// A binary DAG of shared aggregates is acyclic and would expand to 2^30 entries.
+    /// The walk stops at 64 nodes, finishes quickly, and writes <c>(+n+ more)</c>.
+    /// Text and JSON list the same entries.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_SharedDagStopsAtNodeCap()
+    {
+        await Task.CompletedTask;
+        var leaf = new InvalidOperationException("x");
+        var node = new AggregateException(leaf);
+        for (var level = 0; level < 30; level++)
+            node = new AggregateException(node, node);
+
+        _ = ExceptionReport.FormatText(node);
+        _ = ExceptionReport.CreateBody(node);
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var start = Stopwatch.GetTimestamp();
+        var text = ExceptionReport.FormatText(node);
+        var body = ExceptionReport.CreateBody(node);
+        var elapsed = Stopwatch.GetElapsedTime(start);
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.Matches(new Regex(@"\(\+\d+\+ more\)"), text);
+        Assert.True(elapsed < TimeSpan.FromMilliseconds(50), elapsed.ToString());
+        Assert.True(allocated < 256 * 1024, allocated.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        Assert.True(text.Length < 500, text);
+        var jsonMessages = new List<string>();
+        if (body.Inner != null)
+        {
+            Assert.True(body.Inner.Count <= 16);
+            for (var i = 0; i < body.Inner.Count; i++)
+                jsonMessages.Add(body.Inner[i].Message ?? string.Empty);
+        }
+
+        var json = new JsonFormatter().Format(new LogEvent(CoverageClock.UtcNow, LogLevel.Error, "m", node));
+        using var doc = JsonDocument.Parse(json);
+        if (jsonMessages.Count == 0)
+            Assert.False(doc.RootElement.GetProperty("exception").TryGetProperty("inner", out _));
+        else
+        {
+            var inner = doc.RootElement.GetProperty("exception").GetProperty("inner");
+            Assert.Equal(jsonMessages.Count, inner.GetArrayLength());
+            for (var i = 0; i < jsonMessages.Count; i++)
+                Assert.Equal(jsonMessages[i], inner[i].GetProperty("message").GetString());
         }
     }
 
@@ -1159,7 +1283,9 @@ public sealed class ExceptionFormatTests
 
     /// <summary>
     /// <c>(+N more)</c> is written only when the walk counted every node.
-    /// A 17-level chain stops at 16 and writes <c>(+13+ more)</c>. An aggregate that still has an unread node does the same.
+    /// A 17-level chain stops at 16 and writes <c>(+13+ more)</c>.
+    /// An aggregate whose flatten stops at 64 nodes writes <c>(+N+ more)</c>.
+    /// A chain of 15 aggregate wrappers stays under that cap and is fully counted.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task Chain_SuffixMarksAStoppedWalk()
@@ -1200,8 +1326,8 @@ public sealed class ExceptionFormatTests
         for (var i = 0; i < 15; i++)
             current = new AggregateException(current);
         var capped = ExceptionReport.FormatText(current);
-        Assert.Contains("InvalidOperationException: e0; InvalidOperationException: e1; InvalidOperationException: e2 (+1+ more)", capped, StringComparison.Ordinal);
-        Assert.DoesNotContain("(+1 more)", capped, StringComparison.Ordinal);
+        Assert.Contains("InvalidOperationException: e0; InvalidOperationException: e1; InvalidOperationException: e2 (+2 more)", capped, StringComparison.Ordinal);
+        Assert.DoesNotContain("(+2+ more)", capped, StringComparison.Ordinal);
         Assert.DoesNotContain("hidden", capped, StringComparison.Ordinal);
         Assert.DoesNotContain(": e3", capped, StringComparison.Ordinal);
     }
@@ -1726,40 +1852,76 @@ public sealed class ExceptionFormatTests
         Assert.Equal(wanted, actual);
     }
 
-    /// <summary>Builds one acyclic aggregate. The budgets keep the leaf count inside the JSON cap.</summary>
+    /// <summary>Picks a finished non-aggregate so a random tree can repeat an instance without forming a cycle.</summary>
+    /// <param name="finished">Nodes already built. Not null.</param>
+    /// <param name="random">Fixed-seed generator. Not null.</param>
+    /// <returns>A leaf to insert again, or null when this slot should be a new node.</returns>
+    private static Exception? LeafToReuse(List<Exception> finished, Random random)
+    {
+        if (finished.Count == 0 || random.Next(0, 4) != 0)
+            return null;
+        for (var attempt = 0; attempt < 4; attempt++)
+        {
+            var candidate = finished[random.Next(finished.Count)];
+            if (candidate is not AggregateException)
+                return candidate;
+        }
+
+        return null;
+    }
+
+    /// <summary>Builds one acyclic aggregate. Finished nodes may be reused, which keeps the graph a DAG.</summary>
     /// <param name="random">Fixed-seed generator. Not null.</param>
     /// <param name="nextId">Next leaf id. Updated.</param>
     /// <param name="leavesLeft">Leaves still allowed. Updated.</param>
     /// <param name="aggsLeft">Nested aggregates still allowed. Updated.</param>
     /// <param name="depth">Current depth. The walk stops nesting at 4.</param>
+    /// <param name="finished">Nodes whose construction has finished. Not null. Reuse does not create a cycle.</param>
     /// <returns>A new aggregate. Not null.</returns>
-    private static AggregateException RandomAggregate(Random random, ref int nextId, ref int leavesLeft, ref int aggsLeft, int depth)
+    private static AggregateException RandomAggregate(
+        Random random,
+        ref int nextId,
+        ref int leavesLeft,
+        ref int aggsLeft,
+        int depth,
+        List<Exception> finished)
     {
         var width = 1 + random.Next(3);
         var children = new List<Exception>(width);
         for (var i = 0; i < width; i++)
         {
+            var reuse = LeafToReuse(finished, random);
             var nest = depth < 3 && aggsLeft > 0 && leavesLeft > 1 && random.Next(0, 2) == 0;
-            if (nest)
+            if (reuse != null)
+            {
+                children.Add(reuse);
+            }
+            else if (nest)
             {
                 aggsLeft--;
-                children.Add(RandomAggregate(random, ref nextId, ref leavesLeft, ref aggsLeft, depth + 1));
+                children.Add(RandomAggregate(random, ref nextId, ref leavesLeft, ref aggsLeft, depth + 1, finished));
             }
             else if (leavesLeft > 0)
             {
                 leavesLeft--;
-                children.Add(new InvalidOperationException("n" + nextId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                var leaf = new InvalidOperationException("n" + nextId.ToString(System.Globalization.CultureInfo.InvariantCulture));
                 nextId++;
+                children.Add(leaf);
+                finished.Add(leaf);
             }
         }
 
         if (children.Count == 0)
         {
-            children.Add(new InvalidOperationException("n" + nextId.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            var leaf = new InvalidOperationException("n" + nextId.ToString(System.Globalization.CultureInfo.InvariantCulture));
             nextId++;
+            children.Add(leaf);
+            finished.Add(leaf);
         }
 
-        return new AggregateException(children.ToArray());
+        var built = new AggregateException(children.ToArray());
+        finished.Add(built);
+        return built;
     }
 
     /// <summary>JSON <c>inner</c> messages, in walk order, match <paramref name="messages"/>.</summary>

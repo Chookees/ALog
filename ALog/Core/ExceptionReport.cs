@@ -35,7 +35,11 @@ internal static class ExceptionReport
     /// <summary>Stack frames read from one exception.</summary>
     private const int MaxFrames = 64;
 
-    /// <summary>Aggregate nodes and flattened entries visited by one walk.</summary>
+    /// <summary>
+    /// Nodes one flatten, inner, or origin walk may visit.
+    /// The work list and the flattened entry list each stop here.
+    /// Hitting the cap writes <c>(+N+ more)</c>.
+    /// </summary>
     private const int MaxFlatten = 64;
 
     /// <summary>
@@ -512,32 +516,32 @@ internal static class ExceptionReport
     /// <param name="exception">Exception on the event. Not null.</param>
     /// <returns>The segment without a newline.</returns>
     /// <remarks>
-    /// The chain loop stops at 16. A repeated instance is a cycle and stops the walk.
-    /// Aggregate nodes stop the chain because their entries are inside the node; an entry's own inner exception is not text.
+    /// The chain loop stops at 16. An instance that is already an ancestor is a cycle and stops the walk.
+    /// A duplicate that is not an ancestor is kept. Aggregate nodes stop the chain because their entries are inside the node.
     /// When the walk stops because of the cap and a further node remains, the suffix is <c>(+N+ more)</c>.
     /// When every node was counted, the suffix is <c>(+N more)</c>.
     /// </remarks>
     private static string FormatTextCore(Exception exception)
     {
         var parts = new List<string>(MaxTextSegments);
-        var seen = new List<Exception>(MaxChain);
+        var path = new List<Exception>(MaxChain);
         var current = exception;
         var total = 0;
         var steps = 0;
         while (current != null && steps < MaxChain)
         {
             steps++;
-            if (Contains(seen, current))
+            if (Contains(path, current))
             {
                 current = null;
                 break;
             }
 
-            if (seen.Count < MaxChain)
-                seen.Add(current);
+            if (path.Count < MaxChain)
+                path.Add(current);
             total++;
             if (parts.Count < MaxTextSegments)
-                parts.Add(current is AggregateException aggregate ? RenderAggregate(aggregate, seen) : RenderOne(current));
+                parts.Add(current is AggregateException aggregate ? RenderAggregate(aggregate, path) : RenderOne(current));
             if (current is AggregateException)
             {
                 current = null;
@@ -617,30 +621,34 @@ internal static class ExceptionReport
     /// Renders an aggregate without its own message.
     /// Entries follow <see cref="Flatten"/>, at most three, then <c>(+N more)</c> or <c>(+N+ more)</c>.
     /// An entry is rendered alone. Its inner exception is not part of the text.
-    /// An instance already on <paramref name="seen"/> is not repeated.
+    /// The same instance is repeated when it is a sibling. It is omitted only when it is an ancestor.
     /// </summary>
     /// <param name="exception">Aggregate on the chain. Not null.</param>
-    /// <param name="seen">Instances already visited by this walk, including <paramref name="exception"/>. Not null.</param>
+    /// <param name="ancestors">Ancestor path of this walk, including <paramref name="exception"/>. Not null.</param>
     /// <returns>The aggregate node, including its new entries.</returns>
     /// <remarks>
     /// The aggregate's message is omitted because the runtime repeats the inner messages there.
     /// <c>N</c> is the number of flattened entries that were not shown.
     /// The extra plus means the flatten walk stopped at its cap with entries still unread.
+    /// An empty list that stopped at the cap still writes <c>(+1+ more)</c>, a lower bound.
     /// </remarks>
-    private static string RenderAggregate(AggregateException exception, List<Exception> seen)
+    private static string RenderAggregate(AggregateException exception, List<Exception> ancestors)
     {
-        var flat = Flatten(exception, seen);
+        var flat = Flatten(exception, ancestors);
         var type = DisplayName(exception);
         if (flat.Entries.Count == 0)
-            return type;
+            return flat.Incomplete ? type + MoreSuffix(1, true) : type;
 
         var shown = flat.Entries.Count < MaxTextSegments ? flat.Entries.Count : MaxTextSegments;
         var pieces = new string[shown];
         for (var i = 0; i < shown; i++)
             pieces[i] = RenderOne(flat.Entries[i]);
         var text = type + " --> " + string.Join("; ", pieces);
-        if (flat.Entries.Count > MaxTextSegments)
-            text += MoreSuffix(flat.Entries.Count - MaxTextSegments, flat.Incomplete);
+        var hidden = flat.Entries.Count - shown;
+        if (flat.Incomplete && hidden < 1)
+            hidden = 1;
+        if (hidden > 0)
+            text += MoreSuffix(hidden, flat.Incomplete);
         return text;
     }
 
@@ -1034,107 +1042,175 @@ internal static class ExceptionReport
         };
     }
 
-    /// <summary>Innermost exception that has a stack, or null when none do.</summary>
+    /// <summary>
+    /// Exception whose frame is shown in <c>at</c> and in the top-level JSON <c>source</c>.
+    /// </summary>
     /// <param name="exception">Outermost exception. Not null.</param>
     /// <param name="stacks">
     /// Stack strings already read for this build, or null when each exception is read once.
     /// A JSON build passes the same map the inner entries used.
     /// </param>
-    /// <returns>The deepest exception whose stack string is non-empty.</returns>
+    /// <returns>
+    /// The innermost exception that has a stack and a user frame.
+    /// When that exception's frames are all framework frames, the nearest outer exception that has a user frame.
+    /// When no exception on that path has a user frame, the innermost exception that has a stack.
+    /// Null when no exception has a stack.
+    /// </returns>
     /// <remarks>
     /// Depth follows <see cref="Exception.InnerException"/> and each aggregate child.
-    /// The walk stops at 16 levels and 64 nodes, and a repeated instance is a cycle.
+    /// The walk stops at 16 levels and 64 nodes. An instance that is its own ancestor is a cycle and is not entered again.
+    /// A duplicate sibling is entered again, until the node cap.
     /// </remarks>
     private static Exception? FindOrigin(Exception exception, Dictionary<Exception, string?>? stacks = null)
     {
-        Exception? best = null;
+        var nodes = new List<OriginNode>(8);
+        var pending = new List<int>(8);
+        nodes.Add(new OriginNode(exception, -1, 0));
+        pending.Add(0);
+        var visits = 0;
+        var best = -1;
         var bestDepth = -1;
-        var seen = new List<Exception>(MaxFlatten);
-        var pending = new List<Walk>(MaxFlatten);
-        pending.Add(new Walk(exception, 0));
-        var steps = 0;
-        while (pending.Count > 0 && steps < MaxFlatten)
+        while (pending.Count > 0 && visits < MaxFlatten)
         {
-            steps++;
-            var last = pending.Count - 1;
-            var item = pending[last];
-            pending.RemoveAt(last);
-            if (item.Depth > MaxChain)
+            var index = pending[pending.Count - 1];
+            pending.RemoveAt(pending.Count - 1);
+            var node = nodes[index];
+            if (node.Depth > MaxChain)
                 continue;
-            if (Contains(seen, item.Exception))
+            if (AppearsOnOriginPath(nodes, node.Parent, node.Exception))
                 continue;
-            if (seen.Count < MaxFlatten)
-                seen.Add(item.Exception);
-            if (HasStack(item.Exception, stacks) && item.Depth > bestDepth)
+            visits++;
+            if (HasStack(node.Exception, stacks) && node.Depth > bestDepth)
             {
-                best = item.Exception;
-                bestDepth = item.Depth;
+                best = index;
+                bestDepth = node.Depth;
             }
 
-            PushDeeper(item.Exception, item.Depth + 1, pending);
+            PushOriginChildren(node.Exception, index, node.Depth + 1, nodes, pending);
         }
 
-        return best;
+        if (best < 0)
+            return null;
+        for (var i = best; i >= 0; i = nodes[i].Parent)
+        {
+            if (HasUserFrame(nodes[i].Exception))
+                return nodes[i].Exception;
+        }
+
+        return nodes[best].Exception;
+    }
+
+    /// <summary>True when one frame of <paramref name="exception"/> is application code.</summary>
+    /// <param name="exception">Exception whose frames are read. Not null.</param>
+    /// <returns>True when <see cref="IsSkipped"/> rejects a frame.</returns>
+    /// <remarks>Does not throw. A throwing frame read is treated as no user frame, so the caller can walk outward.</remarks>
+    private static bool HasUserFrame(Exception exception)
+    {
+        var frames = ReadFrames(exception);
+        var count = frames.Count;
+        if (count > MaxFrames)
+            count = MaxFrames;
+        for (var i = 0; i < count; i++)
+        {
+            if (!IsSkipped(frames[i].AssemblyName, frames[i].Namespace))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>True when <paramref name="candidate"/> is already on the parent chain.</summary>
+    /// <param name="nodes">Nodes recorded by the origin walk. Not null.</param>
+    /// <param name="parent">Index of the parent, or -1 at the root.</param>
+    /// <param name="candidate">Exception about to be entered. Not null.</param>
+    /// <returns>True when the same instance is an ancestor.</returns>
+    /// <remarks>Does not throw. The parent walk stops at 64 steps.</remarks>
+    private static bool AppearsOnOriginPath(List<OriginNode> nodes, int parent, Exception candidate)
+    {
+        var guard = 0;
+        var index = parent;
+        while (index >= 0 && guard < MaxFlatten)
+        {
+            if (ReferenceEquals(nodes[index].Exception, candidate))
+                return true;
+            index = nodes[index].Parent;
+            guard++;
+        }
+
+        return false;
     }
 
     /// <summary>Pushes the next level of one exception onto the origin walk.</summary>
     /// <param name="exception">Node just visited. Not null.</param>
+    /// <param name="parent">Index of <paramref name="exception"/> in <paramref name="nodes"/>.</param>
     /// <param name="depth">Depth of the children. Greater than 16 is ignored.</param>
-    /// <param name="pending">Explicit stack. Not null. Capped at 64 entries.</param>
+    /// <param name="nodes">Recorded nodes. Not null. Capped at 64.</param>
+    /// <param name="pending">Explicit stack of node indexes. Not null. Capped at 64.</param>
     /// <remarks>Aggregates push their direct children so nesting still has a depth. Other exceptions push one inner.</remarks>
-    private static void PushDeeper(Exception exception, int depth, List<Walk> pending)
+    private static void PushOriginChildren(Exception exception, int parent, int depth, List<OriginNode> nodes, List<int> pending)
     {
-        if (depth > MaxChain || pending.Count >= MaxFlatten)
+        if (depth > MaxChain || nodes.Count >= MaxFlatten || pending.Count >= MaxFlatten)
             return;
         if (exception is AggregateException aggregate)
         {
             var inners = CopyInners(aggregate, out _);
-            for (var i = inners.Count - 1; i >= 0 && pending.Count < MaxFlatten; i--)
-                pending.Add(new Walk(inners[i], depth));
+            for (var i = inners.Count - 1; i >= 0 && nodes.Count < MaxFlatten && pending.Count < MaxFlatten; i--)
+            {
+                nodes.Add(new OriginNode(inners[i], parent, depth));
+                pending.Add(nodes.Count - 1);
+            }
+
             return;
         }
 
-        if (TryInner(exception, out var inner) && inner != null)
-            pending.Add(new Walk(inner, depth));
+        if (TryInner(exception, out var inner) && inner != null && nodes.Count < MaxFlatten && pending.Count < MaxFlatten)
+        {
+            nodes.Add(new OriginNode(inner, parent, depth));
+            pending.Add(nodes.Count - 1);
+        }
     }
 
     /// <summary>
-    /// Inner exceptions for JSON, at most 16, with a cycle cut on <see cref="object.ReferenceEquals"/>.
+    /// Inner exceptions for JSON, at most 16.
     /// An <see cref="AggregateException"/> contributes its flattened entries instead of itself.
     /// </summary>
     /// <param name="root">Outermost exception. It is not included in the result. Not null.</param>
     /// <returns>The inner entries in walk order. Empty when there are none.</returns>
     /// <remarks>
-    /// The loop stops at 16 steps. A repeated instance is skipped by <see cref="object.ReferenceEquals"/>,
-    /// including when an aggregate entry's inner exception points back at an aggregate already visited.
+    /// The result stops at 16 entries. The walk stops at 64 steps.
+    /// An instance that is already an ancestor is a cycle and is not repeated.
+    /// The same instance is repeated when it appears twice as a sibling, matching <see cref="Flatten"/>.
     /// </remarks>
     private static List<Exception> CollectInners(Exception root)
     {
         var result = new List<Exception>(8);
-        var seen = new List<Exception>(MaxChain);
-        seen.Add(root);
-        var pending = new List<Exception>(MaxFlatten);
-        EnqueueChildren(root, pending, seen);
+        var path = new List<Exception>(8);
+        path.Add(root);
+        var pending = new List<Walk>(MaxFlatten);
+        EnqueueChildren(root, pending, path);
         var steps = 0;
-        while (pending.Count > 0 && result.Count < MaxChain && steps < MaxChain)
+        while (pending.Count > 0 && result.Count < MaxChain && steps < MaxFlatten)
         {
             steps++;
             var last = pending.Count - 1;
-            var current = pending[last];
+            var item = pending[last];
             pending.RemoveAt(last);
-            if (Contains(seen, current))
+            while (path.Count > item.Depth)
+                path.RemoveAt(path.Count - 1);
+            var current = item.Exception;
+            if (Contains(path, current))
                 continue;
-            if (seen.Count < MaxChain)
-                seen.Add(current);
+            if (path.Count < MaxFlatten)
+                path.Add(current);
             if (current is AggregateException aggregate)
             {
-                var flat = Flatten(aggregate, seen);
-                if (flat.Entries.Count == 0 && ChildrenAreAlreadyVisited(aggregate, seen))
+                var flat = Flatten(aggregate, path);
+                if (flat.Entries.Count == 0 && ChildrenAreOnPath(aggregate, path))
                     result.Add(aggregate);
                 else
                 {
                     for (var i = flat.Entries.Count - 1; i >= 0 && pending.Count < MaxFlatten; i--)
-                        pending.Add(flat.Entries[i]);
+                        pending.Add(new Walk(flat.Entries[i], path.Count));
                 }
 
                 continue;
@@ -1142,7 +1218,7 @@ internal static class ExceptionReport
 
             result.Add(current);
             if (TryInner(current, out var inner) && inner != null && pending.Count < MaxFlatten)
-                pending.Add(inner);
+                pending.Add(new Walk(inner, path.Count));
         }
 
         return result;
@@ -1151,48 +1227,48 @@ internal static class ExceptionReport
     /// <summary>Pushes the first level of children of the outermost exception.</summary>
     /// <param name="exception">Outermost exception. Not null.</param>
     /// <param name="pending">Explicit stack. Not null.</param>
-    /// <param name="seen">Instances already visited, including <paramref name="exception"/>. Not null.</param>
+    /// <param name="path">Ancestor path, including <paramref name="exception"/>. Not null.</param>
     /// <remarks>A root aggregate pushes flattened entries so the wrapper is not also an inner entry.</remarks>
-    private static void EnqueueChildren(Exception exception, List<Exception> pending, List<Exception> seen)
+    private static void EnqueueChildren(Exception exception, List<Walk> pending, List<Exception> path)
     {
         if (exception is AggregateException aggregate)
         {
-            EnqueueFlattened(aggregate, pending, seen);
+            EnqueueFlattened(aggregate, pending, path);
             return;
         }
 
         if (TryInner(exception, out var inner) && inner != null && pending.Count < MaxFlatten)
-            pending.Add(inner);
+            pending.Add(new Walk(inner, path.Count));
     }
 
     /// <summary>Pushes flattened entries in reverse so the first entry is visited first.</summary>
     /// <param name="aggregate">Aggregate to expand. Not null.</param>
     /// <param name="pending">Explicit stack. Not null. Stops accepting entries at 64.</param>
-    /// <param name="seen">Instances already visited by the outer walk. Not null.</param>
+    /// <param name="path">Ancestor path. Not null.</param>
     /// <remarks>Uses <see cref="Flatten"/>, so JSON <c>inner</c> follows the same order as the text.</remarks>
-    private static void EnqueueFlattened(AggregateException aggregate, List<Exception> pending, List<Exception> seen)
+    private static void EnqueueFlattened(AggregateException aggregate, List<Walk> pending, List<Exception> path)
     {
-        var flat = Flatten(aggregate, seen);
+        var flat = Flatten(aggregate, path);
         for (var i = flat.Entries.Count - 1; i >= 0 && pending.Count < MaxFlatten; i--)
-            pending.Add(flat.Entries[i]);
+            pending.Add(new Walk(flat.Entries[i], path.Count));
     }
 
     /// <summary>
-    /// True when every direct child is already in <paramref name="seen"/>.
+    /// True when every direct child is already an ancestor.
     /// An empty aggregate and a truncated child list are false.
     /// </summary>
     /// <param name="aggregate">Aggregate whose children are checked. Not null.</param>
-    /// <param name="seen">Instances already visited. Not null.</param>
-    /// <returns>True when each readable child is the same instance as one already visited.</returns>
+    /// <param name="path">Ancestor path. Not null.</param>
+    /// <returns>True when each readable child is the same instance as an ancestor.</returns>
     /// <remarks>Does not throw. The child loop stops at 64. A null child was not copied and does not count.</remarks>
-    private static bool ChildrenAreAlreadyVisited(AggregateException aggregate, List<Exception> seen)
+    private static bool ChildrenAreOnPath(AggregateException aggregate, List<Exception> path)
     {
         var inners = CopyInners(aggregate, out var truncated);
         if (truncated || inners.Count == 0)
             return false;
         for (var i = 0; i < inners.Count; i++)
         {
-            if (!Contains(seen, inners[i]))
+            if (!Contains(path, inners[i]))
                 return false;
         }
 
@@ -1204,39 +1280,34 @@ internal static class ExceptionReport
     /// Non-aggregate entries are kept. The root aggregate is not an entry.
     /// </summary>
     /// <param name="root">Aggregate to flatten. Not null.</param>
-    /// <param name="externalSeen">
-    /// Instances already visited by the caller. A child in this list is not emitted again.
+    /// <param name="ancestors">
+    /// Ancestor path of the caller. A child on this path is a cycle and is not emitted.
     /// Not null. The root is still processed when it appears here.
     /// </param>
     /// <returns>The flattened entries, at most 64, and whether the walk stopped with nodes still unread.</returns>
     /// <remarks>
     /// Each aggregate appends its non-aggregate children immediately, in order, and appends nested
     /// aggregates to the end of the work list. <c>Agg(x, Agg(y), z)</c> is <c>x, z, y</c>.
+    /// The same instance is emitted twice when it is a sibling. It is skipped only when it is an ancestor.
     /// The method does not call <see cref="AggregateException.Flatten"/>, because that loops on a reflective cycle.
-    /// The loop visits at most 16 aggregates and keeps at most 64 entries.
-    /// A repeated aggregate instance is skipped by <see cref="object.ReferenceEquals"/> and does not mark the walk incomplete.
+    /// The work list and the entry list each stop at 64 nodes. Hitting either cap marks the walk incomplete.
     /// </remarks>
-    private static (List<Exception> Entries, bool Incomplete) Flatten(AggregateException root, List<Exception> externalSeen)
+    private static (List<Exception> Entries, bool Incomplete) Flatten(AggregateException root, List<Exception> ancestors)
     {
         var result = new List<Exception>(8);
         var work = new List<AggregateException>(8);
-        var seen = new List<Exception>(8);
+        var parent = new int[MaxFlatten];
         work.Add(root);
+        parent[0] = -1;
         var read = 0;
         var incomplete = false;
         while (read < work.Count && result.Count < MaxFlatten)
         {
-            var aggregate = work[read];
+            var index = read;
+            var aggregate = work[index];
             read++;
-            if (Contains(seen, aggregate))
+            if (IsAggregateAncestor(work, parent, parent[index], aggregate))
                 continue;
-            if (seen.Count >= MaxChain)
-            {
-                incomplete = true;
-                continue;
-            }
-
-            seen.Add(aggregate);
             var inners = CopyInners(aggregate, out var truncated);
             if (truncated)
                 incomplete = true;
@@ -1245,7 +1316,7 @@ internal static class ExceptionReport
                 var child = inners[i];
                 if (child is AggregateException nested)
                 {
-                    if (Contains(seen, nested) || Contains(externalSeen, nested))
+                    if (IsAggregateAncestor(work, parent, index, nested) || Contains(ancestors, nested))
                         continue;
                     if (work.Count >= MaxFlatten)
                     {
@@ -1253,9 +1324,10 @@ internal static class ExceptionReport
                         continue;
                     }
 
+                    parent[work.Count] = index;
                     work.Add(nested);
                 }
-                else if (Contains(externalSeen, child))
+                else if (Contains(ancestors, child))
                 {
                     continue;
                 }
@@ -1274,6 +1346,27 @@ internal static class ExceptionReport
         if (read < work.Count)
             incomplete = true;
         return (result, incomplete);
+    }
+
+    /// <summary>True when <paramref name="candidate"/> is on the parent chain of one queued aggregate.</summary>
+    /// <param name="work">Aggregates in queue order. Not null.</param>
+    /// <param name="parent">Parent index of each queued aggregate. Index -1 is the root.</param>
+    /// <param name="index">Aggregate to start from. -1 means the chain is empty.</param>
+    /// <param name="candidate">Exception that might be an ancestor. Not null.</param>
+    /// <returns>True when the same instance appears at <paramref name="index"/> or above it.</returns>
+    /// <remarks>Does not throw. The walk stops at 64 steps, which is the work-list cap.</remarks>
+    private static bool IsAggregateAncestor(List<AggregateException> work, int[] parent, int index, Exception candidate)
+    {
+        var guard = 0;
+        while (index >= 0 && guard < MaxFlatten)
+        {
+            if (ReferenceEquals(work[index], candidate))
+                return true;
+            index = parent[index];
+            guard++;
+        }
+
+        return false;
     }
 
     /// <summary>Copies at most 64 direct inner exceptions. A throwing getter yields an empty list.</summary>
@@ -1866,7 +1959,7 @@ internal static class ExceptionReport
     {
         /// <summary>Creates a walk step.</summary>
         /// <param name="exception">Exception at this depth. Not null.</param>
-        /// <param name="depth">Zero at the outermost exception.</param>
+        /// <param name="depth">Path length of the parent. The node is appended at this depth.</param>
         public Walk(Exception exception, int depth)
         {
             Exception = exception;
@@ -1875,6 +1968,30 @@ internal static class ExceptionReport
 
         /// <summary>Exception to consider.</summary>
         public Exception Exception { get; }
+
+        /// <summary>How many ancestors are already on the path.</summary>
+        public int Depth { get; }
+    }
+
+    /// <summary>One exception recorded while choosing the origin frame.</summary>
+    private readonly struct OriginNode
+    {
+        /// <summary>Creates a recorded node.</summary>
+        /// <param name="exception">Exception at this node. Not null.</param>
+        /// <param name="parent">Index of the parent node, or -1 for the root.</param>
+        /// <param name="depth">Zero at the outermost exception.</param>
+        public OriginNode(Exception exception, int parent, int depth)
+        {
+            Exception = exception;
+            Parent = parent;
+            Depth = depth;
+        }
+
+        /// <summary>Exception at this node.</summary>
+        public Exception Exception { get; }
+
+        /// <summary>Index of the parent, or -1 at the root.</summary>
+        public int Parent { get; }
 
         /// <summary>How many steps from the outermost exception.</summary>
         public int Depth { get; }
