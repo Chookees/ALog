@@ -1769,6 +1769,7 @@ internal static class ExceptionReport
     /// <remarks>
     /// Does not throw. The loop stops at <paramref name="text"/>.Length.
     /// The scan stays a single comparison per character unless a backslash, pipe, line break, or arrow appears.
+    /// A string with none of those characters is returned as the same instance and is not copied.
     /// <c>\\</c>, <c>\|</c>, <c>\r</c>, <c>\n</c>, and <c>--\&gt;</c> are the only sequences a decoder treats as escapes.
     /// Any other backslash stands for itself, so <c>C:\temp</c> is returned unchanged.
     /// </remarks>

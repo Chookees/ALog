@@ -25,15 +25,22 @@ else
   exit 1
 fi
 
-filter_args=()
+# One --filter option, then each pattern. Repeating --filter is rejected by BenchmarkDotNet.
+filter_args=(--filter)
 IFS='|' read -r -a patterns <<< "$filter"
 for pattern in "${patterns[@]}"; do
   if [ -z "$pattern" ]; then
     echo "empty filter pattern" >&2
     exit 1
   fi
-  filter_args+=(--filter "$pattern")
+  filter_args+=("$pattern")
 done
 
 mkdir -p "$out"
 dotnet run -c Release --project "$project" -- "${filter_args[@]}" --artifacts "$out"
+shopt -s nullglob
+reports=("$out"/results/*-report-github.md)
+if [ "${#reports[@]}" -eq 0 ]; then
+  echo "no github report in $out" >&2
+  exit 1
+fi
