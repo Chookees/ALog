@@ -24,10 +24,10 @@ public sealed class ExceptionFormatTests
         "Payment failed | InvalidOperationException: Card declined | at CheckoutService.Pay in CheckoutService.cs:42 | ctx: orderId=17";
 
     private const string BreakingBullet =
-        "- Plain text, console, and file output write exceptions as \"Type: Message\", followed by inner exceptions and the source line (\"at Class.Method in File.cs:42\"). The \"EX:\" label is gone; update log parsers that match it. \"|\" and \"-->\" in the message, the category, and context or property names and values are escaped as \"\\|\" and \"--\\>\", line breaks as \"\\r\" and \"\\n\", and a backslash is doubled only where it would otherwise read as one of these escapes (\"C:\\temp\" stays as is), so each event stays one line.";
+        "- Plain text, console, and file output write exceptions as \"Type: Message\", followed by inner exceptions and the source line (\"at Class.Method in File.cs:42\"). The \"EX:\" label is gone; update log parsers that match it. `|` and `-->` in the message, the category, and context or property names and values are escaped as `\\|` and `--\\>`, line breaks as `\\r` and `\\n`, and a backslash is doubled only where it would otherwise read as one of these escapes (`C:\\temp` stays as is), so each event stays one line.";
 
     private const string ReadmeEscapeSentence =
-        "\"|\" and \"-->\" in the message, the category, and context or property names and values are escaped as \"\\|\" and \"--\\>\", line breaks as \"\\r\" and \"\\n\", and a backslash is doubled only where it would otherwise read as one of these escapes (\"C:\\temp\" stays as is), so each event stays one line.";
+        "`|` and `-->` in the message, the category, and context or property names and values are escaped as `\\|` and `--\\>`, line breaks as `\\r` and `\\n`, and a backslash is doubled only where it would otherwise read as one of these escapes (`C:\\temp` stays as is), so each event stays one line.";
 
     private const string AddedSourceBullet =
         "- JSON and HTTP exception output add \"source\" (method, file, line) and \"inner\" (type, message, and source of each inner exception, up to 16).";

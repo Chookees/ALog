@@ -60,7 +60,7 @@ An exception shares that line. The form is `Type: Message`, then inner exception
 [20:55:19] [Error] Payment failed | InvalidOperationException: Card declined | at CheckoutService.Pay in CheckoutService.cs:42 | ctx: orderId=17
 ```
 
-"|" and "-->" in the message, the category, and context or property names and values are escaped as "\|" and "--\>", line breaks as "\r" and "\n", and a backslash is doubled only where it would otherwise read as one of these escapes ("C:\temp" stays as is), so each event stays one line. `PlainTextFormatter(includeStackTrace: true)` appends the full stack trace indented by four spaces. The default is off.
+`|` and `-->` in the message, the category, and context or property names and values are escaped as `\|` and `--\>`, line breaks as `\r` and `\n`, and a backslash is doubled only where it would otherwise read as one of these escapes (`C:\temp` stays as is), so each event stays one line. `PlainTextFormatter(includeStackTrace: true)` appends the full stack trace indented by four spaces. The default is off.
 
 `PlainTextFormatter(includeStackTrace: true)` calls .NET's `Exception.ToString()`, and a self-referencing exception built via reflection can overflow inside that call.
 
