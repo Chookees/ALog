@@ -1213,7 +1213,7 @@ public sealed class ExceptionFormatTests
     /// The later leaf is still unread, so the text is <c>AggregateException (+1+ more)</c>.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task Aggregate_SecondUnreadAggregateStops()
+    public async Task Aggregate_LaterUnreadAggregateIsIncomplete()
     {
         await Task.CompletedTask;
         var root = new AggregateException(Enumerable.Range(0, 63).Select(_ => (Exception)new AggregateException()).Append(new AggregateException(new InvalidOperationException("y"))));
@@ -1247,7 +1247,7 @@ public sealed class ExceptionFormatTests
     /// The visit counter is full, so the leaf is not shown and the suffix has the extra plus.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task Aggregate_SecondSlotOfUnreadAggregateStops()
+    public async Task Aggregate_NullBeforeUnreadLeafIsIncomplete()
     {
         await Task.CompletedTask;
         var nested = new AggregateException();
