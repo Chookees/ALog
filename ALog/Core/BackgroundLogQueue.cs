@@ -1,31 +1,33 @@
 // Background queue for UseBackgroundQueue (C4).
-// One opt-in queue. A full queue drops the new event and counts it (ALOG0070).
+// One opt-in queue. Drop counts a full queue (ALOG0070). Block waits for room.
 // Shutdown, flush, and the new-write cutoff use the injected TimeProvider (ALOG0071).
+// The static 5000 ms and 4900 ms bounds stay. The instance flush timeout is the real wait.
 // Production uses ProductionClock.Default. Tests pass a clock they can move.
 // The open ALOG0070 window is written at shutdown. The first event after close is ALOG0072.
 // Idle writers are disposed at the deadline. A call that is still running is not.
-// Next file: ALog/Core/LoggerEngine.cs.
+// Next file: ALog/Core/BackgroundLogQueue.Block.cs.
 
 namespace ALog.Core;
 
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
+using ALog.Config;
 using ALog.Public.Interfaces;
 
 /// <summary>
 /// Accepts log events on a bounded channel and writes them on a pool thread.
-/// A full queue drops the new event. Shutdown stops accepting and drains until
-/// the deadline. The caller never waits without a bound.
+/// <see cref="QueueFullMode.Drop"/> drops a new event when the queue is full.
+/// <see cref="QueueFullMode.Block"/> waits until there is room, unless the caller is the queue's own writer thread or shutdown has started.
 /// </summary>
-public class BackgroundLogQueue : IDisposable
+public partial class BackgroundLogQueue : IDisposable
 {
-    /// <summary>How long <see cref="Dispose"/> and <see cref="FlushAsync"/> may wait. 5000 ms. C4-02. Not configurable.</summary>
+    /// <summary>Default wait for <see cref="Dispose"/> and <see cref="FlushAsync"/>. 5000 ms. C4-02. The instance flush timeout is the real wait.</summary>
     internal static readonly TimeSpan ShutdownDeadline = TimeSpan.FromMilliseconds(5000);
 
     /// <summary>
-    /// New writer calls stop after 4900 ms of <see cref="ShutdownDeadline"/>.
-    /// The last 100 ms lets a call that already started finish. Not configurable.
+    /// Default new-write cutoff. 4900 ms of <see cref="ShutdownDeadline"/>.
+    /// The last 100 ms lets a call that already started finish. An instance timeout derives its own cutoff.
     /// </summary>
     internal static readonly TimeSpan NewWriteBudget = TimeSpan.FromMilliseconds(4900);
 
@@ -155,6 +157,10 @@ public class BackgroundLogQueue : IDisposable
         _flushInterval = settings.FlushInterval;
         _asyncEnabled = settings.AsyncEnabled;
         _clock = settings.Clock;
+        _fullMode = LogOptionRules.RequireMode(settings.FullMode);
+        _shutdownDeadline = settings.FlushTimeout;
+        LogOptionRules.RequireDuration(_shutdownDeadline, LogOptionRules.PathOf("FlushTimeout"));
+        _newWriteBudget = LogOptionRules.DeriveCutoff(_shutdownDeadline);
 
         _channel = Channel.CreateBounded<LogEvent>(new BoundedChannelOptions(settings.Capacity)
         {
@@ -267,10 +273,11 @@ public class BackgroundLogQueue : IDisposable
     /// Queues <paramref name="logEvent"/> or drops it. The returned task is already complete unless it was cancelled.
     /// </summary>
     /// <param name="logEvent">Event to write. A null event is passed through to the channel like any other value.</param>
-    /// <returns>A completed task when the event was accepted or dropped. Never an unbounded wait.</returns>
+    /// <returns>A completed task when the event was accepted or dropped. <see cref="QueueFullMode.Block"/> waits inside this call, then completes the task.</returns>
     /// <remarks>
     /// Does not throw when the queue is closed or full. Safe to call from several threads.
     /// A cancellation token is not observed; use the internal overload when the caller has one.
+    /// Drop returns as soon as the queue is full. Block waits while the queue is open.
     /// </remarks>
     public ValueTask EnqueueAsync(LogEvent logEvent)
         => EnqueueAsync(logEvent, CancellationToken.None);
@@ -284,6 +291,7 @@ public class BackgroundLogQueue : IDisposable
     /// <returns>
     /// A cancelled task when the token is already cancelled.
     /// Otherwise a completed task, including when the event was dropped.
+    /// <see cref="QueueFullMode.Block"/> waits before that task is returned.
     /// </returns>
     /// <remarks>
     /// Does not throw for a full or closed queue. Does not emit ALOG0070 for a cancelled entry.
@@ -302,13 +310,15 @@ public class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Queues <paramref name="logEvent"/> or drops it. Returns as soon as the decision is made.
+    /// Queues <paramref name="logEvent"/> or drops it.
+    /// <see cref="QueueFullMode.Drop"/> returns as soon as the decision is made.
+    /// <see cref="QueueFullMode.Block"/> waits until the queue has room, unless this thread is the queue writer or shutdown has started.
     /// </summary>
     /// <param name="logEvent">Event to write. Not inspected.</param>
     /// <returns>True when the event was accepted. False when it was dropped or the queue is closed.</returns>
     /// <remarks>
-    /// Does not throw. Does not wait for a writer. Safe to call from several threads.
-    /// A false return is a drop, not a five-second timeout.
+    /// Does not throw. Does not wait for a writer to finish the event. Safe to call from several threads.
+    /// A false return is a drop. Drop mode does not wait. Block mode can wait while the queue is open.
     /// </remarks>
     public bool TryEnqueue(LogEvent logEvent)
     {
@@ -335,15 +345,44 @@ public class BackgroundLogQueue : IDisposable
         if (cancellationToken.IsCancellationRequested)
             return OfferResult.Cancelled;
 
-        OfferResult result;
-        var firstClosed = false;
-        lock (_gate)
-            result = DecideUnderGate(logEvent, ref firstClosed);
+        BlockWaiter? waiter = null;
+        for (var attempt = 0; attempt < MaxBlockAttempts; attempt++)
+        {
+            OfferResult result;
+            var firstClosed = false;
+            lock (_gate)
+            {
+                result = waiter is null
+                    ? DecideUnderGate(logEvent, ref firstClosed)
+                    : OfferResult.NeedWait;
 
-        if (firstClosed)
+                if (result == OfferResult.NeedWait)
+                    result = PrepareWait(logEvent, ref waiter, ref firstClosed);
+            }
+
+            if (firstClosed)
+                SelfLog.ReportLine(ClosedDropLine);
+
+            if (result != OfferResult.NeedWait)
+                return result;
+
+            Interlocked.Increment(ref _blockWaitsStarted);
+            WaitHandle.WaitAny(new WaitHandle[] { waiter!.Signal.WaitHandle });
+        }
+
+        var abandoned = false;
+        lock (_gate)
+        {
+            if (waiter is not null)
+                Unregister(waiter);
+
+            NoteClosed(ref abandoned);
+        }
+
+        if (abandoned)
             SelfLog.ReportLine(ClosedDropLine);
 
-        return result;
+        return OfferResult.Closed;
     }
 
     /// <summary>
@@ -359,13 +398,15 @@ public class BackgroundLogQueue : IDisposable
     {
         if (_closed)
         {
-            Interlocked.Increment(ref _closedDrops);
-            firstClosed = Interlocked.CompareExchange(ref _closedReported, 1, 0) == 0;
+            NoteClosed(ref firstClosed);
             return OfferResult.Closed;
         }
 
         if (_outstanding >= _capacity || !_channel.Writer.TryWrite(logEvent))
         {
+            if (_fullMode == QueueFullMode.Block && !OnConsumer())
+                return OfferResult.NeedWait;
+
             NoteFullDrop();
             return OfferResult.Full;
         }
@@ -476,17 +517,39 @@ public class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Builds the ALOG0071 sentence. The deadline in the text is the fixed 5 s.
+    /// Builds the ALOG0071 sentence. Exactly five seconds stays <c>5 s</c>. Other whole seconds use the same shape. Anything else uses the invariant constant format.
     /// </summary>
     /// <param name="count">Accepted events that were not written when the deadline won. Greater than zero.</param>
     /// <returns>The catalog sentence, with no extra prefix.</returns>
     /// <remarks>Does not throw. Allocates the line. Called only from <see cref="Dispose"/>.</remarks>
-    private static string FormatShutdown(long count)
+    private string FormatShutdown(long count)
     {
         return string.Concat(
-            "Shutdown deadline of 5 s reached: ",
+            "Shutdown deadline of ",
+            DeadlineText(_shutdownDeadline),
+            " reached: ",
             count.ToString(CultureInfo.InvariantCulture),
             " queued events were not written. A writer is too slow to drain the queue in time; check the target or reduce the log volume before shutdown.");
+    }
+
+    /// <summary>
+    /// The duration text inside ALOG0071. Five seconds is <c>5 s</c>.
+    /// </summary>
+    /// <param name="timeout">The flush timeout. Negative values use the invariant constant format.</param>
+    /// <returns><c>5 s</c> for exactly five seconds, <c>{n} s</c> for any other non-negative whole number of seconds, otherwise the invariant <c>c</c> format.</returns>
+    /// <remarks>Does not throw. Does not read a clock.</remarks>
+    internal static string DeadlineText(TimeSpan timeout)
+    {
+        if (timeout == TimeSpan.FromSeconds(5))
+            return "5 s";
+
+        if (timeout >= TimeSpan.Zero && timeout.Ticks % TimeSpan.TicksPerSecond == 0)
+        {
+            var seconds = timeout.Ticks / TimeSpan.TicksPerSecond;
+            return seconds.ToString(CultureInfo.InvariantCulture) + " s";
+        }
+
+        return timeout.ToString("c", CultureInfo.InvariantCulture);
     }
 
     /// <summary>
@@ -680,7 +743,7 @@ public class BackgroundLogQueue : IDisposable
     /// Does not throw. This is the only elapsed comparison. The cutoff timer does not change the result.
     /// </remarks>
     private bool ElapsedPastNewWriteBudget(long start)
-        => _clock.GetElapsedTime(start) >= NewWriteBudget;
+        => _clock.GetElapsedTime(start) >= _newWriteBudget;
 
     /// <summary>
     /// Hands one event to every writer. A writer failure stays on the dispatcher error path.
@@ -690,20 +753,32 @@ public class BackgroundLogQueue : IDisposable
     /// <remarks>Does not throw. Allocates nothing beyond what the dispatcher allocates. One event, so the deadline can be checked between events.</remarks>
     private async Task<bool> DispatchOneAsync(LogEvent logEvent)
     {
-        _writerGate.PrepareEvent();
+        var previousQueue = ConsumerQueue.Value;
+        var previousThread = Volatile.Read(ref _consumerThread);
+        ConsumerQueue.Value = this;
+        Volatile.Write(ref _consumerThread, Environment.CurrentManagedThreadId);
         try
         {
-            if (!_asyncEnabled)
-                _dispatcher.Dispatch(logEvent);
-            else
-                await _dispatcher.DispatchAsync(logEvent).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine("[BackgroundLogQueue] Batch processing error: " + ex.GetType().Name);
-        }
+            _writerGate.PrepareEvent();
+            try
+            {
+                if (!_asyncEnabled)
+                    _dispatcher.Dispatch(logEvent);
+                else
+                    await _dispatcher.DispatchAsync(logEvent).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine("[BackgroundLogQueue] Batch processing error: " + ex.GetType().Name);
+            }
 
-        return !_writerGate.EventSkipped;
+            return !_writerGate.EventSkipped;
+        }
+        finally
+        {
+            ConsumerQueue.Value = previousQueue;
+            Volatile.Write(ref _consumerThread, previousThread);
+        }
     }
 
     /// <summary>
@@ -718,7 +793,10 @@ public class BackgroundLogQueue : IDisposable
         lock (_gate)
         {
             if (_outstanding > 0)
+            {
                 _outstanding--;
+                SignalWaiters();
+            }
 
             if (!_frozen)
                 _written++;
@@ -886,6 +964,12 @@ public class BackgroundLogQueue : IDisposable
         if (IsGateClosed())
             return;
 
+        if (_shutdownDeadline <= TimeSpan.Zero)
+        {
+            TryCompleteFlushIfIdle();
+            return;
+        }
+
         var idle = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _flushTcs, idle);
         WakeProcessor();
@@ -896,7 +980,7 @@ public class BackgroundLogQueue : IDisposable
         using var timer = _clock.CreateTimer(
             _ => CompleteFlushDeadline(deadline),
             null,
-            ShutdownDeadline,
+            _shutdownDeadline,
             Timeout.InfiniteTimeSpan);
         Interlocked.Increment(ref _flushWaitsStarted);
 
@@ -957,8 +1041,7 @@ public class BackgroundLogQueue : IDisposable
             _closed = true;
 
         Volatile.Write(ref _disposeStartTimestamp, _clock.GetTimestamp());
-        // False means the channel was already completed. The drain still runs.
-        _ = _channel.Writer.TryComplete();
+        // The channel stays open until PublishOutcome so a Block waiter can still write before the deadline.
         SignalProcessor();
     }
 
@@ -972,16 +1055,30 @@ public class BackgroundLogQueue : IDisposable
     /// </remarks>
     private void DrainUntilDeadline()
     {
+        if (_shutdownDeadline <= TimeSpan.Zero)
+        {
+            OnNewWriteCutoff(this);
+            MarkShutdownDeadline();
+            return;
+        }
+
         if (_stopped.IsSet)
             return;
+
+        if (_newWriteBudget <= TimeSpan.Zero)
+        {
+            OnNewWriteCutoff(this);
+            WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, _shutdownDeadline, ref _disposeWaitsStarted);
+            return;
+        }
 
         // Both timers are registered before the wait is visible, so one clock step can hit either bound.
         using var cutoff = _clock.CreateTimer(
             static state => OnNewWriteCutoff(state),
             this,
-            NewWriteBudget,
+            _newWriteBudget,
             Timeout.InfiniteTimeSpan);
-        WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, ref _disposeWaitsStarted);
+        WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, _shutdownDeadline, ref _disposeWaitsStarted);
     }
 
     /// <summary>
@@ -1024,6 +1121,12 @@ public class BackgroundLogQueue : IDisposable
     /// </remarks>
     private void MarkShutdownDeadline()
     {
+        lock (_gate)
+        {
+            _blockRelease = true;
+            SignalWaiters();
+        }
+
         Interlocked.Increment(ref _shutdownDeadlineElapsed);
     }
 
@@ -1046,6 +1149,29 @@ public class BackgroundLogQueue : IDisposable
         ManualResetEventSlim signaled,
         Action onDeadline,
         ref int armedCount)
+        => WaitUntilSignaledOrDeadline(clock, signaled, onDeadline, ShutdownDeadline, ref armedCount);
+
+    /// <summary>
+    /// Blocks until <paramref name="signaled"/> is set or <paramref name="due"/> elapses on <paramref name="clock"/>.
+    /// </summary>
+    /// <param name="clock">Clock that owns the deadline. Not null.</param>
+    /// <param name="signaled">Set by the work this wait is joining. Not null. Not disposed by this method.</param>
+    /// <param name="onDeadline">Runs on the clock callback when the deadline elapses, before the waiter is released. Not null.</param>
+    /// <param name="due">How long to wait. Zero or less runs <paramref name="onDeadline"/> and returns without a timer.</param>
+    /// <param name="armedCount">Incremented after the deadline timer is registered. Not incremented when the signal is already set or <paramref name="due"/> is not positive.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="clock"/>, <paramref name="signaled"/>, or <paramref name="onDeadline"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">The wait ended without the signal or the deadline.</exception>
+    /// <remarks>
+    /// Does not capture a caller context. The timer is disposed before this returns.
+    /// A signal that is already set returns without a timer. The entry is still counted.
+    /// There is no wall-clock timeout, because that would release a frozen test clock.
+    /// </remarks>
+    internal static void WaitUntilSignaledOrDeadline(
+        TimeProvider clock,
+        ManualResetEventSlim signaled,
+        Action onDeadline,
+        TimeSpan due,
+        ref int armedCount)
     {
         ArgumentNullException.ThrowIfNull(clock);
         ArgumentNullException.ThrowIfNull(signaled);
@@ -1055,11 +1181,16 @@ public class BackgroundLogQueue : IDisposable
         if (signaled.IsSet)
             return;
 
+        if (due <= TimeSpan.Zero)
+        {
+            onDeadline();
+            return;
+        }
+
         using var wake = new ManualResetEventSlim(false);
         var gate = new DeadlineGate(onDeadline);
         var started = clock.GetTimestamp();
         // One due value. The timer and the keep-alive check below both use it.
-        var due = ShutdownDeadline;
         using var timer = clock.CreateTimer(
             _ => SignalDeadline(wake, gate.Fire),
             null,
@@ -1144,6 +1275,8 @@ public class BackgroundLogQueue : IDisposable
     /// </remarks>
     private void PublishOutcome()
     {
+        // Block waiters have already been released. Completing the channel here stops a late write.
+        _ = _channel.Writer.TryComplete();
         var ended = _stopped.IsSet;
         var unwritten = FreezeUnwritten();
         PublishReports(unwritten);
@@ -1257,7 +1390,10 @@ public class BackgroundLogQueue : IDisposable
         Closed = 2,
 
         /// <summary>The token was already cancelled. Not counted.</summary>
-        Cancelled = 3
+        Cancelled = 3,
+
+        /// <summary><see cref="QueueFullMode.Block"/> needs a slot. The caller waits outside the lock.</summary>
+        NeedWait = 4
     }
 
     /// <summary>
@@ -1278,6 +1414,8 @@ public class BackgroundLogQueue : IDisposable
             FlushInterval = flushInterval;
             AsyncEnabled = asyncEnabled;
             Clock = clock;
+            FullMode = QueueFullMode.Drop;
+            FlushTimeout = ShutdownDeadline;
         }
 
         /// <summary>Channel capacity and the outstanding-event cap.</summary>
@@ -1294,6 +1432,12 @@ public class BackgroundLogQueue : IDisposable
 
         /// <summary>Clock for shutdown, flush, the new-write cutoff, and the full-queue report.</summary>
         internal TimeProvider Clock { get; }
+
+        /// <summary>What a full queue does. The constructor starts at <see cref="QueueFullMode.Drop"/>. An initializer can select Block.</summary>
+        internal QueueFullMode FullMode { get; init; }
+
+        /// <summary>How long flush and shutdown wait. The constructor starts at <see cref="ShutdownDeadline"/>. An initializer can replace it.</summary>
+        internal TimeSpan FlushTimeout { get; init; }
     }
 
     /// <summary>

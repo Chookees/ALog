@@ -48,10 +48,15 @@ public class LoggerEngine : ILogger, IDisposable
     {
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(clock);
+        LogOptionRules.Validate(config);
+        if (config is LoggerConfig concrete)
+            concrete.Seal();
+
         _config = config;
         _levels = new MinimumLevelCache(config);
 
         ApplyDefaultFormatter(config);
+        ApplyFileStartup(config, clock);
 
         _dispatcher = new LogDispatcher(config.Writers, config.AsyncEnabled);
 
@@ -64,7 +69,27 @@ public class LoggerEngine : ILogger, IDisposable
                     config.BackgroundQueueBatchSize,
                     config.BackgroundQueueFlushInterval,
                     config.AsyncEnabled,
-                    clock));
+                    clock)
+                {
+                    FullMode = config.QueueFullMode,
+                    FlushTimeout = config.FlushTimeout
+                });
+        }
+    }
+
+    /// <summary>
+    /// Gives each file writer the configuration buffer, interval, and this engine's clock before any event.
+    /// </summary>
+    /// <param name="config">The engine configuration. Not null.</param>
+    /// <param name="clock">The engine clock. Not null.</param>
+    /// <remarks>Does not throw. A writer that is not a <see cref="FileLogWriter"/> is skipped. The loop is bounded by the writer list.</remarks>
+    private static void ApplyFileStartup(ILogConfiguration config, TimeProvider clock)
+    {
+        var writers = config.Writers;
+        for (var i = 0; i < writers.Count; i++)
+        {
+            if (writers[i] is FileLogWriter file)
+                file.ApplyStartup(config.FileBufferSize, config.FileFlushInterval, clock);
         }
     }
 
@@ -376,11 +401,44 @@ public class LoggerEngine : ILogger, IDisposable
     /// </summary>
     internal BackgroundLogQueue? Queue => _backgroundQueue;
 
+    /// <summary>
+    /// Waits until the background queue is idle, then asks every writer to push bytes it is still holding.
+    /// Without a queue, only the writers are flushed.
+    /// </summary>
+    /// <returns>A task that finishes when those flushes have returned.</returns>
+    /// <remarks>
+    /// Does not throw. A writer that throws is written to the error stream and the next writer still runs.
+    /// The queue flush does not report ALOG0071. That line stays on dispose and shutdown.
+    /// </remarks>
     public async Task FlushAsync()
     {
         if (_backgroundQueue != null)
-        {
             await _backgroundQueue.FlushAsync().ConfigureAwait(false);
+
+        FlushWriters();
+    }
+
+    /// <summary>
+    /// Asks every configured writer to push buffered bytes. A writer that throws does not stop the others.
+    /// </summary>
+    /// <remarks>Does not throw. The loop is bounded by the writer list, which does not grow after the engine is built.</remarks>
+    private void FlushWriters()
+    {
+        var writers = _config.Writers;
+        for (var i = 0; i < writers.Count; i++)
+        {
+            var writer = writers[i];
+            if (writer is null)
+                continue;
+
+            try
+            {
+                writer.Flush();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[LoggerEngine] Writer flush failed: {ex}");
+            }
         }
     }
 

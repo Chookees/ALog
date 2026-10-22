@@ -2,3 +2,4 @@
 ALog/Core/LoggerEngine.cs
 ALog/Core/BackgroundLogQueue.cs
 ALog/Writers/Cloud/AwsCloudWatchWriter.cs
+ALog/Writers/File/FileLogWriter.cs

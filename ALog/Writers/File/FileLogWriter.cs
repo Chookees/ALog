@@ -3,25 +3,99 @@
 using System;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
+using System.Text;
 using System.Threading.Tasks;
+using ALog.Config;
 using ALog.Core;
 using ALog.Public.Interfaces;
 
 public class FileLogWriter : ILogWriter, IFormattableLogWriter
 {
+    private static readonly Encoding Utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
     private readonly string _filePath;
     private readonly long? _maxFileSizeInBytes;
     private readonly object _writeLock = new();
+    private readonly SharedLogFile _shared;
+    private int _disposed;
 
     public ILogFormatter? Formatter { get; set; }
 
-    public FileLogWriter(string filePath, ILogFormatter? formatter = null, long? maxFileSizeInBytes = null)
+    /// <summary>
+    /// Keeps <paramref name="filePath"/> open from the first event until dispose, rotation, or shutdown.
+    /// </summary>
+    /// <param name="filePath">Destination path. Null is rejected. The directory is created when it can be.</param>
+    /// <param name="formatter">Optional formatter. Null uses the built-in line.</param>
+    /// <param name="maxFileSizeInBytes">Rotate before a line when the logical length is already at least this value. Null never rotates.</param>
+    /// <param name="fileBufferSize">Bytes to collect before a write. Null uses 64 KiB. An explicit value must be 4096..16777216.</param>
+    /// <param name="fileFlushInterval">How often to write a partial buffer. Null uses 1 second. Zero writes every event. An explicit value must be 0..60 seconds.</param>
+    /// <param name="clock">Clock for the flush interval. Null uses <see cref="ProductionClock.Default"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="filePath"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">An explicit buffer or interval is outside its range.</exception>
+    /// <remarks>
+    /// Does not open the file. The first write does. Two writers in this process for the same normalized path share one stream.
+    /// A second process writing the same file is unsupported.
+    /// </remarks>
+    public FileLogWriter(
+        string filePath,
+        ILogFormatter? formatter = null,
+        long? maxFileSizeInBytes = null,
+        int? fileBufferSize = null,
+        TimeSpan? fileFlushInterval = null,
+        TimeProvider? clock = null)
+        : this(clock ?? ProductionClock.Default, filePath, formatter, maxFileSizeInBytes, fileBufferSize, fileFlushInterval)
+    {
+    }
+
+    /// <summary>Stores the path and takes a reference on the shared file. The public constructor ends here.</summary>
+    /// <param name="clock">Clock for the interval. Not null.</param>
+    /// <param name="filePath">Destination path. Not null.</param>
+    /// <param name="formatter">Optional formatter.</param>
+    /// <param name="maxFileSizeInBytes">Rotation cap. Null never rotates.</param>
+    /// <param name="fileBufferSize">Explicit buffer, or null for 64 KiB.</param>
+    /// <param name="fileFlushInterval">Explicit interval, or null for 1 second.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="filePath"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">An explicit buffer or interval is outside its range.</exception>
+    /// <remarks>Does not throw for a missing directory. That failure is written to the error stream.</remarks>
+    private FileLogWriter(
+        TimeProvider clock,
+        string filePath,
+        ILogFormatter? formatter,
+        long? maxFileSizeInBytes,
+        int? fileBufferSize,
+        TimeSpan? fileFlushInterval)
     {
         _filePath = filePath ?? throw new ArgumentNullException(nameof(filePath));
         Formatter = formatter;
         _maxFileSizeInBytes = maxFileSizeInBytes;
+        var buffer = LogOptionRules.DefaultBuffer;
+        var interval = LogOptionRules.DefaultInterval;
+        if (fileBufferSize is int explicitBuffer)
+        {
+            LogOptionRules.RequireBuffer(explicitBuffer, LogOptionRules.PathOf("FileBufferSize"));
+            buffer = explicitBuffer;
+        }
+
+        if (fileFlushInterval is TimeSpan explicitInterval)
+        {
+            LogOptionRules.RequireDuration(explicitInterval, LogOptionRules.PathOf("FileFlushInterval"));
+            interval = explicitInterval;
+        }
 
         EnsureDirectoryExists(_filePath);
+        _shared = LogFileRegistry.Acquire(_filePath, buffer, interval, clock);
+    }
+
+    /// <summary>
+    /// Applies the engine's buffer, interval, and clock before the first write.
+    /// </summary>
+    /// <param name="bufferSize">Bytes collected before a write.</param>
+    /// <param name="interval">Flush interval. Zero writes every event.</param>
+    /// <param name="clock">The engine clock. Not null.</param>
+    /// <remarks>Does not throw. A call after the file is open keeps the settings that opened it.</remarks>
+    internal void ApplyStartup(int bufferSize, TimeSpan interval, TimeProvider clock)
+    {
+        _shared.ApplyStartup(bufferSize, interval, clock);
     }
 
     /// <summary>
@@ -51,6 +125,27 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
         return Task.CompletedTask;
     }
 
+    /// <summary>Writes buffered lines to the operating system. There is no fsync.</summary>
+    /// <remarks>Does not throw. Safe to call before the first event and after dispose.</remarks>
+    public void Flush()
+    {
+        lock (_writeLock)
+            _shared.Flush();
+    }
+
+    /// <summary>The rotated path for <paramref name="path"/>. The stamp comes from <see cref="RotationStamp"/>.</summary>
+    /// <param name="path">The open file. Not null.</param>
+    /// <returns>A path in the same directory with <c>_yyyyMMdd_HHmmss</c> before the extension.</returns>
+    /// <remarks>Does not throw. Called only when a file is large enough to rotate.</remarks>
+    internal static string RotationName(string path)
+    {
+        var directory = Path.GetDirectoryName(path);
+        var filename = Path.GetFileNameWithoutExtension(path);
+        var ext = Path.GetExtension(path);
+        var timestamp = RotationStamp();
+        return Path.Combine(directory ?? ".", $"{filename}_{timestamp}{ext}");
+    }
+
     /// <summary>
     /// Formats one event and appends it under the writer lock.
     /// </summary>
@@ -68,11 +163,9 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
 
             var line = Formatter?.Format(logEvent) ?? FormatFallback(logEvent);
             var lineWithNewline = line + Environment.NewLine;
+            var bytes = Utf8.GetBytes(lineWithNewline);
             lock (_writeLock)
-            {
-                RotateIfNeeded();
-                System.IO.File.AppendAllText(_filePath, lineWithNewline);
-            }
+                _shared.Append(bytes, _maxFileSizeInBytes);
         }
         catch (Exception ex)
         {
@@ -96,30 +189,6 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
         head += " " + ExceptionReport.EscapeLine(logEvent.Message);
         var exception = logEvent.Exception == null ? null : ExceptionReport.FormatText(logEvent.Exception);
         return ExceptionReport.JoinLine(head, exception, props: null, ExceptionReport.FormatContext(logEvent.Context));
-    }
-
-    private void RotateIfNeeded()
-    {
-        if (_maxFileSizeInBytes == null) return;
-
-        try
-        {
-            var fileInfo = new FileInfo(_filePath);
-            if (!fileInfo.Exists || fileInfo.Length < _maxFileSizeInBytes) return;
-
-            var directory = Path.GetDirectoryName(_filePath);
-            var filename = Path.GetFileNameWithoutExtension(_filePath);
-            var ext = Path.GetExtension(_filePath);
-            var timestamp = RotationStamp();
-
-            var rotated = Path.Combine(directory ?? ".", $"{filename}_{timestamp}{ext}");
-
-            System.IO.File.Move(_filePath, rotated, overwrite: true);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[FileLogWriter] Rolling failed: {ex}");
-        }
     }
 
     /// <summary>
@@ -150,8 +219,14 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
         }
     }
 
+    /// <summary>Flushes and drops this writer's reference. A second call does nothing.</summary>
+    /// <remarks>Does not throw. The last reference closes the stream. An earlier one still flushes.</remarks>
     public void Dispose()
     {
-        // no unmanaged resources
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return;
+
+        lock (_writeLock)
+            LogFileRegistry.Release(_shared);
     }
 }

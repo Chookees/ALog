@@ -48,4 +48,16 @@ internal sealed class FloorConfiguration : ILogConfiguration
     public int BackgroundQueueCapacity => _inner.BackgroundQueueCapacity;
     public int BackgroundQueueBatchSize => _inner.BackgroundQueueBatchSize;
     public TimeSpan BackgroundQueueFlushInterval => _inner.BackgroundQueueFlushInterval;
+
+    /// <summary>The inner queue mode. A default on this type would hide the value the caller set.</summary>
+    public QueueFullMode QueueFullMode => _inner.QueueFullMode;
+
+    /// <summary>The inner file buffer size.</summary>
+    public int FileBufferSize => _inner.FileBufferSize;
+
+    /// <summary>The inner file flush interval.</summary>
+    public TimeSpan FileFlushInterval => _inner.FileFlushInterval;
+
+    /// <summary>The inner flush timeout.</summary>
+    public TimeSpan FlushTimeout => _inner.FlushTimeout;
 }

@@ -35,7 +35,11 @@ public static class LoggerConfigFactory
                 options.BackgroundQueueEnabled,
                 options.BackgroundQueueCapacity,
                 options.BackgroundQueueBatchSize,
-                TimeSpan.FromMilliseconds(Math.Max(1, options.BackgroundQueueFlushIntervalMs)));
+                TimeSpan.FromMilliseconds(Math.Max(1, options.BackgroundQueueFlushIntervalMs)))
+            .SetQueueFullMode(options.QueueFullMode)
+            .SetFileBufferSize(options.FileBufferSize)
+            .SetFileFlushInterval(options.FileFlushInterval)
+            .SetFlushTimeout(options.FlushTimeout);
 
         foreach (var enricher in CreateEnrichers(options.Enrichers))
             config.AddEnricher(enricher);
@@ -56,7 +60,9 @@ public static class LoggerConfigFactory
         {
             config.AddWriter(new FileLogWriter(
                 options.File.Path,
-                maxFileSizeInBytes: options.File.MaxFileSizeInBytes));
+                maxFileSizeInBytes: options.File.MaxFileSizeInBytes,
+                fileBufferSize: options.FileBufferSize,
+                fileFlushInterval: options.FileFlushInterval));
         }
 
         return config;
