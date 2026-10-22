@@ -30,6 +30,17 @@
 - Breaking (dependency): `AWSSDK.CloudWatchLogs` moves from 3.7.509.3 (AWS SDK for .NET V3, end of support since 2026-06-01) to 4.0.106 (V4). If your app references other `AWSSDK.*` packages, upgrade all of them to V4 together; otherwise restore fails with NU1107 (version conflict on `AWSSDK.Core`), or it succeeds with warning NU1608 and the app throws `MissingMethodException` at runtime.
 - Fixed: `AwsCloudWatchWriter` now sends the message-template properties and the context with each event, not only the rendered message.
 
+### Breaking (output)
+
+- Plain text, console, and file output write exceptions as "Type: Message", followed by inner exceptions and the source line ("at Class.Method in File.cs:42"). The "EX:" label is gone; update log parsers that match it. `|` and `-->` in the message, the category, and context or property names and values are escaped as `\|` and `--\>`, line breaks as `\r` and `\n`, and a backslash is doubled only where it would otherwise read as one of these escapes (`C:\temp` stays as is), so each event stays one line.
+- Escaping also covers the event message, the category, and context and property names, not only exception messages. An exception message longer than 500 characters is cut before escaping, and then ` [truncated]` is appended. Inner exceptions and aggregate entries follow the order of `AggregateException.Flatten()`; when the list stops at its limit, the suffix is `(+N+ more)`, and `(+N more)` means every entry was counted.
+- Plain text shows exception type names in C# syntax (`Outer.NestedEx`, `GenEx<Int32>`) without assembly details, and lists only the entries of an aggregate, not their inner exceptions. JSON and HTTP keep `Type.FullName` in `type` and include each entry's inner exceptions.
+
+### Added
+
+- JSON and HTTP exception output add "source" (method, file, line) and "inner" (type, message, and source of each inner exception, up to 16).
+- PlainTextFormatter(includeStackTrace: true) appends the full stack trace.
+
 ## 0.2.0
 
 - Message templates (`Log.Write(LogLevel, template, args...)`) and `LogEvent.Properties`
