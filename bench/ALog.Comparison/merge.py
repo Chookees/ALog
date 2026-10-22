@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Merge ALog comparison results (arc §8c BEN-07/08).
+"""Merge ALog comparison results.
 
 Reads every <results>/<agent>-<ts>/raw.csv (directories starting with "_" such as _smoke are skipped unless
 --include-underscore) and writes:
-  merged.csv   all rows of all runs, BEN-07 columns plus "source" (the run directory)
+  merged.csv   all rows of all runs, fixed columns plus "source" (the run directory)
   summary.csv  valid rows only, grouped
                  scope=agent   per runner x framework x mode x scenario
                  scope=overall per framework x mode x scenario across all runners
                with count, mean, stddev (sample), min, max for every metric
 Invalid and n/a rows are counted (invalid, n_a) but never enter the statistics.
-Ranking: ALog sync is an extra row (DC 2026-10-22, question 7). It gets ranked=no and is excluded from
+Ranking: ALog sync is an extra row (decided 2026-10-22). It gets ranked=no and is excluded from
 rank_total_ms. rank_total_ms orders the ranked rows of one scope/runner/scenario by total_ms_mean (1 = lowest);
-only groups with valid rows get a rank. Use only ranked=yes rows for the BEN-08 evaluation.
-The BEN-08 win rule (>= 5 % better than every competitor, on the runner and the majority of environments) is DC's
-evaluation and is not decided here.
+only groups with valid rows get a rank. Use only ranked=yes rows for the evaluation.
+The win rule (>= 5 % better than every competitor, on the runner and the majority of environments) is applied
+in the evaluation, not here.
 Standard library only.
 """
 import argparse
