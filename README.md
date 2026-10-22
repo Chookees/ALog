@@ -54,7 +54,7 @@ See `samples/ALog.AspNetSample`.
 
 ALog writes to the console only when `ALog:Console:Enabled` is `true`. With `AddALog`, choose one console: keep the Microsoft console provider and leave ALog's console off, or call `builder.Logging.ClearProviders()` and set `ALog:Console:Enabled` to `true` (as in `samples/ALog.AspNetSample`). With both, every line appears twice.
 
-An exception shares that line. The form is `Type: Message`, then inner exceptions, then the source frame. There is no `EX:` label. Types in `System.*` use the short name; every other type keeps its namespace. A thrown exception names the application frame:
+An exception shares that line. The form is `Type: Message`, then inner exceptions, then the source frame. Types in `System.*` use the short name; every other type keeps its namespace. A thrown exception names the application frame:
 
 ```
 [20:55:19] [Error] Payment failed | InvalidOperationException: Card declined | at CheckoutService.Pay in CheckoutService.cs:42 | ctx: orderId=17
