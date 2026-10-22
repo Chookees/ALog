@@ -10,7 +10,7 @@ using Microsoft.Win32.SafeHandles;
 /// Uses the runtime's <c>SystemNative_Stat</c> and <c>SystemNative_FStat</c> so Linux and macOS share one layout.
 /// Compiled only when the build is not Windows. A missing path or a failed status call is not the same file.
 /// </remarks>
-internal static partial class FileIdentity
+internal static class FileIdentity
 {
     /// <summary>
     /// True when <paramref name="path"/> names the same file as <paramref name="handle"/>, and reports that file's length.
@@ -63,9 +63,12 @@ internal static partial class FileIdentity
         public uint UserFlags;
     }
 
-    [LibraryImport("libSystem.Native", EntryPoint = "SystemNative_FStat", SetLastError = true)]
-    private static partial int FStat(SafeFileHandle fd, out FileStatus output);
+    [DllImport("libSystem.Native", EntryPoint = "SystemNative_FStat", SetLastError = true)]
+    private static extern int FStat(SafeFileHandle fd, out FileStatus output);
 
-    [LibraryImport("libSystem.Native", EntryPoint = "SystemNative_Stat", StringMarshalling = StringMarshalling.Utf8, SetLastError = true)]
-    private static partial int Stat(string path, out FileStatus output);
+    // LPUTF8Str is the marshalling. CA2101 does not treat it as specified.
+#pragma warning disable CA2101
+    [DllImport("libSystem.Native", EntryPoint = "SystemNative_Stat", SetLastError = true)]
+    private static extern int Stat([MarshalAs(UnmanagedType.LPUTF8Str)] string path, out FileStatus output);
+#pragma warning restore CA2101
 }

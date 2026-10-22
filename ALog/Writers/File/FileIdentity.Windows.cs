@@ -12,7 +12,7 @@ using Microsoft.Win32.SafeHandles;
 /// The path is opened with <see cref="FileShare.ReadWrite"/> and <see cref="FileShare.Delete"/> so the comparison
 /// can run while this process already holds the file for write. A missing path is not the same file.
 /// </remarks>
-internal static partial class FileIdentity
+internal static class FileIdentity
 {
     /// <summary>
     /// True when <paramref name="path"/> names the same file as <paramref name="handle"/>, and reports that file's length.
@@ -91,8 +91,8 @@ internal static partial class FileIdentity
         public uint FileIndexLow;
     }
 
-    [LibraryImport("kernel32.dll", SetLastError = true)]
+    [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     [SupportedOSPlatform("windows")]
-    private static partial bool GetFileInformationByHandle(SafeFileHandle hFile, out ByHandleFileInformation lpFileInformation);
+    private static extern bool GetFileInformationByHandle(SafeFileHandle hFile, out ByHandleFileInformation lpFileInformation);
 }

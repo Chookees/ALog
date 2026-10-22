@@ -50,8 +50,6 @@ It is designed to be simple to use, highly configurable, and ready for modern de
 
   <PropertyGroup>
     <WarningsAsErrors>$(WarningsAsErrors);RS0030</WarningsAsErrors>
-    <!-- LibraryImport for the file-identity status calls generates unsafe marshalling. -->
-    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>
