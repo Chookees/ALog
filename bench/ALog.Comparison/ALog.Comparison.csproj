@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    ALog comparison benchmark (arc §8c BEN). Lives in the ALog repo as bench/ALog.Comparison/.
+    Not packable, not published. Only this project references NLog, Serilog and log4net (BEN-01, BEN-12).
+    ALog comes in as a ProjectReference. Default: the repo root two levels up (../../ALog/ALog.csproj).
+    Override with -p:AlogSrc=<ALog repo root> or the environment variable AlogSrc (run.sh exports it,
+    so BenchmarkDotNet's child build sees the same path).
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- AssemblyName = project file name: BenchmarkDotNet locates the csproj by the assembly name. -->
+    <AssemblyName>ALog.Comparison</AssemblyName>
+    <RootNamespace>AlogComparison</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsPublishable>false</IsPublishable>
+    <IsTestProject>false</IsTestProject>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- Same runtime settings for every library: workstation GC, concurrent GC, tiered PGO (the .NET 10 defaults, pinned). -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AlogSrc Condition="'$(AlogSrc)' == ''">$(MSBuildThisFileDirectory)../..</AlogSrc>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="$(AlogSrc)/ALog/ALog.csproj" />
+  </ItemGroup>
+
+  <!-- Pinned: newest stable on NuGet at harness time (2026-10-22). Versions are written into every result (env.json, raw.csv). -->
+  <ItemGroup>
+    <PackageReference Include="NLog" Version="6.2.2" />
+    <PackageReference Include="Serilog" Version="4.4.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+    <PackageReference Include="Serilog.Sinks.Async" Version="2.1.0" />
+    <PackageReference Include="log4net" Version="3.5.0" />
+    <PackageReference Include="BenchmarkDotNet" Version="0.15.8" />
+  </ItemGroup>
+</Project>
