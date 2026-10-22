@@ -68,9 +68,7 @@ public static class ALogLoggingBuilderExtensions
         ArgumentNullException.ThrowIfNull(builder);
         ArgumentNullException.ThrowIfNull(configuration);
 
-        RejectMalformedSections(configuration);
-        var options = new ALogOptions();
-        configuration.GetSection(ALogOptions.SectionName).Bind(options);
+        var options = BindOptions(configuration);
         var config = LoggerConfigFactory.FromOptions(options);
         return builder.AddALog(config);
     }
@@ -106,9 +104,27 @@ public static class ALogLoggingBuilderExtensions
     public static ALogOptions GetALogOptions(this IConfiguration configuration)
     {
         ArgumentNullException.ThrowIfNull(configuration);
+        return BindOptions(configuration);
+    }
+
+    /// <summary>
+    /// Rejects a malformed writer section and an invalid queue or file scalar, binds, then copies the parsed scalars back.
+    /// </summary>
+    /// <param name="configuration">Application configuration. Not null.</param>
+    /// <returns>The bound options. The caller owns the instance.</returns>
+    /// <exception cref="InvalidOperationException">A writer section is malformed, or a present queue or file value is not allowed.</exception>
+    /// <remarks>
+    /// The writer-section check runs first, so its sentences stay unchanged.
+    /// A bad enum is rejected from the raw text before <c>Bind</c>, then applied again so the binder cannot leave Drop.
+    /// </remarks>
+    private static ALogOptions BindOptions(IConfiguration configuration)
+    {
         RejectMalformedSections(configuration);
+        var section = configuration.GetSection(ALogOptions.SectionName);
+        LogOptionBinding.RejectInvalid(section);
         var options = new ALogOptions();
-        configuration.GetSection(ALogOptions.SectionName).Bind(options);
+        section.Bind(options);
+        LogOptionBinding.ApplyParsed(section, options);
         return options;
     }
 

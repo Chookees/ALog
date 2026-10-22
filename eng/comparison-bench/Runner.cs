@@ -37,7 +37,9 @@ public static class Runner
         var work = Path.Combine(outDir, "_work");
 
         var env = Env.Collect(agent, runs, seed);
-        File.WriteAllText(Path.Combine(outDir, "env.json"), env.ToJsonString(Indented));
+        var envPath = Path.Combine(outDir, "env.json");
+        File.WriteAllText(envPath, env.ToJsonString(Indented));
+        var blockReason = ShownFullMode(ReadAsyncQueueFullMode(envPath)) is string shown ? BlockMismatchReason(shown) : null;
 
         var rng = new Random(seed);
         var csvPath = Path.Combine(outDir, "raw.csv");
@@ -57,6 +59,12 @@ public static class Runner
                     var cellDir = Path.Combine(work, $"r{run}-{scId}-{lib}");
                     var r = Spawn(lib, scId, cellDir, timeout);
                     TryDelete(cellDir);
+                    if (blockReason is not null && IsAlogAsync(r))
+                    {
+                        r["valid"] = "false";
+                        r["reason"] = blockReason;
+                    }
+
                     r["runner"] = agent;
                     r["run"] = run;
                     r["order_position"] = pos;
@@ -80,13 +88,87 @@ public static class Runner
         env["finished_utc"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
         env["loadavg_end"] = Env.LoadAvg();
         env["cells"] = new JsonObject { ["total"] = total, ["valid"] = valid, ["invalid"] = invalid, ["n_a"] = na };
-        File.WriteAllText(Path.Combine(outDir, "env.json"), env.ToJsonString(Indented));
+        File.WriteAllText(envPath, env.ToJsonString(Indented));
         Console.Out.WriteLine($"cells: {total}, valid: {valid}, invalid: {invalid}, n/a: {na}; results in {outDir}");
         return invalid == 0 ? 0 : 1;
     }
 
     private static bool IsSmall()
         => Scenario.EnvLong("BENCH_N") is long n ? n <= 10_000 : (Scenario.EnvDouble("BENCH_N_SCALE") ?? 1.0) < 0.05;
+
+    /// <summary>
+    /// Reason stored on every ALog async cell when the written env.json does not say QueueFullMode=Block.
+    /// </summary>
+    /// <param name="shown">Mode text from that file, or <c>missing</c>.</param>
+    private static string BlockMismatchReason(string shown)
+        => "ALog async requires QueueFullMode=Block for this comparison, but env.json shows "
+           + shown + ". All ALog async cells of this run are invalid.";
+
+    /// <summary>True for the ALog background-queue row, including a cell that failed before it reported a framework.</summary>
+    private static bool IsAlogAsync(Dictionary<string, object?> row)
+    {
+        if (string.Equals(row.GetValueOrDefault("lib")?.ToString(), "alog-async", StringComparison.Ordinal))
+            return true;
+        return string.Equals(row.GetValueOrDefault("framework")?.ToString(), "ALog", StringComparison.Ordinal)
+            && string.Equals(row.GetValueOrDefault("mode")?.ToString(), "async", StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Reads <c>libraries[].queue_full_mode</c> for id alog-async from the env.json on disk.
+    /// Null when the file, the row, or the value is missing or unreadable.
+    /// </summary>
+    private static string? ReadAsyncQueueFullMode(string envPath)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(envPath));
+            if (!doc.RootElement.TryGetProperty("libraries", out var libs) || libs.ValueKind != JsonValueKind.Array)
+                return null;
+            foreach (var lib in libs.EnumerateArray())
+            {
+                if (!lib.TryGetProperty("id", out var id) || id.ValueKind != JsonValueKind.String || id.GetString() != "alog-async")
+                    continue;
+                if (!lib.TryGetProperty("queue_full_mode", out var mode) || mode.ValueKind != JsonValueKind.String)
+                    return null;
+                var text = mode.GetString();
+                return string.IsNullOrEmpty(text) ? null : text;
+            }
+
+            return null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Mode name to show when <paramref name="recorded"/> is not exactly <c>QueueFullMode=Block</c>.
+    /// Null when the comparison may rank this run. <c>missing</c> when there is no mode text.
+    /// </summary>
+    private static string? ShownFullMode(string? recorded)
+    {
+        const string prefix = "QueueFullMode=";
+        if (string.IsNullOrEmpty(recorded))
+            return "missing";
+        if (string.Equals(recorded, prefix + "Block", StringComparison.Ordinal))
+            return null;
+        if (recorded.StartsWith(prefix, StringComparison.Ordinal))
+        {
+            var mode = recorded[prefix.Length..];
+            return mode.Length == 0 ? "missing" : mode;
+        }
+
+        return recorded;
+    }
 
     private static string Get(Dictionary<string, object?> r, string key) => r.GetValueOrDefault(key)?.ToString() ?? string.Empty;
 
@@ -230,6 +312,8 @@ public static class Env
         foreach (System.Collections.DictionaryEntry e in Environment.GetEnvironmentVariables())
         {
             var key = e.Key.ToString() ?? string.Empty;
+            if (key == "BENCH_MUTANT_FULL_MODE")
+                continue;
             if (key.StartsWith("DOTNET_", StringComparison.Ordinal) || key.StartsWith("BENCH_", StringComparison.Ordinal) || key == "TZ" || key == "AlogSrc")
                 dotnetVars[key] = e.Value?.ToString();
         }
@@ -297,7 +381,10 @@ public static class Env
                     na[s] = reason;
             }
 
-            a.Add(new JsonObject { ["id"] = l.Id, ["framework"] = l.Framework, ["mode"] = l.Mode, ["ranked"] = l.Ranked, ["config"] = l.Notes, ["n_a"] = na });
+            var row = new JsonObject { ["id"] = l.Id, ["framework"] = l.Framework, ["mode"] = l.Mode, ["ranked"] = l.Ranked, ["config"] = l.Notes, ["n_a"] = na };
+            if (l is AlogLib alog)
+                row["queue_full_mode"] = alog.QueueFullModeRecord;
+            a.Add(row);
         }
 
         return a;

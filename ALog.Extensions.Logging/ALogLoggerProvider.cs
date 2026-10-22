@@ -49,6 +49,7 @@ public sealed class ALogLoggerProvider : ILoggerProvider, ISupportExternalScope
         IOptionsMonitor<LoggerFilterOptions>? monitor)
     {
         ArgumentNullException.ThrowIfNull(config);
+        config.Seal();
         _floorConfig = new FloorConfiguration(config);
         _table = LevelTable.Capture(monitor?.CurrentValue, generation: 0);
         _floorConfig.SetRuleFloor(_table.RuleFloor);

@@ -15,6 +15,31 @@ public sealed class ALogOptions
     public int BackgroundQueueBatchSize { get; set; } = 10;
     public int BackgroundQueueFlushIntervalMs { get; set; } = 100;
 
+    /// <summary>
+    /// What a full background queue does. <see cref="QueueFullMode.Drop"/> is the default.
+    /// The property setter does not reject an unknown cast. Startup does.
+    /// </summary>
+    /// <remarks>Read once when the engine starts. A later change is ignored.</remarks>
+    public QueueFullMode QueueFullMode { get; set; } = QueueFullMode.Drop;
+
+    /// <summary>
+    /// Bytes <c>FileLogWriter</c> collects before it writes. Default 64 KiB. Startup allows 4096..16777216.
+    /// </summary>
+    /// <remarks>The setter stores the value. An out-of-range value fails when the engine or the options factory starts.</remarks>
+    public int FileBufferSize { get; set; } = LogOptionRules.DefaultBuffer;
+
+    /// <summary>
+    /// How often a file buffer is written when it is not full. Default 1 second. Zero writes every event. Startup allows 0..60 seconds.
+    /// </summary>
+    /// <remarks>The setter stores the value. An out-of-range value fails at startup.</remarks>
+    public TimeSpan FileFlushInterval { get; set; } = LogOptionRules.DefaultInterval;
+
+    /// <summary>
+    /// How long <c>Flush</c>, <c>Dispose</c>, and <c>Shutdown</c> wait. Default 5 seconds. Zero does not wait. Startup allows 0..60 seconds.
+    /// </summary>
+    /// <remarks>The setter stores the value. An out-of-range value fails at startup. This is not a logging-time throw.</remarks>
+    public TimeSpan FlushTimeout { get; set; } = LogOptionRules.DefaultFlushTimeout;
+
     /// <summary>Builtin enrichers: MachineName, ThreadId, ProcessId, Activity.</summary>
     public List<string> Enrichers { get; set; } = new();
 

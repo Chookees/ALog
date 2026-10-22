@@ -40,6 +40,14 @@
 
 - JSON and HTTP exception output add "source" (method, file, line) and "inner" (type, message, and source of each inner exception, up to 16).
 - PlainTextFormatter(includeStackTrace: true) appends the full stack trace.
+- `QueueFullMode`: `Drop` (default, as before) or `Block`. With `Block`, a full background queue makes the caller wait instead of dropping the event.
+- `FileBufferSize` and `FileFlushInterval` control how `FileLogWriter` buffers lines.
+- `FlushTimeout` sets how long `Flush`, `Dispose`, and `Shutdown` wait (0 to 60 s, default 5 s; previously fixed at 5 s).
+
+### Changed
+
+- `FileLogWriter` keeps the file open and writes buffered lines instead of opening and closing it for every event. By default, lines reach the file within 1 second; set `FileFlushInterval` to `0` for the previous per-event behavior.
+- A log file must have a single writer process; give each process its own file. On Windows a second writer gets an error; on Linux and macOS it is not detected and lines from both processes can mix. Reading, tailing, and rotating the file from outside still work (rename or copy-and-truncate); after a rename or delete, ALog starts the new file within one second, or within `FileFlushInterval` if that is longer. Lines written to a deleted file before then are lost.
 
 ## 0.2.0
 

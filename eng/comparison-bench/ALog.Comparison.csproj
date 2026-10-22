@@ -1,6 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <!--
-    ALog comparison benchmark (arc §8c BEN). Lives in the ALog repo as bench/ALog.Comparison/.
+    ALog comparison benchmark (arc §8c BEN). Lives in the ALog repo as eng/comparison-bench/.
     Not packable, not published. Only this project references NLog, Serilog and log4net (BEN-01, BEN-12).
     ALog comes in as a ProjectReference. Default: the repo root two levels up (../../ALog/ALog.csproj).
     Override with -p:AlogSrc=<ALog repo root> or the environment variable AlogSrc (run.sh exports it,

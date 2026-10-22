@@ -48,10 +48,15 @@ public class LoggerEngine : ILogger, IDisposable
     {
         ArgumentNullException.ThrowIfNull(config);
         ArgumentNullException.ThrowIfNull(clock);
+        LogOptionRules.Validate(config);
+        if (config is LoggerConfig concrete)
+            concrete.Seal();
+
         _config = config;
         _levels = new MinimumLevelCache(config);
 
         ApplyDefaultFormatter(config);
+        ApplyFileStartup(config, clock);
 
         _dispatcher = new LogDispatcher(config.Writers, config.AsyncEnabled);
 
@@ -64,7 +69,34 @@ public class LoggerEngine : ILogger, IDisposable
                     config.BackgroundQueueBatchSize,
                     config.BackgroundQueueFlushInterval,
                     config.AsyncEnabled,
-                    clock));
+                    clock)
+                {
+                    FullMode = config.QueueFullMode,
+                    FlushTimeout = config.FlushTimeout
+                });
+        }
+    }
+
+    /// <summary>
+    /// Gives each file writer this engine's clock, and the configuration buffer or interval when that option was set.
+    /// </summary>
+    /// <param name="config">The engine configuration. Not null.</param>
+    /// <param name="clock">The engine clock. Not null.</param>
+    /// <remarks>
+    /// Does not throw. A writer that is not a <see cref="FileLogWriter"/> is skipped. The loop is bounded by the writer list.
+    /// A set <see cref="ILogConfiguration.HasFileBufferSize"/> or <see cref="ILogConfiguration.HasFileFlushInterval"/>
+    /// replaces the writer's constructor value. An option that was not set leaves the constructor value,
+    /// including an explicit zero interval or an explicit 4096-byte buffer. The clock is always the engine clock.
+    /// </remarks>
+    private static void ApplyFileStartup(ILogConfiguration config, TimeProvider clock)
+    {
+        var writers = config.Writers;
+        int? buffer = config.HasFileBufferSize ? config.FileBufferSize : null;
+        TimeSpan? interval = config.HasFileFlushInterval ? config.FileFlushInterval : null;
+        for (var i = 0; i < writers.Count; i++)
+        {
+            if (writers[i] is FileLogWriter file)
+                file.ApplyStartup(buffer, interval, clock);
         }
     }
 
@@ -376,11 +408,44 @@ public class LoggerEngine : ILogger, IDisposable
     /// </summary>
     internal BackgroundLogQueue? Queue => _backgroundQueue;
 
+    /// <summary>
+    /// Waits until the background queue is idle, then asks every writer to push bytes it is still holding.
+    /// Without a queue, only the writers are flushed.
+    /// </summary>
+    /// <returns>A task that finishes when those flushes have returned.</returns>
+    /// <remarks>
+    /// Does not throw. A writer that throws is written to the error stream and the next writer still runs.
+    /// The queue flush does not report ALOG0071. That line stays on dispose and shutdown.
+    /// </remarks>
     public async Task FlushAsync()
     {
         if (_backgroundQueue != null)
-        {
             await _backgroundQueue.FlushAsync().ConfigureAwait(false);
+
+        FlushWriters();
+    }
+
+    /// <summary>
+    /// Asks every configured writer to push buffered bytes. A writer that throws does not stop the others.
+    /// </summary>
+    /// <remarks>Does not throw. The loop is bounded by the writer list, which does not grow after the engine is built.</remarks>
+    private void FlushWriters()
+    {
+        var writers = _config.Writers;
+        for (var i = 0; i < writers.Count; i++)
+        {
+            var writer = writers[i];
+            if (writer is null)
+                continue;
+
+            try
+            {
+                writer.Flush();
+            }
+            catch (Exception ex)
+            {
+                Console.Error.WriteLine($"[LoggerEngine] Writer flush failed: {ex}");
+            }
         }
     }
 

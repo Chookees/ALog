@@ -10,14 +10,14 @@ and log4net.
 ## Quick start
 
 ```bash
-# from bench/ALog.Comparison in the ALog repo, one run at a time per machine
-./run.sh 5 <your-name>                 # 5 process runs + 1 BenchmarkDotNet run -> results/<your-name>-<UTC>/
-./merge.sh                             # all results/*/raw.csv -> results/merged.csv + results/summary.csv
+# from eng/comparison-bench in the ALog repo, one run at a time per machine
+./run.sh 5 <your-name>                 # 5 process runs + 1 BenchmarkDotNet run -> eng/comparison-bench/results/<your-name>-<UTC>/
+./merge.sh                             # all results/*/raw.csv -> eng/comparison-bench/results/merged-<UTC date>/merged.csv + summary.csv
 
-# smoke (tiny N, no BenchmarkDotNet, about 10 s)
+# smoke (tiny N, no BenchmarkDotNet, about 10 s). BENCH_N_SCALE does not change the results directory.
 BENCH_N_SCALE=0.001 BENCH_RESULTS=results/_smoke ./run.sh 1 smoke
-# CI smoke (N = 1000 for every scenario)
-BENCH_N=1000 BENCH_RESULTS=results/_smoke ./run.sh 1 ci
+# CI smoke (N = 1000 for every scenario). BENCH_N with no BENCH_RESULTS writes under eng/comparison-bench/results/_smoke/.
+BENCH_N=1000 ./run.sh 1 ci
 ```
 
 Outside the repo, point the build at an ALog checkout: `AlogSrc=/path/to/ALog ./run.sh 1 smoke`
@@ -65,13 +65,14 @@ drain so the queue is empty. T6 has no warm-up. The warm-up events stay in the f
 Same fields in every line: timestamp ISO-8601 UTC with milliseconds, level, category, message, values or the
 exception in the library's standard format (see the decisions below), `\n` line endings, UTF-8. Every run uses a
 fresh directory inside the result directory (same local disk), deleted after each cell. No rotation. Queue
-capacity 10,000 for every library with a queue (`Libs.QueueCapacity`). NLog and Serilog block when full; ALog has
-no Block mode yet, so a drop makes the ALog cell invalid. Flush and dispose are inside the timed span.
+capacity 10,000 for every library with a queue (`Libs.QueueCapacity`). NLog, Serilog and ALog wait when the
+queue is full (`QueueFullMode.Block` for ALog). A lost event still makes the cell invalid. Flush and dispose
+are inside the timed span.
 
 | Mode | Configuration | Sources |
 |---|---|---|
-| ALog `async` | `LoggerEngine` + `FileLogWriter`, `UseBackgroundQueue(capacity 10000, batch 10, 100 ms)`, full mode: drop (ALog has no Block mode in this version); `PlainTextFormatter("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")` (standard exception format) / `JsonFormatter` | README "Step 3: Background Queue" https://github.com/Chookees/ALog#step-3-background-queue-optional |
-| ALog `sync` | the same without the queue (writes on the caller thread); extra row, **not ranked** | same |
+| ALog `async` | `LoggerEngine` + `FileLogWriter` (file kept open, 64 KiB buffer, flush every 1 s), `UseBackgroundQueue(capacity 10000, batch 10, 100 ms)`, `QueueFullMode.Block`, `FlushTimeout` 5 s; Close flushes once, then disposes; `PlainTextFormatter("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")` (standard exception format) / `JsonFormatter` | README "Step 3: Background Queue" https://github.com/Chookees/ALog#step-3-background-queue-optional |
+| ALog `sync` | the same writer without the queue (writes on the caller thread); extra row, **not ranked** | same |
 | NLog `async` | `FileTarget(KeepFileOpen=true, AutoFlush=false)` in `AsyncTargetWrapper(QueueLimit=10000, OverflowAction=Block)`; `${exception}` with its default format; `JsonLayout` for T7 | https://github.com/NLog/NLog/wiki/Exception-Layout-Renderer, https://github.com/NLog/NLog/wiki/Performance ("File Logging Performance"), https://github.com/NLog/NLog/wiki/AsyncWrapper-target, https://github.com/NLog/NLog/wiki/File-target, https://github.com/NLog/NLog/wiki/JsonLayout |
 | Serilog `async` | `WriteTo.Async(bufferSize: 10000, blockWhenFull: true)` → `File(buffered: true)`, `{NewLine}{Exception}` as in the default output template; `Serilog.Formatting.Json.JsonFormatter(renderMessage: true)` for T7 | https://github.com/serilog/serilog-sinks-async/blob/dev/README.md, https://github.com/serilog/serilog-sinks-file/blob/dev/README.md#performance, https://github.com/serilog/serilog/wiki/Formatting-Output |
 | log4net `buffered` | `BufferingForwardingAppender(lossy=false, Fix=Partial, bufferSize 512 default)` → `FileAppender(ImmediateFlush=false, ExclusiveLock)`, standard `%exception`; flush + repository shutdown at the end | https://logging.apache.org/log4net/manual/configuration/appenders/bufferingforwardingappender.html, https://logging.apache.org/log4net/manual/configuration/appenders/fileappender.html, `ImmediateFlush`: https://github.com/apache/logging-log4net/blob/master/src/log4net/Appender/TextWriterAppender.cs |
@@ -89,22 +90,20 @@ Deviations from defaults, recorded in `details.jsonl` (`notes`) and `env.json` (
 
 ## Fairness decisions (2026-10-22)
 
-1. **Same capacity for every library: 10,000, blocking.** NLog `AsyncTargetWrapper(QueueLimit=10000,
+1. **Same capacity for every library: 10,000, and a full queue waits.** NLog `AsyncTargetWrapper(QueueLimit=10000,
    OverflowAction=Block)`, Serilog `WriteTo.Async(bufferSize: 10000, blockWhenFull: true)`, ALog
-   `UseBackgroundQueue(capacity 10000)`, all from the one constant `Libs.QueueCapacity`. log4net's
-   `BufferingForwardingAppender` stays as it is (documented default `bufferSize` 512, lossy=false): it is a
-   synchronous batch buffer on the caller thread, not a queue, so a capacity does not apply. ALog has no Block mode
-   yet: a full queue drops the event (ALOG0070), and a cell with a drop fails the event count and is **invalid. That
-   is intended** until a Block mode is added. The single switch for that is `AlogLib.FullMode` in `Adapters.cs`
-   plus the marked line in `AlogLib.Init`: when that mode exists, set its Block option there (with the API name it
-   introduces) and update `FullMode`. No such option exists in ALog 0.2.1, and the harness does not invent one.
-2. **Flush retry stays.** ALog's `FlushAsync`/`Dispose` wait at most 5 s; `Close` repeats `FlushAsync` until one
-   call returns before that deadline, then disposes. Obsolete once a Block mode exists; remove it together with that change.
-3. **ALog `FileLogWriter` opens and closes the file per event** (`File.AppendAllText`). Nothing to change in this version.
+   `UseBackgroundQueue(capacity 10000)` with `QueueFullMode.Block`, all from the one constant `Libs.QueueCapacity`.
+   log4net's `BufferingForwardingAppender` stays as it is (documented default `bufferSize` 512, lossy=false): it is a
+   synchronous batch buffer on the caller thread, not a queue, so a capacity does not apply. A full ALog queue waits.
+   A lost event still makes the cell invalid.
+2. **Close flushes once.** ALog `Close` calls `FlushAsync` once, then `Dispose`. Both use `FlushTimeout` (default 5 s).
+3. **ALog `FileLogWriter` keeps the file open.** The buffer is 64 KiB and the file is flushed at least every 1 s
+   (an interval of 0 would write every event; this harness keeps 1 s).
 4. **No per-event flush for the competitors** (Serilog `buffered: true`, NLog `AutoFlush=false`, log4net
-   `ImmediateFlush=false`) is OK. The same applies to ALog once it has a Block mode.
+   `ImmediateFlush=false`) is OK. ALog keeps the file open and flushes on the 64 KiB buffer, on the 1 s interval,
+   and on flush, rotation, and dispose.
 5. **T3: every library writes its standard exception format, as users get it.** ALog: `PlainTextFormatter`
-   default (EXF one-line form with the inner chain and the source frame, no forced stack). NLog: `${exception}`
+   default (one-line form with the inner chain and the source frame, no forced stack). NLog: `${exception}`
    without format (default `ToString,Data`). Serilog: `{Exception}` as in the default output template
    (`ToString()`). log4net: `%exception` (`ToString()`). The check requires all three exception types of the chain
    in the record; stack frames are not required.
@@ -113,7 +112,10 @@ Deviations from defaults, recorded in `details.jsonl` (`notes`) and `env.json` (
 7. **ALog sync stays as an extra row, not ranked.** `details.jsonl` and `env.json` carry `ranked: false`;
    `merge.py` writes `ranked=no` and leaves it out of `rank_total_ms`. The evaluation uses only
    `ranked=yes` rows. `raw.csv` keeps the fixed columns; the row is identified by `framework=ALog,mode=sync`.
-8. **Results location** stays `results/<agent>-<UTC>/` inside this directory (`BENCH_RESULTS` overrides).
+8. **Results location.** Raw runs stay `eng/comparison-bench/results/<agent>-<UTC>/` (`BENCH_RESULTS` overrides).
+   A run started with `BENCH_N` and no `BENCH_RESULTS` writes under `eng/comparison-bench/results/_smoke/` (git-ignored).
+   `./merge.sh` writes `eng/comparison-bench/results/merged-<YYYY-MM-DD>/` (`merged.csv` and `summary.csv`, UTC date).
+   `--out` overrides that directory.
 9. **BenchmarkDotNet** keeps fixed invocation counts per class (needed for `IterationSetup`).
 10. **Serilog JSON timestamps** end in `+00:00` (TZ=UTC) instead of `Z`.
 
@@ -140,13 +142,17 @@ warm-up, drains, forces a GC, then times the N calls plus flush and dispose with
 | `alloc_bytes_per_op` | `GC.GetTotalAllocatedBytes(true)` delta / N (all threads) |
 | `mean_ns_per_op` | `total_ms × 10⁶ / N` |
 | `events_per_s` | `N / total_s` |
-| `valid` | `true`, `false` (check failed, crash or hang guard) or `n/a` |
+| `valid` | `true`, `false` (check failed, crash, hang guard, or the ALog async queue mode in `env.json` is not Block) or `n/a` |
 
 After the timed span the child checks the file: the number of records must equal N + warm-up (T5: 1),
 every record must contain the scenario's message, and the first, a middle and the last record must contain the
 timestamp, level, category, message, values (T2/T7) or all three exception types of the chain (T3). Any
 miss sets `valid=false`; the reason is in `details.jsonl`. `BENCH_MUTANT_DROP=1` skips one event to prove that
-a lost event makes the cell invalid.
+a lost event makes the cell invalid. `BENCH_MUTANT_FULL_MODE=Drop` builds the ALog queue with Drop.
+`env.json` records the mode read back from that configuration (`QueueFullMode=Drop`), not the environment variable.
+Every ALog async cell of that run is then invalid, and `run.sh` exits with
+status 1. Unset, or `Block`, records `QueueFullMode=Block`. Any other value is stored as Drop, so the record is
+`QueueFullMode=Drop` and the run is invalid. The reason names the mode from `env.json`, or `missing` when that record is absent.
 
 The order of the libraries is shuffled per run and scenario with a seed (`BENCH_SEED`, otherwise random). The
 seed is in `env.json` and every `details.jsonl` line. A cell that runs longer than the hang guard
@@ -154,7 +160,7 @@ seed is in `env.json` and every `details.jsonl` line. A cell that runs longer th
 
 ## Result directory
 
-`results/<agent>-<yyyyMMddTHHmmssZ>/`:
+`eng/comparison-bench/results/<agent>-<yyyyMMddTHHmmssZ>/`:
 
 - `raw.csv`: fixed columns
   `runner,run,framework,version,scenario,mode,n,total_ms,cpu_ms,cpu_pct,peak_ws_mb,alloc_bytes_per_op,mean_ns_per_op,events_per_s,valid`
@@ -162,7 +168,8 @@ seed is in `env.json` and every `details.jsonl` line. A cell that runs longer th
   GC counts, VmHWM, order, seed, configuration notes and the reason for `valid=false`/`n/a`
 - `env.json`: machine, CPU model, logical cores, cgroup CPU limit, RAM, OS, kernel, .NET SDK and runtime, GC mode,
   load average at start and end, file system type, ALog SHA and dirty flag, harness SHA, versions of all packages,
-  seed, scale, `DOTNET_*`/`BENCH_*` variables, scenario and library tables
+  seed, scale, `DOTNET_*`/`BENCH_*` variables, scenario and library tables. The ALog async library row records
+  `queue_full_mode` as `QueueFullMode=Block`. The ALog sync row records `n/a (no queue)`.
 - `run.log`: build and console output
 - `bdn/`: BenchmarkDotNet reports (full-size runs only)
 
@@ -175,18 +182,22 @@ One benchmark class per scenario (T1, T2, T3, T4, T5, T7), parameter `Lib` over 
 job, `MemoryDiagnoser` and `ThreadingDiagnoser`. Init runs in `IterationSetup`, flush and dispose in
 `IterationCleanup`; only the write is measured. `IterationSetup` requires a fixed invocation count, so each class
 sets `[InvocationCount]` (T1/T2/T7 10,000, T3 5,000, T4 1 × 8 threads × 1,250 events, T5 1,000,000). No
-iteration writes more than 10,000 events, so ALog's queue (capacity 10,000, no Block mode in this version) cannot drop
-inside an iteration. T3 logs a pre-thrown chain, T4 runs 8 parallel writers per invocation and reports per event.
+iteration writes more than 10,000 events. ALog uses `QueueFullMode.Block`, so a full queue waits and an
+iteration cannot drop an event. T3 logs a pre-thrown chain, T4 runs 8 parallel writers per invocation and reports per event.
 
 ## Lock
 
 `run.sh` takes `flock` on `/tmp/alog-comparison-bench.lock` (`BENCH_LOCK`) for the whole run and fails at once
-with the current holder if another run is active. Runs on one machine always run one after another.
+if another run holds the lock. The message names that process id, or says the PID is unknown when it cannot be
+determined. Runs on one machine always run one after another. Build and benchmark processes do not keep the lock
+open after `run.sh` exits.
 
 ## Merge
 
 `./merge.sh [results-dir] [--out dir] [--include-underscore]` reads every `*/raw.csv` (directories starting with
-`_`, such as `_smoke`, only with `--include-underscore`) and writes:
+`_`, such as `_smoke`, only with `--include-underscore`) and writes `merged.csv` and `summary.csv` into
+`eng/comparison-bench/results/merged-<YYYY-MM-DD>/` (UTC date; `--out` overrides). An ALog async row is marked invalid unless that
+run's `env.json` records `QueueFullMode=Block` for `alog-async`. The files are:
 
 - `merged.csv`: all rows plus `source` (the run directory)
 - `summary.csv`: valid rows only; `scope=agent` per runner × framework × mode × scenario and `scope=overall`

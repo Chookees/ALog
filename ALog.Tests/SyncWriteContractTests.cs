@@ -141,6 +141,7 @@ public sealed class SyncWriteContractTests
     /// <remarks>
     /// Z1-07. The formatter records the managed thread id. A <c>Task.Run</c> hop would leave
     /// the task incomplete or run the formatter on another thread.
+    /// The flush interval is zero so the line is in the file before dispose.
     /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task FileWriteAsync_CompletesInlineOnCallerThread()
@@ -152,7 +153,7 @@ public sealed class SyncWriteContractTests
         var formatter = new ThreadStampFormatter();
         try
         {
-            using var writer = new FileLogWriter(path, formatter);
+            using var writer = new FileLogWriter(path, formatter, fileFlushInterval: TimeSpan.Zero);
             var caller = Environment.CurrentManagedThreadId;
             var pending = writer.WriteAsync(Event("inline-line"));
             Assert.True(pending.IsCompleted);
@@ -168,6 +169,7 @@ public sealed class SyncWriteContractTests
 
     /// <summary>
     /// A null file event is reported and does not throw to the caller.
+    /// The flush interval is zero so the line is in the file before dispose.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task FileWrite_NullEvent_IsReported()
@@ -178,7 +180,7 @@ public sealed class SyncWriteContractTests
         try
         {
             var path = Path.Combine(directory, "null.log");
-            using var writer = new FileLogWriter(path);
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
             var error = CaptureError(() =>
             {
                 writer.Write(null!);

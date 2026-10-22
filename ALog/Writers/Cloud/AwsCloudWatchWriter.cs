@@ -186,6 +186,8 @@ public class AwsCloudWatchWriter : ILogWriter, IFormattableLogWriter
     /// Does not catch a transport failure. <see cref="Write"/> reports that.
     /// The timeout is the AWS transport bound, not a shutdown deadline.
     /// The put starts on the thread pool. This method blocks the caller only on the wait.
+    /// A cancellation from this timeout is the same 100 second timeout. The token can win the race
+    /// with the wait when both are due on the same clock tick.
     /// </remarks>
     private void PutWithinTransportTimeout(LogEvent logEvent)
     {
@@ -195,11 +197,24 @@ public class AwsCloudWatchWriter : ILogWriter, IFormattableLogWriter
         {
             pending.WaitAsync(SyncPutTimeout, _clock).GetAwaiter().GetResult();
         }
-        catch (TimeoutException)
+        catch (Exception ex) when (IsTransportTimeout(ex, timeout))
         {
             timeout.Cancel();
             throw new TimeoutException("CloudWatch put exceeded the 100 second transport timeout.");
         }
+    }
+
+    /// <summary>True when the sync wait ended because <paramref name="timeout"/> elapsed.</summary>
+    /// <param name="ex">The exception from the wait. Not null.</param>
+    /// <param name="timeout">The source created for this put. Not null.</param>
+    /// <returns>True for a wait timeout, or for cancellation after that source has fired.</returns>
+    /// <remarks>Does not throw. A transport failure that is not this timeout returns false so <see cref="Write"/> can report it.</remarks>
+    private static bool IsTransportTimeout(Exception ex, CancellationTokenSource timeout)
+    {
+        if (ex is TimeoutException)
+            return true;
+
+        return ex is OperationCanceledException && timeout.IsCancellationRequested;
     }
 
     /// <summary>

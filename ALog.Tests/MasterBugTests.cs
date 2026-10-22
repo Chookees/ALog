@@ -1370,13 +1370,15 @@ public sealed class MasterBugTests : IDisposable
     /// <param name="path">File the file writer creates. Not null.</param>
     /// <param name="probe">Extra writer that must receive the original property. Not null.</param>
     /// <returns>A configuration the caller passes to one engine. Not shared.</returns>
+    /// <remarks>The file flush interval is zero so a read before shutdown still sees the line.</remarks>
     private static LoggerConfig BuildPlainConfig(string path, RecordingWriter probe)
     {
         return new LoggerConfig()
             .AddWriter(new ConsoleLogWriter(useColors: false))
-            .AddWriter(new FileLogWriter(path))
+            .AddWriter(new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero))
             .AddWriter(probe)
             .SetFormatter(new PlainTextFormatter())
+            .SetFileFlushInterval(TimeSpan.Zero)
             .UseAsync(false)
             .SetMinimumLevel(LogLevel.Trace);
     }

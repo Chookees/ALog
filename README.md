@@ -15,7 +15,7 @@ It is designed to be simple to use, highly configurable, and ready for modern de
 - Enrichers (`MachineName`, `ThreadId`, `ProcessId`, `Activity`, custom)
 - JSON/env options via `ALogOptions` / `LoggerConfigFactory`
 - `Microsoft.Extensions.Logging` provider (`ALog.Extensions.Logging`) + ASP.NET sample
-- Formatters, scopes, background queue with backpressure, `FlushAsync` / `Shutdown`
+- Formatters, scopes, background queue (drops and counts events when full, or applies backpressure with `QueueFullMode = Block`), `FlushAsync` / `Shutdown`
 - Writers: Console, File, HTTP, SQL, Azure App Insights, AWS CloudWatch
 - Benchmarks: `ALog.Benchmarks`
 
@@ -178,6 +178,18 @@ Log.Write("This will be processed asynchronously");
 await Log.FlushAsync();
 Log.Shutdown();
 ```
+
+When the queue is full, ALog drops the new event by default and counts it (SelfLog ALOG0070). To make the caller wait instead, set `QueueFullMode = Block` (in JSON: `"ALog": { "QueueFullMode": "Block" }`). Even with `Block`, a call from the queue's own writer thread or after shutdown has started is dropped and counted, so logging can never deadlock.
+
+#### Queue, file buffer, and shutdown options
+
+- `QueueFullMode`: `Drop` (default) drops and counts new events while the queue is full. `Block` makes the caller wait until there is room.
+- `FileBufferSize`: how much `FileLogWriter` collects before it writes to the file. Default 64 KiB, 4 KiB to 16 MiB.
+- `FileFlushInterval`: how often buffered lines are written even if the buffer is not full. Default 1 s, 0 to 60 s. `0` writes every event right away.
+- `FlushTimeout`: how long `Flush`, `Dispose`, and `Shutdown` wait for queued events. Default 5 s, 0 to 60 s. Events still unwritten after that are counted (ALOG0071).
+- Each log file has one writer process: give each process its own file. Other programs can read, tail, and rotate it.
+
+If the process crashes, the file can miss up to one `FileFlushInterval` or one `FileBufferSize` of lines, whichever comes first. Set `FileFlushInterval` to `0` if every line must reach the operating system immediately.
 
 ### Step 4: Shipping Writers
 
