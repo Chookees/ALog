@@ -895,6 +895,44 @@ public sealed class AwsV4Tests
     }
 
     /// <summary>
+    /// Cancellation and the sync wait become due on one fake-clock tick, and the report is still the transport timeout.
+    /// </summary>
+    /// <remarks>
+    /// The clock fires the timeout token and the wait together. The transport task is cancelled when the token fires,
+    /// so the wait observes <see cref="TaskCanceledException"/> rather than <see cref="TimeoutException"/>.
+    /// The error text is the 100 second transport timeout. Catching only <see cref="TimeoutException"/> leaves
+    /// "A task was canceled" and fails this test.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task SyncPut_SameTickCancellation_ReportsTransportTimeout()
+    {
+        var clock = new SameTickClock();
+        var transport = new CancelWhenTokenFiresAwsTransport();
+        using var writer = new AwsCloudWatchWriter("group", "stream", transport, clock);
+        Exception? thrown = null;
+        string error = string.Empty;
+        var write = Task.Run(() =>
+        {
+            try
+            {
+                error = CaptureError(() => writer.Write(Plain("same-tick")));
+            }
+            catch (Exception ex)
+            {
+                thrown = ex;
+            }
+        });
+
+        await Task.WhenAll(transport.Entered, clock.BothTimersArmed);
+        clock.Advance(TimeSpan.FromSeconds(100));
+        await write;
+        Assert.Null(thrown);
+        Assert.Contains("[AwsCloudWatchWriter]", error, StringComparison.Ordinal);
+        Assert.Contains("100 second", error, StringComparison.Ordinal);
+        Assert.DoesNotContain("A task was canceled", error, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// One synchronous write and one async write must report the fault and return.
     /// </summary>
     /// <param name="fault">Builds a fresh exception for each put. Not null.</param>
@@ -1464,6 +1502,187 @@ internal sealed class SignalingFakeTimeProvider : FakeTimeProvider
         if (Interlocked.Increment(ref _timers) >= 2)
             _timersArmed.TrySetResult();
         return timer;
+    }
+}
+
+/// <summary>
+/// Fake clock that fires every due timer in registration order during one <see cref="Advance"/>.
+/// </summary>
+internal sealed class SameTickClock : TimeProvider
+{
+    private readonly object _gate = new();
+    private readonly List<Slot> _slots = new();
+    private readonly TaskCompletionSource _bothTimers = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private DateTimeOffset _utc = new(2026, 6, 1, 0, 0, 0, TimeSpan.Zero);
+
+    /// <summary>Completes after the cancellation source and the wait have each registered a timer.</summary>
+    internal Task BothTimersArmed => _bothTimers.Task;
+
+    /// <summary>The injected UTC time. It moves only in <see cref="Advance"/>.</summary>
+    /// <returns>The current fake UTC time.</returns>
+    /// <remarks>Does not throw. Does not read the wall clock.</remarks>
+    public override DateTimeOffset GetUtcNow()
+    {
+        lock (_gate)
+            return _utc;
+    }
+
+    /// <summary>Records one timer. The product timeout and the wait each call this once.</summary>
+    /// <param name="callback">Invoked when the timer is due. Not null.</param>
+    /// <param name="state">State passed back to <paramref name="callback"/>.</param>
+    /// <param name="dueTime">Delay from now. Infinite never fires.</param>
+    /// <param name="period">Ignored. These timeouts are one-shot.</param>
+    /// <returns>A timer <see cref="Advance"/> can fire.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="callback"/> is null.</exception>
+    /// <remarks>Signals <see cref="BothTimersArmed"/> when the second timer exists.</remarks>
+    public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        lock (_gate)
+        {
+            var due = dueTime == Timeout.InfiniteTimeSpan ? (DateTimeOffset?)null : _utc + dueTime;
+            var slot = new Slot(this, callback, state, due);
+            _slots.Add(slot);
+            if (_slots.Count >= 2)
+                _bothTimers.TrySetResult();
+
+            return slot;
+        }
+    }
+
+    /// <summary>Moves UTC forward and runs every timer that is now due, in registration order.</summary>
+    /// <param name="by">How far to move. Negative is rejected by the caller; zero fires timers already due.</param>
+    /// <remarks>Does not throw. Both the timeout token and the wait are due together after one call of 100 seconds.</remarks>
+    internal void Advance(TimeSpan by)
+    {
+        List<Slot> due;
+        lock (_gate)
+        {
+            _utc += by;
+            due = new List<Slot>();
+            var count = _slots.Count;
+            for (var i = 0; i < count; i++)
+            {
+                var slot = _slots[i];
+                if (slot.Due is DateTimeOffset at && at <= _utc)
+                    due.Add(slot);
+            }
+        }
+
+        var firing = due.Count;
+        for (var i = 0; i < firing; i++)
+            due[i].Fire();
+    }
+
+    private sealed class Slot : ITimer
+    {
+        private readonly SameTickClock _clock;
+        private readonly TimerCallback _callback;
+        private readonly object? _state;
+        private int _active = 1;
+
+        internal Slot(SameTickClock clock, TimerCallback callback, object? state, DateTimeOffset? due)
+        {
+            _clock = clock;
+            _callback = callback;
+            _state = state;
+            Due = due;
+        }
+
+        internal DateTimeOffset? Due { get; private set; }
+
+        internal void Fire()
+        {
+            if (Volatile.Read(ref _active) == 1)
+                _callback(_state);
+        }
+
+        /// <summary>Updates the due time. The product timeouts do not call this.</summary>
+        /// <param name="dueTime">The new delay. Infinite disarms the timer.</param>
+        /// <param name="period">Ignored.</param>
+        /// <returns>False after <see cref="Dispose"/>.</returns>
+        /// <remarks>Does not throw. The due time is measured on this clock, not the wall clock.</remarks>
+        public bool Change(TimeSpan dueTime, TimeSpan period)
+        {
+            lock (_clock._gate)
+            {
+                if (Volatile.Read(ref _active) == 0)
+                    return false;
+
+                Due = dueTime == Timeout.InfiniteTimeSpan ? null : _clock._utc + dueTime;
+                return true;
+            }
+        }
+
+        /// <summary>Stops later callbacks.</summary>
+        /// <remarks>Does not throw.</remarks>
+        public void Dispose()
+        {
+            Volatile.Write(ref _active, 0);
+        }
+
+        /// <summary>Stops later callbacks.</summary>
+        /// <returns>A completed task.</returns>
+        /// <remarks>Does not throw.</remarks>
+        public ValueTask DisposeAsync()
+        {
+            Dispose();
+            return ValueTask.CompletedTask;
+        }
+    }
+}
+
+/// <summary>
+/// Transport whose put completes as cancelled when the caller's token fires.
+/// </summary>
+internal sealed class CancelWhenTokenFiresAwsTransport : IAwsCloudWatchLogsTransport
+{
+    private readonly TaskCompletionSource _entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Completes once the put has registered its cancellation callback.</summary>
+    internal Task Entered => _entered.Task;
+
+    /// <summary>Returns a task that becomes cancelled when <paramref name="cancellationToken"/> fires.</summary>
+    /// <param name="logGroupName">Ignored.</param>
+    /// <param name="logStreamName">Ignored.</param>
+    /// <param name="events">Ignored.</param>
+    /// <param name="cancellationToken">Cancels the returned task.</param>
+    /// <returns>A task that stays incomplete until the token fires.</returns>
+    /// <remarks>
+    /// The callback is registered before <see cref="Entered"/> completes, so a clock advance cannot miss it.
+    /// Completion is synchronous, so the wait observes the cancellation before its own timer callback runs.
+    /// </remarks>
+    public Task PutLogEventsAsync(
+        string logGroupName,
+        string logStreamName,
+        IReadOnlyList<AwsCloudWatchLogEvent>? events,
+        CancellationToken cancellationToken = default)
+    {
+        var pending = new TaskCompletionSource();
+        cancellationToken.Register(() => pending.TrySetCanceled(cancellationToken));
+        _entered.TrySetResult();
+        return pending.Task;
+    }
+
+    /// <summary>Forwards one event to <see cref="PutLogEventsAsync"/>.</summary>
+    /// <param name="logGroupName">Ignored.</param>
+    /// <param name="logStreamName">Ignored.</param>
+    /// <param name="message">Ignored.</param>
+    /// <param name="timestampUnixMs">Ignored.</param>
+    /// <param name="cancellationToken">Cancels the returned task.</param>
+    /// <returns>The batch task.</returns>
+    /// <remarks>The writer calls the batch method. This member exists so the interface is explicit.</remarks>
+    public Task PutLogEventAsync(
+        string logGroupName,
+        string logStreamName,
+        string message,
+        long timestampUnixMs,
+        CancellationToken cancellationToken = default)
+        => PutLogEventsAsync(logGroupName, logStreamName, null, cancellationToken);
+
+    /// <summary>No resources to release.</summary>
+    public void Dispose()
+    {
     }
 }
 

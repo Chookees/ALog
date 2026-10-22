@@ -22,6 +22,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      actions: write
     env:
       COVERAGE_ENFORCE: "true"
       # Only the value 1 enables the SQL live tests. true (any case) does too.
@@ -92,6 +93,17 @@ jobs:
         dotnet pack ALog/ALog.csproj -c Release --no-restore -o "$out" --nologo
         dotnet pack ALog.Extensions.Logging/ALog.Extensions.Logging.csproj -c Release --no-restore -o "$out" --nologo
         bash eng/test_nupkg_license.sh --dir "$out"
+        python3 eng/test_nupkg_native.py --dir "$out"
+        mkdir -p "$out/core"
+        cp "$out"/ALog.[0-9]*.nupkg "$out/core/"
+
+    - name: Upload packed ALog
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: alog-nupkg
+        path: ${{ runner.temp }}/license-nupkgs/core/*.nupkg
+        if-no-files-found: error
+        retention-days: 1
 
     - name: RS0030 justification
       run: python3 eng/rs0030-justification-check.py --sarif "${{ runner.temp }}/ALog.sarif" --sarif "${{ runner.temp }}/ALog.Extensions.Logging.sarif"
@@ -356,11 +368,15 @@ jobs:
         print("mutant invalid ok", sys.argv[1], "exit was required non-zero")
         PY
 
-  # Windows file identity for external rename and delete. Not a required check.
+  # Not a required check. Consumes the nupkg packed on ubuntu, then runs the file rotation tests.
   # Copy-and-truncate stays on Linux: a second writer is denied on Windows.
   test-windows:
+    needs: build
     runs-on: windows-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
 
     steps:
     - name: Checkout
@@ -377,6 +393,23 @@ jobs:
         version=$(dotnet --version)
         echo "dotnet --version ${version}"
         test "$version" = "10.0.402"
+
+    - name: Download ubuntu nupkg
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      with:
+        name: alog-nupkg
+        path: nupkg
+
+    - name: Package has no native identity and the file sink runs
+      shell: bash
+      run: |
+        if command -v python3 >/dev/null 2>&1; then
+          py=python3
+        else
+          py=python
+        fi
+        "$py" eng/test_nupkg_native.py --dir nupkg
+        bash eng/test_nupkg_consumer.sh nupkg
 
     - name: File rotation tests
       run: dotnet test ALog.Tests/ALog.Tests.csproj -c Release --nologo --filter FullyQualifiedName~BkpExternalRotationTests

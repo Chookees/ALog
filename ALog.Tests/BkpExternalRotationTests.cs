@@ -7,7 +7,6 @@ using ALog.Core;
 using ALog.Public.Interfaces;
 using ALog.Writers.File;
 using Microsoft.Extensions.Time.Testing;
-using Microsoft.Win32.SafeHandles;
 
 namespace ALog.Tests;
 
@@ -54,7 +53,11 @@ public sealed class BkpExternalRotationTests
     }
 
     /// <summary>A path that someone else recreated is appended to. The renamed file keeps the earlier line.</summary>
-    /// <remarks>The two files have different identities. Skipping the comparison appends the new line to the renamed file.</remarks>
+    /// <remarks>
+    /// The recreated file is shorter than the write position, so the next line is appended there.
+    /// Reading <c>FileStream.Length</c> on the open handle instead of <c>FileInfo.Length</c>
+    /// on the path keeps writing the renamed file: that handle still names the longer file. This test fails that change.
+    /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task ExternalRename_AppendsWhenThePathWasRecreated()
     {
@@ -373,31 +376,62 @@ public sealed class BkpExternalRotationTests
         }
     }
 
-    /// <summary>A closed handle and a descriptor the runtime cannot stat are not the open file.</summary>
-    /// <remarks>The length is zero on both failures. A live descriptor is required for the unknown-fd case.</remarks>
+    /// <summary>
+    /// Dispose writes buffered lines at the start after an external truncate, with no zero bytes.
+    /// </summary>
+    /// <remarks>
+    /// Fifty lines are flushed, the file is truncated, and ten lines stay in the buffer.
+    /// Dispose runs before the flush interval, so only the close path can notice the shorter file.
+    /// Skipping that check writes the ten lines at the old position and the file contains a zero byte.
+    /// Windows denies the second write, so this case is the Unix one.
+    /// </remarks>
     [Fact(Timeout = 30000)]
-    public async Task ExternalIdentity_RejectsClosedAndUnknownHandles()
+    public async Task ExternalTruncate_DisposeWritesBufferedLinesWithoutNulBytes()
     {
-        await Task.CompletedTask;
+        if (OperatingSystem.IsWindows())
+        {
+            await Task.CompletedTask;
+            return;
+        }
+
         var directory = NewDirectory();
+        var clock = NewClock();
         try
         {
-            var path = Path.Combine(directory, "id.log");
-            var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
-            var handle = stream.SafeFileHandle;
-            Assert.Throws<ArgumentNullException>(() => FileIdentity.TryMatch(null!, path, out _));
-            Assert.Throws<ArgumentNullException>(() => FileIdentity.TryMatch(handle, null!, out _));
-            stream.Dispose();
-            Assert.False(FileIdentity.TryMatch(handle, path, out var closedLength));
-            Assert.Equal(0, closedLength);
+            var path = Path.Combine(directory, "app.log");
+            using (var engine = new LoggerEngine(
+                new LoggerConfig().AddWriter(new FileLogWriter(
+                    path,
+                    fileFlushInterval: TimeSpan.FromSeconds(60),
+                    clock: clock)),
+                clock))
+            {
+                for (var i = 0; i < 50; i++)
+                    engine.Log("flushed-" + i.ToString(CultureInfo.InvariantCulture));
 
-            using var unknown = new SafeFileHandle(new IntPtr(int.MaxValue), ownsHandle: false);
-            Assert.False(FileIdentity.TryMatch(unknown, path, out var unknownLength));
-            Assert.Equal(0, unknownLength);
+                await engine.FlushAsync();
+                using (var truncating = new FileStream(
+                    path,
+                    FileMode.Open,
+                    FileAccess.Write,
+                    FileShare.ReadWrite | FileShare.Delete))
+                {
+                    truncating.SetLength(0);
+                }
 
-            using var invalid = new SafeFileHandle(new IntPtr(-1), ownsHandle: false);
-            Assert.False(FileIdentity.TryMatch(invalid, path, out var invalidLength));
-            Assert.Equal(0, invalidLength);
+                for (var i = 0; i < 10; i++)
+                    engine.Log("kept-" + i.ToString(CultureInfo.InvariantCulture));
+            }
+
+            var raw = File.ReadAllBytes(path);
+            Assert.NotEmpty(raw);
+            Assert.Equal(-1, Array.IndexOf(raw, (byte)0));
+            Assert.Equal((byte)'[', raw[0]);
+            var lines = File.ReadAllLines(path);
+            Assert.Equal(10, lines.Length);
+            Assert.Contains("kept-0", lines[0], StringComparison.Ordinal);
+            Assert.Contains("kept-9", lines[9], StringComparison.Ordinal);
+            Assert.DoesNotContain("flushed-0", Encoding.UTF8.GetString(raw), StringComparison.Ordinal);
         }
         finally
         {
@@ -485,6 +519,7 @@ public sealed class BkpExternalRotationTests
                 FileShare.ReadWrite | FileShare.Delete);
             SetField(shared, "_stream", replaced);
             original.Dispose();
+            File.Delete(path);
             SetField(shared, "_bufferSize", 8192);
             writer.Flush();
             Assert.Contains("Write failed", buffer.ToString(), StringComparison.Ordinal);

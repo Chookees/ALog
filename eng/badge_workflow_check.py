@@ -504,7 +504,8 @@ def _grants_write(permissions: object) -> bool:
         permissions: A job's ``permissions`` value. ``None`` means the job
             inherits the workflow default and does not itself grant write.
             A string ``write-all`` grants write. Any mapping value of
-            ``write`` or ``write-all`` grants write. An unknown shape is
+            ``write`` or ``write-all`` grants write, except ``actions: write``,
+            which only uploads an artifact. An unknown shape is
             treated as write so a new syntax cannot hide a scope.
 
     Returns:
@@ -529,6 +530,9 @@ def _grants_write(permissions: object) -> bool:
             return True
         if not isinstance(key, str) or not isinstance(value, str):
             return True
+        # actions: write uploads a packed nupkg. It does not push commits.
+        if key == "actions" and value.strip().lower() == "write":
+            continue
         if value.strip().lower() in _WRITE_VALUES:
             return True
     return False

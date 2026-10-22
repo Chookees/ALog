@@ -104,8 +104,8 @@ internal static class LogFileRegistry
 /// The stream is opened with <see cref="FileShare.Read"/> and <see cref="FileShare.Delete"/> so another handle can read or rename it.
 /// Omitting <see cref="FileShare.Write"/> stops a second writer on Windows only. Linux and macOS still allow one, and the lines can mix.
 /// The timer is disposed outside the file lock. The callback also takes that lock.
-/// An external rename, delete, or truncate is noticed on the flush tick, on <see cref="Flush"/>, and before this process rotates the file.
-/// The path comparison runs at most once per <see cref="FileFlushInterval"/>, or once per second when that interval is zero.
+/// An external rename, delete, or truncate is noticed on the flush tick, on <see cref="Flush"/>, before this process rotates the file, and on close.
+/// The path check runs at most once per <see cref="FileFlushInterval"/>, or once per second when that interval is zero. Close, flush, and rotation do not wait for that gap.
 /// </remarks>
 internal sealed class SharedLogFile
 {
@@ -239,8 +239,15 @@ internal sealed class SharedLogFile
         }
     }
 
-    /// <summary>Flushes, then closes the stream. The timer is disposed after the file lock is released.</summary>
-    /// <remarks>Does not throw. A second call returns. Called only for the last reference, outside the registry lock.</remarks>
+    /// <summary>
+    /// Checks the path, writes any buffered bytes, and closes the stream.
+    /// The timer is disposed after the file lock is released.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. A second call returns. Called only for the last reference, outside the registry lock.
+    /// The path check runs before the final buffer write. A missing path is flushed into the old stream and opened again.
+    /// A path shorter than the write position is opened again before those bytes are written, so a truncate does not leave a gap.
+    /// </remarks>
     internal void Close()
     {
         ITimer? timer;
@@ -250,15 +257,17 @@ internal sealed class SharedLogFile
             if (_closed != 0)
                 return;
 
-            _closed = 1;
             try
             {
+                Reconcile(force: true);
                 FlushPending();
             }
             catch (Exception ex)
             {
                 System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
             }
+
+            _closed = 1;
 
             timer = _timer;
             _timer = null;
@@ -350,14 +359,15 @@ internal sealed class SharedLogFile
     }
 
     /// <summary>
-    /// Reopens the configured path when it no longer names the open file, and seeks to the end after an external truncate.
+    /// Reopens the configured path when it is missing or shorter than this stream's write position.
     /// </summary>
-    /// <param name="force">True on a flush tick, <see cref="Flush"/>, and before this process rotates. False waits for the check gap.</param>
+    /// <param name="force">True on a flush tick, <see cref="Flush"/>, close, and before this process rotates. False waits for the check gap.</param>
     /// <remarks>
     /// The caller holds the file lock. A forced call still runs when the gap has not elapsed.
     /// A call that is not forced returns until <see cref="FileFlushInterval"/> has elapsed, or one second when that interval is zero.
-    /// A missing path or a different file is flushed into the old stream, closed, and opened again.
-    /// The same file whose length is behind the write position is seeked to the end before the next write, so a truncate does not leave a gap.
+    /// Length comes from <c>FileInfo.Length</c> on the path, not from the open stream.
+    /// A missing path is flushed into the old stream, closed, and opened again.
+    /// A shorter path is closed without writing at the old position, then opened again, and the buffer is written there.
     /// </remarks>
     private void Reconcile(bool force)
     {
@@ -369,16 +379,13 @@ internal sealed class SharedLogFile
 
         LogFileRegistry.NoteIdentityCheck();
         _lastIdentityCheck = _clock.GetUtcNow();
-        if (!FileIdentity.TryMatch(_stream.SafeFileHandle, _path, out var openLength))
+        // shortcut: P1-24: a new file at the path that grows beyond our position before the next check is not detected.
+        if (!System.IO.File.Exists(_path) || new System.IO.FileInfo(_path).Length < _stream.Position)
         {
-            ReopenPath();
-            return;
-        }
-
-        if (openLength < _stream.Position)
-        {
-            _stream.Seek(0, SeekOrigin.End);
-            _logicalLength = _stream.Position + _pending;
+            if (!System.IO.File.Exists(_path))
+                ReopenPath();
+            else
+                ReopenKeepingPending();
         }
     }
 
@@ -416,6 +423,28 @@ internal sealed class SharedLogFile
         }
 
         OpenStream();
+    }
+
+    /// <summary>
+    /// Closes the current stream without writing at its position, then opens <see cref="Path"/> and keeps the buffer.
+    /// </summary>
+    /// <remarks>
+    /// The caller holds the file lock. Used when the path exists but is shorter than the write position.
+    /// Writing the buffer first would extend a truncated file with zero bytes. The bytes stay in the buffer
+    /// and the next flush writes them on the stream that was just opened. A failed open leaves the stream unset and throws.
+    /// </remarks>
+    private void ReopenKeepingPending()
+    {
+        var pending = _pending;
+        var stream = _stream!;
+        _stream = null;
+        if (stream.CanSeek)
+            stream.Seek(0, SeekOrigin.Begin);
+
+        stream.Dispose();
+        OpenStream();
+        _pending = pending;
+        _logicalLength = _stream!.Position + pending;
     }
 
     /// <summary>Moves the file when the next line would start at or past <paramref name="maxBytes"/>.</summary>

@@ -31,15 +31,6 @@ It is designed to be simple to use, highly configurable, and ready for modern de
     <InternalsVisibleTo Include="ALog.Extensions.Logging" />
   </ItemGroup>
 
-  <!--
-    File identity is platform-specific. Linux coverage must not count the Windows
-    file-id path, and a Windows build must not call libSystem.Native.
-  -->
-  <ItemGroup>
-    <Compile Remove="Writers\File\FileIdentity.Windows.cs" Condition="!$([MSBuild]::IsOSPlatform('Windows'))" />
-    <Compile Remove="Writers\File\FileIdentity.Unix.cs" Condition="$([MSBuild]::IsOSPlatform('Windows'))" />
-  </ItemGroup>
-
   <ItemGroup>
     <PackageReference Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="5.6.0">
       <PrivateAssets>all</PrivateAssets>
