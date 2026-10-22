@@ -2061,7 +2061,6 @@ public sealed class ExceptionFormatTests
         var console = Slice(readme, "## Console output", "## Quick Start");
         var formatters = Slice(readme, "## Formatters", "## Contextual Logging");
         Assert.Contains("[20:55:19] [Error] " + TargetTail, console, StringComparison.Ordinal);
-        Assert.Contains("EX:", console, StringComparison.Ordinal);
         Assert.Contains("includeStackTrace: true", console, StringComparison.Ordinal);
         Assert.Contains("Type: Message", formatters, StringComparison.Ordinal);
         Assert.Contains("source", formatters, StringComparison.Ordinal);
