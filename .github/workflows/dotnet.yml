@@ -289,14 +289,14 @@ jobs:
         test "$version" = "10.0.402"
 
     - name: Build comparison harness
-      run: dotnet build bench/ALog.Comparison/ALog.Comparison.csproj -c Release --nologo
+      run: dotnet build eng/comparison-bench -c Release --nologo
 
     - name: Smoke N=1000
-      working-directory: bench/ALog.Comparison
+      working-directory: eng/comparison-bench
       run: BENCH_N=1000 ./run.sh 1 ci
 
     - name: Assert QueueFullMode=Block and a free lock
-      working-directory: bench/ALog.Comparison
+      working-directory: eng/comparison-bench
       run: |
         set -euo pipefail
         envf=$(find results/_smoke -path '*/ci-*/env.json' -print | sort | tail -n 1)
@@ -319,7 +319,7 @@ jobs:
         echo "lockcheck exit $status"
 
     - name: Drop mode makes the run invalid
-      working-directory: bench/ALog.Comparison
+      working-directory: eng/comparison-bench
       run: |
         set -euo pipefail
         set +e

@@ -3,16 +3,16 @@
 #
 #   ./run.sh [runs=5] [agent-name]
 #
-# Writes results/<agent>-<UTC timestamp>/ with raw.csv (fixed BEN-07 columns), details.jsonl, env.json, run.log
+# Writes eng/comparison-bench/results/<agent>-<UTC timestamp>/ with raw.csv (fixed BEN-07 columns), details.jsonl, env.json, run.log
 # and, for full-size runs, bdn/ (one BenchmarkDotNet run, BEN-05/07).
 # Environment (all optional):
-#   AlogSrc=<ALog repo root>    default: two levels up (the repo when this lives in bench/ALog.Comparison)
+#   AlogSrc=<ALog repo root>    default: two levels up (the repo when this lives in eng/comparison-bench)
 #   DOTNET=<dotnet binary>      default: dotnet on PATH, else ~/.dotnet/dotnet
 #   BENCH_N_SCALE=0.001         scale every N (smoke); BENCH_N=1000 fixes N for every scenario (CI smoke, BEN-09)
 #   BENCH_BDN=0|1               BenchmarkDotNet after the process runs; default 1 for full size, 0 when scaled
 #   BENCH_SEED=<int>            library order seed (default random, always recorded)
 #   BENCH_LIBS / BENCH_SCENARIOS  comma lists to restrict the matrix (default all)
-#   BENCH_RESULTS=<dir>         results root (default ./results). When BENCH_N is set and this is empty, results/_smoke.
+#   BENCH_RESULTS=<dir>         results root (default eng/comparison-bench/results). When BENCH_N is set and this is empty, eng/comparison-bench/results/_smoke.
 #   BENCH_LOCK=<file>           machine-wide lock (default /tmp/alog-comparison-bench.lock)
 #   BENCH_CELL_TIMEOUT_S        per-cell hang guard (default 1800 s, 30 s for smoke sizes)
 #   BENCH_MUTANT_FULL_MODE      proof switch for the ALog async queue mode (Block when unset)

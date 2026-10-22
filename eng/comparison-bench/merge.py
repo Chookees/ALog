@@ -2,8 +2,9 @@
 """Merge ALog comparison results.
 
 Reads every <results>/<agent>-<ts>/raw.csv (directories starting with "_" such as _smoke are skipped unless
---include-underscore; a merged-<date> directory has no raw.csv and is skipped) and writes, by default, into
-<results>/merged-<YYYY-MM-DD>/ (UTC date; --out overrides):
+--include-underscore; a merged-<date> directory has no raw.csv and is skipped). merge.sh passes
+eng/comparison-bench/results. Writes, by default, into <results>/merged-<YYYY-MM-DD>/ (UTC date; --out overrides),
+which is eng/comparison-bench/results/merged-<YYYY-MM-DD>/ for that default:
   merged.csv   all rows of all runs, fixed columns plus "source" (the run directory)
   summary.csv  valid rows only, grouped
                  scope=agent   per runner x framework x mode x scenario

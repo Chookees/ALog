@@ -10,13 +10,13 @@ and log4net.
 ## Quick start
 
 ```bash
-# from bench/ALog.Comparison in the ALog repo, one run at a time per machine
-./run.sh 5 <your-name>                 # 5 process runs + 1 BenchmarkDotNet run -> results/<your-name>-<UTC>/
-./merge.sh                             # all results/*/raw.csv -> results/merged-<UTC date>/merged.csv + summary.csv
+# from eng/comparison-bench in the ALog repo, one run at a time per machine
+./run.sh 5 <your-name>                 # 5 process runs + 1 BenchmarkDotNet run -> eng/comparison-bench/results/<your-name>-<UTC>/
+./merge.sh                             # all results/*/raw.csv -> eng/comparison-bench/results/merged-<UTC date>/merged.csv + summary.csv
 
 # smoke (tiny N, no BenchmarkDotNet, about 10 s). BENCH_N_SCALE does not change the results directory.
 BENCH_N_SCALE=0.001 BENCH_RESULTS=results/_smoke ./run.sh 1 smoke
-# CI smoke (N = 1000 for every scenario). BENCH_N with no BENCH_RESULTS writes under results/_smoke/.
+# CI smoke (N = 1000 for every scenario). BENCH_N with no BENCH_RESULTS writes under eng/comparison-bench/results/_smoke/.
 BENCH_N=1000 ./run.sh 1 ci
 ```
 
@@ -112,9 +112,10 @@ Deviations from defaults, recorded in `details.jsonl` (`notes`) and `env.json` (
 7. **ALog sync stays as an extra row, not ranked.** `details.jsonl` and `env.json` carry `ranked: false`;
    `merge.py` writes `ranked=no` and leaves it out of `rank_total_ms`. The evaluation uses only
    `ranked=yes` rows. `raw.csv` keeps the fixed columns; the row is identified by `framework=ALog,mode=sync`.
-8. **Results location.** Raw runs stay `results/<agent>-<UTC>/` inside this directory (`BENCH_RESULTS` overrides).
-   A run started with `BENCH_N` and no `BENCH_RESULTS` writes under `results/_smoke/`. `./merge.sh` writes
-   `results/merged-<YYYY-MM-DD>/` (`merged.csv` and `summary.csv`, UTC date). `--out` overrides that directory.
+8. **Results location.** Raw runs stay `eng/comparison-bench/results/<agent>-<UTC>/` (`BENCH_RESULTS` overrides).
+   A run started with `BENCH_N` and no `BENCH_RESULTS` writes under `eng/comparison-bench/results/_smoke/` (git-ignored).
+   `./merge.sh` writes `eng/comparison-bench/results/merged-<YYYY-MM-DD>/` (`merged.csv` and `summary.csv`, UTC date).
+   `--out` overrides that directory.
 9. **BenchmarkDotNet** keeps fixed invocation counts per class (needed for `IterationSetup`).
 10. **Serilog JSON timestamps** end in `+00:00` (TZ=UTC) instead of `Z`.
 
@@ -158,7 +159,7 @@ seed is in `env.json` and every `details.jsonl` line. A cell that runs longer th
 
 ## Result directory
 
-`results/<agent>-<yyyyMMddTHHmmssZ>/`:
+`eng/comparison-bench/results/<agent>-<yyyyMMddTHHmmssZ>/`:
 
 - `raw.csv`: fixed columns
   `runner,run,framework,version,scenario,mode,n,total_ms,cpu_ms,cpu_pct,peak_ws_mb,alloc_bytes_per_op,mean_ns_per_op,events_per_s,valid`
@@ -194,7 +195,7 @@ open after `run.sh` exits.
 
 `./merge.sh [results-dir] [--out dir] [--include-underscore]` reads every `*/raw.csv` (directories starting with
 `_`, such as `_smoke`, only with `--include-underscore`) and writes `merged.csv` and `summary.csv` into
-`results/merged-<YYYY-MM-DD>/` (UTC date; `--out` overrides). An ALog async row is marked invalid unless that
+`eng/comparison-bench/results/merged-<YYYY-MM-DD>/` (UTC date; `--out` overrides). An ALog async row is marked invalid unless that
 run's `env.json` records `QueueFullMode=Block` for `alog-async`. The files are:
 
 - `merged.csv`: all rows plus `source` (the run directory)
