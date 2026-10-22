@@ -262,6 +262,37 @@ jobs:
         retention-days: 7
         if-no-files-found: error
 
+  # Comparison harness smoke (BEN-09). Not a required check.
+  # Release build, then N=1000. The job is green only when run.sh exits 0,
+  # which is every cell valid or n/a. No performance gate.
+  # The harness sets a 30s per-cell hang guard for this N. The job timeout
+  # below is the runner backstop, not a measurement bound.
+  bench-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        global-json-file: global.json
+
+    - name: Assert SDK version
+      run: |
+        version=$(dotnet --version)
+        echo "dotnet --version ${version}"
+        test "$version" = "10.0.402"
+
+    - name: Build comparison harness
+      run: dotnet build bench/ALog.Comparison/ALog.Comparison.csproj -c Release --nologo
+
+    - name: Smoke N=1000
+      working-directory: bench/ALog.Comparison
+      run: BENCH_N=1000 ./run.sh 1 ci
+
   badge:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     needs: build
