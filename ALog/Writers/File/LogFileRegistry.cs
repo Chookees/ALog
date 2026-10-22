@@ -446,7 +446,7 @@ internal sealed class SharedLogFile
     /// <remarks>
     /// The caller holds the file lock. Used when the path exists but is shorter than the write position.
     /// Writing the buffer first would extend a truncated file with zero bytes. The bytes stay in the buffer.
-    /// The old stream is disposed in a finally block and is not seeked. Append mode opens at the current length,
+    /// The old stream is disposed before the path is opened again and is not seeked. Append mode opens at the current length,
     /// and the next flush writes the buffer there. A failed open leaves the stream unset and throws.
     /// </remarks>
     private void ReopenKeepingPending()
@@ -454,14 +454,9 @@ internal sealed class SharedLogFile
         var pending = _pending;
         var stream = _stream!;
         _stream = null;
-        try
-        {
-            // Case B writes nothing here. The pending bytes are for the stream opened below.
-        }
-        finally
-        {
-            DisposeDetached(stream);
-        }
+        // Case B (path length < position: copytruncate / rename with recreate) writes nothing
+        // into the old stream. Writing there would recreate the NUL hole on copytruncate.
+        DisposeDetached(stream);
 
         OpenStream();
         _pending = pending;
