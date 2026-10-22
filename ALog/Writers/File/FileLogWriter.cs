@@ -80,17 +80,22 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
         }
     }
 
+    /// <summary>
+    /// Renders the line used when no formatter was attached.
+    /// The exception segment comes from <see cref="ExceptionReport"/>, the same helper the other text sinks use.
+    /// </summary>
+    /// <param name="logEvent">Event to render. Not null.</param>
+    /// <returns>One line, without a trailing newline.</returns>
+    /// <remarks>
+    /// Does not throw. The message is always included, including when it is empty, matching the previous file fallback.
+    /// The category is not written here. The message, context keys, and context values are escaped so none of them can forge a <c>|</c> separator or a second line.
+    /// </remarks>
     private string FormatFallback(LogEvent logEvent)
     {
-        var baseLine = $"[{logEvent.Timestamp:yyyy-MM-dd HH:mm:ss}] [{logEvent.Level}] {logEvent.Message}";
-
-        if (logEvent.Exception is not null)
-            baseLine += $" | EX: {logEvent.Exception.GetType().Name}: {logEvent.Exception.Message}";
-
-        if (logEvent.Context is not null && logEvent.Context.Count > 0)
-            baseLine += " | ctx: " + CaptureText.Join(logEvent.Context);
-
-        return baseLine;
+        var head = "[" + logEvent.Timestamp.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + logEvent.Level + "]";
+        head += " " + ExceptionReport.EscapeLine(logEvent.Message);
+        var exception = logEvent.Exception == null ? null : ExceptionReport.FormatText(logEvent.Exception);
+        return ExceptionReport.JoinLine(head, exception, props: null, ExceptionReport.FormatContext(logEvent.Context));
     }
 
     private void RotateIfNeeded()

@@ -937,13 +937,14 @@ public sealed class MasterBugTests : IDisposable
 
         var changelog = Slice(ReadRepoFile("CHANGELOG.md"), "## 0.2.1\n", "\n## 0.2.0");
         var lines = NonEmptyLines(changelog);
-        Assert.True(lines.Count >= 3, "0.2.1 section is too short.");
+        Assert.True(lines.Count >= 8, "0.2.1 section is too short.");
         Assert.StartsWith("- Breaking (dependency): `Microsoft.Data.SqlClient`", lines[0], StringComparison.Ordinal);
-        Assert.StartsWith("- Fixed: with the background queue,", lines[lines.Count - 5], StringComparison.Ordinal);
-        Assert.Equal(BreakingLine, lines[lines.Count - 4]);
-        Assert.Equal(FixedLine, lines[lines.Count - 3]);
-        Assert.Equal(AwsBreakingLine, lines[lines.Count - 2]);
-        Assert.Equal(AwsFixedLine, lines[lines.Count - 1]);
+        var queue = lines.FindIndex(line => line.StartsWith("- Fixed: with the background queue,", StringComparison.Ordinal));
+        Assert.True(queue >= 0, "background queue line missing");
+        Assert.Equal(BreakingLine, lines[queue + 1]);
+        Assert.Equal(FixedLine, lines[queue + 2]);
+        Assert.Equal(AwsBreakingLine, lines[queue + 3]);
+        Assert.Equal(AwsFixedLine, lines[queue + 4]);
 
         var project = ReadRepoFile("ALog/ALog.csproj");
         Assert.Contains("GHSA-846f-f764-76mx", project, StringComparison.Ordinal);

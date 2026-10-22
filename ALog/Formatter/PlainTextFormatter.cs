@@ -1,60 +1,238 @@
 ﻿namespace ALog.Formatters;
 
-using System;
-using System.Linq;
 using ALog.Core;
 using ALog.Public.Interfaces;
 
+/// <summary>
+/// Renders one event as a single plain-text line.
+/// An exception is <c>Type: Message</c> plus the origin, from <see cref="ExceptionReport"/>,
+/// so this formatter cannot drift from the console and file fallbacks.
+/// </summary>
 public class PlainTextFormatter : ILogFormatter
 {
     private readonly string _dateTimeFormat;
+    private readonly bool _includeStackTrace;
 
-    public PlainTextFormatter(string dateTimeFormat = "yyyy-MM-dd HH:mm:ss")
+    /// <summary>How many lines of <see cref="Exception.ToString"/> are indented. The rest are dropped.</summary>
+    private const int MaxStackLines = 256;
+
+    /// <summary>
+    /// Creates a formatter that writes one line and does not append the full stack.
+    /// The time format is <c>yyyy-MM-dd HH:mm:ss</c>.
+    /// </summary>
+    /// <remarks>
+    /// This constructor is the call <c>new PlainTextFormatter()</c>. It chains to the two-argument
+    /// constructor so the default format lives in one place.
+    /// </remarks>
+    public PlainTextFormatter()
+        : this("yyyy-MM-dd HH:mm:ss", false)
+    {
+    }
+
+    /// <summary>
+    /// Creates a formatter that writes one line and does not append the full stack.
+    /// </summary>
+    /// <param name="dateTimeFormat">
+    /// Format passed to <see cref="DateTime.ToString(string)"/>. Callers that want the default pass
+    /// <c>yyyy-MM-dd HH:mm:ss</c> or use <see cref="PlainTextFormatter()"/>.
+    /// </param>
+    /// <remarks>
+    /// Kept as its own constructor so a program built against the previous one-argument constructor
+    /// still binds after this package is replaced.
+    /// </remarks>
+    public PlainTextFormatter(string dateTimeFormat)
+        : this(dateTimeFormat, false)
+    {
+    }
+
+    /// <summary>
+    /// Creates a formatter that uses <c>yyyy-MM-dd HH:mm:ss</c> and optionally appends the full stack.
+    /// </summary>
+    /// <param name="includeStackTrace">
+    /// When true, <see cref="Exception.ToString"/> is appended after the line, each of its lines indented
+    /// by four spaces. When false, <see cref="Exception.ToString"/> is not called.
+    /// </param>
+    /// <remarks>
+    /// This is the constructor named <c>PlainTextFormatter(includeStackTrace: true)</c>.
+    /// </remarks>
+    public PlainTextFormatter(bool includeStackTrace)
+        : this("yyyy-MM-dd HH:mm:ss", includeStackTrace)
+    {
+    }
+
+    /// <summary>
+    /// Creates a formatter with an explicit time format and an explicit stack choice.
+    /// </summary>
+    /// <param name="dateTimeFormat">Format passed to <see cref="DateTime.ToString(string)"/>.</param>
+    /// <param name="includeStackTrace">
+    /// When true, <see cref="Exception.ToString"/> is appended after the line, each of its lines indented
+    /// by four spaces. When false, <see cref="Exception.ToString"/> is not called.
+    /// </param>
+    /// <remarks>Both values are stored. Neither is validated; an unusable format fails when a line is rendered.</remarks>
+    public PlainTextFormatter(string dateTimeFormat, bool includeStackTrace)
     {
         _dateTimeFormat = dateTimeFormat;
+        _includeStackTrace = includeStackTrace;
     }
 
     /// <summary>
     /// Renders one event as a single plain-text line.
     /// A property whose <c>ToString</c> throws is shown as <c>[capture failed: ExceptionType]</c>
     /// and does not drop the rest of the line.
+    /// The exception segment, when present, is separated with <c> | </c>.
     /// </summary>
     /// <param name="logEvent">Event to render. The writer passes the event it is formatting.</param>
-    /// <returns>The line, without a trailing newline. Empty parts are omitted.</returns>
+    /// <returns>
+    /// The line, without a trailing newline. Empty parts are omitted.
+    /// When stack traces were requested, a newline and the indented stack follow the line.
+    /// </returns>
     /// <remarks>
     /// Does not call SelfLog and does not replace the property object on the event.
-    /// Every property and context pair is rendered. The loop is bounded by that collection.
-    /// A throwing context value uses the same capture placeholder as a property.
+    /// Every property and context pair is rendered. The property loop is bounded by that collection.
+    /// The category, the message, context, and <c>props:</c> are escaped so <c>|</c> and <c>--&gt;</c> cannot look like separators.
+    /// A backslash in those fields is doubled only when it would read as an escape.
+    /// <see cref="Exception.ToString"/> runs only when this formatter was constructed with
+    /// <c>includeStackTrace: true</c>. A throw from that call becomes a capture placeholder
+    /// and the line above it is kept.
     /// Allocates the line. The formatter has no shared mutable state.
     /// </remarks>
     public string Format(LogEvent logEvent)
     {
-        var parts = new[]
-        {
-            $"[{logEvent.Timestamp.ToString(_dateTimeFormat)}]",
-            $"[{logEvent.Level}]",
-            string.IsNullOrEmpty(logEvent.Category) ? null : $"[{logEvent.Category}]",
-            logEvent.Message,
-            logEvent.Exception != null ? FormatException(logEvent.Exception) : null,
-            logEvent.Properties != null && logEvent.Properties.Count > 0
-                ? "props: " + CaptureText.Join(logEvent.Properties)
-                : null,
-            logEvent.Context != null && logEvent.Context.Count > 0
-                ? "ctx: " + CaptureText.Join(logEvent.Context)
-                : null
-        };
+        var line = logEvent.Exception == null
+            ? FormatWithoutException(logEvent)
+            : ExceptionReport.JoinLine(
+                FormatHead(logEvent),
+                ExceptionReport.FormatText(logEvent.Exception),
+                FormatProps(logEvent.Properties),
+                ExceptionReport.FormatContext(logEvent.Context));
+        if (!_includeStackTrace || logEvent.Exception == null)
+            return line;
 
-        return string.Join(" ", parts.Where(p => !string.IsNullOrWhiteSpace(p)));
+        var stack = ReadFullStack(logEvent.Exception);
+        if (stack == null)
+            return line;
+        return line + "\n" + stack;
+    }
+
+    /// <summary>Joins time, level, category, and message with spaces. Blank pieces are left out.</summary>
+    /// <param name="logEvent">Event being rendered. Not null.</param>
+    /// <returns>The head of the line, before the first <c> | </c>.</returns>
+    /// <remarks>
+    /// Does not throw. The time format is the one given to the constructor. At most four pieces are joined.
+    /// The category and the message are escaped with the same rules as an exception message.
+    /// Neither is cut to 500 characters.
+    /// </remarks>
+    private string FormatHead(LogEvent logEvent)
+    {
+        var parts = new List<string>(4);
+        parts.Add("[" + logEvent.Timestamp.ToString(_dateTimeFormat) + "]");
+        parts.Add("[" + logEvent.Level + "]");
+        if (!string.IsNullOrEmpty(logEvent.Category))
+            parts.Add("[" + ExceptionReport.EscapeLine(logEvent.Category) + "]");
+        if (!string.IsNullOrWhiteSpace(logEvent.Message))
+            parts.Add(ExceptionReport.EscapeLine(logEvent.Message));
+        return string.Join(" ", parts);
     }
 
     /// <summary>
-    /// Renders the exception as <c>EX: TypeName: message</c>.
+    /// Renders an event that has no exception with one space join, the same shape as a line that has no tail.
+    /// Property and context segments already start with <c>| </c>, so the join still reads as <c> | </c>.
     /// </summary>
-    /// <param name="ex">Exception on the event. Not null.</param>
-    /// <returns>The exception fragment, without a newline.</returns>
-    /// <remarks>Does not throw. The message is the exception's own message.</remarks>
-    private static string FormatException(Exception ex)
+    /// <param name="logEvent">Event being rendered. Its exception is null.</param>
+    /// <returns>The line, without a trailing newline.</returns>
+    /// <remarks>
+    /// Does not throw. Does not call <see cref="Exception.ToString"/>.
+    /// The category, the message, keys, and values are escaped. The category and the message are not cut to 500 characters.
+    /// Blank slots are left out of the join. The present pieces are copied into one array, then joined once.
+    /// </remarks>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private string FormatWithoutException(LogEvent logEvent)
     {
-        return $"EX: {ex.GetType().Name}: {ex.Message}";
+        var parts = new string[6];
+        var count = 0;
+        parts[count++] = "[" + logEvent.Timestamp.ToString(_dateTimeFormat) + "]";
+        parts[count++] = "[" + logEvent.Level + "]";
+        if (!string.IsNullOrEmpty(logEvent.Category))
+            parts[count++] = "[" + ExceptionReport.EscapeLine(logEvent.Category) + "]";
+        if (!string.IsNullOrWhiteSpace(logEvent.Message))
+            parts[count++] = ExceptionReport.EscapeLine(logEvent.Message);
+        var props = ExceptionReport.FormatProps(logEvent.Properties, leadingPipe: true);
+        if (!string.IsNullOrWhiteSpace(props))
+            parts[count++] = props;
+        var context = ExceptionReport.FormatContext(logEvent.Context, leadingPipe: true);
+        if (!string.IsNullOrWhiteSpace(context))
+            parts[count++] = context;
+        return string.Join(" ", parts.AsSpan(0, count));
+    }
+
+    /// <summary>Renders template properties as <c>props: name=value</c>. Values are escaped like context values.</summary>
+    /// <param name="properties">Property bag. Null or empty omits the segment.</param>
+    /// <returns>The props segment, or null.</returns>
+    /// <remarks>
+    /// The text comes from <see cref="ExceptionReport.FormatProps"/>, the same helper the line uses for context.
+    /// JSON output does not call this method. The loop is bounded by the bag.
+    /// </remarks>
+    private static string? FormatProps(IReadOnlyDictionary<string, object>? properties)
+    {
+        return ExceptionReport.FormatProps(properties);
+    }
+
+    /// <summary>
+    /// Reads <see cref="Exception.ToString"/> and indents every line by four spaces.
+    /// This is the only place a text sink calls <see cref="Exception.ToString"/>.
+    /// </summary>
+    /// <param name="exception">Exception on the event. Not null.</param>
+    /// <returns>The indented stack, or null when <see cref="Exception.ToString"/> returns empty.</returns>
+    /// <remarks>
+    /// Does not throw. A throwing <see cref="Exception.ToString"/> becomes one indented capture placeholder.
+    /// At most 256 lines are kept so a pathological stack cannot grow the record without a bound.
+    /// </remarks>
+    private static string? ReadFullStack(Exception exception)
+    {
+        string? text;
+        try
+        {
+            // shortcut: Exception.ToString walks inners with no cycle guard. A self-referencing exception built via reflection can overflow inside .NET's ToString().
+            text = exception.ToString();
+        }
+        catch (Exception failure)
+        {
+            return "    [capture failed: " + failure.GetType().Name + "]";
+        }
+
+        if (string.IsNullOrEmpty(text))
+            return null;
+        return IndentStack(text);
+    }
+
+    /// <summary>Prefixes each line with four spaces so the stack sits under the summary line.</summary>
+    /// <param name="text">Result of <see cref="Exception.ToString"/>. Not null or empty.</param>
+    /// <returns>The indented block, lines separated by <c>\n</c>.</returns>
+    /// <remarks>Does not throw. A trailing newline does not add a blank indented line. The loop stops at 256 lines.</remarks>
+    private static string IndentStack(string text)
+    {
+        var builder = new System.Text.StringBuilder(text.Length + 16);
+        var start = 0;
+        var lines = 0;
+        for (var i = 0; i <= text.Length && lines < MaxStackLines; i++)
+        {
+            var atEnd = i == text.Length;
+            if (atEnd && start >= text.Length)
+                break;
+            if (!atEnd && text[i] != '\n')
+                continue;
+
+            var end = i;
+            if (end > start && text[end - 1] == '\r')
+                end--;
+            if (lines > 0)
+                builder.Append('\n');
+            builder.Append("    ");
+            builder.Append(text, start, end - start);
+            lines++;
+            start = i + 1;
+        }
+
+        return builder.ToString();
     }
 }

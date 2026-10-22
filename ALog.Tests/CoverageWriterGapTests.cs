@@ -41,7 +41,8 @@ public sealed class CoverageWriterGapTests
             "Orders");
 
         var plain = new PlainTextFormatter("yyyy").Format(evt);
-        Assert.Contains("EX:", plain, StringComparison.Ordinal);
+        Assert.Contains("InvalidOperationException: boom", plain, StringComparison.Ordinal);
+        Assert.DoesNotContain("EX:", plain, StringComparison.Ordinal);
         Assert.Contains("Orders", plain, StringComparison.Ordinal);
         Assert.Contains("A=alpha", plain, StringComparison.Ordinal);
         Assert.Contains("User=ada", plain, StringComparison.Ordinal);
@@ -114,6 +115,8 @@ public sealed class CoverageWriterGapTests
 
         var text = buffer.ToString();
         Assert.Contains("with-ex", text, StringComparison.Ordinal);
+        Assert.Contains("InvalidOperationException: boom", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("EX:", text, StringComparison.Ordinal);
         Assert.Contains("User=ada", text, StringComparison.Ordinal);
         Assert.Contains("async-line", text, StringComparison.Ordinal);
     }

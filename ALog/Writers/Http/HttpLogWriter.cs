@@ -160,6 +160,17 @@ public class HttpLogWriter : ILogWriter, IFormattableLogWriter
         Console.Error.WriteLine($"[HttpLogWriter] HTTP write failed: {ex}");
     }
 
+    /// <summary>
+    /// Builds the request body. A caller-supplied formatter wins.
+    /// The default body uses <see cref="ExceptionReport.CreateBody"/> for the exception,
+    /// so HTTP JSON matches <c>JsonFormatter</c> on <c>type</c>, <c>message</c>, <c>stackTrace</c>, <c>source</c>, and <c>inner</c>.
+    /// </summary>
+    /// <param name="logEvent">Event to send. Not null.</param>
+    /// <returns>The body text. Compact JSON when no formatter is set.</returns>
+    /// <remarks>
+    /// Does not throw from the exception reader. Null <c>stackTrace</c> is still written, matching the previous default body.
+    /// <c>source</c> and <c>inner</c> are omitted when they are null.
+    /// </remarks>
     private string PrepareContent(LogEvent logEvent)
     {
         if (Formatter != null)
@@ -172,12 +183,7 @@ public class HttpLogWriter : ILogWriter, IFormattableLogWriter
             timestamp = logEvent.Timestamp.ToString("o"),
             level = logEvent.Level.ToString(),
             message = logEvent.Message,
-            exception = logEvent.Exception != null ? new
-            {
-                type = logEvent.Exception.GetType().FullName,
-                message = logEvent.Exception.Message,
-                stackTrace = logEvent.Exception.StackTrace
-            } : null,
+            exception = logEvent.Exception != null ? ExceptionReport.CreateBody(logEvent.Exception) : null,
             context = logEvent.Context
         };
 

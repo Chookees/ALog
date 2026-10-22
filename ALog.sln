@@ -29,6 +29,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ALog.HangProbe", "eng\c4-ha
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ALog.QuickstartSample", "samples\ALog.QuickstartSample\ALog.QuickstartSample.csproj", "{CF625E04-9C21-4FC8-84DE-E7F180F95163}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ExfTopLevel", "eng\exf-toplevel\ExfTopLevel.csproj", "{C4E8A1B7-6D24-4F0A-8E55-2B9D7C31A6E0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -71,6 +73,10 @@ Global
 		{CF625E04-9C21-4FC8-84DE-E7F180F95163}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{CF625E04-9C21-4FC8-84DE-E7F180F95163}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{CF625E04-9C21-4FC8-84DE-E7F180F95163}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C4E8A1B7-6D24-4F0A-8E55-2B9D7C31A6E0}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C4E8A1B7-6D24-4F0A-8E55-2B9D7C31A6E0}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C4E8A1B7-6D24-4F0A-8E55-2B9D7C31A6E0}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C4E8A1B7-6D24-4F0A-8E55-2B9D7C31A6E0}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -82,6 +88,7 @@ Global
 		{D8027FF8-1831-4147-8C72-2E481B66FBAD} = {1D56F8AA-5ED7-C3E7-8207-38204C13D36F}
 		{154DFAD5-B88A-4BE5-85A3-1C035337467E} = {7525B257-249C-EE79-B10A-65D0BC27ABA9}
 		{CF625E04-9C21-4FC8-84DE-E7F180F95163} = {5D20AA90-6969-D8BD-9DCD-8634F4692FDA}
+		{C4E8A1B7-6D24-4F0A-8E55-2B9D7C31A6E0} = {7525B257-249C-EE79-B10A-65D0BC27ABA9}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {871AB757-DF71-4C2E-A362-514D4C40A0F8}
