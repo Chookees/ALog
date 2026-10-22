@@ -77,32 +77,51 @@ using ALog.Writers.Console;
 using ALog.Writers.File;
 using ALog.Formatters;
 
-var config = new LoggerConfig()
-    .AddWriter(new ConsoleLogWriter(useColors: true, formatter: new PlainTextFormatter("HH:mm:ss")))
-    .AddWriter(new FileLogWriter("logs/app.log", new JsonFormatter(pretty: true), maxFileSizeInBytes: 1_048_576)) // 1 MB
-    .SetMinimumLevel(LogLevel.Debug);
+internal static class Program
+{
+    /// <summary>
+    /// Runs the Quick Start and waits until the console and file writers have finished.
+    /// Step 2 throws and catches <see cref="InvalidOperationException"/> ("Card declined")
+    /// and logs that exception at error, so the recorded frame is <c>Program.Main</c>.
+    /// The entry point stays synchronous; an async Main would record a compiler state machine instead.
+    /// </summary>
+    private static void Main()
+    {
+        var config = new LoggerConfig()
+            .AddWriter(new ConsoleLogWriter(useColors: true, formatter: new PlainTextFormatter("HH:mm:ss")))
+            .AddWriter(new FileLogWriter("logs/app.log", new JsonFormatter(pretty: true), maxFileSizeInBytes: 1_048_576)) // 1 MB
+            .SetMinimumLevel(LogLevel.Debug);
 
-Log.Init(config);
+        Log.Init(config);
 ```
 
 ### Step 2: Start Logging
 
 ```csharp
-Log.Write("Application started");
+        Log.Write("Application started");
 
-using (Log.BeginScope("userId", 42))
-{
-    using (Log.BeginScope("feature", "Login"))
-    {
-        Log.Write("User successfully authenticated");
-        Log.Write(new Exception("Test failure"), "Something went wrong", LogLevel.Error);
+        using (Log.BeginScope("userId", 42))
+        {
+            using (Log.BeginScope("feature", "Login"))
+            {
+                Log.Write("User successfully authenticated");
+                try
+                {
+                    throw new InvalidOperationException("Card declined");
+                }
+                catch (InvalidOperationException ex)
+                {
+                    Log.Write(ex, "Something went wrong", LogLevel.Error);
+                }
+            }
+        }
+
+        Log.WriteAsync("Async log message").GetAwaiter().GetResult();
+
+        Log.FlushAsync().GetAwaiter().GetResult();
+        Log.Shutdown();
     }
 }
-
-await Log.WriteAsync("Async log message");
-
-await Log.FlushAsync();
-Log.Shutdown();
 ```
 
 ### Example output
@@ -115,19 +134,25 @@ The first entry and the error entry from `logs/app.log` of the same run:
 
 ```json
 {
-  "timestamp": "2026-10-20T20:55:19.4758886Z",
+  "timestamp": "2026-10-22T03:04:19.8022471Z",
   "level": "Info",
   "message": "Application started",
   "properties": {},
   "context": {}
 }
 {
-  "timestamp": "2026-10-20T20:55:19.5318101Z",
+  "timestamp": "2026-10-22T03:04:19.8559513Z",
   "level": "Error",
   "message": "Something went wrong",
   "exception": {
-    "type": "System.Exception",
-    "message": "Test failure"
+    "type": "System.InvalidOperationException",
+    "message": "Card declined",
+    "stackTrace": "   at Program.Main() in /_/Program.cs:line 36",
+    "source": {
+      "method": "Program.Main",
+      "file": "Program.cs",
+      "line": 36
+    }
   },
   "properties": {},
   "context": {

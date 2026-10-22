@@ -6,6 +6,8 @@
     <IsPackable>false</IsPackable>
     <!-- DC-Z2: samples opt out of TreatWarningsAsErrors. Libraries and tests keep the CI gate. -->
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <!-- Stack frames name /_/ instead of the machine path that built the sample. -->
+    <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
     <!--
       The solution build uses the project reference. eng/consumer-smoke.sh readme
       sets ALogSmokeFromFeed so this sample restores the packed nupkgs instead.

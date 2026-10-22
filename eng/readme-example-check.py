@@ -3,7 +3,7 @@
 # Command: dotnet run --project samples/ALog.QuickstartSample
 # Terminal: XTerm(390) on Xvfb, background black, foreground white.
 # Font: DejaVu Sans Mono, size 16.
-# Window size: 1330x166 pixels, xterm geometry 102x6.
+# Window size: 1317x193 pixels, xterm geometry 101x7.
 """Keep the Quick Start README example tied to one real run.
 
 The sample, the screenshot text, and the JSON excerpt are allowed to change

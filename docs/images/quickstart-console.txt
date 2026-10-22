@@ -1,5 +1,5 @@
 $ dotnet run --project samples/ALog.QuickstartSample
-[20:55:19] [Info] Application started
-[20:55:19] [Info] User successfully authenticated ctx: feature=Login, userId=42
-[20:55:19] [Error] Something went wrong EX: Exception: Test failure ctx: feature=Login, userId=42
-[20:55:19] [Info] Async log message
+[03:04:19] [Info] Application started
+[03:04:19] [Info] User successfully authenticated | ctx: feature=Login, userId=42
+[03:04:19] [Error] Something went wrong | InvalidOperationException: Card declined | at Program.Main in Program.cs:36 | ctx: feature=Login, userId=42
+[03:04:19] [Info] Async log message
