@@ -2,8 +2,8 @@
 // scenario T1–T5 and T7 (T6 only in the process runner). The benchmark measures the write call; init runs in
 // IterationSetup, flush and dispose in IterationCleanup and are not measured (the process runner measures them).
 // IterationSetup needs a fixed invocation count, so each class sets [InvocationCount]; the rest is the default job.
-// Queue capacity is Libs.QueueCapacity (10,000) for every library. Invocations per iteration stay <= 10,000 events, so
-// ALog's queue (no Block mode before BKP) cannot overflow inside one iteration and its number is not a drop path.
+// Queue capacity is Libs.QueueCapacity (10,000) for every library. Invocations per iteration stay <= 10,000 events.
+// ALog uses QueueFullMode.Block, so a full queue waits and an iteration does not drop an event.
 using BenchmarkDotNet.Attributes;
 using BenchmarkDotNet.Running;
 

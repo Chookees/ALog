@@ -265,6 +265,8 @@ jobs:
   # Comparison harness smoke (BEN-09). Not a required check.
   # Release build, then N=1000. The job is green only when run.sh exits 0,
   # which is every cell valid or n/a. No performance gate.
+  # After that smoke the lock must be free, a second run must not exit 3,
+  # and a Drop full-queue proof must exit non-zero with every ALog async cell invalid.
   # The harness sets a 30s per-cell hang guard for this N. The job timeout
   # below is the runner backstop, not a measurement bound.
   bench-smoke:
@@ -292,6 +294,54 @@ jobs:
     - name: Smoke N=1000
       working-directory: bench/ALog.Comparison
       run: BENCH_N=1000 ./run.sh 1 ci
+
+    - name: Assert QueueFullMode=Block and a free lock
+      working-directory: bench/ALog.Comparison
+      run: |
+        set -euo pipefail
+        envf=$(find results/_smoke -path '*/ci-*/env.json' -print | sort | tail -n 1)
+        test -n "$envf"
+        python3 - "$envf" <<'PY'
+        import json, sys
+        env = json.load(open(sys.argv[1], encoding="utf-8"))
+        libs = {row["id"]: row.get("queue_full_mode") for row in env["libraries"]}
+        assert libs["alog-async"] == "QueueFullMode=Block", libs
+        assert libs["alog-sync"] == "n/a (no queue)", libs
+        print("env.json queue_full_mode ok", sys.argv[1])
+        PY
+        flock -n /tmp/alog-comparison-bench.lock true
+        set +e
+        BENCH_N=1 BENCH_LIBS=alog-sync BENCH_SCENARIOS=T6 ./run.sh 1 lockcheck
+        status=$?
+        set -e
+        test "$status" -ne 3
+        test "$status" -eq 0
+        echo "lockcheck exit $status"
+
+    - name: Drop mode makes the run invalid
+      working-directory: bench/ALog.Comparison
+      run: |
+        set -euo pipefail
+        set +e
+        BENCH_N=1 BENCH_LIBS=alog-async BENCH_SCENARIOS=T6 BENCH_MUTANT_FULL_MODE=Drop ./run.sh 1 mutant
+        status=$?
+        set -e
+        test "$status" -eq 1
+        echo "mutant exit $status"
+        details=$(find results/_smoke -path '*/mutant-*/details.jsonl' -print | sort | tail -n 1)
+        test -n "$details"
+        python3 - "$details" <<'PY'
+        import json, sys
+        reason = "ALog async requires QueueFullMode=Block for this comparison, but env.json shows Drop. All ALog async cells of this run are invalid."
+        lines = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+        assert lines, "no cells"
+        for row in lines:
+            async_row = row.get("lib") == "alog-async" or (row.get("framework") == "ALog" and row.get("mode") == "async")
+            assert async_row, row
+            assert row.get("valid") == "false", row
+            assert row.get("reason") == reason, row.get("reason")
+        print("mutant invalid ok", sys.argv[1], "exit was required non-zero")
+        PY
 
   badge:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'

@@ -68,9 +68,10 @@ public static class Libs
 
     /// <summary>
     /// Async queue capacity, the same for every library that has a queue (DC 2026-10-22, question 1): NLog
-    /// AsyncTargetWrapper QueueLimit, Serilog.Sinks.Async bufferSize, ALog UseBackgroundQueue capacity. All block
-    /// when full except ALog, which has no Block mode before PR "BKP" (see <see cref="AlogLib.FullMode"/>).
-    /// log4net's BufferingForwardingAppender is a synchronous batch buffer, not a queue; it keeps its default 512.
+    /// AsyncTargetWrapper QueueLimit, Serilog.Sinks.Async bufferSize, ALog UseBackgroundQueue capacity. NLog,
+    /// Serilog, and ALog wait when the queue is full (ALog: <see cref="ALog.Config.QueueFullMode.Block"/>). A lost
+    /// event still makes the cell invalid. log4net's BufferingForwardingAppender is a synchronous batch buffer,
+    /// not a queue; it keeps its default 512.
     /// </summary>
     public const int QueueCapacity = 10_000;
 
@@ -146,29 +147,25 @@ public static class Libs
 
 /// <summary>
 /// ALog through the public <see cref="ALog.Core.LoggerEngine"/>: <c>LogStructured</c> is the only public call that
-/// carries a category (the static <c>Log</c> class has none). Writer: <c>FileLogWriter</c> (one
-/// <c>File.AppendAllText</c> per event; not configurable before BKP). Formatter: <c>PlainTextFormatter</c> with its
-/// standard exception format (EXF one-line form, no forced stack; DC 2026-10-22, question 5) or <c>JsonFormatter</c>.
+/// carries a category (the static <c>Log</c> class has none). Writer: <c>FileLogWriter</c> keeps the file open
+/// (64 KiB buffer, flush at least every 1 s). Formatter: <c>PlainTextFormatter</c> with its
+/// standard exception format (one-line form, no forced stack; DC 2026-10-22, question 5) or <c>JsonFormatter</c>.
 /// </summary>
 /// <remarks>
 /// Async mode: <c>UseBackgroundQueue</c> as in the README "Step 3: Background Queue"
 /// (https://github.com/Chookees/ALog#step-3-background-queue-optional), capacity <see cref="Libs.QueueCapacity"/>,
-/// batch 10, 100 ms. ALog has no Block mode yet: a full queue drops the event (ALOG0070). A cell with a drop fails
-/// the event count and is invalid; DC 2026-10-22 decided that this is intended until PR "BKP" adds a Block mode.
-/// FlushAsync and Dispose wait at most 5 s (C4-02); Close repeats FlushAsync until one returns before that deadline,
-/// then disposes (DC question 2; obsolete after BKP).
+/// batch 10, 100 ms, <see cref="ALog.Config.QueueFullMode.Block"/>. A full queue waits. A lost event still makes
+/// the cell invalid. Close calls <c>FlushAsync</c> once, then <c>Dispose</c>. Both honour <c>FlushTimeout</c>
+/// (default 5 s).
 /// </remarks>
 public sealed class AlogLib(bool useQueue) : ILib
 {
     /// <summary>
-    /// TODO-BKP: the single switch for ALog's queue full mode. ALog 0.2.1 (master 29469ae) has no option, so the
-    /// queue drops when full. When PR "BKP" lands, set its Block option in <see cref="Init"/> at the line marked
-    /// TODO-BKP (use the API name BKP introduces), change this text to the mode set there, and remove the flush retry
-    /// in <see cref="Drain"/> (DC 2026-10-22, questions 1, 2 and 4). Written into Notes and details.jsonl.
+    /// Queue-full behaviour of the async row: <see cref="ALog.Config.QueueFullMode.Block"/>. A full queue waits.
+    /// Written into Notes and env.json (<c>alog_full_mode</c>).
     /// </summary>
-    public const string FullMode = "drop (ALog has no Block mode in this version)";
+    public const string FullMode = "block (QueueFullMode.Block)";
 
-    private static readonly TimeSpan FlushDeadline = TimeSpan.FromMilliseconds(4500);
     private ALog.Core.LoggerEngine? engine;
 
     public string Id => useQueue ? "alog-async" : "alog-sync";
@@ -177,9 +174,29 @@ public sealed class AlogLib(bool useQueue) : ILib
 
     public string Mode => useQueue ? "async" : "sync";
 
+    /// <summary>
+    /// Value of <c>queue_full_mode</c> for this row. Async is <c>QueueFullMode=Block</c> unless a proof run
+    /// selects another mode. Sync is <c>n/a (no queue)</c>.
+    /// </summary>
+    public string QueueFullModeRecord
+    {
+        get
+        {
+            if (!useQueue)
+                return "n/a (no queue)";
+            var raw = Environment.GetEnvironmentVariable("BENCH_MUTANT_FULL_MODE");
+            if (string.IsNullOrWhiteSpace(raw) || string.Equals(raw.Trim(), "Block", StringComparison.OrdinalIgnoreCase))
+                return "QueueFullMode=Block";
+            raw = raw.Trim();
+            if (string.Equals(raw, "Drop", StringComparison.OrdinalIgnoreCase))
+                return "QueueFullMode=Drop";
+            return "QueueFullMode=" + raw;
+        }
+    }
+
     public string Notes => useQueue
-        ? "ALog LoggerEngine + FileLogWriter; UseBackgroundQueue(capacity=10000, batch 10, 100 ms) per README Step 3; full mode: " + FullMode + ", a drop makes the cell invalid (decided 2026-10-22); Close = FlushAsync until it returns before the 5 s deadline, then Dispose (obsolete once a Block mode exists); FileLogWriter appends per event (File.AppendAllText), not configurable in this version; PlainTextFormatter standard exception format / JsonFormatter"
-        : "ALog LoggerEngine + FileLogWriter on the caller thread (no queue); extra row, not ranked (decided 2026-10-22); FileLogWriter appends per event (File.AppendAllText); PlainTextFormatter standard exception format / JsonFormatter";
+        ? "ALog LoggerEngine + FileLogWriter; the file stays open (64 KiB buffer, flush every 1 s); UseBackgroundQueue(capacity=10000, batch 10, 100 ms) per README Step 3; full mode: " + FullMode + "; FlushTimeout 5 s; Close flushes once, then disposes; PlainTextFormatter standard exception format / JsonFormatter"
+        : "ALog LoggerEngine + FileLogWriter on the caller thread (no queue); extra row, not ranked (decided 2026-10-22); the file stays open (64 KiB buffer, flush every 1 s); PlainTextFormatter standard exception format / JsonFormatter";
 
     public bool Ranked => useQueue;
 
@@ -192,11 +209,14 @@ public sealed class AlogLib(bool useQueue) : ILib
             : new ALog.Formatters.PlainTextFormatter("yyyy-MM-dd'T'HH:mm:ss.fff'Z'");
         var cfg = new ALog.Config.LoggerConfig()
             .AddWriter(new ALog.Writers.File.FileLogWriter(config.Path, formatter))
-            .SetMinimumLevel(config.Filtered ? ALog.LogLevel.Warn : ALog.LogLevel.Info);
+            .SetMinimumLevel(config.Filtered ? ALog.LogLevel.Warn : ALog.LogLevel.Info)
+            .SetFileBufferSize(65536)
+            .SetFileFlushInterval(TimeSpan.FromSeconds(1))
+            .SetFlushTimeout(TimeSpan.FromSeconds(5));
         if (useQueue)
         {
             cfg.UseBackgroundQueue(true, Libs.QueueCapacity);
-            // TODO-BKP: set ALog's Block full mode here once PR "BKP" provides it (see FullMode). No such option exists yet.
+            cfg.SetQueueFullMode(ConfiguredMode());
         }
 
         engine = new ALog.Core.LoggerEngine(cfg);
@@ -212,22 +232,31 @@ public sealed class AlogLib(bool useQueue) : ILib
 
     public void Drain()
     {
-        if (!useQueue)
+        if (!useQueue || engine is null)
             return;
-        for (var i = 0; i < 1000; i++)
-        {
-            var sw = Stopwatch.StartNew();
-            engine!.FlushAsync().GetAwaiter().GetResult();
-            if (sw.Elapsed < FlushDeadline)
-                return;
-        }
+        engine.FlushAsync().GetAwaiter().GetResult();
     }
 
     public void Close()
     {
+        if (engine is null)
+            return;
         Drain();
-        engine!.Dispose();
+        engine.Dispose();
         engine = null;
+    }
+
+    /// <summary>
+    /// Mode passed to <see cref="ALog.Config.LoggerConfig.SetQueueFullMode"/>. Block, unless
+    /// <c>BENCH_MUTANT_FULL_MODE</c> names something else; any other value builds with Drop so the
+    /// recorded <see cref="QueueFullModeRecord"/> cannot be Block.
+    /// </summary>
+    private ALog.Config.QueueFullMode ConfiguredMode()
+    {
+        var raw = Environment.GetEnvironmentVariable("BENCH_MUTANT_FULL_MODE");
+        if (!string.IsNullOrWhiteSpace(raw) && !string.Equals(raw.Trim(), "Block", StringComparison.OrdinalIgnoreCase))
+            return ALog.Config.QueueFullMode.Drop;
+        return ALog.Config.QueueFullMode.Block;
     }
 }
 

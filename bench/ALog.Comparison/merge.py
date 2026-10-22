@@ -2,13 +2,17 @@
 """Merge ALog comparison results.
 
 Reads every <results>/<agent>-<ts>/raw.csv (directories starting with "_" such as _smoke are skipped unless
---include-underscore) and writes:
+--include-underscore; a merged-<date> directory has no raw.csv and is skipped) and writes, by default, into
+<results>/merged-<YYYY-MM-DD>/ (UTC date; --out overrides):
   merged.csv   all rows of all runs, fixed columns plus "source" (the run directory)
   summary.csv  valid rows only, grouped
                  scope=agent   per runner x framework x mode x scenario
                  scope=overall per framework x mode x scenario across all runners
                with count, mean, stddev (sample), min, max for every metric
 Invalid and n/a rows are counted (invalid, n_a) but never enter the statistics.
+An ALog async row stays valid only when that run's env.json records queue_full_mode
+QueueFullMode=Block on the alog-async library. Any other value, or a missing record,
+marks those rows invalid so they are counted and left out of the means.
 Ranking: ALog sync is an extra row (decided 2026-10-22). It gets ranked=no and is excluded from
 rank_total_ms. rank_total_ms orders the ranked rows of one scope/runner/scenario by total_ms_mean (1 = lowest);
 only groups with valid rows get a rank. Use only ranked=yes rows for the evaluation.
@@ -18,9 +22,11 @@ Standard library only.
 """
 import argparse
 import csv
+import json
 import os
 import statistics
 import sys
+from datetime import datetime, timezone
 
 COLUMNS = ["runner", "run", "framework", "version", "scenario", "mode", "n", "total_ms", "cpu_ms", "cpu_pct",
            "peak_ws_mb", "alloc_bytes_per_op", "mean_ns_per_op", "events_per_s", "valid"]
@@ -30,18 +36,39 @@ UNRANKED = {("ALog", "sync")}
 SCENARIO_ORDER = {s: i for i, s in enumerate(["T1", "T2", "T7", "T3", "T4", "T5", "T6"])}
 
 
+def async_block_recorded(run_dir):
+    """True only when env.json lists alog-async queue_full_mode as exactly QueueFullMode=Block."""
+    env_path = os.path.join(run_dir, "env.json")
+    try:
+        with open(env_path, encoding="utf-8") as f:
+            env = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    libs = env.get("libraries")
+    if not isinstance(libs, list):
+        return False
+    for lib in libs:
+        if isinstance(lib, dict) and lib.get("id") == "alog-async":
+            return lib.get("queue_full_mode") == "QueueFullMode=Block"
+    return False
+
+
 def read_runs(root, include_underscore):
     rows = []
     for name in sorted(os.listdir(root)):
-        path = os.path.join(root, name, "raw.csv")
+        run_dir = os.path.join(root, name)
+        path = os.path.join(run_dir, "raw.csv")
         if not os.path.isfile(path) or (name.startswith("_") and not include_underscore):
             continue
+        block_ok = async_block_recorded(run_dir)
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             if reader.fieldnames != COLUMNS:
                 sys.exit(f"{path}: columns {reader.fieldnames} differ from the fixed column list {COLUMNS}")
             for r in reader:
                 r["source"] = name
+                if not block_ok and r.get("framework") == "ALog" and r.get("mode") == "async":
+                    r["valid"] = "false"
                 rows.append(r)
     return rows
 
@@ -95,13 +122,14 @@ def summarize(rows, key_fields, scope):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--results", required=True, help="results root containing <agent>-<ts>/raw.csv")
-    ap.add_argument("--out", help="output directory (default: the results root)")
+    ap.add_argument("--out", help="output directory (default: <results>/merged-<YYYY-MM-DD>, UTC date)")
     ap.add_argument("--include-underscore", action="store_true", help="also read _smoke and other _* directories")
     a = ap.parse_args()
     rows = read_runs(a.results, a.include_underscore)
     if not rows:
         sys.exit(f"no raw.csv under {a.results}")
-    out = a.out or a.results
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out = a.out or os.path.join(a.results, "merged-" + day)
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "merged.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS + ["source"], lineterminator="\n")
