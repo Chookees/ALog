@@ -47,7 +47,7 @@
 ### Changed
 
 - `FileLogWriter` keeps the file open and writes buffered lines instead of opening and closing it for every event. By default, lines reach the file within 1 second; set `FileFlushInterval` to `0` for the previous per-event behavior.
-- A log file now has a single writer process. A second process that opens the same file for writing gets an error; give each process its own file. Reading, tailing, and rotating the file still work.
+- A log file must have a single writer process; give each process its own file. On Windows a second writer gets an error; on Linux and macOS it is not detected and lines from both processes can mix. Reading, tailing, and rotating the file from outside still work (rename or copy-and-truncate); after a rename, ALog starts the new file within one second, or within `FileFlushInterval` if that is longer.
 
 ## 0.2.0
 

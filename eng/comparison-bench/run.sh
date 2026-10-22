@@ -18,34 +18,23 @@
 #   BENCH_MUTANT_FULL_MODE      proof switch for the ALog async queue mode (Block when unset)
 set -euo pipefail
 
-# PID of another process that holds an flock on the lock file. Empty when it cannot be named.
-# Prefers /proc/locks (FLOCK row, same inode). Skips this shell: it has the file open but does not hold the lock.
+# PID of another process that holds an flock on the lock file. Empty when /proc/locks has no matching FLOCK row.
+# Matches the lock file's inode. Skips this shell: it has the file open but does not hold the lock.
 lock_holder_pid() {
   local lock="$1"
-  local ino="" kind="" pid="" devino="" token=""
+  local ino="" kind="" pid="" devino=""
   ino="$(stat -c '%i' "$lock" 2>/dev/null || true)"
-  if [[ -n "$ino" && -r /proc/locks ]]; then
-    while read -r _ kind _ _ pid devino _; do
-      [[ "$kind" == "FLOCK" ]] || continue
-      [[ "$devino" == *":$ino" ]] || continue
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      [[ "$pid" == "$$" ]] && continue
-      printf '%s\n' "$pid"
-      return 0
-    done < /proc/locks
+  if [[ -z "$ino" || ! -r /proc/locks ]]; then
+    return 0
   fi
-  if command -v fuser >/dev/null 2>&1; then
-    local text=""
-    text="$(fuser "$lock" 2>&1 || true)"
-    text="${text//"$lock"/ }"
-    for token in $text; do
-      pid="${token//[^0-9]/}"
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      [[ "$pid" == "$$" ]] && continue
-      printf '%s\n' "$pid"
-      return 0
-    done
-  fi
+  while read -r _ kind _ _ pid devino _; do
+    [[ "$kind" == "FLOCK" ]] || continue
+    [[ "$devino" == *":$ino" ]] || continue
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" == "$$" ]] && continue
+    printf '%s\n' "$pid"
+    return 0
+  done < /proc/locks
   return 0
 }
 

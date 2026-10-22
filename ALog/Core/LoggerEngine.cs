@@ -78,18 +78,25 @@ public class LoggerEngine : ILogger, IDisposable
     }
 
     /// <summary>
-    /// Gives each file writer the configuration buffer, interval, and this engine's clock before any event.
+    /// Gives each file writer this engine's clock, and the configuration buffer or interval when that option was set.
     /// </summary>
     /// <param name="config">The engine configuration. Not null.</param>
     /// <param name="clock">The engine clock. Not null.</param>
-    /// <remarks>Does not throw. A writer that is not a <see cref="FileLogWriter"/> is skipped. The loop is bounded by the writer list.</remarks>
+    /// <remarks>
+    /// Does not throw. A writer that is not a <see cref="FileLogWriter"/> is skipped. The loop is bounded by the writer list.
+    /// A set <see cref="ILogConfiguration.HasFileBufferSize"/> or <see cref="ILogConfiguration.HasFileFlushInterval"/>
+    /// replaces the writer's constructor value. An option that was not set leaves the constructor value,
+    /// including an explicit zero interval or an explicit 4096-byte buffer. The clock is always the engine clock.
+    /// </remarks>
     private static void ApplyFileStartup(ILogConfiguration config, TimeProvider clock)
     {
         var writers = config.Writers;
+        int? buffer = config.HasFileBufferSize ? config.FileBufferSize : null;
+        TimeSpan? interval = config.HasFileFlushInterval ? config.FileFlushInterval : null;
         for (var i = 0; i < writers.Count; i++)
         {
             if (writers[i] is FileLogWriter file)
-                file.ApplyStartup(config.FileBufferSize, config.FileFlushInterval, clock);
+                file.ApplyStartup(buffer, interval, clock);
         }
     }
 

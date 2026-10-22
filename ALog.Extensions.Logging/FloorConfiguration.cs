@@ -58,6 +58,12 @@ internal sealed class FloorConfiguration : ILogConfiguration
     /// <summary>The inner file flush interval.</summary>
     public TimeSpan FileFlushInterval => _inner.FileFlushInterval;
 
+    /// <summary>True when the inner configuration named a file buffer size.</summary>
+    public bool HasFileBufferSize => _inner.HasFileBufferSize;
+
+    /// <summary>True when the inner configuration named a file flush interval.</summary>
+    public bool HasFileFlushInterval => _inner.HasFileFlushInterval;
+
     /// <summary>The inner flush timeout.</summary>
     public TimeSpan FlushTimeout => _inner.FlushTimeout;
 }

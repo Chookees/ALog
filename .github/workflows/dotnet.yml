@@ -64,6 +64,7 @@ jobs:
         python3 eng/test_analyzer_ratchet_check.py
         bash eng/test_bb_grep.sh
         bash eng/test_clk_grep.sh
+        bash eng/test_lock_pid.sh
         bash eng/test_build_base_assemblies.sh
         python3 eng/test_coverage_metadata.py
         python3 eng/test_sync_wait_check.py
@@ -267,6 +268,7 @@ jobs:
   # which is every cell valid or n/a. No performance gate.
   # After that smoke the lock must be free, a second run must not exit 3,
   # and a Drop full-queue proof must exit non-zero with every ALog async cell invalid.
+  # queue_full_mode is read back from the built configuration before the smoke.
   # The harness sets a 30s per-cell hang guard for this N. The job timeout
   # below is the runner backstop, not a measurement bound.
   bench-smoke:
@@ -290,6 +292,17 @@ jobs:
 
     - name: Build comparison harness
       run: dotnet build eng/comparison-bench -c Release --nologo
+
+    - name: Queue mode is read back from the built configuration
+      working-directory: eng/comparison-bench
+      run: |
+        set -euo pipefail
+        bin="bin/Release/net10.0/ALog.Comparison.dll"
+        mode=$(dotnet "$bin" queue-mode | tail -n 1)
+        test "$mode" = "QueueFullMode=Block"
+        mode=$(BENCH_MUTANT_FULL_MODE=Drop dotnet "$bin" queue-mode | tail -n 1)
+        test "$mode" = "QueueFullMode=Drop"
+        echo "queue-mode read-back ok"
 
     - name: Smoke N=1000
       working-directory: eng/comparison-bench
@@ -342,6 +355,31 @@ jobs:
             assert row.get("reason") == reason, row.get("reason")
         print("mutant invalid ok", sys.argv[1], "exit was required non-zero")
         PY
+
+  # Windows file identity for external rename and delete. Not a required check.
+  # Copy-and-truncate stays on Linux: a second writer is denied on Windows.
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      with:
+        global-json-file: global.json
+
+    - name: Assert SDK version
+      shell: bash
+      run: |
+        version=$(dotnet --version)
+        echo "dotnet --version ${version}"
+        test "$version" = "10.0.402"
+
+    - name: File rotation tests
+      run: dotnet test ALog.Tests/ALog.Tests.csproj -c Release --nologo --filter FullyQualifiedName~BkpExternalRotationTests
 
   badge:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'

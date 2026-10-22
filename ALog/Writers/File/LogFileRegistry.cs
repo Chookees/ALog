@@ -9,7 +9,9 @@ using ALog.Core;
 /// </summary>
 /// <remarks>
 /// The dictionary key is <see cref="Path.GetFullPath(string)"/>. Windows compares it without case. Other systems do not.
-/// A second process that writes the same file is unsupported. This registry does not take an advisory lock.
+/// The stream is opened with <see cref="FileShare.Read"/> and <see cref="FileShare.Delete"/>, and not <see cref="FileShare.Write"/>.
+/// On Windows that share mode makes a second writer fail with a sharing violation. On Linux and macOS it does not,
+/// so lines from two processes can mix. This registry does not take an advisory lock.
 /// </remarks>
 internal static class LogFileRegistry
 {
@@ -19,6 +21,7 @@ internal static class LogFileRegistry
 
     private static readonly Dictionary<string, SharedLogFile> Files = new(PathComparer);
     private static int _openCount;
+    private static int _identityChecks;
 
     /// <summary>The lock around <see cref="Files"/>. Callers must not take it while they hold a file lock.</summary>
     internal static object Gate { get; } = new();
@@ -31,6 +34,16 @@ internal static class LogFileRegistry
     internal static void NoteOpen()
     {
         Interlocked.Increment(ref _openCount);
+    }
+
+    /// <summary>How many times an open file was compared with its path. A skipped check does not count.</summary>
+    internal static int IdentityCheckCount => Volatile.Read(ref _identityChecks);
+
+    /// <summary>Records one path comparison.</summary>
+    /// <remarks>Does not throw. Called under the file lock when the check is due or forced.</remarks>
+    internal static void NoteIdentityCheck()
+    {
+        Interlocked.Increment(ref _identityChecks);
     }
 
     /// <summary>
@@ -89,7 +102,10 @@ internal static class LogFileRegistry
 /// </summary>
 /// <remarks>
 /// The stream is opened with <see cref="FileShare.Read"/> and <see cref="FileShare.Delete"/> so another handle can read or rename it.
+/// Omitting <see cref="FileShare.Write"/> stops a second writer on Windows only. Linux and macOS still allow one, and the lines can mix.
 /// The timer is disposed outside the file lock. The callback also takes that lock.
+/// An external rename, delete, or truncate is noticed on the flush tick, on <see cref="Flush"/>, and before this process rotates the file.
+/// The path comparison runs at most once per <see cref="FileFlushInterval"/>, or once per second when that interval is zero.
 /// </remarks>
 internal sealed class SharedLogFile
 {
@@ -106,6 +122,7 @@ internal sealed class SharedLogFile
     private int _closed;
     private FileStream? _stream;
     private ITimer? _timer;
+    private DateTimeOffset _lastIdentityCheck;
 
     /// <summary>Stores the first opener's settings. The stream stays closed until the first append.</summary>
     /// <param name="path">Normalized full path. Not null.</param>
@@ -144,13 +161,16 @@ internal sealed class SharedLogFile
     }
 
     /// <summary>
-    /// Replaces the buffer, interval, and clock when the stream is not open yet.
+    /// Replaces the clock, and the buffer or interval when the configuration set that option, before the stream opens.
     /// </summary>
-    /// <param name="bufferSize">Bytes collected before a write. The caller checked the range.</param>
-    /// <param name="interval">Flush interval. Zero writes every line.</param>
-    /// <param name="clock">Clock for the interval. Not null.</param>
-    /// <remarks>Does not throw. A call after the first open keeps the settings that opened the stream.</remarks>
-    internal void ApplyStartup(int bufferSize, TimeSpan interval, TimeProvider clock)
+    /// <param name="bufferSize">New buffer, or null to keep the constructor size.</param>
+    /// <param name="interval">New interval, or null to keep the constructor interval. Zero writes every line.</param>
+    /// <param name="clock">Clock for the interval and the path check. Not null.</param>
+    /// <remarks>
+    /// Does not throw. A call after the first open keeps the settings that opened the stream.
+    /// Null leaves the value the constructor stored, so an explicit writer argument is not replaced by the default.
+    /// </remarks>
+    internal void ApplyStartup(int? bufferSize, TimeSpan? interval, TimeProvider clock)
     {
         ArgumentNullException.ThrowIfNull(clock);
         lock (_fileLock)
@@ -158,11 +178,17 @@ internal sealed class SharedLogFile
             if (_opened != 0)
                 return;
 
-            _bufferSize = bufferSize;
-            _interval = interval;
+            if (bufferSize is int size)
+            {
+                _bufferSize = size;
+                if (_buffer.Length != size)
+                    _buffer = new byte[size];
+            }
+
+            if (interval is TimeSpan gap)
+                _interval = gap;
+
             _clock = clock;
-            if (_buffer.Length != bufferSize)
-                _buffer = new byte[bufferSize];
         }
     }
 
@@ -179,10 +205,22 @@ internal sealed class SharedLogFile
         EnsureOpen();
         lock (_fileLock)
         {
-            if (_closed != 0 || _stream is null)
+            if (_closed != 0)
+                return;
+
+            if (_stream is null)
+                TryReopen();
+            if (_stream is null)
+                return;
+
+            Reconcile(force: false);
+            if (_stream is null)
                 return;
 
             RotateIfNeeded(maxBytes);
+            if (_stream is null)
+                return;
+
             WriteLine(line);
         }
     }
@@ -196,6 +234,7 @@ internal sealed class SharedLogFile
             if (_closed != 0 && _stream is null)
                 return;
 
+            Reconcile(force: true);
             FlushPending();
         }
     }
@@ -275,6 +314,7 @@ internal sealed class SharedLogFile
 
         Volatile.Write(ref _opened, 1);
         LogFileRegistry.NoteOpen();
+        _lastIdentityCheck = _clock.GetUtcNow();
         if (_timer is null && _interval > TimeSpan.Zero)
         {
             _timer = _clock.CreateTimer(
@@ -299,6 +339,7 @@ internal sealed class SharedLogFile
 
             try
             {
+                Reconcile(force: true);
                 FlushPending();
             }
             catch (Exception ex)
@@ -306,6 +347,75 @@ internal sealed class SharedLogFile
                 System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
             }
         }
+    }
+
+    /// <summary>
+    /// Reopens the configured path when it no longer names the open file, and seeks to the end after an external truncate.
+    /// </summary>
+    /// <param name="force">True on a flush tick, <see cref="Flush"/>, and before this process rotates. False waits for the check gap.</param>
+    /// <remarks>
+    /// The caller holds the file lock. A forced call still runs when the gap has not elapsed.
+    /// A call that is not forced returns until <see cref="FileFlushInterval"/> has elapsed, or one second when that interval is zero.
+    /// A missing path or a different file is flushed into the old stream, closed, and opened again.
+    /// The same file whose length is behind the write position is seeked to the end before the next write, so a truncate does not leave a gap.
+    /// </remarks>
+    private void Reconcile(bool force)
+    {
+        if (_closed != 0 || _stream is null)
+            return;
+
+        if (!force && !IdentityCheckDue())
+            return;
+
+        LogFileRegistry.NoteIdentityCheck();
+        _lastIdentityCheck = _clock.GetUtcNow();
+        if (!FileIdentity.TryMatch(_stream.SafeFileHandle, _path, out var openLength))
+        {
+            ReopenPath();
+            return;
+        }
+
+        if (openLength < _stream.Position)
+        {
+            _stream.Seek(0, SeekOrigin.End);
+            _logicalLength = _stream.Position + _pending;
+        }
+    }
+
+    /// <summary>True when the clock says the path may be compared again.</summary>
+    /// <returns>True when no check has been recorded or the gap has elapsed.</returns>
+    /// <remarks>The caller holds the file lock. Does not touch the disk. The gap is the flush interval, or one second when the interval is zero.</remarks>
+    private bool IdentityCheckDue()
+    {
+        if (_lastIdentityCheck == default)
+            return true;
+
+        var gap = _interval > TimeSpan.Zero ? _interval : TimeSpan.FromSeconds(1);
+        return _clock.GetUtcNow() - _lastIdentityCheck >= gap;
+    }
+
+    /// <summary>Writes the buffer into the current stream, closes it, and opens <see cref="Path"/> again.</summary>
+    /// <remarks>
+    /// The caller holds the file lock. The buffered bytes are written before the old stream is closed.
+    /// A failed flush or close is reported and the path is still opened again.
+    /// A failed open leaves the stream unset and throws, so the caller reports it on the write-error path.
+    /// </remarks>
+    private void ReopenPath()
+    {
+        var stream = _stream!;
+        try
+        {
+            FlushPending();
+            _stream = null;
+            stream.Dispose();
+        }
+        catch (Exception ex)
+        {
+            _stream = null;
+            System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+        }
+
+        OpenStream();
     }
 
     /// <summary>Moves the file when the next line would start at or past <paramref name="maxBytes"/>.</summary>
@@ -318,6 +428,10 @@ internal sealed class SharedLogFile
 
         try
         {
+            Reconcile(force: true);
+            if (_stream is null || _logicalLength <= 0 || _logicalLength < maxBytes.Value)
+                return;
+
             FlushPending();
             var stream = _stream;
             _stream = null;

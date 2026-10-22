@@ -29,6 +29,20 @@ public interface ILogConfiguration
     /// <remarks>Zero writes every event. A default keeps an older implementation compiling.</remarks>
     TimeSpan FileFlushInterval => LogOptionRules.DefaultInterval;
 
+    /// <summary>
+    /// True when this configuration named a file buffer size.
+    /// False leaves each <c>FileLogWriter</c> at the size it was constructed with.
+    /// </summary>
+    /// <remarks>A default keeps an older implementation compiling. The engine reads this once at startup.</remarks>
+    bool HasFileBufferSize => false;
+
+    /// <summary>
+    /// True when this configuration named a file flush interval.
+    /// False leaves each <c>FileLogWriter</c> at the interval it was constructed with.
+    /// </summary>
+    /// <remarks>A default keeps an older implementation compiling. The engine reads this once at startup.</remarks>
+    bool HasFileFlushInterval => false;
+
     /// <summary>How long flush and shutdown wait. The default is 5 seconds.</summary>
     /// <remarks>Zero does not wait. A default keeps an older implementation compiling.</remarks>
     TimeSpan FlushTimeout => LogOptionRules.DefaultFlushTimeout;

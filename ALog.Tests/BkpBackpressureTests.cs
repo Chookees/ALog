@@ -680,7 +680,7 @@ public sealed class BkpBackpressureTests : IDisposable
         Assert.Contains("`FileBufferSize`: how much `FileLogWriter` collects before it writes to the file. Default 64 KiB, 4 KiB to 16 MiB.", readme, StringComparison.Ordinal);
         Assert.Contains("`FileFlushInterval`: how often buffered lines are written even if the buffer is not full. Default 1 s, 0 to 60 s. `0` writes every event right away.", readme, StringComparison.Ordinal);
         Assert.Contains("`FlushTimeout`: how long `Flush`, `Dispose`, and `Shutdown` wait for queued events. Default 5 s, 0 to 60 s. Events still unwritten after that are counted (ALOG0071).", readme, StringComparison.Ordinal);
-        Assert.Contains("Each log file has one writer process. Give each process its own file; other programs can still read, tail, and rotate it.", readme, StringComparison.Ordinal);
+        Assert.Contains("Each log file has one writer process: give each process its own file. Other programs can read, tail, and rotate it.", readme, StringComparison.Ordinal);
         Assert.Contains("If the process crashes, the file can miss up to one `FileFlushInterval` or one `FileBufferSize` of lines, whichever comes first. Set `FileFlushInterval` to `0` if every line must reach the operating system immediately.", readme, StringComparison.Ordinal);
         Assert.DoesNotContain(OneWriterProvisional, readme, StringComparison.Ordinal);
         Assert.DoesNotContain(ChangelogProvisional, readme, StringComparison.Ordinal);
@@ -690,7 +690,7 @@ public sealed class BkpBackpressureTests : IDisposable
         Assert.Contains("`FileBufferSize` and `FileFlushInterval` control how `FileLogWriter` buffers lines.", changelog, StringComparison.Ordinal);
         Assert.Contains("`FlushTimeout` sets how long `Flush`, `Dispose`, and `Shutdown` wait (0 to 60 s, default 5 s; previously fixed at 5 s).", changelog, StringComparison.Ordinal);
         Assert.Contains("`FileLogWriter` keeps the file open and writes buffered lines instead of opening and closing it for every event. By default, lines reach the file within 1 second; set `FileFlushInterval` to `0` for the previous per-event behavior.", changelog, StringComparison.Ordinal);
-        Assert.Contains("A log file now has a single writer process. A second process that opens the same file for writing gets an error; give each process its own file. Reading, tailing, and rotating the file still work.", changelog, StringComparison.Ordinal);
+        Assert.Contains("A log file must have a single writer process; give each process its own file. On Windows a second writer gets an error; on Linux and macOS it is not detected and lines from both processes can mix. Reading, tailing, and rotating the file from outside still work (rename or copy-and-truncate); after a rename, ALog starts the new file within one second, or within `FileFlushInterval` if that is longer.", changelog, StringComparison.Ordinal);
     }
 
     /// <summary>A zero flush timeout reports events that are still open and does not arm a wait.</summary>

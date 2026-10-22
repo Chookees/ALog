@@ -148,10 +148,11 @@ After the timed span the child checks the file: the number of records must equal
 every record must contain the scenario's message, and the first, a middle and the last record must contain the
 timestamp, level, category, message, values (T2/T7) or all three exception types of the chain (T3). Any
 miss sets `valid=false`; the reason is in `details.jsonl`. `BENCH_MUTANT_DROP=1` skips one event to prove that
-a lost event makes the cell invalid. `BENCH_MUTANT_FULL_MODE=Drop` builds the ALog queue with Drop and records
-`QueueFullMode=Drop` in `env.json`. Every ALog async cell of that run is then invalid, and `run.sh` exits with
-status 1. Unset, or `Block`, records `QueueFullMode=Block`. Any other recorded mode does the same: the run is
-invalid and the exit status is 1. The reason names the mode from `env.json`, or `missing` when that record is absent.
+a lost event makes the cell invalid. `BENCH_MUTANT_FULL_MODE=Drop` builds the ALog queue with Drop.
+`env.json` records the mode read back from that configuration (`QueueFullMode=Drop`), not the environment variable.
+Every ALog async cell of that run is then invalid, and `run.sh` exits with
+status 1. Unset, or `Block`, records `QueueFullMode=Block`. Any other value is stored as Drop, so the record is
+`QueueFullMode=Drop` and the run is invalid. The reason names the mode from `env.json`, or `missing` when that record is absent.
 
 The order of the libraries is shuffled per run and scenario with a seed (`BENCH_SEED`, otherwise random). The
 seed is in `env.json` and every `details.jsonl` line. A cell that runs longer than the hang guard

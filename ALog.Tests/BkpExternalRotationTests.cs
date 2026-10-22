@@ -1,0 +1,637 @@
+using System.Globalization;
+using System.Reflection;
+using System.Runtime.Versioning;
+using System.Text;
+using ALog.Config;
+using ALog.Core;
+using ALog.Public.Interfaces;
+using ALog.Writers.File;
+using Microsoft.Extensions.Time.Testing;
+using Microsoft.Win32.SafeHandles;
+
+namespace ALog.Tests;
+
+/// <summary>
+/// External rename, delete, and truncate of a file that <see cref="FileLogWriter"/> still has open.
+/// </summary>
+public sealed class BkpExternalRotationTests
+{
+    /// <summary>
+    /// A rename leaves the first line in the old file and the next line in a new file at the configured path.
+    /// </summary>
+    /// <remarks>
+    /// The clock moves one second because a zero flush interval checks the path at most that often.
+    /// Removing the path comparison writes the second line into the renamed file.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalRename_PutsTheNextLineInTheNewFile()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            var rotated = path + ".1";
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock);
+            writer.Write(Event("first-line"));
+            File.Move(path, rotated);
+            clock.Advance(TimeSpan.FromSeconds(1));
+            writer.Write(Event("second-line"));
+            writer.Dispose();
+
+            var oldText = File.ReadAllText(rotated);
+            var newText = File.ReadAllText(path);
+            Assert.Contains("first-line", oldText, StringComparison.Ordinal);
+            Assert.DoesNotContain("second-line", oldText, StringComparison.Ordinal);
+            Assert.Contains("second-line", newText, StringComparison.Ordinal);
+            Assert.DoesNotContain("first-line", newText, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A path that someone else recreated is appended to. The renamed file keeps the earlier line.</summary>
+    /// <remarks>The two files have different identities. Skipping the comparison appends the new line to the renamed file.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalRename_AppendsWhenThePathWasRecreated()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            var rotated = path + ".1";
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock);
+            writer.Write(Event("first-line"));
+            File.Move(path, rotated);
+            File.WriteAllText(path, "external\n");
+            clock.Advance(TimeSpan.FromSeconds(1));
+            writer.Write(Event("second-line"));
+            writer.Dispose();
+
+            var oldText = File.ReadAllText(rotated);
+            var newText = File.ReadAllText(path);
+            Assert.Contains("first-line", oldText, StringComparison.Ordinal);
+            Assert.DoesNotContain("second-line", oldText, StringComparison.Ordinal);
+            Assert.Contains("external", newText, StringComparison.Ordinal);
+            Assert.Contains("second-line", newText, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>Bytes still in the buffer are written to the renamed file before that handle is closed.</summary>
+    /// <remarks>
+    /// The flush interval is the check. Closing without flushing leaves the renamed file empty.
+    /// The new file must not receive that buffered line.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalRename_FlushesBufferedLinesIntoTheRenamedFile()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            var rotated = path + ".1";
+            var interval = TimeSpan.FromSeconds(60);
+            using var writer = new FileLogWriter(path, fileFlushInterval: interval, clock: clock);
+            writer.Write(Event("buffered-line"));
+            Assert.DoesNotContain("buffered-line", ReadShared(path), StringComparison.Ordinal);
+            File.Move(path, rotated);
+            clock.Advance(interval);
+
+            Assert.Contains("buffered-line", File.ReadAllText(rotated), StringComparison.Ordinal);
+            Assert.DoesNotContain("buffered-line", ReadShared(path), StringComparison.Ordinal);
+            Assert.True(File.Exists(path));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>Size rotation does not rename a file that an external move already took. The buffered line stays with the old file.</summary>
+    /// <remarks>The check is forced because a rotation is about to run, even though the flush interval has not elapsed.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalRename_KeepsSizeRotationOffTheReplacement()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            var rotated = path + ".1";
+            using var writer = new FileLogWriter(
+                path,
+                maxFileSizeInBytes: 1,
+                fileFlushInterval: TimeSpan.FromSeconds(60),
+                clock: clock);
+            writer.Write(Event("first-line"));
+            File.Move(path, rotated);
+            writer.Write(Event("second-line"));
+            writer.Dispose();
+
+            Assert.Contains("first-line", File.ReadAllText(rotated), StringComparison.Ordinal);
+            Assert.Contains("second-line", File.ReadAllText(path), StringComparison.Ordinal);
+            Assert.Equal(2, Directory.GetFiles(directory).Length);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>Deleting the path makes the next line create it again.</summary>
+    /// <remarks>The open handle still refers to the deleted inode until the check closes it.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalDelete_RecreatesThePath()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock);
+            writer.Write(Event("first-line"));
+            File.Delete(path);
+            Assert.False(File.Exists(path));
+            clock.Advance(TimeSpan.FromSeconds(1));
+            writer.Write(Event("second-line"));
+            writer.Dispose();
+
+            var text = File.ReadAllText(path);
+            Assert.Contains("second-line", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("first-line", text, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// Copy-and-truncate leaves the next line at the start of the file and does not insert zero bytes.
+    /// </summary>
+    /// <remarks>
+    /// On Unix an append stream does not move when another handle truncates the file.
+    /// Skipping the length comparison writes the next line at the old offset and the read-back contains zero bytes.
+    /// Windows denies that second write because the share mode excludes writers, so this case is the Unix one.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalTruncate_WritesTheNextLineAtTheStart()
+    {
+        await Task.CompletedTask;
+        if (OperatingSystem.IsWindows())
+            return;
+
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            var copy = path + ".1";
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock);
+            writer.Write(Event("first-line"));
+            File.Copy(path, copy);
+            using (var truncating = new FileStream(path, FileMode.Truncate, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+            {
+            }
+
+            clock.Advance(TimeSpan.FromSeconds(1));
+            writer.Write(Event("second-line"));
+            writer.Dispose();
+
+            var raw = File.ReadAllBytes(path);
+            Assert.NotEmpty(raw);
+            Assert.Equal(-1, Array.IndexOf(raw, (byte)0));
+            Assert.Single(File.ReadAllLines(path));
+            var text = Encoding.UTF8.GetString(raw);
+            Assert.Contains("second-line", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("first-line", text, StringComparison.Ordinal);
+            Assert.Equal((byte)'[', raw[0]);
+            Assert.Contains("first-line", File.ReadAllText(copy), StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A zero flush interval compares the path once after a one-second gap, not on every event.</summary>
+    /// <remarks>
+    /// Comparing on every event makes the first burst larger than one.
+    /// Removing the comparison leaves the count at zero after the gap.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalCheck_SkipsABurstAndRunsAfterTheGap()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            var before = LogFileRegistry.IdentityCheckCount;
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock);
+            for (var i = 0; i < 8; i++)
+                writer.Write(Event("n" + i.ToString(CultureInfo.InvariantCulture)));
+
+            Assert.Equal(0, LogFileRegistry.IdentityCheckCount - before);
+            clock.Advance(TimeSpan.FromSeconds(1) - TimeSpan.FromTicks(1));
+            writer.Write(Event("early"));
+            Assert.Equal(0, LogFileRegistry.IdentityCheckCount - before);
+            clock.Advance(TimeSpan.FromTicks(1));
+            writer.Write(Event("due"));
+            Assert.Equal(1, LogFileRegistry.IdentityCheckCount - before);
+            for (var i = 0; i < 8; i++)
+                writer.Write(Event("m" + i.ToString(CultureInfo.InvariantCulture)));
+            Assert.Equal(1, LogFileRegistry.IdentityCheckCount - before);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>An explicit zero interval still writes the first event when the configuration does not set one.</summary>
+    /// <remarks>Applying the configuration default of one second on every writer leaves this line in the buffer.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExplicitFileInterval_ReachesDiskOnTheFirstEvent()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "explicit.log");
+            using var engine = new LoggerEngine(
+                new LoggerConfig().AddWriter(new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock)),
+                clock);
+            engine.Log("on-disk");
+            Assert.Contains("on-disk", ReadShared(path), StringComparison.Ordinal);
+            engine.Dispose();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>An explicit 4096-byte buffer flushes when it fills, not at 64 KiB.</summary>
+    /// <remarks>The configuration does not set a buffer. Overwriting the constructor with 64 KiB keeps both lines in memory.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExplicitFileBuffer_FlushesWhenThatBufferFills()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "buffer.log");
+            using var engine = new LoggerEngine(
+                new LoggerConfig().AddWriter(new FileLogWriter(
+                    path,
+                    fileBufferSize: 4096,
+                    fileFlushInterval: TimeSpan.FromSeconds(60),
+                    clock: clock)),
+                clock);
+            var payload = new string('B', 3000);
+            engine.Log(payload);
+            Assert.DoesNotContain(payload, ReadShared(path), StringComparison.Ordinal);
+            engine.Log(payload);
+            Assert.Contains(payload, ReadShared(path), StringComparison.Ordinal);
+            engine.Dispose();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A configuration interval applies when the writer was constructed without one.</summary>
+    /// <remarks>Ignoring a set interval leaves the default of one second, so the line stays buffered.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ConfigFileInterval_AppliesWhenTheWriterUsesTheDefault()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "config.log");
+            using var engine = new LoggerEngine(
+                new LoggerConfig()
+                    .AddWriter(new FileLogWriter(path, clock: clock))
+                    .SetFileFlushInterval(TimeSpan.Zero),
+                clock);
+            engine.Log("from-config");
+            Assert.Contains("from-config", ReadShared(path), StringComparison.Ordinal);
+            engine.Dispose();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A configuration buffer of 4096 applies when the writer was constructed without a buffer.</summary>
+    /// <remarks>The writer's interval stays the explicit one minute, so only the smaller buffer can explain the bytes.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ConfigFileBuffer_AppliesWhenTheWriterUsesTheDefault()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "config-buffer.log");
+            using var engine = new LoggerEngine(
+                new LoggerConfig()
+                    .AddWriter(new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60), clock: clock))
+                    .SetFileBufferSize(4096),
+                clock);
+            var payload = new string('C', 3000);
+            engine.Log(payload);
+            Assert.DoesNotContain(payload, ReadShared(path), StringComparison.Ordinal);
+            engine.Log(payload);
+            Assert.Contains(payload, ReadShared(path), StringComparison.Ordinal);
+            engine.Dispose();
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A closed handle and a descriptor the runtime cannot stat are not the open file.</summary>
+    /// <remarks>The length is zero on both failures. A live descriptor is required for the unknown-fd case.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalIdentity_RejectsClosedAndUnknownHandles()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "id.log");
+            var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+            var handle = stream.SafeFileHandle;
+            Assert.Throws<ArgumentNullException>(() => FileIdentity.TryMatch(null!, path, out _));
+            Assert.Throws<ArgumentNullException>(() => FileIdentity.TryMatch(handle, null!, out _));
+            stream.Dispose();
+            Assert.False(FileIdentity.TryMatch(handle, path, out var closedLength));
+            Assert.Equal(0, closedLength);
+
+            using var unknown = new SafeFileHandle(new IntPtr(int.MaxValue), ownsHandle: false);
+            Assert.False(FileIdentity.TryMatch(unknown, path, out var unknownLength));
+            Assert.Equal(0, unknownLength);
+
+            using var invalid = new SafeFileHandle(new IntPtr(-1), ownsHandle: false);
+            Assert.False(FileIdentity.TryMatch(invalid, path, out var invalidLength));
+            Assert.Equal(0, invalidLength);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>After a failed reopen, the next event tries the path again and still drops the line while the directory is locked.</summary>
+    /// <remarks>The first failure is the rotation. The next event finds no stream and reports its own write failure.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalReopen_RetriesWhenTheDirectoryIsLocked()
+    {
+        await Task.CompletedTask;
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var directory = NewDirectory();
+        var previous = Console.Error;
+        var buffer = new StringWriter();
+        Console.SetError(buffer);
+        try
+        {
+            var path = Path.Combine(directory, "retry.log");
+            var mode = ReadDirectoryMode(directory);
+            using var writer = new FileLogWriter(path, maxFileSizeInBytes: 1, fileFlushInterval: TimeSpan.Zero);
+            try
+            {
+                writer.Write(Event("first-line"));
+                File.Delete(path);
+                LockDirectory(directory, mode);
+                writer.Write(Event("second-line"));
+                writer.Write(Event("third-line"));
+            }
+            finally
+            {
+                RestoreDirectory(directory, mode);
+            }
+
+            writer.Write(Event("fourth-line"));
+            var text = File.ReadAllText(path);
+            Assert.Contains("fourth-line", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("third-line", text, StringComparison.Ordinal);
+            var errors = buffer.ToString();
+            Assert.Contains("Rolling failed", errors, StringComparison.Ordinal);
+            Assert.Contains("Write failed", errors, StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(previous);
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// A flush that fails while the path is switched is reported, and the writer opens the path again.
+    /// </summary>
+    /// <remarks>
+    /// The old handle is a full device, so the buffered bytes cannot be written. The buffer size is also
+    /// different from the array, which is the branch taken when the stream is opened again.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalReopen_ReportsAFlushFailureOnTheOldHandle()
+    {
+        await Task.CompletedTask;
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        var directory = NewDirectory();
+        var clock = NewClock();
+        var previous = Console.Error;
+        var buffer = new StringWriter();
+        Console.SetError(buffer);
+        FileStream? replaced = null;
+        try
+        {
+            var path = Path.Combine(directory, "full.log");
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60), clock: clock);
+            writer.Write(Event("buffered-line"));
+            var shared = SharedOf(writer);
+            var original = (FileStream)GetField(shared, "_stream")!;
+            replaced = new FileStream(
+                "/dev/full",
+                FileMode.Open,
+                FileAccess.Write,
+                FileShare.ReadWrite | FileShare.Delete);
+            SetField(shared, "_stream", replaced);
+            original.Dispose();
+            SetField(shared, "_bufferSize", 8192);
+            writer.Flush();
+            Assert.Contains("Write failed", buffer.ToString(), StringComparison.Ordinal);
+            writer.Write(Event("after-failure"));
+            clock.Advance(TimeSpan.FromSeconds(60));
+            Assert.Contains("after-failure", ReadShared(path), StringComparison.Ordinal);
+        }
+        finally
+        {
+            try
+            {
+                replaced?.Dispose();
+            }
+            catch (IOException)
+            {
+            }
+
+            Console.SetError(previous);
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A missing check time compares the path on the next event.</summary>
+    /// <remarks>Opening the stream records a time, so this clears that field and writes again without moving the clock.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalCheck_RunsWhenNoCheckWasRecorded()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "due.log");
+            var before = LogFileRegistry.IdentityCheckCount;
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock);
+            writer.Write(Event("first"));
+            Assert.Equal(0, LogFileRegistry.IdentityCheckCount - before);
+            SetField(SharedOf(writer), "_lastIdentityCheck", default(DateTimeOffset));
+            writer.Write(Event("second"));
+            Assert.Equal(1, LogFileRegistry.IdentityCheckCount - before);
+            Assert.Contains("second", ReadShared(path), StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A flush tick after dispose returns without touching the file.</summary>
+    /// <remarks>The timer is disposed with the writer. This calls the tick once more, which is what a late callback does.</remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalFlush_StopsWhenTheWriterIsClosed()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        try
+        {
+            var path = Path.Combine(directory, "closed.log");
+            var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(30), clock: clock);
+            writer.Write(Event("kept"));
+            var shared = SharedOf(writer);
+            writer.Dispose();
+            var tick = typeof(SharedLogFile).GetMethod("OnInterval", BindingFlags.Instance | BindingFlags.NonPublic);
+            Assert.NotNull(tick);
+            tick!.Invoke(shared, null);
+            Assert.Contains("kept", File.ReadAllText(path), StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    private static object SharedOf(FileLogWriter writer)
+    {
+        var field = typeof(FileLogWriter).GetField("_shared", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        var shared = field!.GetValue(writer);
+        Assert.NotNull(shared);
+        return shared!;
+    }
+
+    private static object? GetField(object target, string name)
+    {
+        var field = target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        return field!.GetValue(target);
+    }
+
+    private static void SetField(object target, string name, object? value)
+    {
+        var field = target.GetType().GetField(name, BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        field!.SetValue(target, value);
+    }
+
+    [SupportedOSPlatform("linux")]
+    private static UnixFileMode ReadDirectoryMode(string directory)
+        => File.GetUnixFileMode(directory);
+
+    /// <summary>Removes write permission so a create in this directory fails.</summary>
+    /// <param name="directory">The directory. Not null.</param>
+    /// <param name="mode">The mode to start from. Write bits are cleared.</param>
+    [SupportedOSPlatform("linux")]
+    private static void LockDirectory(string directory, UnixFileMode mode)
+        => File.SetUnixFileMode(directory, mode & ~(UnixFileMode.UserWrite | UnixFileMode.GroupWrite | UnixFileMode.OtherWrite));
+
+    /// <summary>Puts the directory mode back so the test can delete it.</summary>
+    /// <param name="directory">The directory. Not null.</param>
+    /// <param name="mode">The mode from <see cref="ReadDirectoryMode"/>.</param>
+    [SupportedOSPlatform("linux")]
+    private static void RestoreDirectory(string directory, UnixFileMode mode)
+        => File.SetUnixFileMode(directory, mode);
+
+    private static string ReadShared(string path)
+    {
+        if (!File.Exists(path))
+            return string.Empty;
+
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using var reader = new StreamReader(stream);
+        return reader.ReadToEnd();
+    }
+
+    private static FakeTimeProvider NewClock()
+        => new(new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero));
+
+    private static LogEvent Event(string message)
+        => new(new DateTime(2026, 6, 1, 0, 0, 0, DateTimeKind.Utc), LogLevel.Info, message, null, null);
+
+    private static string NewDirectory()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "alog-bkp-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(path);
+        return path;
+    }
+
+    private static void DeleteDirectory(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+                Directory.Delete(path, recursive: true);
+        }
+        catch (IOException)
+        {
+        }
+    }
+}

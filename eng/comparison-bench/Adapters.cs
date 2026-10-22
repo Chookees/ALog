@@ -175,22 +175,20 @@ public sealed class AlogLib(bool useQueue) : ILib
     public string Mode => useQueue ? "async" : "sync";
 
     /// <summary>
-    /// Value of <c>queue_full_mode</c> for this row. Async is <c>QueueFullMode=Block</c> unless a proof run
-    /// selects another mode. Sync is <c>n/a (no queue)</c>.
+    /// Value of <c>queue_full_mode</c> for this row. Async is the mode stored on the built configuration
+    /// after <see cref="ALog.Config.LoggerConfig.SetQueueFullMode"/>. Sync is <c>n/a (no queue)</c>.
     /// </summary>
+    /// <remarks>
+    /// The text is read back from that configuration. It is not copied from the environment.
+    /// Omitting <see cref="ALog.Config.LoggerConfig.SetQueueFullMode"/> leaves <see cref="ALog.Config.QueueFullMode.Drop"/>.
+    /// </remarks>
     public string QueueFullModeRecord
     {
         get
         {
             if (!useQueue)
                 return "n/a (no queue)";
-            var raw = Environment.GetEnvironmentVariable("BENCH_MUTANT_FULL_MODE");
-            if (string.IsNullOrWhiteSpace(raw) || string.Equals(raw.Trim(), "Block", StringComparison.OrdinalIgnoreCase))
-                return "QueueFullMode=Block";
-            raw = raw.Trim();
-            if (string.Equals(raw, "Drop", StringComparison.OrdinalIgnoreCase))
-                return "QueueFullMode=Drop";
-            return "QueueFullMode=" + raw;
+            return "QueueFullMode=" + CreateConfig(null).QueueFullMode;
         }
     }
 
@@ -204,22 +202,38 @@ public sealed class AlogLib(bool useQueue) : ILib
 
     public void Init(LibConfig config)
     {
-        ALog.Public.Interfaces.ILogFormatter formatter = config.Format == Fmt.Json
-            ? new ALog.Formatters.JsonFormatter()
-            : new ALog.Formatters.PlainTextFormatter("yyyy-MM-dd'T'HH:mm:ss.fff'Z'");
-        var cfg = new ALog.Config.LoggerConfig()
-            .AddWriter(new ALog.Writers.File.FileLogWriter(config.Path, formatter))
-            .SetMinimumLevel(config.Filtered ? ALog.LogLevel.Warn : ALog.LogLevel.Info)
-            .SetFileBufferSize(65536)
-            .SetFileFlushInterval(TimeSpan.FromSeconds(1))
-            .SetFlushTimeout(TimeSpan.FromSeconds(5));
+        engine = new ALog.Core.LoggerEngine(CreateConfig(config));
+    }
+
+    /// <summary>
+    /// Builds the configuration this row logs with. <paramref name="file"/> null skips the file writer
+    /// and still applies the queue mode, so a read-back sees the same <see cref="ALog.Config.LoggerConfig.SetQueueFullMode"/> call.
+    /// </summary>
+    /// <param name="file">Cell paths and format, or null when only the queue mode is required.</param>
+    /// <returns>A configuration the caller owns. Not sealed.</returns>
+    /// <remarks>Does not open a log file when <paramref name="file"/> is null. Does not throw for a null file.</remarks>
+    private ALog.Config.LoggerConfig CreateConfig(LibConfig? file)
+    {
+        var cfg = new ALog.Config.LoggerConfig();
+        if (file is not null)
+        {
+            ALog.Public.Interfaces.ILogFormatter formatter = file.Format == Fmt.Json
+                ? new ALog.Formatters.JsonFormatter()
+                : new ALog.Formatters.PlainTextFormatter("yyyy-MM-dd'T'HH:mm:ss.fff'Z'");
+            cfg.AddWriter(new ALog.Writers.File.FileLogWriter(file.Path, formatter))
+                .SetMinimumLevel(file.Filtered ? ALog.LogLevel.Warn : ALog.LogLevel.Info)
+                .SetFileBufferSize(65536)
+                .SetFileFlushInterval(TimeSpan.FromSeconds(1))
+                .SetFlushTimeout(TimeSpan.FromSeconds(5));
+        }
+
         if (useQueue)
         {
             cfg.UseBackgroundQueue(true, Libs.QueueCapacity);
             cfg.SetQueueFullMode(ConfiguredMode());
         }
 
-        engine = new ALog.Core.LoggerEngine(cfg);
+        return cfg;
     }
 
     public void Simple() => engine!.LogStructured(Texts.Category, ALog.LogLevel.Info, null, Texts.Simple);
@@ -248,8 +262,8 @@ public sealed class AlogLib(bool useQueue) : ILib
 
     /// <summary>
     /// Mode passed to <see cref="ALog.Config.LoggerConfig.SetQueueFullMode"/>. Block, unless
-    /// <c>BENCH_MUTANT_FULL_MODE</c> names something else; any other value builds with Drop so the
-    /// recorded <see cref="QueueFullModeRecord"/> cannot be Block.
+    /// <c>BENCH_MUTANT_FULL_MODE</c> names something else. Any other value is stored as Drop.
+    /// <see cref="QueueFullModeRecord"/> reads that stored mode back.
     /// </summary>
     private ALog.Config.QueueFullMode ConfiguredMode()
     {

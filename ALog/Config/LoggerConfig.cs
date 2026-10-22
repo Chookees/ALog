@@ -31,6 +31,8 @@ public class LoggerConfig : ILogConfiguration
     private QueueFullMode _queueFullMode = QueueFullMode.Drop;
     private int _fileBufferSize = LogOptionRules.DefaultBuffer;
     private TimeSpan _fileFlushInterval = LogOptionRules.DefaultInterval;
+    private bool _fileBufferSet;
+    private bool _fileIntervalSet;
     private TimeSpan _flushTimeout = LogOptionRules.DefaultFlushTimeout;
     private int _sealed;
     private int _reportedMode;
@@ -46,6 +48,12 @@ public class LoggerConfig : ILogConfiguration
 
     /// <summary>How often a file buffer is written when it is not full.</summary>
     public TimeSpan FileFlushInterval => _fileFlushInterval;
+
+    /// <summary>True after <see cref="SetFileBufferSize"/> stored a size. That size then wins over a writer's constructor.</summary>
+    public bool HasFileBufferSize => _fileBufferSet;
+
+    /// <summary>True after <see cref="SetFileFlushInterval"/> stored an interval. That interval then wins over a writer's constructor.</summary>
+    public bool HasFileFlushInterval => _fileIntervalSet;
 
     /// <summary>How long flush and shutdown wait.</summary>
     public TimeSpan FlushTimeout => _flushTimeout;
@@ -128,7 +136,12 @@ public class LoggerConfig : ILogConfiguration
     /// <param name="bytes">The size in bytes.</param>
     /// <returns>This configuration. The previous size stays when the call is ignored.</returns>
     /// <exception cref="InvalidOperationException"><paramref name="bytes"/> is outside the range and the configuration is not sealed.</exception>
-    /// <remarks>After <see cref="Seal"/>, reports ALOG0105 once and does not change the stored size.</remarks>
+    /// <remarks>
+    /// After <see cref="Seal"/>, reports ALOG0105 once and does not change the stored size.
+    /// A successful call marks the size as set, so the engine applies it to every file writer,
+    /// including one constructed with an explicit buffer. A writer keeps its constructor buffer
+    /// only when this setter was never called.
+    /// </remarks>
     public LoggerConfig SetFileBufferSize(int bytes)
     {
         if (RejectedBySeal(ref _reportedBuffer, "FileBufferSize"))
@@ -136,6 +149,7 @@ public class LoggerConfig : ILogConfiguration
 
         LogOptionRules.RequireBuffer(bytes, LogOptionRules.PathOf("FileBufferSize"));
         _fileBufferSize = bytes;
+        _fileBufferSet = true;
         return this;
     }
 
@@ -143,7 +157,12 @@ public class LoggerConfig : ILogConfiguration
     /// <param name="interval">The interval. Zero writes every event.</param>
     /// <returns>This configuration. The previous interval stays when the call is ignored.</returns>
     /// <exception cref="InvalidOperationException"><paramref name="interval"/> is outside the range and the configuration is not sealed.</exception>
-    /// <remarks>After <see cref="Seal"/>, reports ALOG0105 once and does not change the stored interval.</remarks>
+    /// <remarks>
+    /// After <see cref="Seal"/>, reports ALOG0105 once and does not change the stored interval.
+    /// A successful call marks the interval as set, so the engine applies it to every file writer,
+    /// including one constructed with an explicit interval. A writer keeps its constructor interval
+    /// only when this setter was never called.
+    /// </remarks>
     public LoggerConfig SetFileFlushInterval(TimeSpan interval)
     {
         if (RejectedBySeal(ref _reportedInterval, "FileFlushInterval"))
@@ -151,6 +170,7 @@ public class LoggerConfig : ILogConfiguration
 
         LogOptionRules.RequireDuration(interval, LogOptionRules.PathOf("FileFlushInterval"));
         _fileFlushInterval = interval;
+        _fileIntervalSet = true;
         return this;
     }
 

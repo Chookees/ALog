@@ -3,6 +3,7 @@
 //   ALog.Comparison cell <lib> <scenario> <workdir>                  one cell in this process, prints "RESULT {json}"
 //   ALog.Comparison micro [BenchmarkDotNet args]                     BenchmarkDotNet (MemoryDiagnoser, ThreadingDiagnoser)
 //   ALog.Comparison versions                                         package versions as JSON
+//   ALog.Comparison queue-mode                                       ALog async queue_full_mode read back from the built configuration
 using System.Text.Json;
 
 namespace AlogComparison;
@@ -27,6 +28,9 @@ public static class Program
             case "versions":
                 Console.Out.WriteLine(JsonSerializer.Serialize(Libs.Versions()));
                 return 0;
+            case "queue-mode":
+                Console.Out.WriteLine(new AlogLib(useQueue: true).QueueFullModeRecord);
+                return 0;
             default:
                 return Usage();
         }
@@ -34,7 +38,7 @@ public static class Program
 
     private static int Usage()
     {
-        Console.Error.WriteLine("usage: ALog.Comparison run --runs R --agent NAME --out DIR [--seed S] | cell <lib> <scenario> <workdir> | micro [...] | versions");
+        Console.Error.WriteLine("usage: ALog.Comparison run --runs R --agent NAME --out DIR [--seed S] | cell <lib> <scenario> <workdir> | micro [...] | versions | queue-mode");
         Console.Error.WriteLine("libs: " + string.Join(", ", Libs.All) + "; scenarios: " + string.Join(", ", Scenario.All));
         return 2;
     }

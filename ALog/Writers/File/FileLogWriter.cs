@@ -34,7 +34,10 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     /// <exception cref="InvalidOperationException">An explicit buffer or interval is outside its range.</exception>
     /// <remarks>
     /// Does not open the file. The first write does. Two writers in this process for the same normalized path share one stream.
-    /// A second process writing the same file is unsupported.
+    /// On Windows a second process writing the same file gets a sharing violation. On Linux and macOS that second writer is not detected.
+    /// An explicit buffer or interval is kept when the <see cref="LoggerConfig"/> never calls
+    /// <see cref="LoggerConfig.SetFileBufferSize"/> or <see cref="LoggerConfig.SetFileFlushInterval"/>.
+    /// A configuration that does call the setter replaces this constructor value.
     /// </remarks>
     public FileLogWriter(
         string filePath,
@@ -87,13 +90,16 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     }
 
     /// <summary>
-    /// Applies the engine's buffer, interval, and clock before the first write.
+    /// Applies the engine clock, and the buffer or interval when the configuration set that option.
     /// </summary>
-    /// <param name="bufferSize">Bytes collected before a write.</param>
-    /// <param name="interval">Flush interval. Zero writes every event.</param>
+    /// <param name="bufferSize">Bytes collected before a write, or null to keep this writer's constructor size.</param>
+    /// <param name="interval">Flush interval, or null to keep this writer's constructor interval. Zero writes every event.</param>
     /// <param name="clock">The engine clock. Not null.</param>
-    /// <remarks>Does not throw. A call after the file is open keeps the settings that opened it.</remarks>
-    internal void ApplyStartup(int bufferSize, TimeSpan interval, TimeProvider clock)
+    /// <remarks>
+    /// Does not throw. A call after the file is open keeps the settings that opened it.
+    /// Null means the configuration did not set that option, so an explicit constructor value stays.
+    /// </remarks>
+    internal void ApplyStartup(int? bufferSize, TimeSpan? interval, TimeProvider clock)
     {
         _shared.ApplyStartup(bufferSize, interval, clock);
     }
