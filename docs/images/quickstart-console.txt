@@ -1,0 +1,5 @@
+$ dotnet run --project samples/ALog.QuickstartSample
+[03:43:09] [Info] Application started
+[03:43:10] [Info] User successfully authenticated | ctx: feature=Login, userId=42
+[03:43:10] [Error] Payment failed | InvalidOperationException: Card declined | at Program.Main in Program.cs:33 | ctx: feature=Checkout, orderId=17
+[03:43:10] [Info] Async log message

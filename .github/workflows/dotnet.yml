@@ -56,6 +56,7 @@ jobs:
         bash eng/test_vuln_check.sh
         bash eng/test_start_sql.sh
         bash eng/test_consumer_smoke.sh
+        python3 eng/readme-example-check.py --self-test
         bash eng/test_s4_grep.sh
         python3 eng/test_coverage_gate.py
         python3 eng/test_coverage_badge.py
@@ -231,6 +232,9 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        # git log -1 on the screenshot files must see the commit that added them.
+        fetch-depth: 0
 
     - name: Setup .NET
       uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
@@ -245,6 +249,18 @@ jobs:
 
     - name: Consumer smoke console
       run: bash eng/consumer-smoke.sh console
+
+    - name: Consumer smoke readme
+      run: bash eng/consumer-smoke.sh readme
+
+    - name: Upload readme smoke artifacts
+      if: always()
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+      with:
+        name: readme-smoke
+        path: ${{ runner.temp }}/readme-smoke
+        retention-days: 7
+        if-no-files-found: error
 
   badge:
     if: github.event_name == 'push' && github.ref == 'refs/heads/master'

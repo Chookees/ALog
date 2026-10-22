@@ -95,7 +95,21 @@ using (Log.BeginScope("userId", 42))
     using (Log.BeginScope("feature", "Login"))
     {
         Log.Write("User successfully authenticated");
-        Log.Write(new Exception("Test failure"), "Something went wrong", LogLevel.Error);
+    }
+}
+
+using (Log.BeginScope("orderId", 17))
+{
+    using (Log.BeginScope("feature", "Checkout"))
+    {
+        try
+        {
+            throw new InvalidOperationException("Card declined");
+        }
+        catch (InvalidOperationException ex)
+        {
+            Log.Write(ex, "Payment failed", LogLevel.Error);
+        }
     }
 }
 
@@ -104,6 +118,46 @@ await Log.WriteAsync("Async log message");
 await Log.FlushAsync();
 Log.Shutdown();
 ```
+
+### Example output
+
+Step 1 and Step 2 together are a complete program: [`samples/ALog.QuickstartSample`](https://github.com/Chookees/ALog/tree/master/samples/ALog.QuickstartSample). Running it prints this to the console:
+
+![Console output of the Quick Start sample from Step 1 and Step 2](https://raw.githubusercontent.com/Chookees/ALog/master/docs/images/quickstart-console.png)
+
+The first entry and the error entry from `logs/app.log` of the same run:
+
+```json
+{
+  "timestamp": "2026-10-22T03:43:09.9681404Z",
+  "level": "Info",
+  "message": "Application started",
+  "properties": {},
+  "context": {}
+}
+{
+  "timestamp": "2026-10-22T03:43:10.0425193Z",
+  "level": "Error",
+  "message": "Payment failed",
+  "exception": {
+    "type": "System.InvalidOperationException",
+    "message": "Card declined",
+    "stackTrace": "   at Program.\u003CMain\u003E$(String[] args) in /_/Program.cs:line 33",
+    "source": {
+      "method": "Program.Main",
+      "file": "Program.cs",
+      "line": 33
+    }
+  },
+  "properties": {},
+  "context": {
+    "feature": "Checkout",
+    "orderId": 17
+  }
+}
+```
+
+Both come from a real run of the sample, unedited.
 
 ### Step 3: Background Queue (Optional)
 

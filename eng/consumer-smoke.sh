@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Packs ALog and runs the console consumer that arc_spec 4.1 point 7 describes.
-# Usage: eng/consumer-smoke.sh file|console
+# Packs ALog and runs one consumer that arc_spec 4.1 point 7 and DOC-02 describe.
+# Usage: eng/consumer-smoke.sh file|console|readme
 #
-# Both modes restore with -p:ALogSmokeFromFeed=true and print
+# file and console restore with -p:ALogSmokeFromFeed=true and print
 # SMOKE-PACKAGE ALog <version> from-feed and the same line for
 # ALog.Extensions.Logging after checking project.assets.json and both SHA-512s.
 # file is green when SMOKE-<guid> appears once in the ALog file and the process
 # exits 0. console prints SMOKE-CONSOLE count=<n> and is green only when n is 1.
+# readme packs the same feed, runs the Quick Start sample in an empty directory,
+# and asks eng/readme-example-check.py to compare that run with the README.
 # ALog does not add a console writer unless ALog:Console:Enabled is true, so the
 # Microsoft console provider writes the line once. The normal solution build uses the
 # project reference; only this script selects the packed package.
@@ -171,12 +173,13 @@ prove_feed_package() {
   python3 eng/smoke-assets-check.py "$1" "$2" "$3"
 }
 
-# Accepts the two smoke jobs. Args: file or console. Returns 1 for anything else.
+# Accepts the smoke jobs. Args: file, console, or readme. Returns 1 for anything else.
+# readme runs the Quick Start sample against the same packed feed as the other two.
 require_smoke_mode() {
   case "$1" in
-    file|console) return 0 ;;
+    file|console|readme) return 0 ;;
   esac
-  echo "Usage: eng/consumer-smoke.sh file|console" >&2
+  echo "Usage: eng/consumer-smoke.sh file|console|readme" >&2
   return 1
 }
 
@@ -370,10 +373,146 @@ run_consumer() {
   return "$status"
 }
 
+# Proves the Quick Start project builds from the solution and from the feed.
+# Args: csproj path, expected package version. Returns 1 when the smoke switch
+# or either package version is wrong. Both packages are referenced so the same
+# SHA-512 proof used by file and console can read this project's assets file.
+assert_quickstart_project() {
+  local path="$1"
+  local expected="$2"
+  python3 - "$path" "$expected" << 'PY'
+import sys
+import xml.etree.ElementTree as ET
+path, expected = sys.argv[1], sys.argv[2]
+raw = open(path, encoding="utf-8").read()
+if "'$(ALogSmokeFromFeed)' == 'true'" not in raw or "'$(ALogSmokeFromFeed)' != 'true'" not in raw:
+    sys.stderr.write("quickstart sample is missing the ALogSmokeFromFeed switch\n")
+    sys.exit(1)
+root = ET.parse(path).getroot()
+found = {}
+found_project = False
+for element in root.iter():
+    if element.tag.endswith("ProjectReference") and "ALog.csproj" in element.attrib.get("Include", ""):
+        found_project = True
+    if element.tag.endswith("PackageReference"):
+        name = element.attrib.get("Include", "")
+        if name in ("ALog", "ALog.Extensions.Logging"):
+            found[name] = element.attrib.get("Version", "")
+for name in ("ALog", "ALog.Extensions.Logging"):
+    version = found.get(name, "")
+    if version != expected:
+        sys.stderr.write(f"quickstart {name} version {version} != {expected}\n")
+        sys.exit(1)
+if not found_project:
+    sys.stderr.write("quickstart sample needs a project reference to ALog\n")
+    sys.exit(1)
+PY
+}
+
+# Restores the Quick Start sample from the local feed.
+# Args: work directory. Deletes obj so a project-reference assets file cannot be reused.
+# Returns the dotnet restore status.
+restore_quickstart() {
+  local work="$1"
+  rm -rf samples/ALog.QuickstartSample/obj
+  dotnet restore samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj \
+    -p:ALogSmokeFromFeed=true --configfile "$work/nuget.config" --nologo
+}
+
+# Builds the already restored feed-based Quick Start sample.
+# The property stays on so the build cannot switch back to the project reference.
+# Returns the dotnet build status.
+build_quickstart() {
+  dotnet build samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj \
+    -c Release -p:ALogSmokeFromFeed=true --no-restore --nologo
+}
+
+# Runs the sample in an empty directory and writes the console transcript.
+# Args: work directory. The transcript is the prompt line plus process stdout,
+# because that is the text the screenshot shows and the README check compares.
+# Copies logs/app.log to the work directory when the sample created it.
+# Returns the sample's exit code.
+run_quickstart_in_empty_dir() {
+  local work="$1"
+  local empty="$work/empty"
+  local project
+  project="$(pwd)/samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj"
+  mkdir -p "$empty"
+  clear_inherited_alog_keys
+  local status=0
+  (
+    cd "$empty"
+    dotnet run --project "$project" -c Release --no-build -p:ALogSmokeFromFeed=true
+  ) >"$work/process-stdout.txt" 2>"$work/stderr.txt" || status=$?
+  {
+    printf '%s\n' '$ dotnet run --project samples/ALog.QuickstartSample'
+    cat "$work/process-stdout.txt"
+  } > "$work/stdout.txt"
+  if [ -f "$empty/logs/app.log" ]; then
+    cp "$empty/logs/app.log" "$work/app.log"
+  fi
+  return "$status"
+}
+
+# Copies the transcript and the log into the job artifact directory.
+# Args: work directory. Uses RUNNER_TEMP on CI so the workflow can upload them.
+# A missing file is skipped so a failed run still publishes what was written.
+# Prints the directory. Returns 0.
+publish_readme_artifacts() {
+  local work="$1"
+  local dest
+  if [ -n "${RUNNER_TEMP:-}" ]; then
+    dest="${RUNNER_TEMP}/readme-smoke"
+  else
+    dest="$work/readme-smoke"
+  fi
+  mkdir -p "$dest"
+  local name
+  for name in stdout.txt app.log process-stdout.txt stderr.txt; do
+    if [ -f "$work/$name" ]; then
+      cp "$work/$name" "$dest/$name"
+    fi
+  done
+  printf 'readme artifacts: %s\n' "$dest"
+}
+
+# Packs, proves the feed, and runs the Quick Start sample in an empty directory.
+# Args: package version. Exit 0 is required, and stdout plus logs/app.log are
+# kept for the README check and for the CI artifact upload.
+# Returns 1 when the feed proof, the sample, or the README check fails.
+run_readme_mode() {
+  local version="$1"
+  if [ -z "$version" ]; then
+    echo "readme mode needs the packed version." >&2
+    return 1
+  fi
+  assert_quickstart_project "samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj" "$version"
+  local work
+  work=$(prepare_work_dir)
+  export NUGET_PACKAGES="$work/packages"
+  pack_packages "$work" "$version"
+  restore_quickstart "$work"
+  prove_feed_package "samples/ALog.QuickstartSample/obj/project.assets.json" "$version" "$work/feed"
+  build_quickstart
+  local status=0
+  run_quickstart_in_empty_dir "$work" || status=$?
+  publish_readme_artifacts "$work"
+  if [ "$status" -ne 0 ]; then
+    echo "Quick Start sample exited ${status}." >&2
+    return 1
+  fi
+  if [ ! -f "$work/app.log" ]; then
+    echo "Quick Start sample did not write logs/app.log." >&2
+    return 1
+  fi
+  python3 eng/readme-example-check.py --stdout "$work/stdout.txt" --log "$work/app.log"
+}
+
 # Packs, proves the feed package, runs, and returns the status for one smoke mode.
-# Args: file or console. A pack or restore failure still writes counts.
-# file is green only for one ALog-file token and exit 0.
+# Args: file, console, or readme. A pack or restore failure still writes counts
+# for file and console. file is green only for one ALog-file token and exit 0.
 # console prints SMOKE-CONSOLE count=<n> and is green only when that count is 1.
+# readme returns the Quick Start sample's feed proof and README check.
 main() {
   local mode="${1:-}"
   require_smoke_mode "$mode" || return 1
@@ -385,6 +524,10 @@ main() {
   if [ "$version" != "$ext" ]; then
     echo "ALog version ${version} does not match Extensions ${ext}." >&2
     return 1
+  fi
+  if [ "$mode" = "readme" ]; then
+    run_readme_mode "$version"
+    return $?
   fi
   assert_consumer_project "$CONSUMER_PROJECT" "$version"
   local work
