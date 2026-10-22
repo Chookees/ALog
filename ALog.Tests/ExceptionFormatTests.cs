@@ -1091,6 +1091,175 @@ public sealed class ExceptionFormatTests
     }
 
     /// <summary>
+    /// A self-reference or a null after 63 or 64 leaves does not count as a real child.
+    /// The walk finishes, so the suffix has no extra plus.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_NullAndCycleAfterLeavesStayComplete()
+    {
+        await Task.CompletedTask;
+        const string sixty = "AggregateException --> InvalidOperationException: 0; InvalidOperationException: 1; InvalidOperationException: 2 (+60 more)";
+        const string sixtyOne = "AggregateException --> InvalidOperationException: 0; InvalidOperationException: 1; InvalidOperationException: 2 (+61 more)";
+
+        var selfAfter63 = new AggregateException();
+        var after63 = NumberedLeaves(63);
+        var withSelf = new Exception[64];
+        Array.Copy(after63, withSelf, 63);
+        withSelf[63] = selfAfter63;
+        SetChildren(selfAfter63, withSelf);
+        Assert.Equal(sixty, ExceptionReport.FormatText(selfAfter63));
+
+        var nullAfter63 = new Exception[64];
+        Array.Copy(after63, nullAfter63, 63);
+        var nullRoot = new AggregateException();
+        SetChildren(nullRoot, nullAfter63);
+        Assert.Equal(sixty, ExceptionReport.FormatText(nullRoot));
+
+        var selfAfter64 = new AggregateException();
+        var withSelf64 = new Exception[65];
+        Array.Copy(NumberedLeaves(64), withSelf64, 64);
+        withSelf64[64] = selfAfter64;
+        SetChildren(selfAfter64, withSelf64);
+        Assert.Equal(sixtyOne, ExceptionReport.FormatText(selfAfter64));
+
+        var nullsAfter64 = new Exception[66];
+        Array.Copy(NumberedLeaves(64), nullsAfter64, 64);
+        var nullsRoot = new AggregateException();
+        SetChildren(nullsRoot, nullsAfter64);
+        Assert.Equal(sixtyOne, ExceptionReport.FormatText(nullsRoot));
+    }
+
+    /// <summary>
+    /// Leading self-references and leading nulls do not consume the 64 real-child counter.
+    /// Sixty-three leaves after those skips are all counted, so the suffix is <c>(+60 more)</c>.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_LeadingSkipsDoNotDropLeaves()
+    {
+        await Task.CompletedTask;
+        const string text = "AggregateException --> InvalidOperationException: 0; InvalidOperationException: 1; InvalidOperationException: 2 (+60 more)";
+
+        var cycled = new AggregateException();
+        var cycleChildren = new Exception[73];
+        for (var i = 0; i < 10; i++)
+            cycleChildren[i] = cycled;
+        Array.Copy(NumberedLeaves(63), 0, cycleChildren, 10, 63);
+        SetChildren(cycled, cycleChildren);
+        Assert.Equal(text, ExceptionReport.FormatText(cycled));
+
+        var padded = new Exception[68];
+        Array.Copy(NumberedLeaves(63), 0, padded, 5, 63);
+        var paddedRoot = new AggregateException();
+        SetChildren(paddedRoot, padded);
+        Assert.Equal(text, ExceptionReport.FormatText(paddedRoot));
+    }
+
+    /// <summary>
+    /// More than 4096 null slots stop the walk before a later leaf.
+    /// The suffix is <c>(+1+ more)</c> and the walk finishes quickly.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_SlotBudgetStops()
+    {
+        await Task.CompletedTask;
+        var children = new Exception[4097];
+        children[4096] = new InvalidOperationException("past");
+        var root = new AggregateException();
+        SetChildren(root, children);
+        var start = Stopwatch.GetTimestamp();
+        var text = ExceptionReport.FormatText(root);
+        var elapsed = Stopwatch.GetElapsedTime(start);
+        Assert.Equal("AggregateException (+1+ more)", text);
+        Assert.DoesNotContain("past", text, StringComparison.Ordinal);
+        Assert.True(elapsed < TimeSpan.FromMilliseconds(50), elapsed.ToString());
+    }
+
+    /// <summary>
+    /// An unread aggregate whose only child is itself is a cycle, not a real child.
+    /// The suffix keeps the counted leaves and has no extra plus.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_UnreadAggregateCycleDoesNotStop()
+    {
+        await Task.CompletedTask;
+        var nested = new AggregateException();
+        SetChildren(nested, new Exception[] { nested });
+        var text = ExceptionReport.FormatText(LeavesThen(nested));
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: 0; InvalidOperationException: 1; InvalidOperationException: 2 (+60 more)",
+            text);
+        Assert.DoesNotContain("(+60+ more)", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An unread aggregate whose only slot is null has no real child.
+    /// The suffix keeps the counted leaves and has no extra plus.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_UnreadNullDoesNotStop()
+    {
+        await Task.CompletedTask;
+        var nested = new AggregateException();
+        SetChildren(nested, new Exception[] { null! });
+        var text = ExceptionReport.FormatText(LeavesThen(nested));
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: 0; InvalidOperationException: 1; InvalidOperationException: 2 (+60 more)",
+            text);
+        Assert.DoesNotContain("(+60+ more)", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Sixty-three empty aggregates and one later aggregate that holds <c>y</c> fill the visit counter.
+    /// The later leaf is still unread, so the text is <c>AggregateException (+1+ more)</c>.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_SecondUnreadAggregateStops()
+    {
+        await Task.CompletedTask;
+        var root = new AggregateException(Enumerable.Range(0, 63).Select(_ => (Exception)new AggregateException()).Append(new AggregateException(new InvalidOperationException("y"))));
+        Assert.Equal("AggregateException (+1+ more)", ExceptionReport.FormatText(root));
+    }
+
+    /// <summary>
+    /// An unread aggregate whose inner-exceptions getter throws counts as no children.
+    /// The suffix keeps the counted leaves and has no extra plus.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_ThrowingUnreadInnerDoesNotStop()
+    {
+        await Task.CompletedTask;
+        var nested = new AggregateException();
+        var inners = typeof(AggregateException).GetField("_innerExceptions", BindingFlags.Instance | BindingFlags.NonPublic);
+        var view = typeof(AggregateException).GetField("_rocView", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(inners);
+        Assert.NotNull(view);
+        inners.SetValue(nested, null);
+        view.SetValue(nested, null);
+        var text = ExceptionReport.FormatText(LeavesThen(nested));
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: 0; InvalidOperationException: 1; InvalidOperationException: 2 (+60 more)",
+            text);
+        Assert.DoesNotContain("(+60+ more)", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// An unread aggregate whose first slot is null and whose second slot is a leaf still has a real child.
+    /// The visit counter is full, so the leaf is not shown and the suffix has the extra plus.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_SecondSlotOfUnreadAggregateStops()
+    {
+        await Task.CompletedTask;
+        var nested = new AggregateException();
+        SetChildren(nested, new Exception[] { null!, new InvalidOperationException("y") });
+        var text = ExceptionReport.FormatText(LeavesThen(nested));
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: 0; InvalidOperationException: 1; InvalidOperationException: 2 (+60+ more)",
+            text);
+        Assert.DoesNotContain(": y", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// JSON keeps <c>type</c>, <c>message</c>, and <c>stackTrace</c> and adds <c>source</c> and <c>inner</c>.
     /// Compact output stays one line. Pretty output stays indented. The message is raw and full.
     /// </summary>
@@ -2079,6 +2248,30 @@ public sealed class ExceptionFormatTests
         for (var i = count - 2; i >= 0; i--)
             current = new InvalidOperationException("m" + i.ToString(System.Globalization.CultureInfo.InvariantCulture), current);
         return current;
+    }
+
+    /// <summary>An aggregate of 63 numbered leaves followed by <paramref name="tail"/>.</summary>
+    /// <param name="tail">The 64th child. Not null.</param>
+    /// <returns>The root. Not null.</returns>
+    private static AggregateException LeavesThen(Exception tail)
+    {
+        var children = new Exception[64];
+        Array.Copy(NumberedLeaves(63), children, 63);
+        children[63] = tail;
+        var root = new AggregateException();
+        SetChildren(root, children);
+        return root;
+    }
+
+    /// <summary>Builds <paramref name="count"/> leaves whose messages are <c>0</c> through <c>count - 1</c>.</summary>
+    /// <param name="count">How many leaves. Not negative.</param>
+    /// <returns>The leaves. Not null.</returns>
+    private static Exception[] NumberedLeaves(int count)
+    {
+        var leaves = new Exception[count];
+        for (var i = 0; i < count; i++)
+            leaves[i] = new InvalidOperationException(i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        return leaves;
     }
 
     /// <summary>Replaces an aggregate's children, including a child that is the aggregate itself.</summary>

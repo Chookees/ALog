@@ -39,9 +39,17 @@ internal static class ExceptionReport
     /// Nodes one flatten, inner, or origin walk may visit.
     /// A flatten counts nested aggregates and leaves on this one counter.
     /// The root is the node already being rendered and is not counted again.
-    /// A child still unread at this cap writes <c>(+N+ more)</c>.
+    /// Null slots and cycle children do not count toward a flatten.
+    /// Stopping at this cap writes <c>(+N+ more)</c>.
     /// </summary>
     private const int MaxFlatten = 64;
+
+    /// <summary>
+    /// Slots one flatten may read, nulls and cycle children included.
+    /// The main loop and the check of aggregates left queued share this one counter.
+    /// Hitting it stops the walk and writes <c>(+N+ more)</c>.
+    /// </summary>
+    private const int MaxFlattenSlots = 4096;
 
     /// <summary>
     /// Compiler-name unwrapping stops after this many peels.
@@ -566,11 +574,14 @@ internal static class ExceptionReport
         return text + " | " + at;
     }
 
-    /// <summary>The <c>(+N more)</c> suffix, with an extra plus when the walk stopped at its cap.</summary>
+    /// <summary>The <c>(+N more)</c> suffix, with an extra plus when the walk stopped at a limit.</summary>
     /// <param name="hidden">Counted nodes that were not shown. Greater than zero.</param>
-    /// <param name="capped">True when a further node exists beyond the walk cap.</param>
+    /// <param name="capped">True when the walk stopped at a limit.</param>
     /// <returns><c>(+N more)</c> or <c>(+N+ more)</c>.</returns>
-    /// <remarks>Does not throw. The extra plus is the only sign that the remainder is a lower bound.</remarks>
+    /// <remarks>
+    /// Does not throw. The extra plus means the walk stopped at a limit.
+    /// It does not mean an entry is certainly missing.
+    /// </remarks>
     private static string MoreSuffix(int hidden, bool capped)
     {
         var n = hidden.ToString(CultureInfo.InvariantCulture);
@@ -630,8 +641,8 @@ internal static class ExceptionReport
     /// <remarks>
     /// The aggregate's message is omitted because the runtime repeats the inner messages there.
     /// <c>N</c> is the number of flattened entries that were not shown.
-    /// The extra plus means a child is still unread.
-    /// An empty entry list writes <c>(+1+ more)</c> when a child is still unread, a lower bound.
+    /// The extra plus means the walk stopped at a limit. It does not mean an entry is certainly missing.
+    /// An empty entry list writes <c>(+1+ more)</c> when the walk stopped, a lower bound.
     /// </remarks>
     private static string RenderAggregate(AggregateException exception, List<Exception> ancestors)
     {
@@ -1285,17 +1296,17 @@ internal static class ExceptionReport
     /// Ancestor path of the caller. A child on this path is a cycle and is not emitted.
     /// Not null. The root is still processed when it appears here.
     /// </param>
-    /// <returns>The flattened entries, and whether a child is still unread.</returns>
+    /// <returns>The flattened entries, and whether the walk stopped at a limit.</returns>
     /// <remarks>
     /// Each aggregate appends its non-aggregate children immediately, in order, and appends nested
     /// aggregates to the end of the work list. <c>Agg(x, Agg(y), z)</c> is <c>x, z, y</c>.
     /// The same instance is emitted twice when it is a sibling. It is skipped only when it is an ancestor.
     /// The method does not call <see cref="AggregateException.Flatten"/>, because that loops on a reflective cycle.
     /// Nested aggregates and leaves share one counter of 64. The rendered root does not count.
-    /// An aggregate copies only as many children as slots remain.
-    /// A child that is an ancestor is not recorded and does not increment the counter.
-    /// An aggregate already counted is fully visited when it has no child left to read.
-    /// The walk is incomplete only when a child is still unread.
+    /// Null slots and cycle children are skipped and do not count toward that counter.
+    /// The walk reads at most 4096 slots in total. Hitting 4096 stops the walk.
+    /// An aggregate already counted is fully visited when it has no real child left to read.
+    /// Incomplete means the walk stopped at a limit, not that an entry is certainly missing.
     /// Does not throw. The work list holds at most 64 aggregates beyond the root.
     /// </remarks>
     private static (List<Exception> Entries, bool Incomplete) Flatten(AggregateException root, List<Exception> ancestors)
@@ -1307,112 +1318,190 @@ internal static class ExceptionReport
         parent[0] = -1;
         var read = 0;
         var visited = 0;
+        var slots = 0;
         var incomplete = false;
-        while (read < work.Count && visited < MaxFlatten)
+        while (read < work.Count && visited < MaxFlatten && !incomplete)
         {
             var index = read;
             var aggregate = work[index];
             read++;
             if (IsAggregateAncestor(work, parent, parent[index], aggregate))
                 continue;
-            var inners = CopyInners(aggregate, MaxFlatten - visited, out var truncated);
-            if (truncated)
-                incomplete = true;
-            for (var i = 0; i < inners.Count; i++)
-            {
-                var child = inners[i];
-                if (child is AggregateException nested)
-                {
-                    if (IsAggregateAncestor(work, parent, index, nested) || Contains(ancestors, nested))
-                        continue;
-                    parent[work.Count] = index;
-                    work.Add(nested);
-                    visited++;
-                }
-                else if (Contains(ancestors, child))
-                {
-                    continue;
-                }
-                else
-                {
-                    result.Add(child);
-                    visited++;
-                }
-            }
+            if (!AppendRealChildren(aggregate, work, parent, index, ancestors, result, ref visited, ref slots, ref incomplete))
+                break;
         }
 
-        if (!incomplete && read < work.Count && UnreadWorkHasChild(work, parent, read, ancestors))
+        if (!incomplete && read < work.Count && UnreadWorkHasChild(work, parent, read, ancestors, ref slots))
             incomplete = true;
         return (result, incomplete);
     }
 
-    /// <summary>True when an aggregate still queued has a child that would be emitted.</summary>
+    /// <summary>
+    /// Appends real children of <paramref name="aggregate"/> until the visit room or the slot budget is used.
+    /// </summary>
+    /// <param name="aggregate">Aggregate being opened. Not null.</param>
+    /// <param name="work">Aggregates in queue order. Not null. Real nested aggregates are appended.</param>
+    /// <param name="parent">Parent index of each queued aggregate. Index -1 is the root.</param>
+    /// <param name="index">Index of <paramref name="aggregate"/> in <paramref name="work"/>.</param>
+    /// <param name="ancestors">Caller ancestor path. A child on this path is a cycle. Not null.</param>
+    /// <param name="result">Flattened leaves. Not null. Real leaves are appended.</param>
+    /// <param name="visited">Real children kept so far. At most 64.</param>
+    /// <param name="slots">Slots read by this flatten so far, shared with the unread check. At most 4096.</param>
+    /// <param name="incomplete">Set when the walk stops at a limit.</param>
+    /// <returns>False when the caller should stop the walk.</returns>
+    /// <remarks>
+    /// Does not throw. Null slots and cycle children do not increment <paramref name="visited"/>.
+    /// The slot loop stops at 4096. A throwing inner-exceptions getter counts as no children.
+    /// </remarks>
+    private static bool AppendRealChildren(
+        AggregateException aggregate,
+        List<AggregateException> work,
+        int[] parent,
+        int index,
+        List<Exception> ancestors,
+        List<Exception> result,
+        ref int visited,
+        ref int slots,
+        ref bool incomplete)
+    {
+        System.Collections.ObjectModel.ReadOnlyCollection<Exception>? inners;
+        try
+        {
+            inners = aggregate.InnerExceptions;
+        }
+        catch
+        {
+            return true;
+        }
+
+        if (inners == null)
+            return true;
+
+        try
+        {
+            foreach (var inner in inners)
+            {
+                if (slots == MaxFlattenSlots)
+                {
+                    incomplete = true;
+                    return false;
+                }
+
+                slots++;
+                if (inner == null || IsCycleChild(inner, work, parent, index, ancestors))
+                    continue;
+                if (visited == MaxFlatten)
+                {
+                    incomplete = true;
+                    return false;
+                }
+
+                if (inner is AggregateException nested)
+                {
+                    parent[work.Count] = index;
+                    work.Add(nested);
+                }
+                else
+                {
+                    result.Add(inner);
+                }
+
+                visited++;
+            }
+        }
+        catch
+        {
+            return true;
+        }
+
+        return true;
+    }
+
+    /// <summary>True when <paramref name="child"/> is a cycle and must not be emitted.</summary>
+    /// <param name="child">Child just read. Not null.</param>
+    /// <param name="work">Aggregates in queue order. Not null.</param>
+    /// <param name="parent">Parent index of each queued aggregate. Index -1 is the root.</param>
+    /// <param name="index">Aggregate whose child is being tested.</param>
+    /// <param name="ancestors">Caller ancestor path. Not null.</param>
+    /// <returns>True when the child is an aggregate on the work chain or any child already on <paramref name="ancestors"/>.</returns>
+    /// <remarks>Does not throw. The ancestor walk stops at 64 steps.</remarks>
+    private static bool IsCycleChild(
+        Exception child,
+        List<AggregateException> work,
+        int[] parent,
+        int index,
+        List<Exception> ancestors)
+    {
+        if (child is AggregateException nested)
+            return IsAggregateAncestor(work, parent, index, nested) || Contains(ancestors, nested);
+        return Contains(ancestors, child);
+    }
+
+    /// <summary>True when an aggregate still queued has a real child, or the slot budget is hit.</summary>
     /// <param name="work">Aggregates in queue order. Not null.</param>
     /// <param name="parent">Parent index of each queued aggregate. Index -1 is the root.</param>
     /// <param name="read">First index that was not opened.</param>
     /// <param name="ancestors">Caller ancestor path. A child on this path is a cycle. Not null.</param>
-    /// <returns>True when one remaining aggregate has a child that is not a cycle.</returns>
+    /// <param name="slots">Slots read by this flatten so far. Shared with <see cref="AppendRealChildren"/>. At most 4096.</param>
+    /// <returns>True when the walk should stop at a limit.</returns>
     /// <remarks>
     /// Does not throw. At most 64 remaining aggregates are checked.
-    /// Each check stops at the first child that would be emitted.
-    /// Null slots do not count. A throwing inner-exceptions getter counts as no children.
+    /// Each check stops at the first real child. Null slots and cycle children are skipped.
+    /// A throwing inner-exceptions getter counts as no children. The shared slot loop stops at 4096.
     /// </remarks>
     private static bool UnreadWorkHasChild(
         List<AggregateException> work,
         int[] parent,
         int read,
-        List<Exception> ancestors)
+        List<Exception> ancestors,
+        ref int slots)
     {
         var end = read + MaxFlatten;
         if (end > work.Count)
             end = work.Count;
         for (var index = read; index < end; index++)
         {
-            if (HasReadableChild(work, parent, index, ancestors))
+            if (IsAggregateAncestor(work, parent, parent[index], work[index]))
+                continue;
+            if (HasReadableChild(work, parent, index, ancestors, ref slots))
                 return true;
         }
 
         return false;
     }
 
-    /// <summary>True when <paramref name="index"/> has a child the flatten walk would emit or queue.</summary>
+    /// <summary>True when <paramref name="index"/> has a real child, or reading it hits the slot budget.</summary>
     /// <param name="work">Aggregates in queue order. Not null.</param>
     /// <param name="parent">Parent index of each queued aggregate. Index -1 is the root.</param>
     /// <param name="index">Aggregate that was counted and not opened.</param>
     /// <param name="ancestors">Caller ancestor path. A child on this path is a cycle. Not null.</param>
-    /// <returns>True when the first readable child is not an ancestor.</returns>
+    /// <param name="slots">Slots read by this flatten so far. Shared with the main loop. At most 4096.</param>
+    /// <returns>True when a real child remains or the slot budget is hit.</returns>
     /// <remarks>
-    /// Does not throw. The scan stops at the first child that would be emitted.
-    /// A null slot is skipped. A throwing inner-exceptions getter counts as no children.
-    /// The slot loop stops at 64.
+    /// Does not throw. The scan stops at the first real child.
+    /// A null slot is skipped. A cycle child is skipped. Neither ends the scan by itself.
+    /// A throwing inner-exceptions getter counts as no children. The slot loop stops at 4096.
     /// </remarks>
     private static bool HasReadableChild(
         List<AggregateException> work,
         int[] parent,
         int index,
-        List<Exception> ancestors)
+        List<Exception> ancestors,
+        ref int slots)
     {
         try
         {
             var inners = work[index].InnerExceptions;
             if (inners == null)
                 return false;
-            var seen = 0;
             foreach (var inner in inners)
             {
-                if (seen == MaxFlatten)
-                    break;
-                seen++;
+                if (slots == MaxFlattenSlots)
+                    return true;
+                slots++;
                 if (inner == null)
                     continue;
-                if (inner is AggregateException nested)
-                {
-                    if (IsAggregateAncestor(work, parent, index, nested) || Contains(ancestors, nested))
-                        continue;
-                    return true;
-                }
-
-                if (Contains(ancestors, inner))
+                if (IsCycleChild(inner, work, parent, index, ancestors))
                     continue;
                 return true;
             }
@@ -1453,17 +1542,6 @@ internal static class ExceptionReport
     /// <remarks>Does not throw. Null slots are skipped. The loop stops at 64.</remarks>
     private static List<Exception> CopyInners(AggregateException aggregate, out bool truncated)
     {
-        return CopyInners(aggregate, MaxFlatten, out truncated);
-    }
-
-    /// <summary>Copies at most <paramref name="limit"/> direct inner exceptions. A throwing getter yields an empty list.</summary>
-    /// <param name="aggregate">Aggregate whose children are copied. Not null.</param>
-    /// <param name="limit">How many children may be copied. Zero copies nothing. Not above 64.</param>
-    /// <param name="truncated">True when the collection still had an entry after <paramref name="limit"/>.</param>
-    /// <returns>The children that could be read. Never null.</returns>
-    /// <remarks>Does not throw. Null slots are skipped. The loop stops at <paramref name="limit"/>.</remarks>
-    private static List<Exception> CopyInners(AggregateException aggregate, int limit, out bool truncated)
-    {
         truncated = false;
         var copy = new List<Exception>(8);
         try
@@ -1474,7 +1552,7 @@ internal static class ExceptionReport
             var seen = 0;
             foreach (var inner in inners)
             {
-                if (seen == limit)
+                if (seen == MaxFlatten)
                 {
                     truncated = true;
                     break;
