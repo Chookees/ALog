@@ -19,7 +19,7 @@ public sealed class BkpExternalRotationTests
     /// A rename leaves the first line in the old file and the next line in a new file at the configured path.
     /// </summary>
     /// <remarks>
-    /// The clock moves one second because a zero flush interval checks the path at most that often.
+    /// A zero flush interval compares the path before the next write, so the clock does not move.
     /// Removing the path comparison writes the second line into the renamed file.
     /// </remarks>
     [Fact(Timeout = 30000)]
@@ -35,12 +35,14 @@ public sealed class BkpExternalRotationTests
             using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock);
             writer.Write(Event("first-line"));
             File.Move(path, rotated);
-            clock.Advance(TimeSpan.FromSeconds(1));
             writer.Write(Event("second-line"));
+            AssertOneHandle(path);
             writer.Dispose();
 
             var oldText = File.ReadAllText(rotated);
             var newText = File.ReadAllText(path);
+            AssertNoNul(rotated);
+            AssertNoNul(path);
             Assert.Contains("first-line", oldText, StringComparison.Ordinal);
             Assert.DoesNotContain("second-line", oldText, StringComparison.Ordinal);
             Assert.Contains("second-line", newText, StringComparison.Ordinal);
@@ -72,12 +74,14 @@ public sealed class BkpExternalRotationTests
             writer.Write(Event("first-line"));
             File.Move(path, rotated);
             File.WriteAllText(path, "external\n");
-            clock.Advance(TimeSpan.FromSeconds(1));
             writer.Write(Event("second-line"));
+            AssertOneHandle(path);
             writer.Dispose();
 
             var oldText = File.ReadAllText(rotated);
             var newText = File.ReadAllText(path);
+            AssertNoNul(rotated);
+            AssertNoNul(path);
             Assert.Contains("first-line", oldText, StringComparison.Ordinal);
             Assert.DoesNotContain("second-line", oldText, StringComparison.Ordinal);
             Assert.Contains("external", newText, StringComparison.Ordinal);
@@ -110,7 +114,9 @@ public sealed class BkpExternalRotationTests
             Assert.DoesNotContain("buffered-line", ReadShared(path), StringComparison.Ordinal);
             File.Move(path, rotated);
             clock.Advance(interval);
+            AssertOneHandle(path);
 
+            AssertNoNul(rotated);
             Assert.Contains("buffered-line", File.ReadAllText(rotated), StringComparison.Ordinal);
             Assert.DoesNotContain("buffered-line", ReadShared(path), StringComparison.Ordinal);
             Assert.True(File.Exists(path));
@@ -141,8 +147,11 @@ public sealed class BkpExternalRotationTests
             writer.Write(Event("first-line"));
             File.Move(path, rotated);
             writer.Write(Event("second-line"));
+            AssertOneHandle(path);
             writer.Dispose();
 
+            AssertNoNul(rotated);
+            AssertNoNul(path);
             Assert.Contains("first-line", File.ReadAllText(rotated), StringComparison.Ordinal);
             Assert.Contains("second-line", File.ReadAllText(path), StringComparison.Ordinal);
             Assert.Equal(2, Directory.GetFiles(directory).Length);
@@ -168,11 +177,12 @@ public sealed class BkpExternalRotationTests
             writer.Write(Event("first-line"));
             File.Delete(path);
             Assert.False(File.Exists(path));
-            clock.Advance(TimeSpan.FromSeconds(1));
             writer.Write(Event("second-line"));
+            AssertOneHandle(path);
             writer.Dispose();
 
             var text = File.ReadAllText(path);
+            AssertNoNul(path);
             Assert.Contains("second-line", text, StringComparison.Ordinal);
             Assert.DoesNotContain("first-line", text, StringComparison.Ordinal);
         }
@@ -210,8 +220,8 @@ public sealed class BkpExternalRotationTests
             {
             }
 
-            clock.Advance(TimeSpan.FromSeconds(1));
             writer.Write(Event("second-line"));
+            AssertOneHandle(path);
             writer.Dispose();
 
             var raw = File.ReadAllBytes(path);
@@ -230,10 +240,10 @@ public sealed class BkpExternalRotationTests
         }
     }
 
-    /// <summary>A zero flush interval compares the path once after a one-second gap, not on every event.</summary>
+    /// <summary>A positive flush interval compares the path once after that interval, not on every event.</summary>
     /// <remarks>
-    /// Comparing on every event makes the first burst larger than one.
-    /// Removing the comparison leaves the count at zero after the gap.
+    /// Comparing on every event makes the first burst larger than zero. That mutant is this interval, which is one second.
+    /// A zero interval compares before every write and is not this test. Removing the comparison leaves the count at zero after the gap.
     /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task ExternalCheck_SkipsABurstAndRunsAfterTheGap()
@@ -245,7 +255,7 @@ public sealed class BkpExternalRotationTests
         {
             var path = Path.Combine(directory, "app.log");
             var before = LogFileRegistry.IdentityCheckCount;
-            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock);
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(1), clock: clock);
             for (var i = 0; i < 8; i++)
                 writer.Write(Event("n" + i.ToString(CultureInfo.InvariantCulture)));
 
@@ -423,6 +433,7 @@ public sealed class BkpExternalRotationTests
                     engine.Log("kept-" + i.ToString(CultureInfo.InvariantCulture));
             }
 
+            AssertNoHandle(path);
             var raw = File.ReadAllBytes(path);
             Assert.NotEmpty(raw);
             Assert.Equal(-1, Array.IndexOf(raw, (byte)0));
@@ -440,7 +451,10 @@ public sealed class BkpExternalRotationTests
     }
 
     /// <summary>After a failed reopen, the next event tries the path again and still drops the line while the directory is locked.</summary>
-    /// <remarks>The first failure is the rotation. The next event finds no stream and reports its own write failure.</remarks>
+    /// <remarks>
+    /// A zero interval notices the missing path before size rotation. Creating the file fails while the directory is locked.
+    /// The following event reports its own write failure. After the directory is restored, the next line is written.
+    /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task ExternalReopen_RetriesWhenTheDirectoryIsLocked()
     {
@@ -474,9 +488,7 @@ public sealed class BkpExternalRotationTests
             var text = File.ReadAllText(path);
             Assert.Contains("fourth-line", text, StringComparison.Ordinal);
             Assert.DoesNotContain("third-line", text, StringComparison.Ordinal);
-            var errors = buffer.ToString();
-            Assert.Contains("Rolling failed", errors, StringComparison.Ordinal);
-            Assert.Contains("Write failed", errors, StringComparison.Ordinal);
+            Assert.Contains("Write failed", buffer.ToString(), StringComparison.Ordinal);
         }
         finally
         {
@@ -554,12 +566,13 @@ public sealed class BkpExternalRotationTests
         {
             var path = Path.Combine(directory, "due.log");
             var before = LogFileRegistry.IdentityCheckCount;
-            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock);
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60), clock: clock);
             writer.Write(Event("first"));
             Assert.Equal(0, LogFileRegistry.IdentityCheckCount - before);
             SetField(SharedOf(writer), "_lastIdentityCheck", default(DateTimeOffset));
             writer.Write(Event("second"));
             Assert.Equal(1, LogFileRegistry.IdentityCheckCount - before);
+            writer.Flush();
             Assert.Contains("second", ReadShared(path), StringComparison.Ordinal);
         }
         finally
@@ -590,6 +603,254 @@ public sealed class BkpExternalRotationTests
         }
         finally
         {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// Dispose after an external truncate of a pre-filled file keeps the new lines and does not seek.
+    /// </summary>
+    /// <remarks>
+    /// Twenty lines exist before ALog opens the file, so the append start is past byte 0.
+    /// Fifty lines are flushed, the file is truncated, and ten lines stay in the buffer until dispose.
+    /// Re-adding a seek to byte 0 throws because append mode cannot move before that start, and these ten lines are missing.
+    /// Windows denies the second write, so this case is the Unix one.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalTruncate_PrefilledDisposeKeepsTheNewLines()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            await Task.CompletedTask;
+            return;
+        }
+
+        var directory = NewDirectory();
+        var clock = NewClock();
+        var previous = Console.Error;
+        var errors = new StringWriter();
+        Console.SetError(errors);
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            WritePlainLines(path, 20, "prefilled-");
+            using (var engine = new LoggerEngine(
+                new LoggerConfig().AddWriter(new FileLogWriter(
+                    path,
+                    fileFlushInterval: TimeSpan.FromSeconds(60),
+                    clock: clock)),
+                clock))
+            {
+                for (var i = 0; i < 50; i++)
+                    engine.Log("flushed-" + i.ToString(CultureInfo.InvariantCulture));
+
+                await engine.FlushAsync();
+                SetLengthShared(path, 0);
+                for (var i = 0; i < 10; i++)
+                    engine.Log("kept-" + i.ToString(CultureInfo.InvariantCulture));
+            }
+
+            AssertNoSeekFailure(errors.ToString());
+            AssertNoHandle(path);
+            AssertClean(path, "kept-0", "kept-9");
+            Assert.Equal(10, File.ReadAllLines(path).Length);
+            Assert.DoesNotContain("prefilled-0", File.ReadAllText(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("flushed-0", File.ReadAllText(path), StringComparison.Ordinal);
+            Assert.Equal((byte)'[', File.ReadAllBytes(path)[0]);
+        }
+        finally
+        {
+            Console.SetError(previous);
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A pre-filled file that is renamed and recreated receives the next line, with one open handle.</summary>
+    /// <remarks>
+    /// The recreated file is shorter than the write position. The buffered line is written only after the new stream opens.
+    /// Writing it into the old stream first leaves a zero byte. Seeking to byte 0 throws because the file was not empty at open.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalRename_PrefilledRecreateKeepsTheNewLines()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var clock = NewClock();
+        var previous = Console.Error;
+        var errors = new StringWriter();
+        Console.SetError(errors);
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            var rotated = path + ".1";
+            WritePlainLines(path, 20, "prefilled-");
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60), clock: clock);
+            writer.Write(Event("buffered-line"));
+            File.Move(path, rotated);
+            File.WriteAllText(path, "external\n");
+            writer.Flush();
+            AssertOneHandle(path);
+            AssertNoSeekFailure(errors.ToString());
+            writer.Dispose();
+
+            AssertNoNul(rotated);
+            AssertClean(path, "external", "buffered-line");
+            Assert.Contains("prefilled-0", File.ReadAllText(rotated), StringComparison.Ordinal);
+            Assert.DoesNotContain("buffered-line", File.ReadAllText(rotated), StringComparison.Ordinal);
+            Assert.Equal((byte)'e', File.ReadAllBytes(path)[0]);
+        }
+        finally
+        {
+            Console.SetError(previous);
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A later truncate in the same process still appends the new lines and leaves one handle.</summary>
+    /// <remarks>
+    /// The first truncate leaves 100 bytes, which is above zero. The writer reopens, then the file is truncated to empty.
+    /// Dispose writes the later batch. A seek on either reopen throws or leaves a zero byte.
+    /// Windows denies the second write, so this case is the Unix one.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalTruncate_FollowUpCopyKeepsTheNewLines()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            await Task.CompletedTask;
+            return;
+        }
+
+        var directory = NewDirectory();
+        var clock = NewClock();
+        var previous = Console.Error;
+        var errors = new StringWriter();
+        Console.SetError(errors);
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            WritePlainLines(path, 20, "prefilled-");
+            var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60), clock: clock);
+            using (var engine = new LoggerEngine(new LoggerConfig().AddWriter(writer), clock))
+            {
+                for (var i = 0; i < 50; i++)
+                    engine.Log("flushed-" + i.ToString(CultureInfo.InvariantCulture));
+
+                await engine.FlushAsync();
+                SetLengthShared(path, 100);
+                for (var i = 0; i < 10; i++)
+                    engine.Log("wave-a-" + i.ToString(CultureInfo.InvariantCulture));
+
+                writer.Flush();
+                AssertOneHandle(path);
+                AssertNoSeekFailure(errors.ToString());
+                AssertClean(path, "wave-a-0", "wave-a-9");
+
+                SetLengthShared(path, 0);
+                for (var i = 0; i < 10; i++)
+                    engine.Log("wave-b-" + i.ToString(CultureInfo.InvariantCulture));
+            }
+
+            AssertNoSeekFailure(errors.ToString());
+            AssertNoHandle(path);
+            AssertClean(path, "wave-b-0", "wave-b-9");
+            Assert.Equal(10, File.ReadAllLines(path).Length);
+            Assert.DoesNotContain("wave-a-0", File.ReadAllText(path), StringComparison.Ordinal);
+            Assert.Equal((byte)'[', File.ReadAllBytes(path)[0]);
+        }
+        finally
+        {
+            Console.SetError(previous);
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>Copy-and-truncate disposes the old stream, so the path has one handle and no buffered prefix.</summary>
+    /// <remarks>
+    /// The ten lines were still in the buffer. They are written at the start of the truncated file, not at the old offset.
+    /// Writing them into the old stream first inserts a zero byte before them. The old handle is closed.
+    /// Windows denies the second write, so this case is the Unix one.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalTruncate_LeavesOneHandleAndNoOldPrefix()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            await Task.CompletedTask;
+            return;
+        }
+
+        var directory = NewDirectory();
+        var clock = NewClock();
+        var previous = Console.Error;
+        var errors = new StringWriter();
+        Console.SetError(errors);
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            WritePlainLines(path, 20, "prefilled-");
+            var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60), clock: clock);
+            using (var engine = new LoggerEngine(new LoggerConfig().AddWriter(writer), clock))
+            {
+                for (var i = 0; i < 50; i++)
+                    engine.Log("flushed-" + i.ToString(CultureInfo.InvariantCulture));
+
+                await engine.FlushAsync();
+                var oldStream = (FileStream)GetField(SharedOf(writer), "_stream")!;
+                SetLengthShared(path, 0);
+                for (var i = 0; i < 10; i++)
+                    engine.Log("kept-" + i.ToString(CultureInfo.InvariantCulture));
+
+                writer.Flush();
+                Assert.True(oldStream.SafeFileHandle.IsClosed);
+                AssertOneHandle(path);
+                AssertNoSeekFailure(errors.ToString());
+                AssertClean(path, "kept-0", "kept-9");
+                Assert.DoesNotContain("flushed-0", File.ReadAllText(path), StringComparison.Ordinal);
+                Assert.Equal((byte)'[', File.ReadAllBytes(path)[0]);
+            }
+
+            AssertNoHandle(path);
+        }
+        finally
+        {
+            Console.SetError(previous);
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>A zero flush interval notices a truncate before the next line reaches the operating system.</summary>
+    /// <remarks>
+    /// Fifty lines are already on disk. The file is then emptied, and ten more lines are written without waiting out a one-second gap.
+    /// The clock then moves 1200 milliseconds. Dropping the per-write check writes those lines at the old offset, so the file contains a zero byte.
+    /// The same check is what notices a truncate to 100 bytes. Windows denies the second write, so this case is the Unix one.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ExternalTruncate_ZeroIntervalNoticesAShorterFile()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            await Task.CompletedTask;
+            return;
+        }
+
+        var directory = NewDirectory();
+        var clock = NewClock();
+        var previous = Console.Error;
+        var errors = new StringWriter();
+        Console.SetError(errors);
+        try
+        {
+            var path = Path.Combine(directory, "app.log");
+            WritePlainLines(path, 20, "prefilled-");
+            AssertZeroIntervalTruncate(path, clock, errors, 0);
+            var hundred = Path.Combine(directory, "hundred.log");
+            WritePlainLines(hundred, 20, "prefilled-");
+            AssertZeroIntervalTruncate(hundred, clock, errors, 100);
+        }
+        finally
+        {
+            Console.SetError(previous);
             DeleteDirectory(directory);
         }
     }
@@ -643,6 +904,171 @@ public sealed class BkpExternalRotationTests
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using var reader = new StreamReader(stream);
         return reader.ReadToEnd();
+    }
+
+    /// <summary>Writes <paramref name="count"/> plain lines before ALog opens the file.</summary>
+    /// <param name="path">File to create. Not null.</param>
+    /// <param name="count">How many lines. Greater than zero.</param>
+    /// <param name="prefix">Text before the line number. Not null.</param>
+    /// <remarks>Does not throw. The file is non-empty, so an append stream cannot seek back to byte 0.</remarks>
+    private static void WritePlainLines(string path, int count, string prefix)
+    {
+        using var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.Read);
+        using var writer = new StreamWriter(stream, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+        for (var i = 0; i < count; i++)
+        {
+            writer.Write(prefix);
+            writer.WriteLine(i.ToString(CultureInfo.InvariantCulture));
+        }
+    }
+
+    /// <summary>Truncates an open log from another handle.</summary>
+    /// <param name="path">The log path. Not null.</param>
+    /// <param name="length">The new length. Zero or a positive prefix.</param>
+    /// <remarks>Does not throw on Unix. Windows rejects this while ALog holds the file without write sharing.</remarks>
+    private static void SetLengthShared(string path, int length)
+    {
+        using var truncating = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Write,
+            FileShare.ReadWrite | FileShare.Delete);
+        truncating.SetLength(length);
+    }
+
+    /// <summary>
+    /// Writes fifty flushed lines, truncates, then ten more lines at interval zero.
+    /// </summary>
+    /// <param name="path">A pre-filled log. Not null.</param>
+    /// <param name="clock">Clock for the writer. Not null.</param>
+    /// <param name="errors">Error sink already installed as <see cref="Console.Error"/>. Not null.</param>
+    /// <param name="length">Length after the external truncate. Zero or 100.</param>
+    /// <remarks>
+    /// The ten lines are written before the clock moves 1200 milliseconds.
+    /// A check that waits for that gap leaves a zero byte, because those lines already extended the file.
+    /// </remarks>
+    private static void AssertZeroIntervalTruncate(string path, FakeTimeProvider clock, StringWriter errors, int length)
+    {
+        using (var engine = new LoggerEngine(
+            new LoggerConfig().AddWriter(new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock)),
+            clock))
+        {
+            for (var i = 0; i < 50; i++)
+                engine.Log("flushed-" + i.ToString(CultureInfo.InvariantCulture));
+
+            SetLengthShared(path, length);
+            var marked = LogFileRegistry.IdentityCheckCount;
+            for (var i = 0; i < 10; i++)
+                engine.Log("kept-" + i.ToString(CultureInfo.InvariantCulture));
+
+            Assert.True(LogFileRegistry.IdentityCheckCount - marked >= 10);
+            AssertOneHandle(path);
+            clock.Advance(TimeSpan.FromMilliseconds(1200));
+        }
+
+        AssertNoSeekFailure(errors.ToString());
+        AssertNoHandle(path);
+        AssertClean(path, "kept-0", "kept-9");
+        if (length == 0)
+        {
+            Assert.Equal(10, File.ReadAllLines(path).Length);
+            Assert.Equal((byte)'[', File.ReadAllBytes(path)[0]);
+            Assert.DoesNotContain("prefilled-0", File.ReadAllText(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("flushed-0", File.ReadAllText(path), StringComparison.Ordinal);
+        }
+    }
+
+    /// <summary>The file contains each required fragment and no zero byte.</summary>
+    /// <param name="path">File to read. Not null.</param>
+    /// <param name="required">Fragments that must appear. Not null.</param>
+    /// <remarks>Does not throw for a missing fragment. That is an assertion failure.</remarks>
+    private static void AssertClean(string path, params string[] required)
+    {
+        AssertNoNul(path);
+        var text = File.ReadAllText(path);
+        foreach (var item in required)
+            Assert.Contains(item, text, StringComparison.Ordinal);
+    }
+
+    /// <summary>The file has bytes and none of them are zero.</summary>
+    /// <param name="path">File to read. Not null.</param>
+    /// <remarks>Does not throw when the file exists. A zero byte is an assertion failure.</remarks>
+    private static void AssertNoNul(string path)
+    {
+        var raw = File.ReadAllBytes(path);
+        Assert.NotEmpty(raw);
+        Assert.Equal(-1, Array.IndexOf(raw, (byte)0));
+    }
+
+    /// <summary>The error text is not an append-mode seek failure.</summary>
+    /// <param name="errors">Text written to the error stream. Not null.</param>
+    /// <remarks>Does not throw. A seek failure is an assertion failure.</remarks>
+    private static void AssertNoSeekFailure(string errors)
+    {
+        Assert.DoesNotContain("IOException", errors, StringComparison.Ordinal);
+        Assert.DoesNotContain("Unable to seek", errors, StringComparison.Ordinal);
+    }
+
+    /// <summary>On Linux the path has one open handle in this process.</summary>
+    /// <param name="path">The log path. Not null.</param>
+    /// <remarks>Other systems return. The count is this process only.</remarks>
+    private static void AssertOneHandle(string path)
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        Assert.Equal(1, CountHandles(path));
+    }
+
+    /// <summary>On Linux the path has no open handle in this process.</summary>
+    /// <param name="path">The log path. Not null.</param>
+    /// <remarks>Other systems return. A leaked stream keeps a handle after dispose.</remarks>
+    private static void AssertNoHandle(string path)
+    {
+        if (!OperatingSystem.IsLinux())
+            return;
+
+        Assert.Equal(0, CountHandles(path));
+    }
+
+    /// <summary>Counts file descriptors in this process whose target is <paramref name="path"/>.</summary>
+    /// <param name="path">Absolute or relative path. Not null.</param>
+    /// <returns>How many descriptors name that path. A deleted target is not counted.</returns>
+    /// <remarks>Linux only. Does not throw for a descriptor that disappears while it is read.</remarks>
+    private static int CountHandles(string path)
+    {
+        var full = Path.GetFullPath(path);
+        var count = 0;
+        foreach (var entry in Directory.EnumerateFiles("/proc/self/fd"))
+        {
+            string? target;
+            try
+            {
+                target = new FileInfo(entry).LinkTarget;
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            if (target is null)
+                continue;
+
+            string resolved;
+            try
+            {
+                resolved = Path.GetFullPath(target);
+            }
+            catch (IOException)
+            {
+                continue;
+            }
+
+            if (string.Equals(resolved, full, StringComparison.Ordinal))
+                count++;
+        }
+
+        return count;
     }
 
     private static FakeTimeProvider NewClock()

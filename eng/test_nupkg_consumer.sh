@@ -26,6 +26,20 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
+mkdir -p "$work/packages"
+if command -v cygpath >/dev/null 2>&1; then
+  export NUGET_PACKAGES="$(cygpath -m "$work/packages")"
+else
+  export NUGET_PACKAGES="$work/packages"
+fi
+if command -v python3 >/dev/null 2>&1; then
+  py=python3
+elif command -v python >/dev/null 2>&1; then
+  py=python
+else
+  echo "FAIL python is required to hash the nupkg" >&2
+  exit 1
+fi
 
 cat > "$work/nuget.config" <<EOF
 <?xml version="1.0" encoding="utf-8"?>
@@ -96,3 +110,36 @@ finally
 EOF
 
 dotnet run --project "$work/PackConsumer.csproj" -c Release --nologo
+"$py" - "$nupkg" "$work/packages" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+packed = pathlib.Path(sys.argv[1])
+root = pathlib.Path(sys.argv[2])
+
+def digest(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+found = []
+if root.is_dir():
+    for path in root.rglob("*.nupkg"):
+        name = path.name.lower()
+        if name.startswith("alog.") and not name.startswith("alog.extensions"):
+            found.append(path)
+
+packed_hash = digest(packed)
+print(f"packed nupkg sha256: {packed_hash} {packed}")
+if len(found) != 1:
+    print(f"FAIL expected one restored ALog nupkg, found {len(found)}", file=sys.stderr)
+    for path in found:
+        print(path, file=sys.stderr)
+    sys.exit(1)
+
+restored = found[0]
+restored_hash = digest(restored)
+print(f"restored nupkg sha256: {restored_hash} {restored}")
+if packed_hash != restored_hash:
+    print("FAIL restored nupkg does not match the packed nupkg", file=sys.stderr)
+    sys.exit(1)
+PY

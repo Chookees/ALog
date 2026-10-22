@@ -185,7 +185,12 @@ public sealed class BkpCoverageTests
         }
     }
 
-    /// <summary>When the moved file cannot be opened again, the line is dropped and both failures are reported.</summary>
+    /// <summary>When rotation cannot open the path again, the line is dropped and both failures are reported.</summary>
+    /// <remarks>
+    /// The flush interval is positive, so the per-write check waits. Size rotation then forces the check.
+    /// The path is already gone and the directory is locked, so the open fails. A zero interval reports that
+    /// missing path from the write itself and is covered by <see cref="BkpExternalRotationTests"/>.
+    /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task File_DropsTheLineWhenTheFileCannotReopen()
     {
@@ -202,7 +207,7 @@ public sealed class BkpCoverageTests
             var path = Path.Combine(directory, "gone.log");
             var before = LogFileRegistry.OpenCount;
             var mode = ReadDirectoryMode(directory);
-            using var writer = new FileLogWriter(path, maxFileSizeInBytes: 1, fileFlushInterval: TimeSpan.Zero);
+            using var writer = new FileLogWriter(path, maxFileSizeInBytes: 1, fileFlushInterval: TimeSpan.FromSeconds(60));
             try
             {
                 writer.Write(Event("first-line"));

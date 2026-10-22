@@ -105,7 +105,8 @@ internal static class LogFileRegistry
 /// Omitting <see cref="FileShare.Write"/> stops a second writer on Windows only. Linux and macOS still allow one, and the lines can mix.
 /// The timer is disposed outside the file lock. The callback also takes that lock.
 /// An external rename, delete, or truncate is noticed on the flush tick, on <see cref="Flush"/>, before this process rotates the file, and on close.
-/// The path check runs at most once per <see cref="FileFlushInterval"/>, or once per second when that interval is zero. Close, flush, and rotation do not wait for that gap.
+/// A zero <see cref="FileFlushInterval"/> compares the path before every write to the operating system. A positive interval compares at most once per that interval.
+/// Close, flush, and rotation do not wait for the gap.
 /// </remarks>
 internal sealed class SharedLogFile
 {
@@ -247,6 +248,7 @@ internal sealed class SharedLogFile
     /// Does not throw. A second call returns. Called only for the last reference, outside the registry lock.
     /// The path check runs before the final buffer write. A missing path is flushed into the old stream and opened again.
     /// A path shorter than the write position is opened again before those bytes are written, so a truncate does not leave a gap.
+    /// The old stream is disposed even when that check fails. It is not seeked.
     /// </remarks>
     internal void Close()
     {
@@ -306,7 +308,11 @@ internal sealed class SharedLogFile
     }
 
     /// <summary>Creates the append stream and, when the interval is positive, the flush timer.</summary>
-    /// <remarks>The caller holds the file lock. Does not dispose the timer. A failure leaves the stream unset and throws.</remarks>
+    /// <remarks>
+    /// The caller holds the file lock. Does not dispose the timer. A failure leaves the stream unset and throws.
+    /// The stream buffer is one byte. ALog keeps the real buffer, so disposing this stream cannot write leftover bytes.
+    /// The constructor rejects a buffer of zero.
+    /// </remarks>
     private void OpenStream()
     {
         _stream = new FileStream(
@@ -314,7 +320,7 @@ internal sealed class SharedLogFile
             FileMode.Append,
             FileAccess.Write,
             FileShare.Read | FileShare.Delete,
-            bufferSize: 4096,
+            bufferSize: 1,
             FileOptions.None);
         _logicalLength = _stream.Length;
         _pending = 0;
@@ -364,10 +370,11 @@ internal sealed class SharedLogFile
     /// <param name="force">True on a flush tick, <see cref="Flush"/>, close, and before this process rotates. False waits for the check gap.</param>
     /// <remarks>
     /// The caller holds the file lock. A forced call still runs when the gap has not elapsed.
-    /// A call that is not forced returns until <see cref="FileFlushInterval"/> has elapsed, or one second when that interval is zero.
+    /// A call that is not forced returns until <see cref="FileFlushInterval"/> has elapsed. A zero interval is always due.
     /// Length comes from <c>FileInfo.Length</c> on the path, not from the open stream.
-    /// A missing path is flushed into the old stream, closed, and opened again.
-    /// A shorter path is closed without writing at the old position, then opened again, and the buffer is written there.
+    /// A missing path is flushed into the old stream, that stream is disposed, and the path is opened again.
+    /// A shorter path disposes the old stream without writing to it or seeking, then opens the path again.
+    /// Append mode places that new stream at the current length, and the buffer is written there.
     /// </remarks>
     private void Reconcile(bool force)
     {
@@ -389,23 +396,29 @@ internal sealed class SharedLogFile
         }
     }
 
-    /// <summary>True when the clock says the path may be compared again.</summary>
-    /// <returns>True when no check has been recorded or the gap has elapsed.</returns>
-    /// <remarks>The caller holds the file lock. Does not touch the disk. The gap is the flush interval, or one second when the interval is zero.</remarks>
+    /// <summary>True when the path may be compared before the next write.</summary>
+    /// <returns>True when the flush interval is zero, when no check has been recorded, or when the interval has elapsed.</returns>
+    /// <remarks>
+    /// The caller holds the file lock. Does not touch the disk.
+    /// A zero interval writes every line, so the path is compared before each of those writes.
+    /// A positive interval waits until that interval has elapsed. Comparing on every event is wrong for that interval.
+    /// </remarks>
     private bool IdentityCheckDue()
     {
+        if (_interval <= TimeSpan.Zero)
+            return true;
+
         if (_lastIdentityCheck == default)
             return true;
 
-        var gap = _interval > TimeSpan.Zero ? _interval : TimeSpan.FromSeconds(1);
-        return _clock.GetUtcNow() - _lastIdentityCheck >= gap;
+        return _clock.GetUtcNow() - _lastIdentityCheck >= _interval;
     }
 
     /// <summary>Writes the buffer into the current stream, closes it, and opens <see cref="Path"/> again.</summary>
     /// <remarks>
-    /// The caller holds the file lock. The buffered bytes are written before the old stream is closed.
-    /// A failed flush or close is reported and the path is still opened again.
-    /// A failed open leaves the stream unset and throws, so the caller reports it on the write-error path.
+    /// The caller holds the file lock. Used when the path is missing. The buffered bytes are written into the old stream,
+    /// which still names the renamed or deleted file. That stream is disposed in a finally block, including when the write fails.
+    /// The path is still opened again. A failed open leaves the stream unset and throws, so the caller reports it on the write-error path.
     /// </remarks>
     private void ReopenPath()
     {
@@ -413,38 +426,61 @@ internal sealed class SharedLogFile
         try
         {
             FlushPending();
-            _stream = null;
-            stream.Dispose();
         }
         catch (Exception ex)
         {
-            _stream = null;
             System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+        }
+        finally
+        {
+            _stream = null;
+            DisposeDetached(stream);
         }
 
         OpenStream();
     }
 
     /// <summary>
-    /// Closes the current stream without writing at its position, then opens <see cref="Path"/> and keeps the buffer.
+    /// Closes the current stream without writing to it, then opens <see cref="Path"/> and keeps the buffer.
     /// </summary>
     /// <remarks>
     /// The caller holds the file lock. Used when the path exists but is shorter than the write position.
-    /// Writing the buffer first would extend a truncated file with zero bytes. The bytes stay in the buffer
-    /// and the next flush writes them on the stream that was just opened. A failed open leaves the stream unset and throws.
+    /// Writing the buffer first would extend a truncated file with zero bytes. The bytes stay in the buffer.
+    /// The old stream is disposed in a finally block and is not seeked. Append mode opens at the current length,
+    /// and the next flush writes the buffer there. A failed open leaves the stream unset and throws.
     /// </remarks>
     private void ReopenKeepingPending()
     {
         var pending = _pending;
         var stream = _stream!;
         _stream = null;
-        if (stream.CanSeek)
-            stream.Seek(0, SeekOrigin.Begin);
+        try
+        {
+            // Case B writes nothing here. The pending bytes are for the stream opened below.
+        }
+        finally
+        {
+            DisposeDetached(stream);
+        }
 
-        stream.Dispose();
         OpenStream();
         _pending = pending;
         _logicalLength = _stream!.Position + pending;
+    }
+
+    /// <summary>Disposes a stream that is no longer stored in the field.</summary>
+    /// <param name="stream">The stream to close. Not null.</param>
+    /// <remarks>The caller holds the file lock. A failure is reported and not thrown, so the path can still be opened again.</remarks>
+    private static void DisposeDetached(FileStream stream)
+    {
+        try
+        {
+            stream.Dispose();
+        }
+        catch (Exception ex)
+        {
+            System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+        }
     }
 
     /// <summary>Moves the file when the next line would start at or past <paramref name="maxBytes"/>.</summary>
