@@ -39,7 +39,7 @@ def read_runs(root, include_underscore):
         with open(path, newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             if reader.fieldnames != COLUMNS:
-                sys.exit(f"{path}: columns {reader.fieldnames} differ from the fixed BEN-07 list {COLUMNS}")
+                sys.exit(f"{path}: columns {reader.fieldnames} differ from the fixed column list {COLUMNS}")
             for r in reader:
                 r["source"] = name
                 rows.append(r)

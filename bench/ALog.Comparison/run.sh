@@ -67,7 +67,7 @@ SCALED=0
 if [[ -n "${BENCH_N:-}" ]] || [[ -n "${BENCH_N_SCALE:-}" && "${BENCH_N_SCALE}" != "1" ]]; then SCALED=1; fi
 BDN="${BENCH_BDN:-$([[ $SCALED == 1 ]] && echo 0 || echo 1)}"
 if [[ "$BDN" == "1" ]]; then
-  echo "BenchmarkDotNet run (BEN-05)" | tee -a "$LOG"
+  echo "BenchmarkDotNet run" | tee -a "$LOG"
   # BenchmarkDotNet finds ALog.Comparison.csproj from the working directory, so it runs from here.
   (cd "$HERE" && "$DOTNET" "$BIN" micro --filter '*' --artifacts "$OUT/bdn" --exporters csv github json 2>&1 | tee -a "$LOG")
 fi

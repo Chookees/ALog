@@ -166,7 +166,7 @@ public sealed class AlogLib(bool useQueue) : ILib
     /// TODO-BKP (use the API name BKP introduces), change this text to the mode set there, and remove the flush retry
     /// in <see cref="Drain"/> (DC 2026-10-22, questions 1, 2 and 4). Written into Notes and details.jsonl.
     /// </summary>
-    public const string FullMode = "drop (ALog has no Block mode before BKP)";
+    public const string FullMode = "drop (ALog has no Block mode in this version)";
 
     private static readonly TimeSpan FlushDeadline = TimeSpan.FromMilliseconds(4500);
     private ALog.Core.LoggerEngine? engine;
@@ -178,8 +178,8 @@ public sealed class AlogLib(bool useQueue) : ILib
     public string Mode => useQueue ? "async" : "sync";
 
     public string Notes => useQueue
-        ? "ALog LoggerEngine + FileLogWriter; UseBackgroundQueue(capacity=10000, batch 10, 100 ms) per README Step 3; full mode: " + FullMode + ", a drop makes the cell invalid (DC 2026-10-22); Close = FlushAsync until it returns before the 5 s deadline, then Dispose (obsolete after BKP); FileLogWriter appends per event (File.AppendAllText), not configurable before BKP; PlainTextFormatter standard exception format / JsonFormatter"
-        : "ALog LoggerEngine + FileLogWriter on the caller thread (no queue); extra row, not ranked (DC 2026-10-22); FileLogWriter appends per event (File.AppendAllText); PlainTextFormatter standard exception format / JsonFormatter";
+        ? "ALog LoggerEngine + FileLogWriter; UseBackgroundQueue(capacity=10000, batch 10, 100 ms) per README Step 3; full mode: " + FullMode + ", a drop makes the cell invalid (decided 2026-10-22); Close = FlushAsync until it returns before the 5 s deadline, then Dispose (obsolete once a Block mode exists); FileLogWriter appends per event (File.AppendAllText), not configurable in this version; PlainTextFormatter standard exception format / JsonFormatter"
+        : "ALog LoggerEngine + FileLogWriter on the caller thread (no queue); extra row, not ranked (decided 2026-10-22); FileLogWriter appends per event (File.AppendAllText); PlainTextFormatter standard exception format / JsonFormatter";
 
     public bool Ranked => useQueue;
 
@@ -328,7 +328,7 @@ public sealed class SerilogLib : ILib
 
     public bool Ranked => true;
 
-    public string Notes => "Serilog WriteTo.Async(bufferSize=10000, blockWhenFull=true) -> File(buffered=true; default false flushes per event, changed per BEN-03); README https://github.com/serilog/serilog-sinks-async/blob/dev/README.md and https://github.com/serilog/serilog-sinks-file/blob/dev/README.md#performance; JSON = Serilog.Formatting.Json.JsonFormatter(renderMessage=true); timestamps in JSON are DateTimeOffset local, run with TZ=UTC";
+    public string Notes => "Serilog WriteTo.Async(bufferSize=10000, blockWhenFull=true) -> File(buffered=true; default false flushes per event, changed so it does not flush every event); README https://github.com/serilog/serilog-sinks-async/blob/dev/README.md and https://github.com/serilog/serilog-sinks-file/blob/dev/README.md#performance; JSON = Serilog.Formatting.Json.JsonFormatter(renderMessage=true); timestamps in JSON are DateTimeOffset local, run with TZ=UTC";
 
     public string? NotSupported(string scenario) => null;
 
@@ -428,8 +428,8 @@ public sealed class Log4NetLib : ILib
 
     public string? NotSupported(string scenario) => scenario switch
     {
-        "T2" => "log4net has no message templates or named properties; ILog.InfoFormat only formats with String.Format (https://github.com/apache/logging-log4net/blob/master/src/log4net/ILog.cs, checked 2026-10-22, log4net 3.5.0); n/a per DC 2026-10-22",
-        "T7" => "log4net has no built-in JSON layout; JsonLayout only via the external project log4net.Ext.Json (https://logging.apache.org/log4net/manual/configuration/layouts.html, checked 2026-10-22, log4net 3.5.0); BEN-02 forbids third-party substitutes",
+        "T2" => "log4net has no message templates or named properties; ILog.InfoFormat only formats with String.Format (https://github.com/apache/logging-log4net/blob/master/src/log4net/ILog.cs, checked 2026-10-22, log4net 3.5.0); n/a, decided 2026-10-22",
+        "T7" => "log4net has no built-in JSON layout; JsonLayout only via the external project log4net.Ext.Json (https://logging.apache.org/log4net/manual/configuration/layouts.html, checked 2026-10-22, log4net 3.5.0); no third-party substitutes",
         _ => null,
     };
 
