@@ -2048,7 +2048,8 @@ public sealed class ExceptionFormatTests
 
     /// <summary>
     /// README console and formatter sections, and the changelog bullets, use the decided sentences.
-    /// Quick Start step 2 throws and catches a card decline and logs that exception.
+    /// Quick Start step 2 throws and catches a card decline and logs it as a failed payment
+    /// inside the Checkout scope (orderId 17). The Login line stays in its own scope.
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task Docs_LockExceptionFormatText()
@@ -2066,7 +2067,16 @@ public sealed class ExceptionFormatTests
         Assert.Contains("source", formatters, StringComparison.Ordinal);
         Assert.Contains("inner", formatters, StringComparison.Ordinal);
         Assert.Contains("throw new InvalidOperationException(\"Card declined\");", readme, StringComparison.Ordinal);
-        Assert.Contains("Log.Write(ex, \"Something went wrong\", LogLevel.Error);", readme, StringComparison.Ordinal);
+        Assert.Contains("Log.Write(ex, \"Payment failed\", LogLevel.Error);", readme, StringComparison.Ordinal);
+        Assert.Contains("Log.BeginScope(\"feature\", \"Checkout\")", readme, StringComparison.Ordinal);
+        Assert.Contains("Log.BeginScope(\"orderId\", 17)", readme, StringComparison.Ordinal);
+        Assert.Contains("Log.BeginScope(\"feature\", \"Login\")", readme, StringComparison.Ordinal);
+        Assert.Contains("Log.BeginScope(\"userId\", 42)", readme, StringComparison.Ordinal);
+        Assert.Contains(
+            "at Program.\u005Cu003CMain\u005Cu003E$(String[] args) in /_/Program.cs:line 33",
+            readme,
+            StringComparison.Ordinal);
+        Assert.Contains("\"method\": \"Program.Main\"", readme, StringComparison.Ordinal);
         Assert.Contains("new PlainTextFormatter(\"HH:mm:ss\")", readme, StringComparison.Ordinal);
         Assert.Contains("### Breaking (output)", changelog, StringComparison.Ordinal);
         Assert.Contains(BreakingBullet, changelog, StringComparison.Ordinal);

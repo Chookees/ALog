@@ -2,8 +2,8 @@
 # Screenshot recording (DOC-05):
 # Command: dotnet run --project samples/ALog.QuickstartSample
 # Terminal: XTerm(390) on Xvfb, background black, foreground white.
-# Font: DejaVu Sans Mono, size 16.
-# Window size: 1317x193 pixels, xterm geometry 101x7.
+# Font: DejaVu Sans Mono, size 11.
+# Window size: 1336x118 pixels, xterm geometry 148x6.
 """Keep the Quick Start README example tied to one real run.
 
 The sample, the screenshot text, and the JSON excerpt are allowed to change
