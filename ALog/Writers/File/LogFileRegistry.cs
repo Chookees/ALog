@@ -310,8 +310,8 @@ internal sealed class SharedLogFile
     /// <summary>Creates the append stream and, when the interval is positive, the flush timer.</summary>
     /// <remarks>
     /// The caller holds the file lock. Does not dispose the timer. A failure leaves the stream unset and throws.
-    /// The stream buffer is one byte. ALog keeps the real buffer, so disposing this stream cannot write leftover bytes.
-    /// The constructor rejects a buffer of zero.
+    /// bufferSize 1 means the FileStream keeps no internal buffer, so Dispose has nothing left to write.
+    /// .NET 10 accepts bufferSize 0, and 0 and 1 are both unbuffered. ALog buffers itself.
     /// </remarks>
     private void OpenStream()
     {
