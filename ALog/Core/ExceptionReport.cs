@@ -39,7 +39,7 @@ internal static class ExceptionReport
     /// Nodes one flatten, inner, or origin walk may visit.
     /// A flatten counts nested aggregates and leaves on this one counter.
     /// The root is the node already being rendered and is not counted again.
-    /// Hitting the cap writes <c>(+N+ more)</c>.
+    /// A child still unread at this cap writes <c>(+N+ more)</c>.
     /// </summary>
     private const int MaxFlatten = 64;
 
@@ -630,8 +630,8 @@ internal static class ExceptionReport
     /// <remarks>
     /// The aggregate's message is omitted because the runtime repeats the inner messages there.
     /// <c>N</c> is the number of flattened entries that were not shown.
-    /// The extra plus means the flatten walk stopped at its cap with entries still unread.
-    /// An empty list that stopped at the cap still writes <c>(+1+ more)</c>, a lower bound.
+    /// The extra plus means a child is still unread.
+    /// An empty entry list writes <c>(+1+ more)</c> when a child is still unread, a lower bound.
     /// </remarks>
     private static string RenderAggregate(AggregateException exception, List<Exception> ancestors)
     {
@@ -1285,16 +1285,18 @@ internal static class ExceptionReport
     /// Ancestor path of the caller. A child on this path is a cycle and is not emitted.
     /// Not null. The root is still processed when it appears here.
     /// </param>
-    /// <returns>The flattened entries, and whether the walk stopped with nodes still unread.</returns>
+    /// <returns>The flattened entries, and whether a child is still unread.</returns>
     /// <remarks>
     /// Each aggregate appends its non-aggregate children immediately, in order, and appends nested
     /// aggregates to the end of the work list. <c>Agg(x, Agg(y), z)</c> is <c>x, z, y</c>.
     /// The same instance is emitted twice when it is a sibling. It is skipped only when it is an ancestor.
     /// The method does not call <see cref="AggregateException.Flatten"/>, because that loops on a reflective cycle.
-    /// Nested aggregates and leaves share one counter of 64. An aggregate copies only as many children as slots remain.
+    /// Nested aggregates and leaves share one counter of 64. The rendered root does not count.
+    /// An aggregate copies only as many children as slots remain.
     /// A child that is an ancestor is not recorded and does not increment the counter.
-    /// Leaving children unread marks the walk incomplete.
-    /// Does not throw.
+    /// An aggregate already counted is fully visited when it has no child left to read.
+    /// The walk is incomplete only when a child is still unread.
+    /// Does not throw. The work list holds at most 64 aggregates beyond the root.
     /// </remarks>
     private static (List<Exception> Entries, bool Incomplete) Flatten(AggregateException root, List<Exception> ancestors)
     {
@@ -1339,9 +1341,88 @@ internal static class ExceptionReport
             }
         }
 
-        if (read < work.Count)
+        if (!incomplete && read < work.Count && UnreadWorkHasChild(work, parent, read, ancestors))
             incomplete = true;
         return (result, incomplete);
+    }
+
+    /// <summary>True when an aggregate still queued has a child that would be emitted.</summary>
+    /// <param name="work">Aggregates in queue order. Not null.</param>
+    /// <param name="parent">Parent index of each queued aggregate. Index -1 is the root.</param>
+    /// <param name="read">First index that was not opened.</param>
+    /// <param name="ancestors">Caller ancestor path. A child on this path is a cycle. Not null.</param>
+    /// <returns>True when one remaining aggregate has a child that is not a cycle.</returns>
+    /// <remarks>
+    /// Does not throw. At most 64 remaining aggregates are checked.
+    /// Each check stops at the first child that would be emitted.
+    /// Null slots do not count. A throwing inner-exceptions getter counts as no children.
+    /// </remarks>
+    private static bool UnreadWorkHasChild(
+        List<AggregateException> work,
+        int[] parent,
+        int read,
+        List<Exception> ancestors)
+    {
+        var end = read + MaxFlatten;
+        if (end > work.Count)
+            end = work.Count;
+        for (var index = read; index < end; index++)
+        {
+            if (HasReadableChild(work, parent, index, ancestors))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>True when <paramref name="index"/> has a child the flatten walk would emit or queue.</summary>
+    /// <param name="work">Aggregates in queue order. Not null.</param>
+    /// <param name="parent">Parent index of each queued aggregate. Index -1 is the root.</param>
+    /// <param name="index">Aggregate that was counted and not opened.</param>
+    /// <param name="ancestors">Caller ancestor path. A child on this path is a cycle. Not null.</param>
+    /// <returns>True when the first readable child is not an ancestor.</returns>
+    /// <remarks>
+    /// Does not throw. The scan stops at the first child that would be emitted.
+    /// A null slot is skipped. A throwing inner-exceptions getter counts as no children.
+    /// The slot loop stops at 64.
+    /// </remarks>
+    private static bool HasReadableChild(
+        List<AggregateException> work,
+        int[] parent,
+        int index,
+        List<Exception> ancestors)
+    {
+        try
+        {
+            var inners = work[index].InnerExceptions;
+            if (inners == null)
+                return false;
+            var seen = 0;
+            foreach (var inner in inners)
+            {
+                if (seen == MaxFlatten)
+                    break;
+                seen++;
+                if (inner == null)
+                    continue;
+                if (inner is AggregateException nested)
+                {
+                    if (IsAggregateAncestor(work, parent, index, nested) || Contains(ancestors, nested))
+                        continue;
+                    return true;
+                }
+
+                if (Contains(ancestors, inner))
+                    continue;
+                return true;
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        return false;
     }
 
     /// <summary>True when <paramref name="candidate"/> is on the parent chain of one queued aggregate.</summary>

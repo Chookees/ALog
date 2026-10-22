@@ -1029,6 +1029,68 @@ public sealed class ExceptionFormatTests
     }
 
     /// <summary>
+    /// Sixty-four empty aggregates fill the visit counter and have no children left to read.
+    /// They are fully visited, so the text is the aggregate type with no suffix.
+    /// JSON has no inner entries.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_SixtyFourEmptyAggregatesHaveNoSuffix()
+    {
+        await Task.CompletedTask;
+        var children = new Exception[64];
+        for (var i = 0; i < children.Length; i++)
+            children[i] = new AggregateException();
+        var root = new AggregateException(children);
+        Assert.Equal("AggregateException", ExceptionReport.FormatText(root));
+        var body = ExceptionReport.CreateBody(root);
+        Assert.True(body.Inner == null || body.Inner.Count == 0);
+    }
+
+    /// <summary>
+    /// Sixty-three empty aggregates and one leaf fill the visit counter.
+    /// The leaf is a direct child, and each empty aggregate has no child left to read.
+    /// Text shows the leaf and no <c>(+n more)</c> suffix. JSON lists that same leaf.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_EmptyAggregatesThenLeafHaveNoSuffix()
+    {
+        await Task.CompletedTask;
+        var children = new Exception[64];
+        for (var i = 0; i < 63; i++)
+            children[i] = new AggregateException();
+        children[63] = new InvalidOperationException("last");
+        var root = new AggregateException(children);
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: last",
+            ExceptionReport.FormatText(root));
+        AssertInnerMessages(root, "last");
+    }
+
+    /// <summary>
+    /// Sixty-three leaves and an empty aggregate in the last slot fill the visit counter.
+    /// The empty aggregate was counted and has no child left to read, so the suffix has no extra plus.
+    /// JSON lists the first 16 leaves from that same list.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task Aggregate_EmptyAggregateAfterSixtyThreeLeavesIsCounted()
+    {
+        await Task.CompletedTask;
+        var children = new Exception[64];
+        for (var i = 0; i < 63; i++)
+            children[i] = new InvalidOperationException(i.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        children[63] = new AggregateException();
+        var root = new AggregateException(children);
+        var text = ExceptionReport.FormatText(root);
+        Assert.Equal(
+            "AggregateException --> InvalidOperationException: 0; InvalidOperationException: 1; InvalidOperationException: 2 (+60 more)",
+            text);
+        Assert.DoesNotContain("(+60+ more)", text, StringComparison.Ordinal);
+        AssertInnerMessages(
+            root,
+            Enumerable.Range(0, 16).Select(i => i.ToString(System.Globalization.CultureInfo.InvariantCulture)).ToArray());
+    }
+
+    /// <summary>
     /// JSON keeps <c>type</c>, <c>message</c>, and <c>stackTrace</c> and adds <c>source</c> and <c>inner</c>.
     /// Compact output stays one line. Pretty output stays indented. The message is raw and full.
     /// </summary>
