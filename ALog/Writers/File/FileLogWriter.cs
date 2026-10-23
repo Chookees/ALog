@@ -7,11 +7,16 @@ using System.Text;
 using System.Threading.Tasks;
 using ALog.Config;
 using ALog.Core;
+using ALog.Formatters;
 using ALog.Public.Interfaces;
 
 public class FileLogWriter : ILogWriter, IFormattableLogWriter
 {
     private static readonly Encoding Utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+    private static readonly byte[] NewLineBytes = Utf8.GetBytes(Environment.NewLine);
+
+    [ThreadStatic]
+    private static byte[]? _utf8Scratch;
 
     private readonly string _filePath;
     private readonly long? _maxFileSizeInBytes;
@@ -167,7 +172,13 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
             if (logEvent is null)
                 throw new ArgumentNullException(nameof(logEvent));
 
+            if (TryWriteFast(logEvent))
+                return;
+
             var line = Formatter?.Format(logEvent) ?? FormatFallback(logEvent);
+            if (TryWriteAsciiLine(line))
+                return;
+
             var lineWithNewline = line + Environment.NewLine;
             var bytes = Utf8.GetBytes(lineWithNewline);
             lock (_writeLock)
@@ -189,6 +200,66 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     /// Does not throw. The message is always included, including when it is empty, matching the previous file fallback.
     /// The category is not written here. The message, context keys, and context values are escaped so none of them can forge a <c>|</c> separator or a second line.
     /// </remarks>
+    /// <summary>
+    /// Writes one ASCII line straight into the file buffer when the formatter can.
+    /// </summary>
+    /// <param name="logEvent">Event to append. Not null.</param>
+    /// <returns>True when the line is in the file buffer. False when the caller uses the string path.</returns>
+    /// <remarks>Does not throw. The scratch buffer is per thread. The file lock covers only the copy.</remarks>
+    private bool TryWriteFast(LogEvent logEvent)
+    {
+        if (Formatter is not PlainTextFormatter plain)
+            return false;
+
+        var buffer = _utf8Scratch ??= new byte[1024];
+        if (!plain.TryWriteUtf8(logEvent, buffer, out var written))
+        {
+            if (buffer.Length >= 64 * 1024)
+                return false;
+            buffer = _utf8Scratch = new byte[buffer.Length * 2];
+            if (!plain.TryWriteUtf8(logEvent, buffer, out written))
+                return false;
+        }
+
+        var newline = NewLineBytes;
+        if (written + newline.Length > buffer.Length)
+            return false;
+        newline.CopyTo(buffer.AsSpan(written));
+        lock (_writeLock)
+            _shared.Append(buffer.AsSpan(0, written + newline.Length), _maxFileSizeInBytes);
+        return true;
+    }
+
+    /// <summary>Copies an ASCII line plus the newline into the file buffer.</summary>
+    /// <param name="line">Line without a newline. Not null.</param>
+    /// <returns>False when the line is not ASCII or does not fit the scratch buffer.</returns>
+    /// <remarks>Does not throw. The caller uses the encoding path when this returns false.</remarks>
+    private bool TryWriteAsciiLine(string line)
+    {
+        var newline = NewLineBytes;
+        var needed = line.Length + newline.Length;
+        var buffer = _utf8Scratch ??= new byte[1024];
+        if (needed > buffer.Length)
+        {
+            if (needed > 64 * 1024)
+                return false;
+            buffer = _utf8Scratch = new byte[Math.Max(needed, buffer.Length * 2)];
+        }
+
+        for (var i = 0; i < line.Length; i++)
+        {
+            var ch = line[i];
+            if (ch > 127)
+                return false;
+            buffer[i] = (byte)ch;
+        }
+
+        newline.CopyTo(buffer.AsSpan(line.Length));
+        lock (_writeLock)
+            _shared.Append(buffer.AsSpan(0, needed), _maxFileSizeInBytes);
+        return true;
+    }
+
     private string FormatFallback(LogEvent logEvent)
     {
         var head = "[" + logEvent.Timestamp.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + logEvent.Level + "]";
