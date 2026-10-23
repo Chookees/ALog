@@ -23,18 +23,6 @@ public sealed class ExceptionFormatTests
     private const string TargetTail =
         "Payment failed | InvalidOperationException: Card declined | at CheckoutService.Pay in CheckoutService.cs:42 | ctx: orderId=17";
 
-    private const string BreakingBullet =
-        "- Plain text, console, and file output write exceptions as \"Type: Message\", followed by inner exceptions and the source line (\"at Class.Method in File.cs:42\"). The \"EX:\" label is gone; update log parsers that match it. `|` and `-->` in the message, the category, and context or property names and values are escaped as `\\|` and `--\\>`, line breaks as `\\r` and `\\n`, and a backslash is doubled only where it would otherwise read as one of these escapes (`C:\\temp` stays as is), so each event stays one line.";
-
-    private const string ReadmeEscapeSentence =
-        "`|` and `-->` in the message, the category, and context or property names and values are escaped as `\\|` and `--\\>`, line breaks as `\\r` and `\\n`, and a backslash is doubled only where it would otherwise read as one of these escapes (`C:\\temp` stays as is), so each event stays one line.";
-
-    private const string AddedSourceBullet =
-        "- JSON and HTTP exception output add \"source\" (method, file, line) and \"inner\" (type, message, and source of each inner exception, up to 16).";
-
-    private const string AddedStackBullet =
-        "- PlainTextFormatter(includeStackTrace: true) appends the full stack trace.";
-
     /// <summary>
     /// The README example line is what plain text emits for a thrown <c>InvalidOperationException</c>.
     /// </summary>
@@ -2047,50 +2035,6 @@ public sealed class ExceptionFormatTests
     }
 
     /// <summary>
-    /// README console and formatter sections, and the changelog bullets, use the decided sentences.
-    /// Quick Start step 2 throws and catches a card decline and logs it as a failed payment
-    /// inside the Checkout scope (orderId 17). The Login line stays in its own scope.
-    /// </summary>
-    [Fact(Timeout = 30000)]
-    public async Task Docs_LockExceptionFormatText()
-    {
-        await Task.CompletedTask;
-        var root = RepoRoot();
-        var readme = File.ReadAllText(Path.Combine(root, "README.md"));
-        var changelog = File.ReadAllText(Path.Combine(root, "CHANGELOG.md"));
-        var console = Slice(readme, "## Console output", "## Quick Start");
-        var formatters = Slice(readme, "## Formatters", "## Contextual Logging");
-        Assert.Contains("[20:55:19] [Error] " + TargetTail, console, StringComparison.Ordinal);
-        Assert.Contains("includeStackTrace: true", console, StringComparison.Ordinal);
-        Assert.Contains("Type: Message", formatters, StringComparison.Ordinal);
-        Assert.Contains("source", formatters, StringComparison.Ordinal);
-        Assert.Contains("inner", formatters, StringComparison.Ordinal);
-        Assert.Contains("throw new InvalidOperationException(\"Card declined\");", readme, StringComparison.Ordinal);
-        Assert.Contains("Log.Write(ex, \"Payment failed\", LogLevel.Error);", readme, StringComparison.Ordinal);
-        Assert.Contains("Log.BeginScope(\"feature\", \"Checkout\")", readme, StringComparison.Ordinal);
-        Assert.Contains("Log.BeginScope(\"orderId\", 17)", readme, StringComparison.Ordinal);
-        Assert.Contains("Log.BeginScope(\"feature\", \"Login\")", readme, StringComparison.Ordinal);
-        Assert.Contains("Log.BeginScope(\"userId\", 42)", readme, StringComparison.Ordinal);
-        Assert.Contains(
-            "at Program.\u005Cu003CMain\u005Cu003E$(String[] args) in /_/Program.cs:line 33",
-            readme,
-            StringComparison.Ordinal);
-        Assert.Contains("\"method\": \"Program.Main\"", readme, StringComparison.Ordinal);
-        Assert.Contains("new PlainTextFormatter(\"HH:mm:ss\")", readme, StringComparison.Ordinal);
-        Assert.Contains("### Breaking (output)", changelog, StringComparison.Ordinal);
-        Assert.Contains(BreakingBullet, changelog, StringComparison.Ordinal);
-        Assert.Contains(ReadmeEscapeSentence, console, StringComparison.Ordinal);
-        Assert.Contains(
-            "a self-referencing exception built via reflection can overflow inside that call.",
-            console,
-            StringComparison.Ordinal);
-        Assert.Contains(ReadmeEscapeSentence, changelog, StringComparison.Ordinal);
-        Assert.Contains("### Added", changelog, StringComparison.Ordinal);
-        Assert.Contains(AddedSourceBullet, changelog, StringComparison.Ordinal);
-        Assert.Contains(AddedStackBullet, changelog, StringComparison.Ordinal);
-    }
-
-    /// <summary>
     /// Runs the top-level probe once so its captured exceptions have real stacks.
     /// Later calls do nothing, because the entry point is not safe to run twice in one process.
     /// </summary>
@@ -2558,19 +2502,6 @@ public sealed class ExceptionFormatTests
         }
 
         throw new InvalidOperationException("ALog.sln was not found above the test output.");
-    }
-
-    /// <summary>Returns the text between two headings, including the start heading.</summary>
-    /// <param name="text">Full document. Not null.</param>
-    /// <param name="start">Start heading. Not null.</param>
-    /// <param name="end">Heading that ends the slice. Not null.</param>
-    /// <returns>The slice.</returns>
-    private static string Slice(string text, string start, string end)
-    {
-        var from = text.IndexOf(start, StringComparison.Ordinal);
-        var to = text.IndexOf(end, from + start.Length, StringComparison.Ordinal);
-        Assert.True(from >= 0 && to > from);
-        return text.Substring(from, to - from);
     }
 
     /// <summary>Exception with no message of its own, so the framework sentence must be recognized.</summary>

@@ -9,7 +9,7 @@
     <!-- Stack frames name /_/ instead of the machine path that built the sample. -->
     <PathMap>$(MSBuildProjectDirectory)=/_/</PathMap>
     <!--
-      The solution build uses the project reference. eng/consumer-smoke.sh readme
+      The solution build uses the project reference. eng/consumer-smoke.sh quickstart
       sets ALogSmokeFromFeed so this sample restores the packed nupkgs instead.
       Both packages are referenced so the same SHA-512 feed proof used by the
       file and console modes can read this project's assets file.

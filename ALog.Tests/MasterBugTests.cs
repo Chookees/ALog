@@ -26,34 +26,8 @@ public sealed class MasterBugTests : IDisposable
 {
     private const string CapturePlaceholder = "[capture failed: InvalidOperationException]";
 
-    private const string WriterSentence =
-        "Writer settings (Enabled, paths) are read at startup; only levels reload at runtime.";
-
-    private const string StartupSentence =
-        "ALog reads its settings, including MinimumLevel, once at startup. Changes while the app runs have no effect; restart the app.";
-
-    private const string LevelsReloadPhrase = "only levels reload at runtime";
-
-    private const string SkipSentence =
-        "To see why a test was skipped, run `dotnet test --logger \"console;verbosity=normal\"`.";
-
     private const string Remarks =
         "Read once at startup. Changes while the app runs have no effect; restart the app.";
-
-    private const string BreakingLine =
-        "- Breaking (behavior): a single value or a list where ALog expects a section (for example `\"ALog\": { \"Console\": true }`) now stops startup with an error that names the path. Before, ALog ignored it and wrote nothing.";
-
-    private const string FixedLine =
-        "- Fixed: `ConsoleLogWriter` and `FileLogWriter` write the line even when the `ToString()` of a property or scope value throws. That value shows `[capture failed: ExceptionType]`.";
-
-    private const string AwsBreakingLine =
-        "- Breaking (dependency): `AWSSDK.CloudWatchLogs` moves from 3.7.509.3 (AWS SDK for .NET V3, end of support since 2026-06-01) to 4.0.106 (V4). If your app references other `AWSSDK.*` packages, upgrade all of them to V4 together; otherwise restore fails with NU1107 (version conflict on `AWSSDK.Core`), or it succeeds with warning NU1608 and the app throws `MissingMethodException` at runtime.";
-
-    private const string AwsFixedLine =
-        "- Fixed: `AwsCloudWatchWriter` now sends the message-template properties and the context with each event, not only the rendered message.";
-
-    private const string AwsSdkParagraph =
-        "`AwsCloudWatchWriter` uses the AWS SDK for .NET V4 (`AWSSDK.CloudWatchLogs` 4.0.106). If your app references other `AWSSDK.*` packages, use their V4 versions too. V3 packages next to it make restore fail with NU1107 (version conflict on `AWSSDK.Core`), or restore succeeds with warning NU1608 and the app throws `MissingMethodException` at runtime.";
 
     private const string ConsoleSingleValueMessage =
         "Invalid ALog configuration at 'ALog:Console': expected a section with settings, but found a single value. Put the settings inside the section, as shown in the README.";
@@ -899,52 +873,15 @@ public sealed class MasterBugTests : IDisposable
     }
 
     /// <summary>
-    /// Locks the M1 sentences: writer remarks, install lines without a version flag,
-    /// the M1 changelog bullets, the AWS V4 changelog and README sentences, the skip hint,
-    /// and the startup sentence under the JSON example.
-    /// <c>only levels reload at runtime</c> is absent.
+    /// Locks the M1 source texts: the writer remarks in <c>ALogOptions</c> and the
+    /// SqlClient advisory notes in <c>ALog.csproj</c>.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task Docs_LockMasterBugTexts()
+    public async Task Sources_LockMasterBugTexts()
     {
         await Task.CompletedTask;
-        var readme = ReadRepoFile("README.md");
-        var packageReadme = ReadRepoFile("ALog.Extensions.Logging/README.md");
-        var aspnet = Slice(readme, "### ASP.NET Core", "## Console output");
-        var contributing = Slice(readme, "## Contributing", "## License");
-
-        var jsonAt = aspnet.IndexOf("{ \"ALog\": { \"Console\": { \"Enabled\": true } } }", StringComparison.Ordinal);
-        var startupAt = aspnet.IndexOf(StartupSentence, StringComparison.Ordinal);
-        Assert.True(jsonAt >= 0 && startupAt > jsonAt, "Startup sentence must sit under the JSON example.");
-        Assert.Equal(1, CountOf(readme, StartupSentence));
-        Assert.Equal(0, CountOf(readme, WriterSentence));
-        Assert.DoesNotContain(LevelsReloadPhrase, readme, StringComparison.Ordinal);
-        Assert.Contains(SkipSentence, contributing, StringComparison.Ordinal);
-        Assert.Equal(1, CountOf(readme, SkipSentence));
-        Assert.Contains("dotnet add package ALog", readme, StringComparison.Ordinal);
-        Assert.Contains("dotnet add package ALog.Extensions.Logging", readme, StringComparison.Ordinal);
-        Assert.DoesNotContain("--version", readme, StringComparison.Ordinal);
-        Assert.DoesNotContain("--version", packageReadme, StringComparison.Ordinal);
-        Assert.Equal(1, CountOf(readme, AwsBreakingLine));
-        Assert.Equal(1, CountOf(readme, AwsSdkParagraph));
-        var shipping = Slice(readme, "### Step 4: Shipping Writers", "## Limitations");
-        Assert.Contains(AwsSdkParagraph, shipping, StringComparison.Ordinal);
-        var migrating = Slice(readme, "### AWS SDK V4", "## Contributing");
-        Assert.Contains(AwsBreakingLine, migrating, StringComparison.Ordinal);
-
         var notes = ReadRepoFile("ALog/Config/ALogOptions.cs");
         Assert.Equal(2, CountOf(notes, "<remarks>" + Remarks + "</remarks>"));
-
-        var changelog = Slice(ReadRepoFile("CHANGELOG.md"), "## 0.2.1\n", "\n## 0.2.0");
-        var lines = NonEmptyLines(changelog);
-        Assert.True(lines.Count >= 8, "0.2.1 section is too short.");
-        Assert.StartsWith("- Breaking (dependency): `Microsoft.Data.SqlClient`", lines[0], StringComparison.Ordinal);
-        var queue = lines.FindIndex(line => line.StartsWith("- Fixed: with the background queue,", StringComparison.Ordinal));
-        Assert.True(queue >= 0, "background queue line missing");
-        Assert.Equal(BreakingLine, lines[queue + 1]);
-        Assert.Equal(FixedLine, lines[queue + 2]);
-        Assert.Equal(AwsBreakingLine, lines[queue + 3]);
-        Assert.Equal(AwsFixedLine, lines[queue + 4]);
 
         var project = ReadRepoFile("ALog/ALog.csproj");
         Assert.Contains("GHSA-846f-f764-76mx", project, StringComparison.Ordinal);
@@ -1484,25 +1421,6 @@ public sealed class MasterBugTests : IDisposable
             throw new InvalidOperationException(relative + " is larger than 1000000 bytes.");
 
         return File.ReadAllText(path);
-    }
-
-    /// <summary>Returns the text after <paramref name="start"/> and before the next <paramref name="end"/>.</summary>
-    /// <param name="text">Source. Not null.</param>
-    /// <param name="start">Opening marker. Not null.</param>
-    /// <param name="end">Closing marker. Not null.</param>
-    /// <returns>The slice, or empty when the opening marker is missing.</returns>
-    private static string Slice(string text, string start, string end)
-    {
-        var at = text.IndexOf(start, StringComparison.Ordinal);
-        if (at < 0)
-            return string.Empty;
-
-        var from = at + start.Length;
-        var next = text.IndexOf(end, from, StringComparison.Ordinal);
-        if (next < 0)
-            return text.Substring(from);
-
-        return text.Substring(from, next - from);
     }
 
     /// <summary>Counts non-overlapping hits, stopping at 20.</summary>

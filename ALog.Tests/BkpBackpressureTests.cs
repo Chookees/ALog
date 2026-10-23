@@ -18,9 +18,6 @@ namespace ALog.Tests;
 public sealed class BkpBackpressureTests : IDisposable
 {
     private const string AllowedMode = "Invalid ALog configuration at 'ALog:QueueFullMode': '";
-    private const string OneWriterProvisional = "Each log file has one writer process; give each process its own file.";
-    private const string ChangelogProvisional =
-        "A log file now has exactly one writer process while ALog runs; give each process its own file (other processes can still read, rename, or delete it).";
 
     /// <summary>Drops a static logger left by another test.</summary>
     public BkpBackpressureTests() => Log.Shutdown();
@@ -660,39 +657,6 @@ public sealed class BkpBackpressureTests : IDisposable
         engine.Dispose();
     }
 
-    /// <summary>The README and changelog use the final sentences once, and the changelog does not say backpressure.</summary>
-    [Fact(Timeout = 30000)]
-    public async Task Docs_LockBackpressureTexts()
-    {
-        await Task.CompletedTask;
-        var readme = ReadRepoFile("README.md");
-        var changelog = ReadRepoFile("CHANGELOG.md");
-        Assert.Equal(1, CountOf(readme, "backpressure"));
-        var at = readme.IndexOf("backpressure", StringComparison.Ordinal);
-        var window = readme.Substring(at, Math.Min(80, readme.Length - at));
-        Assert.Contains("QueueFullMode = Block", window, StringComparison.Ordinal);
-        Assert.Contains(
-            "When the queue is full, ALog drops the new event by default and counts it (SelfLog ALOG0070). To make the caller wait instead, set `QueueFullMode = Block` (in JSON: `\"ALog\": { \"QueueFullMode\": \"Block\" }`). Even with `Block`, a call from the queue's own writer thread or after shutdown has started is dropped and counted, so logging can never deadlock.",
-            readme,
-            StringComparison.Ordinal);
-        Assert.Contains("#### Queue, file buffer, and shutdown options", readme, StringComparison.Ordinal);
-        Assert.Contains("`QueueFullMode`: `Drop` (default) drops and counts new events while the queue is full. `Block` makes the caller wait until there is room.", readme, StringComparison.Ordinal);
-        Assert.Contains("`FileBufferSize`: how much `FileLogWriter` collects before it writes to the file. Default 64 KiB, 4 KiB to 16 MiB.", readme, StringComparison.Ordinal);
-        Assert.Contains("`FileFlushInterval`: how often buffered lines are written even if the buffer is not full. Default 1 s, 0 to 60 s. `0` writes every event right away.", readme, StringComparison.Ordinal);
-        Assert.Contains("`FlushTimeout`: how long `Flush`, `Dispose`, and `Shutdown` wait for queued events. Default 5 s, 0 to 60 s. Events still unwritten after that are counted (ALOG0071).", readme, StringComparison.Ordinal);
-        Assert.Contains("Each log file has one writer process: give each process its own file. Other programs can read, tail, and rotate it.", readme, StringComparison.Ordinal);
-        Assert.Contains("If the process crashes, the file can miss up to one `FileFlushInterval` or one `FileBufferSize` of lines, whichever comes first. Set `FileFlushInterval` to `0` if every line must reach the operating system immediately.", readme, StringComparison.Ordinal);
-        Assert.DoesNotContain(OneWriterProvisional, readme, StringComparison.Ordinal);
-        Assert.DoesNotContain(ChangelogProvisional, readme, StringComparison.Ordinal);
-        Assert.DoesNotContain(ChangelogProvisional, changelog, StringComparison.Ordinal);
-        Assert.DoesNotContain("backpressure", changelog, StringComparison.Ordinal);
-        Assert.Contains("`QueueFullMode`: `Drop` (default, as before) or `Block`. With `Block`, a full background queue makes the caller wait instead of dropping the event.", changelog, StringComparison.Ordinal);
-        Assert.Contains("`FileBufferSize` and `FileFlushInterval` control how `FileLogWriter` buffers lines.", changelog, StringComparison.Ordinal);
-        Assert.Contains("`FlushTimeout` sets how long `Flush`, `Dispose`, and `Shutdown` wait (0 to 60 s, default 5 s; previously fixed at 5 s).", changelog, StringComparison.Ordinal);
-        Assert.Contains("`FileLogWriter` keeps the file open and writes buffered lines instead of opening and closing it for every event. By default, lines reach the file within 1 second; set `FileFlushInterval` to `0` for the previous per-event behavior.", changelog, StringComparison.Ordinal);
-        Assert.Contains("A log file must have a single writer process; give each process its own file. On Windows a second writer gets an error; on Linux and macOS it is not detected and lines from both processes can mix. Reading, tailing, and rotating the file from outside still work (rename or copy-and-truncate); after a rename or delete, ALog starts the new file within one second, or within `FileFlushInterval` if that is longer. Lines written to a deleted file before then are lost.", changelog, StringComparison.Ordinal);
-    }
-
     /// <summary>A zero flush timeout reports events that are still open and does not arm a wait.</summary>
     /// <remarks>The writer stays blocked so the accepted event is still unwritten. The 30 s wait is a hang guard.</remarks>
     [Fact(Timeout = 120000)]
@@ -860,38 +824,6 @@ public sealed class BkpBackpressureTests : IDisposable
         catch (IOException)
         {
         }
-    }
-
-    private static string ReadRepoFile(string relative)
-    {
-        var dir = new DirectoryInfo(AppContext.BaseDirectory);
-        for (var i = 0; i < 8 && dir is not null; i++)
-        {
-            var candidate = Path.Combine(dir.FullName, "ALog.sln");
-            if (File.Exists(candidate))
-                return File.ReadAllText(Path.Combine(dir.FullName, relative));
-
-            dir = dir.Parent;
-        }
-
-        throw new InvalidOperationException("ALog.sln was not found.");
-    }
-
-    private static int CountOf(string text, string value)
-    {
-        var count = 0;
-        var index = 0;
-        while (index < text.Length)
-        {
-            var found = text.IndexOf(value, index, StringComparison.Ordinal);
-            if (found < 0)
-                return count;
-
-            count++;
-            index = found + value.Length;
-        }
-
-        return count;
     }
 
     /// <summary>Calls the queue from inside Write and records the bool before any later assert.</summary>

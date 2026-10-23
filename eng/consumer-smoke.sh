@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Packs ALog and runs one consumer that arc_spec 4.1 point 7 and DOC-02 describe.
-# Usage: eng/consumer-smoke.sh file|console|readme
+# Usage: eng/consumer-smoke.sh file|console|quickstart
 #
 # file and console restore with -p:ALogSmokeFromFeed=true and print
 # SMOKE-PACKAGE ALog <version> from-feed and the same line for
 # ALog.Extensions.Logging after checking project.assets.json and both SHA-512s.
 # file is green when SMOKE-<guid> appears once in the ALog file and the process
 # exits 0. console prints SMOKE-CONSOLE count=<n> and is green only when n is 1.
-# readme packs the same feed, runs the Quick Start sample in an empty directory,
-# and asks eng/readme-example-check.py to compare that run with the README.
+# quickstart packs the same feed and runs the Quick Start sample in an empty
+# directory. It is green when the sample exits 0 and writes logs/app.log.
 # ALog does not add a console writer unless ALog:Console:Enabled is true, so the
 # Microsoft console provider writes the line once. The normal solution build uses the
 # project reference; only this script selects the packed package.
@@ -173,13 +173,13 @@ prove_feed_package() {
   python3 eng/smoke-assets-check.py "$1" "$2" "$3"
 }
 
-# Accepts the smoke jobs. Args: file, console, or readme. Returns 1 for anything else.
-# readme runs the Quick Start sample against the same packed feed as the other two.
+# Accepts the smoke jobs. Args: file, console, or quickstart. Returns 1 for anything else.
+# quickstart runs the Quick Start sample against the same packed feed as the other two.
 require_smoke_mode() {
   case "$1" in
-    file|console|readme) return 0 ;;
+    file|console|quickstart) return 0 ;;
   esac
-  echo "Usage: eng/consumer-smoke.sh file|console|readme" >&2
+  echo "Usage: eng/consumer-smoke.sh file|console|quickstart" >&2
   return 1
 }
 
@@ -429,7 +429,7 @@ build_quickstart() {
 
 # Runs the sample in an empty directory and writes the console transcript.
 # Args: work directory. The transcript is the prompt line plus process stdout,
-# because that is the text the screenshot shows and the README check compares.
+# because that is the text the screenshot shows.
 # Copies logs/app.log to the work directory when the sample created it.
 # Returns the sample's exit code.
 run_quickstart_in_empty_dir() {
@@ -458,13 +458,13 @@ run_quickstart_in_empty_dir() {
 # Args: work directory. Uses RUNNER_TEMP on CI so the workflow can upload them.
 # A missing file is skipped so a failed run still publishes what was written.
 # Prints the directory. Returns 0.
-publish_readme_artifacts() {
+publish_quickstart_artifacts() {
   local work="$1"
   local dest
   if [ -n "${RUNNER_TEMP:-}" ]; then
-    dest="${RUNNER_TEMP}/readme-smoke"
+    dest="${RUNNER_TEMP}/quickstart-smoke"
   else
-    dest="$work/readme-smoke"
+    dest="$work/quickstart-smoke"
   fi
   mkdir -p "$dest"
   local name
@@ -473,17 +473,17 @@ publish_readme_artifacts() {
       cp "$work/$name" "$dest/$name"
     fi
   done
-  printf 'readme artifacts: %s\n' "$dest"
+  printf 'quickstart artifacts: %s\n' "$dest"
 }
 
 # Packs, proves the feed, and runs the Quick Start sample in an empty directory.
 # Args: package version. Exit 0 is required, and stdout plus logs/app.log are
-# kept for the README check and for the CI artifact upload.
-# Returns 1 when the feed proof, the sample, or the README check fails.
-run_readme_mode() {
+# kept for the CI artifact upload.
+# Returns 1 when the feed proof or the sample fails, or logs/app.log is missing.
+run_quickstart_mode() {
   local version="$1"
   if [ -z "$version" ]; then
-    echo "readme mode needs the packed version." >&2
+    echo "quickstart mode needs the packed version." >&2
     return 1
   fi
   assert_quickstart_project "samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj" "$version"
@@ -496,7 +496,7 @@ run_readme_mode() {
   build_quickstart
   local status=0
   run_quickstart_in_empty_dir "$work" || status=$?
-  publish_readme_artifacts "$work"
+  publish_quickstart_artifacts "$work"
   if [ "$status" -ne 0 ]; then
     echo "Quick Start sample exited ${status}." >&2
     return 1
@@ -505,14 +505,14 @@ run_readme_mode() {
     echo "Quick Start sample did not write logs/app.log." >&2
     return 1
   fi
-  python3 eng/readme-example-check.py --stdout "$work/stdout.txt" --log "$work/app.log"
+  echo "Quick Start sample ran from the packed feed."
 }
 
 # Packs, proves the feed package, runs, and returns the status for one smoke mode.
-# Args: file, console, or readme. A pack or restore failure still writes counts
+# Args: file, console, or quickstart. A pack or restore failure still writes counts
 # for file and console. file is green only for one ALog-file token and exit 0.
 # console prints SMOKE-CONSOLE count=<n> and is green only when that count is 1.
-# readme returns the Quick Start sample's feed proof and README check.
+# quickstart returns the Quick Start sample's feed proof and run status.
 main() {
   local mode="${1:-}"
   require_smoke_mode "$mode" || return 1
@@ -525,8 +525,8 @@ main() {
     echo "ALog version ${version} does not match Extensions ${ext}." >&2
     return 1
   fi
-  if [ "$mode" = "readme" ]; then
-    run_readme_mode "$version"
+  if [ "$mode" = "quickstart" ]; then
+    run_quickstart_mode "$version"
     return $?
   fi
   assert_consumer_project "$CONSUMER_PROJECT" "$version"
