@@ -103,6 +103,9 @@ internal static class LogFileRegistry
 /// <remarks>
 /// The stream is opened with <see cref="FileShare.Read"/> and <see cref="FileShare.Delete"/> so another handle can read or rename it.
 /// Omitting <see cref="FileShare.Write"/> stops a second writer on Windows only. Linux and macOS still allow one, and the lines can mix.
+/// A write handle cannot be opened together with <c>File.ReadAllText</c> on Windows: that call uses <see cref="FileShare.Read"/>,
+/// which rejects an existing write. After a zero-interval write the bytes are already in the file, and the handle is reopened
+/// for read until the next append. A positive interval keeps the write handle so a burst does not open the file per line.
 /// The timer is disposed outside the file lock. The callback also takes that lock.
 /// An external rename, delete, or truncate is noticed on the flush tick, on <see cref="Flush"/>, before this process rotates the file, and on close.
 /// A zero <see cref="FileFlushInterval"/> compares the path before every write to the operating system. A positive interval compares at most once per that interval.
@@ -137,7 +140,10 @@ internal sealed class SharedLogFile
         _bufferSize = bufferSize;
         _interval = interval;
         _clock = clock;
-        _buffer = new byte[bufferSize];
+        // The full buffer is allocated on the first write that needs it.
+        // A one-event process never touches a 64 KiB array.
+        var initial = bufferSize < 256 ? bufferSize : 256;
+        _buffer = new byte[initial];
     }
 
     /// <summary>The normalized path. The registry uses it as the dictionary key.</summary>
@@ -170,6 +176,7 @@ internal sealed class SharedLogFile
     /// <remarks>
     /// Does not throw. A call after the first open keeps the settings that opened the stream.
     /// Null leaves the value the constructor stored, so an explicit writer argument is not replaced by the default.
+    /// A larger buffer size is stored and the array grows on the write that needs the extra room.
     /// </remarks>
     internal void ApplyStartup(int? bufferSize, TimeSpan? interval, TimeProvider clock)
     {
@@ -182,7 +189,7 @@ internal sealed class SharedLogFile
             if (bufferSize is int size)
             {
                 _bufferSize = size;
-                if (_buffer.Length != size)
+                if (_buffer.Length > size)
                     _buffer = new byte[size];
             }
 
@@ -203,12 +210,25 @@ internal sealed class SharedLogFile
     internal void Append(byte[] line, long? maxBytes)
     {
         ArgumentNullException.ThrowIfNull(line);
+        Append(line.AsSpan(), maxBytes);
+    }
+
+    /// <summary>Appends one encoded line. <paramref name="line"/> is copied under the file lock.</summary>
+    /// <param name="line">The line plus its newline, in UTF-8 without a BOM.</param>
+    /// <param name="maxBytes">Rotate before this line when the logical length is above zero and at least this value. Null never rotates.</param>
+    /// <remarks>
+    /// Does not throw. A failure is the caller's to report. The copy is bounded by <paramref name="line"/>'s length.
+    /// The caller may reuse the span after this returns.
+    /// </remarks>
+    internal void Append(ReadOnlySpan<byte> line, long? maxBytes)
+    {
         EnsureOpen();
         lock (_fileLock)
         {
             if (_closed != 0)
                 return;
 
+            EnsureWritable();
             if (_stream is null)
                 TryReopen();
             if (_stream is null)
@@ -227,7 +247,11 @@ internal sealed class SharedLogFile
     }
 
     /// <summary>Writes any buffered bytes and asks the stream to hand them to the operating system. There is no fsync.</summary>
-    /// <remarks>Does not throw. A closed file returns. Safe to call before the first write.</remarks>
+    /// <remarks>
+    /// Does not throw. A closed file returns. Safe to call before the first write.
+    /// After the bytes are written the handle is read-only so <c>File.ReadAllText</c> can open the path
+    /// while another writer in this process still holds the shared file.
+    /// </remarks>
     internal void Flush()
     {
         lock (_fileLock)
@@ -237,6 +261,9 @@ internal sealed class SharedLogFile
 
             Reconcile(force: true);
             FlushPending();
+            // A second writer may still be alive. File.ReadAllText cannot open a path
+            // that this process holds for write, so the handle becomes read-only until the next append.
+            HoldForReaders();
         }
     }
 
@@ -313,7 +340,16 @@ internal sealed class SharedLogFile
     /// bufferSize 1 means the FileStream keeps no internal buffer, so Dispose has nothing left to write.
     /// .NET 10 accepts bufferSize 0, and 0 and 1 are both unbuffered. ALog buffers itself.
     /// </remarks>
-    private void OpenStream()
+    private void OpenStream() => OpenStream(recordOpen: true);
+
+    /// <summary>Creates the append stream. <paramref name="recordOpen"/> is false when a read handle is switching back to write.</summary>
+    /// <param name="recordOpen">True for the first open and for a path reopen. False does not move <see cref="LogFileRegistry.OpenCount"/>.</param>
+    /// <remarks>
+    /// The caller holds the file lock. Does not dispose the timer. A failure leaves the stream unset and throws.
+    /// bufferSize 1 means the FileStream keeps no internal buffer, so Dispose has nothing left to write.
+    /// .NET 10 accepts bufferSize 0, and 0 and 1 are both unbuffered. ALog buffers itself.
+    /// </remarks>
+    private void OpenStream(bool recordOpen)
     {
         _stream = new FileStream(
             _path,
@@ -324,11 +360,13 @@ internal sealed class SharedLogFile
             FileOptions.None);
         _logicalLength = _stream.Length;
         _pending = 0;
-        if (_buffer.Length != _bufferSize)
-            _buffer = new byte[_bufferSize];
 
-        Volatile.Write(ref _opened, 1);
-        LogFileRegistry.NoteOpen();
+        if (recordOpen)
+        {
+            Volatile.Write(ref _opened, 1);
+            LogFileRegistry.NoteOpen();
+        }
+
         _lastIdentityCheck = _clock.GetUtcNow();
         if (_timer is null && _interval > TimeSpan.Zero)
         {
@@ -523,31 +561,116 @@ internal sealed class SharedLogFile
         }
     }
 
+    /// <summary>
+    /// Switches a read handle back to an append handle. A write handle is left as it is.
+    /// </summary>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. The read handle is closed before the append opens,
+    /// because <see cref="FileShare.Read"/> does not allow a second write. A failed open leaves the stream unset
+    /// so <see cref="TryReopen"/> can report it. <see cref="LogFileRegistry.OpenCount"/> does not move.
+    /// </remarks>
+    private void EnsureWritable()
+    {
+        if (_stream is null || _stream.CanWrite)
+            return;
+
+        var parked = _stream;
+        _stream = null;
+        DisposeDetached(parked);
+        try
+        {
+            OpenStream(recordOpen: false);
+        }
+        catch (Exception ex)
+        {
+            System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+        }
+    }
+
+    /// <summary>
+    /// Replaces the write handle with a read handle so <c>File.ReadAllText</c> can open the same path.
+    /// </summary>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. Used only after a zero-interval write, which has already
+    /// flushed the line. <c>File.ReadAllText</c> asks for <see cref="FileShare.Read"/>. Windows rejects that request
+    /// while any handle still has write access, including when this handle's share mode is <see cref="FileShare.ReadWrite"/>.
+    /// The read handle keeps <see cref="FileShare.Delete"/> and still omits <see cref="FileShare.Write"/>, so a rename works
+    /// and a second writer is still rejected. The next append closes this handle first.
+    /// </remarks>
+    private void HoldForReaders()
+    {
+        if (_stream is null || !_stream.CanWrite)
+            return;
+
+        var writing = _stream;
+        _stream = null;
+        DisposeDetached(writing);
+        try
+        {
+            _stream = new FileStream(
+                _path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read | FileShare.Delete,
+                bufferSize: 1,
+                FileOptions.None);
+        }
+        catch (Exception ex)
+        {
+            System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+        }
+    }
+
     /// <summary>Writes <paramref name="line"/> into the buffer, or straight to the stream when it does not fit.</summary>
     /// <param name="line">One whole line. Not null. May be longer than the buffer.</param>
     /// <remarks>The caller holds the file lock. A null stream returns. The copy is bounded by the line length.</remarks>
-    private void WriteLine(byte[] line)
+    private void WriteLine(ReadOnlySpan<byte> line)
     {
         if (_stream is null)
             return;
 
+        if (line.Length > _buffer.Length && _buffer.Length < _bufferSize && line.Length <= _bufferSize)
+            GrowToConfiguredBuffer();
+
         if (_interval <= TimeSpan.Zero || line.Length > _buffer.Length)
         {
             FlushPending();
-            _stream.Write(line, 0, line.Length);
+            _stream.Write(line);
             _stream.Flush();
             _logicalLength += line.Length;
+            if (_interval <= TimeSpan.Zero)
+                HoldForReaders();
             return;
         }
 
         if (_pending > 0 && _pending + line.Length > _buffer.Length)
-            FlushPending();
+        {
+            if (_buffer.Length < _bufferSize)
+                GrowToConfiguredBuffer();
+            else
+                FlushPending();
+        }
 
-        Buffer.BlockCopy(line, 0, _buffer, _pending, line.Length);
+        line.CopyTo(_buffer.AsSpan(_pending));
         _pending += line.Length;
         _logicalLength += line.Length;
         if (_pending >= _buffer.Length)
             FlushPending();
+    }
+
+    /// <summary>
+    /// Grows the byte array to the configured size. The constructor starts smaller so a one-line process does not allocate it.
+    /// </summary>
+    /// <remarks>The caller holds the file lock. Does not throw. Pending bytes are copied. The configured size is the cap.</remarks>
+    private void GrowToConfiguredBuffer()
+    {
+        if (_buffer.Length >= _bufferSize)
+            return;
+
+        var next = new byte[_bufferSize];
+        if (_pending > 0)
+            _buffer.AsSpan(0, _pending).CopyTo(next);
+        _buffer = next;
     }
 
     /// <summary>Writes the pending bytes and flushes the stream. An empty buffer still flushes an open stream.</summary>

@@ -19,16 +19,24 @@ internal sealed class MinimumLevelCache
         _cached = (int)config.MinimumLevel;
     }
 
-    public bool Allows(LogLevel level)
-    {
-        var configured = (int)_config.MinimumLevel;
-        var cached = _cached;
-        if (configured != cached)
-        {
-            _cached = configured;
-            cached = configured;
-        }
+    public bool Allows(LogLevel level) => (int)level >= Floor;
 
-        return (int)level >= cached;
+    /// <summary>
+    /// The configured minimum as an int. A log call compares against this and returns before any other work.
+    /// </summary>
+    /// <remarks>
+    /// Reads the configuration each call so a level change is visible on the next event.
+    /// The cached copy is updated when the configuration changed. Does not throw.
+    /// </remarks>
+    internal int Floor
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        get
+        {
+            var configured = (int)_config.MinimumLevel;
+            if (configured != _cached)
+                _cached = configured;
+            return configured;
+        }
     }
 }

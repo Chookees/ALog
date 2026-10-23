@@ -1,5 +1,6 @@
 ﻿namespace ALog.Formatters;
 
+using System.Globalization;
 using ALog.Core;
 using ALog.Public.Interfaces;
 
@@ -12,6 +13,9 @@ public class PlainTextFormatter : ILogFormatter
 {
     private readonly string _dateTimeFormat;
     private readonly bool _includeStackTrace;
+    private readonly bool _utcMillis;
+    private readonly byte _decimalSep;
+    private readonly byte _timeSep;
 
     /// <summary>How many lines of <see cref="Exception.ToString"/> are indented. The rest are dropped.</summary>
     private const int MaxStackLines = 256;
@@ -73,6 +77,32 @@ public class PlainTextFormatter : ILogFormatter
     {
         _dateTimeFormat = dateTimeFormat;
         _includeStackTrace = includeStackTrace;
+        var utc = dateTimeFormat == "yyyy-MM-dd'T'HH:mm:ss.fff'Z'";
+        var decSep = (byte)'.';
+        var timeSep = (byte)':';
+        if (utc)
+        {
+            var culture = CultureInfo.CurrentCulture;
+            var dec = culture.NumberFormat.NumberDecimalSeparator;
+            var time = culture.DateTimeFormat.TimeSeparator;
+            if (culture.Calendar is not GregorianCalendar
+                || dec.Length != 1
+                || time.Length != 1
+                || dec[0] > 127
+                || time[0] > 127)
+            {
+                utc = false;
+            }
+            else
+            {
+                decSep = (byte)dec[0];
+                timeSep = (byte)time[0];
+            }
+        }
+
+        _utcMillis = utc;
+        _decimalSep = decSep;
+        _timeSep = timeSep;
     }
 
     /// <summary>
@@ -112,6 +142,220 @@ public class PlainTextFormatter : ILogFormatter
         if (stack == null)
             return line;
         return line + "\n" + stack;
+    }
+
+    /// <summary>
+    /// Writes the plain line as UTF-8, without a trailing newline, when it matches <see cref="Format"/>.
+    /// </summary>
+    /// <param name="logEvent">Event to render. Not null.</param>
+    /// <param name="destination">Buffer filled from the start. Ignored when the result is false.</param>
+    /// <param name="written">Byte count when the result is true. Zero when false.</param>
+    /// <returns>
+    /// False when the line has an exception, a context bag, an escape, a non-ASCII character,
+    /// a value this writer does not render, or the buffer is too small. The caller then uses <see cref="Format"/>.
+    /// </returns>
+    /// <remarks>
+    /// Does not throw. The timestamp pattern is the constructor format
+    /// <c>yyyy-MM-dd'T'HH:mm:ss.fff'Z'</c>, with the current culture's separators.
+    /// A false return does not promise that <paramref name="destination"/> is unchanged.
+    /// </remarks>
+    internal bool TryWriteUtf8(LogEvent logEvent, Span<byte> destination, out int written)
+    {
+        written = 0;
+        if (!_utcMillis || logEvent.Exception != null || logEvent.Context is { Count: > 0 })
+            return false;
+
+        var index = 0;
+        if (!WriteByte(destination, ref index, (byte)'['))
+            return false;
+        if (!WriteUtcStamp(destination, logEvent.Timestamp, ref index))
+            return false;
+        if (!WriteAscii(destination, ref index, "] ["))
+            return false;
+        if (!WriteAscii(destination, ref index, LevelName(logEvent.Level)))
+            return false;
+        if (!WriteByte(destination, ref index, (byte)']'))
+            return false;
+
+        if (!string.IsNullOrEmpty(logEvent.Category))
+        {
+            if (!WriteAscii(destination, ref index, " ["))
+                return false;
+            if (!WritePlain(destination, ref index, logEvent.Category))
+                return false;
+            if (!WriteByte(destination, ref index, (byte)']'))
+                return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(logEvent.Message))
+        {
+            if (!WriteByte(destination, ref index, (byte)' '))
+                return false;
+            if (!WritePlain(destination, ref index, logEvent.Message))
+                return false;
+        }
+
+        if (logEvent.Properties is { Count: > 0 })
+        {
+            if (!WriteAscii(destination, ref index, " | props: "))
+                return false;
+            if (!WriteProps(destination, logEvent.Properties, ref index))
+                return false;
+        }
+
+        written = index;
+        return true;
+    }
+
+    /// <summary>Enum name. Matches <see cref="LogLevel.ToString"/> for the known levels.</summary>
+    private static string LevelName(LogLevel level) => level switch
+    {
+        LogLevel.Trace => "Trace",
+        LogLevel.Debug => "Debug",
+        LogLevel.Info => "Info",
+        LogLevel.Warn => "Warn",
+        LogLevel.Error => "Error",
+        LogLevel.Fatal => "Fatal",
+        _ => level.ToString(),
+    };
+
+    private bool WriteUtcStamp(Span<byte> destination, DateTime timestamp, ref int index)
+    {
+        if (index + 24 > destination.Length)
+            return false;
+        Write4(destination, index, timestamp.Year);
+        destination[index + 4] = (byte)'-';
+        Write2(destination, index + 5, timestamp.Month);
+        destination[index + 7] = (byte)'-';
+        Write2(destination, index + 8, timestamp.Day);
+        destination[index + 10] = (byte)'T';
+        Write2(destination, index + 11, timestamp.Hour);
+        destination[index + 13] = _timeSep;
+        Write2(destination, index + 14, timestamp.Minute);
+        destination[index + 16] = _timeSep;
+        Write2(destination, index + 17, timestamp.Second);
+        destination[index + 19] = _decimalSep;
+        Write3(destination, index + 20, timestamp.Millisecond);
+        destination[index + 23] = (byte)'Z';
+        index += 24;
+        return true;
+    }
+
+    private static void Write4(Span<byte> destination, int index, int value)
+    {
+        destination[index] = (byte)('0' + value / 1000);
+        destination[index + 1] = (byte)('0' + (value / 100) % 10);
+        destination[index + 2] = (byte)('0' + (value / 10) % 10);
+        destination[index + 3] = (byte)('0' + value % 10);
+    }
+
+    private static void Write3(Span<byte> destination, int index, int value)
+    {
+        destination[index] = (byte)('0' + value / 100);
+        destination[index + 1] = (byte)('0' + (value / 10) % 10);
+        destination[index + 2] = (byte)('0' + value % 10);
+    }
+
+    private static void Write2(Span<byte> destination, int index, int value)
+    {
+        destination[index] = (byte)('0' + value / 10);
+        destination[index + 1] = (byte)('0' + value % 10);
+    }
+
+    private static bool WriteAscii(Span<byte> destination, ref int index, string text)
+    {
+        if (index + text.Length > destination.Length)
+            return false;
+        for (var i = 0; i < text.Length; i++)
+            destination[index++] = (byte)text[i];
+        return true;
+    }
+
+    private static bool WriteByte(Span<byte> destination, ref int index, byte value)
+    {
+        if (index >= destination.Length)
+            return false;
+        destination[index++] = value;
+        return true;
+    }
+
+    /// <summary>False when the text needs the escaping rules or is not ASCII.</summary>
+    private static bool WritePlain(Span<byte> destination, ref int index, string text)
+    {
+        if (index + text.Length > destination.Length)
+            return false;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch is '\\' or '|' or '\r' or '\n' || ch > 127)
+                return false;
+            if (ch == '-' && i + 2 < text.Length && text[i + 1] == '-' && text[i + 2] == '>')
+                return false;
+            destination[index++] = (byte)ch;
+        }
+
+        return true;
+    }
+
+    private static bool WriteProps(Span<byte> destination, IReadOnlyDictionary<string, object> properties, ref int index)
+    {
+        var first = true;
+        foreach (var pair in properties)
+        {
+            if (!first)
+            {
+                if (!WriteAscii(destination, ref index, ", "))
+                    return false;
+            }
+
+            first = false;
+            if (!WritePlain(destination, ref index, pair.Key))
+                return false;
+            if (!WriteByte(destination, ref index, (byte)'='))
+                return false;
+            if (!WriteValue(destination, ref index, pair.Value))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool WriteValue(Span<byte> destination, ref int index, object? value)
+    {
+        if (value is null)
+            return true;
+        if (value is string text)
+            return WritePlain(destination, ref index, text);
+        if (value is int number)
+            return WriteInt(destination, ref index, number);
+        return false;
+    }
+
+    private static bool WriteInt(Span<byte> destination, ref int index, int value)
+    {
+        if (value == int.MinValue)
+            return false;
+        if (value < 0)
+        {
+            if (!WriteByte(destination, ref index, (byte)'-'))
+                return false;
+            value = -value;
+        }
+
+        Span<byte> digits = stackalloc byte[10];
+        var count = 0;
+        do
+        {
+            digits[count++] = (byte)('0' + (value % 10));
+            value /= 10;
+        }
+        while (value > 0);
+
+        if (index + count > destination.Length)
+            return false;
+        for (var i = count - 1; i >= 0; i--)
+            destination[index++] = digits[i];
+        return true;
     }
 
     /// <summary>Joins time, level, category, and message with spaces. Blank pieces are left out.</summary>

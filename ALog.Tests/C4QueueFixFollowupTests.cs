@@ -248,6 +248,52 @@ public sealed partial class C4QueueFixTests
     }
 
     /// <summary>
+    /// A file writer beside a waiting writer must not run <c>Write</c> on the caller when async is off.
+    /// </summary>
+    /// <returns>A task that finishes after the waiting writer is released.</returns>
+    /// <remarks>
+    /// The file writer is first, so a check of only the first writer would still block.
+    /// The 5 s wait fails the test if <c>Log</c> stays inside <c>Write</c>. Release runs in finally so dispose can return.
+    /// Not thread-safe.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task MixedFileAndWaitingWriter_EnqueueReturnsBeforeRelease()
+    {
+        var path = Path.Combine(Path.GetTempPath(), "alog-qa002-" + Guid.NewGuid().ToString("N") + ".log");
+        var waiting = new BlockingWriter();
+        FileLogWriter? file = null;
+        LoggerEngine? engine = null;
+        try
+        {
+            file = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
+            engine = new LoggerEngine(new LoggerConfig()
+                .AddWriter(file)
+                .AddWriter(waiting)
+                .UseBackgroundQueue(true, 4, 1, TimeSpan.FromHours(1))
+                .UseAsync(false));
+            var caller = 0;
+            var logged = Task.Run(() =>
+            {
+                caller = Environment.CurrentManagedThreadId;
+                engine.Log("mixed", LogLevel.Info);
+            });
+            var finished = await Task.WhenAny(logged, Task.Delay(TimeSpan.FromSeconds(5)));
+            Assert.True(finished == logged, "caller stayed inside Write");
+            await logged;
+            Assert.True(await WaitUntil(() => waiting.WriteThreadId > 0, TimeSpan.FromSeconds(5)));
+            Assert.NotEqual(caller, waiting.WriteThreadId);
+        }
+        finally
+        {
+            waiting.Release();
+            engine?.Dispose();
+            file?.Dispose();
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+    }
+
+    /// <summary>
     /// Releasing the hanging writer after the deadline does not call the spy that sits behind it,
     /// and does not call the spy that already finished.
     /// </summary>

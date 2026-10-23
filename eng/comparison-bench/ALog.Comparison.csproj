@@ -26,6 +26,17 @@
     <AlogSrc Condition="'$(AlogSrc)' == ''">$(MSBuildThisFileDirectory)../..</AlogSrc>
   </PropertyGroup>
 
+  <!--
+    tests/ is the ranked speed project. This harness compiles every .cs file under its directory.
+    Leave that tree out so the harness does not compile the xunit sources or their generated files.
+  -->
+  <ItemGroup>
+    <Compile Remove="tests/**" />
+    <None Remove="tests/**" />
+    <Content Remove="tests/**" />
+    <EmbeddedResource Remove="tests/**" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="$(AlogSrc)/ALog/ALog.csproj" />
   </ItemGroup>

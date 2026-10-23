@@ -5,7 +5,9 @@
 namespace ALog.Core;
 
 using System;
+using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
 using ALog.Config;
 using ALog.Internal;
@@ -14,6 +16,7 @@ using ALog.Public.Interfaces;
 public class LoggerEngine : ILogger, IDisposable
 {
     private readonly ILogConfiguration _config;
+    private readonly LoggerConfig? _fastLevels;
     private readonly LogDispatcher _dispatcher;
     private readonly BackgroundLogQueue? _backgroundQueue;
     private readonly MinimumLevelCache _levels;
@@ -53,6 +56,7 @@ public class LoggerEngine : ILogger, IDisposable
             concrete.Seal();
 
         _config = config;
+        _fastLevels = config as LoggerConfig;
         _levels = new MinimumLevelCache(config);
 
         ApplyDefaultFormatter(config);
@@ -170,7 +174,21 @@ public class LoggerEngine : ILogger, IDisposable
         WriteSync(Enrich(CreateFromTemplate(messageTemplate, exception, level, propertyValues, null)));
     }
 
-    /// <summary>Used by MEL adapter to pass category + template properties.</summary>
+    /// <summary>
+    /// Writes one structured event. The level check is first so a filtered call does no other work.
+    /// </summary>
+    /// <param name="category">Logger name stored on the event. Null stays null.</param>
+    /// <param name="level">Compared with the configured minimum. Below it, the call returns.</param>
+    /// <param name="exception">Attached exception. Null when the caller has none.</param>
+    /// <param name="messageTemplate">Template text. Null is stored as an empty message.</param>
+    /// <param name="propertyValues">Hole values in order. None skips template rendering.</param>
+    /// <remarks>
+    /// Does not throw for a filtered level. A template failure still queues a line.
+    /// The level compare reads <see cref="LoggerConfig.MinimumLevelValue"/> when the configuration is a
+    /// <see cref="LoggerConfig"/>, so a filtered call does not go through the interface.
+    /// Safe to call from several threads. The queue, when enabled, does the file write.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void LogStructured(
         string? category,
         LogLevel level,
@@ -178,11 +196,24 @@ public class LoggerEngine : ILogger, IDisposable
         string messageTemplate,
         params object?[] propertyValues)
     {
-        if (!_levels.Allows(level))
+        // LoggerConfig stores the minimum as a volatile int. The interface read walks a property
+        // and is too slow for a filtered call. A test double keeps the interface path.
+        var floor = _fastLevels is null ? _levels.Floor : _fastLevels.MinimumLevelValue;
+        if ((int)level < floor)
             return;
 
-        WriteSync(Enrich(CreateFromTemplate(messageTemplate, exception, level, propertyValues, category)));
+        LogStructuredCore(category, level, exception, messageTemplate, propertyValues);
     }
+
+    /// <summary>Builds and writes one event that already passed the level gate.</summary>
+    /// <remarks>Not inlined, so a filtered call does not have to compile this body.</remarks>
+    private void LogStructuredCore(
+        string? category,
+        LogLevel level,
+        Exception? exception,
+        string messageTemplate,
+        object?[]? propertyValues)
+        => WriteSync(Enrich(CreateFromTemplate(messageTemplate, exception, level, propertyValues, category)));
 
     /// <summary>
     /// Writes one event whose text is already final.
@@ -249,8 +280,20 @@ public class LoggerEngine : ILogger, IDisposable
     {
         try
         {
-            var values = propertyValues ?? Array.Empty<object?>();
-            var (rendered, props) = MessageTemplate.Format(messageTemplate, values);
+            // No holes to fill. Skip the template parser and the property dictionary.
+            if (propertyValues is null || propertyValues.Length == 0)
+            {
+                return CreatePlain(new Seed
+                {
+                    Message = messageTemplate ?? string.Empty,
+                    Exception = exception,
+                    Level = level,
+                    MessageTemplate = messageTemplate,
+                    Category = category
+                });
+            }
+
+            var (rendered, props) = MessageTemplate.Format(messageTemplate, propertyValues);
             return CreatePlain(new Seed
             {
                 Message = rendered,
@@ -316,12 +359,19 @@ public class LoggerEngine : ILogger, IDisposable
         }
     }
 
+    /// <summary>Shared empty bag. Callers must not mutate it. Enrich copies before an enricher runs.</summary>
+    private static readonly Dictionary<string, object> NoProperties = new(0);
+
     private static LogEvent CreatePlain(in Seed seed)
     {
         var context = ContextManager.GetContext();
-        var props = seed.Properties is null
-            ? new Dictionary<string, object>(StringComparer.Ordinal)
-            : new Dictionary<string, object>(seed.Properties, StringComparer.Ordinal);
+        IReadOnlyDictionary<string, object> props;
+        if (seed.Properties is null || seed.Properties.Count == 0)
+            props = NoProperties;
+        else if (seed.Properties is Dictionary<string, object> ready)
+            props = ready;
+        else
+            props = new Dictionary<string, object>(seed.Properties, StringComparer.Ordinal);
 
         return new LogEvent(
             Timestamp: EventTimestamp(),
@@ -348,15 +398,25 @@ public class LoggerEngine : ILogger, IDisposable
 
     private LogEvent Enrich(LogEvent preliminary)
     {
-        if (preliminary.Properties is not Dictionary<string, object> props)
+        var enrichers = _config.Enrichers;
+        if (enrichers.Count == 0)
+            return preliminary;
+
+        Dictionary<string, object> props;
+        if (preliminary.Properties is Dictionary<string, object> existing
+            && !ReferenceEquals(existing, NoProperties))
         {
-            props = preliminary.Properties is null
+            props = existing;
+        }
+        else
+        {
+            props = preliminary.Properties is null || preliminary.Properties.Count == 0
                 ? new Dictionary<string, object>(StringComparer.Ordinal)
                 : new Dictionary<string, object>(preliminary.Properties, StringComparer.Ordinal);
             preliminary = preliminary with { Properties = props };
         }
 
-        ApplyEnrichers(_config.Enrichers, props, preliminary);
+        ApplyEnrichers(enrichers, props, preliminary);
         return preliminary;
     }
 
@@ -416,12 +476,33 @@ public class LoggerEngine : ILogger, IDisposable
     /// <remarks>
     /// Does not throw. A writer that throws is written to the error stream and the next writer still runs.
     /// The queue flush does not report ALOG0071. That line stays on dispose and shutdown.
+    /// An idle queue flushes writers on this thread and does not build the async state machine.
     /// </remarks>
-    public async Task FlushAsync()
+    public Task FlushAsync()
     {
-        if (_backgroundQueue != null)
-            await _backgroundQueue.FlushAsync().ConfigureAwait(false);
+        if (_backgroundQueue is null)
+        {
+            FlushWriters();
+            return Task.CompletedTask;
+        }
 
+        var pending = _backgroundQueue.FlushAsync();
+        if (pending.IsCompletedSuccessfully)
+        {
+            FlushWriters();
+            return Task.CompletedTask;
+        }
+
+        return FinishFlushAsync(pending);
+    }
+
+    /// <summary>Flushes writers after the queue task. Used only when the queue was not already idle.</summary>
+    /// <param name="pending">The queue flush. Not null. Not already completed.</param>
+    /// <returns>A task that finishes when the writers have been asked to push their buffers.</returns>
+    /// <remarks>Does not throw. A writer failure is reported inside <see cref="FlushWriters"/> and does not stop the next writer.</remarks>
+    private async Task FinishFlushAsync(Task pending)
+    {
+        await pending.ConfigureAwait(false);
         FlushWriters();
     }
 

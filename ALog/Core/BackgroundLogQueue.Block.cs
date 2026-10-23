@@ -14,6 +14,7 @@ public partial class BackgroundLogQueue
     private static readonly AsyncLocal<BackgroundLogQueue?> ConsumerQueue = new();
 
     private readonly List<BlockWaiter> _registered = new();
+    private int _registeredCount;
     private readonly Stack<BlockWaiter> _freeWaiters = new();
 
     private QueueFullMode _fullMode;
@@ -60,6 +61,7 @@ public partial class BackgroundLogQueue
 
             waiter = RentWaiter();
             _registered.Add(waiter);
+            Volatile.Write(ref _registeredCount, _registered.Count);
         }
 
         waiter.Signal.Reset();
@@ -92,14 +94,16 @@ public partial class BackgroundLogQueue
             return OfferResult.Closed;
         }
 
-        if (_outstanding < _capacity && _channel.Writer.TryWrite(logEvent))
+        var next = Interlocked.Increment(ref _outstanding);
+        if (next > _capacity)
         {
-            _outstanding++;
-            _accepted++;
-            return OfferResult.Accepted;
+            Interlocked.Decrement(ref _outstanding);
+            return OfferResult.NeedWait;
         }
 
-        return OfferResult.NeedWait;
+        _queue.Enqueue(logEvent);
+        Interlocked.Increment(ref _accepted);
+        return OfferResult.Accepted;
     }
 
     /// <summary>Counts one closed drop and reports whether it is the first.</summary>
@@ -142,6 +146,7 @@ public partial class BackgroundLogQueue
 
             _registered.RemoveAt(i);
             _freeWaiters.Push(waiter);
+            Volatile.Write(ref _registeredCount, _registered.Count);
             return;
         }
     }
