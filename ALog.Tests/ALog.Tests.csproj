@@ -6,7 +6,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="AWSSDK.CloudWatchLogs" Version="4.0.106" />
+    <PackageReference Include="AWSSDK.CloudWatchLogs" Version="4.0.106.1" />
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
     <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.13" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.13" />
