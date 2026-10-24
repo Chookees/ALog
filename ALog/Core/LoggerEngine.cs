@@ -359,8 +359,11 @@ public class LoggerEngine : ILogger, IDisposable
         }
     }
 
-    /// <summary>Shared empty bag. Callers must not mutate it. Enrich copies before an enricher runs.</summary>
-    private static readonly Dictionary<string, object> NoProperties = new(0);
+    /// <summary>
+    /// Shared empty bag. It is not a <see cref="Dictionary{TKey, TValue}"/>, so a caller cannot add a key to it.
+    /// Enrich copies before an enricher runs because this bag is not a dictionary.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, object> NoProperties = EmptyPropertyBag.Instance;
 
     private static LogEvent CreatePlain(in Seed seed)
     {
@@ -396,6 +399,16 @@ public class LoggerEngine : ILogger, IDisposable
     private static DateTime EventTimestamp()
         => DateTime.UtcNow;
 
+    /// <summary>
+    /// Runs enrichers. A dictionary already on the event is updated in place.
+    /// The shared empty bag is copied first, because it is not a dictionary and must stay empty for every event.
+    /// </summary>
+    /// <param name="preliminary">Event before enrichers. Not null.</param>
+    /// <returns>The same event when there are no enrichers. Otherwise the event whose property bag was updated.</returns>
+    /// <remarks>
+    /// Does not throw for an empty enricher list. An enricher that throws is reported by <see cref="ApplyEnrichers"/> and skipped.
+    /// Safe to call from several threads when each thread has its own event. The shared empty bag is never written.
+    /// </remarks>
     private LogEvent Enrich(LogEvent preliminary)
     {
         var enrichers = _config.Enrichers;
@@ -403,8 +416,8 @@ public class LoggerEngine : ILogger, IDisposable
             return preliminary;
 
         Dictionary<string, object> props;
-        if (preliminary.Properties is Dictionary<string, object> existing
-            && !ReferenceEquals(existing, NoProperties))
+        // The shared empty bag is not a Dictionary, so this branch never mutates it.
+        if (preliminary.Properties is Dictionary<string, object> existing)
         {
             props = existing;
         }

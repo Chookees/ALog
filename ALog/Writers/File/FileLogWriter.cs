@@ -18,6 +18,13 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     [ThreadStatic]
     private static byte[]? _utf8Scratch;
 
+    /// <summary>Largest scratch buffer kept on the thread. A longer line uses an array that is not kept.</summary>
+    private const int MaxRetainedUtf8 = 4096;
+
+    /// <summary>Length of the scratch buffer still kept on this thread. Zero when none is kept.</summary>
+    /// <remarks>Does not throw. Another write on this thread can change it. Other threads have their own buffer.</remarks>
+    internal static int RetainedUtf8Bytes => _utf8Scratch?.Length ?? 0;
+
     private readonly string _filePath;
     private readonly long? _maxFileSizeInBytes;
     private readonly object _writeLock = new();
@@ -219,7 +226,12 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
         {
             if (buffer.Length >= 64 * 1024)
                 return false;
-            buffer = _utf8Scratch = new byte[buffer.Length * 2];
+            var next = buffer.Length * 2;
+            if (next > 64 * 1024)
+                next = 64 * 1024;
+            buffer = new byte[next];
+            if (next <= MaxRetainedUtf8)
+                _utf8Scratch = buffer;
             if (!plain.TryWriteUtf8(logEvent, buffer, out written))
                 return false;
         }
@@ -241,12 +253,25 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     {
         var newline = NewLineBytes;
         var needed = line.Length + newline.Length;
-        var buffer = _utf8Scratch ??= new byte[1024];
-        if (needed > buffer.Length)
+        if (needed > 64 * 1024)
+            return false;
+        byte[] buffer;
+        if (needed <= MaxRetainedUtf8)
         {
-            if (needed > 64 * 1024)
-                return false;
-            buffer = _utf8Scratch = new byte[Math.Max(needed, buffer.Length * 2)];
+            buffer = _utf8Scratch ??= new byte[1024];
+            if (needed > buffer.Length)
+            {
+                var size = buffer.Length * 2;
+                if (size < needed)
+                    size = needed;
+                if (size > MaxRetainedUtf8)
+                    size = MaxRetainedUtf8;
+                buffer = _utf8Scratch = new byte[size];
+            }
+        }
+        else
+        {
+            buffer = new byte[needed];
         }
 
         for (var i = 0; i < line.Length; i++)

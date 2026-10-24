@@ -31,7 +31,14 @@ public static class MessageTemplate
     /// <remarks>Does not throw. The count can change as soon as another thread stores a template.</remarks>
     internal static int CachedTemplateCount => TemplateCache.Count;
 
-    private static readonly Dictionary<string, object> EmptyProperties = new(0);
+    private static readonly IReadOnlyDictionary<string, object> EmptyProperties = EmptyPropertyBag.Instance;
+
+    /// <summary>Largest render buffer kept on the thread. A bigger one is dropped after the call.</summary>
+    internal const int MaxRetainedBuilder = 4096;
+
+    /// <summary>Capacity of the render buffer still kept on this thread. Zero when none is kept.</summary>
+    /// <remarks>Does not throw. Another call on this thread can change it. Other threads have their own buffer.</remarks>
+    internal static int RetainedRenderCapacity => _render?.Capacity ?? 0;
 
     [ThreadStatic]
     private static StringBuilder? _render;
@@ -98,6 +105,8 @@ public static class MessageTemplate
         finally
         {
             _rendering--;
+            if (!nested && builder.Capacity > MaxRetainedBuilder)
+                _render = null;
         }
 
         // Positional leftovers (no holes left) are ignored; unused holes keep raw text.

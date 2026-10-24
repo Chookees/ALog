@@ -56,6 +56,41 @@ public class JsonFormatter : ILogFormatter
     [ThreadStatic]
     private static System.Text.StringBuilder? _json;
 
+    /// <summary>Largest JSON builder kept on the thread. A bigger one is dropped after the call.</summary>
+    private const int MaxRetainedJson = 4096;
+
+    /// <summary>Capacity of the JSON builder still kept on this thread. Zero when none is kept.</summary>
+    /// <remarks>Does not throw. Another call on this thread can change it. Other threads have their own builder.</remarks>
+    internal static int RetainedJsonCapacity => _json?.Capacity ?? 0;
+
+    /// <summary>The thread's JSON builder, replaced when the one still kept is larger than <see cref="MaxRetainedJson"/>.</summary>
+    /// <returns>A cleared builder. Not null.</returns>
+    /// <remarks>Does not throw. Only this thread reads and writes <see cref="_json"/>.</remarks>
+    private static System.Text.StringBuilder TakeJson()
+    {
+        var builder = _json;
+        if (builder == null || builder.Capacity > MaxRetainedJson)
+        {
+            builder = new System.Text.StringBuilder(256);
+            _json = builder;
+        }
+        else
+        {
+            builder.Clear();
+        }
+
+        return builder;
+    }
+
+    /// <summary>Drops the builder when it grew past <see cref="MaxRetainedJson"/>.</summary>
+    /// <param name="builder">The builder <see cref="TakeJson"/> returned. Not null.</param>
+    /// <remarks>Does not throw. Only this thread calls it. A small builder stays for the next event.</remarks>
+    private static void ReleaseJson(System.Text.StringBuilder builder)
+    {
+        if (builder.Capacity > MaxRetainedJson)
+            _json = null;
+    }
+
     /// <summary>
     /// Builds the compact document for an event with no exception and only string or int properties.
     /// </summary>
@@ -71,7 +106,7 @@ public class JsonFormatter : ILogFormatter
         json = string.Empty;
         if (logEvent.Message is null || logEvent.Timestamp.Kind != DateTimeKind.Utc)
             return false;
-        if (logEvent.Properties is not null && logEvent.Properties is not Dictionary<string, object>)
+        if (logEvent.Properties is { Count: > 0 } && logEvent.Properties is not Dictionary<string, object>)
             return false;
         if (logEvent.Context is { Count: > 0 } && logEvent.Context is not Dictionary<string, object>)
             return false;
@@ -80,8 +115,7 @@ public class JsonFormatter : ILogFormatter
             || !IsJsonSafe(logEvent.Category))
             return false;
 
-        var builder = _json ??= new System.Text.StringBuilder(256);
-        builder.Clear();
+        var builder = TakeJson();
         builder.Append("{\"timestamp\":\"");
         AppendUtcRoundTrip(builder, logEvent.Timestamp);
         builder.Append("\",\"level\":\"");
@@ -107,7 +141,10 @@ public class JsonFormatter : ILogFormatter
         {
             builder.Append(",\"properties\":{");
             if (!AppendBag(builder, logEvent.Properties))
+            {
+                ReleaseJson(builder);
                 return false;
+            }
             builder.Append('}');
         }
 
@@ -115,12 +152,16 @@ public class JsonFormatter : ILogFormatter
         {
             builder.Append(",\"context\":{");
             if (logEvent.Context.Count > 0 && !AppendBag(builder, logEvent.Context))
+            {
+                ReleaseJson(builder);
                 return false;
+            }
             builder.Append('}');
         }
 
         builder.Append('}');
         json = builder.ToString();
+        ReleaseJson(builder);
         return true;
     }
 
