@@ -373,5 +373,7 @@ FodyWeavers.xsd
 
 # Custom secrects
 **/.cursor/
+# Local AI tool graphs and settings. Not part of the library.
+.claude/
 # Local agent runtime artifacts
 /inDev/
