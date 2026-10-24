@@ -19,6 +19,17 @@ public static class MessageTemplate
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private static readonly ConcurrentDictionary<string, CompiledTemplate> TemplateCache = new(StringComparer.Ordinal);
+    private static readonly object CacheGate = new();
+
+    /// <summary>Most compiled templates kept. A further template is compiled and not stored.</summary>
+    internal const int MaxCachedTemplates = 1024;
+
+    /// <summary>Longest template text that may be stored. A longer template is compiled and not stored.</summary>
+    internal const int MaxCachedTemplateLength = 4096;
+
+    /// <summary>How many templates are stored. Does not include compiles that were not stored.</summary>
+    /// <remarks>Does not throw. The count can change as soon as another thread stores a template.</remarks>
+    internal static int CachedTemplateCount => TemplateCache.Count;
 
     private static readonly Dictionary<string, object> EmptyProperties = new(0);
 
@@ -28,6 +39,19 @@ public static class MessageTemplate
     [ThreadStatic]
     private static int _rendering;
 
+    /// <summary>
+    /// Renders <paramref name="template"/> and builds the property bag for its holes.
+    /// </summary>
+    /// <param name="template">Template text. Not null. Hole names are letters, digits, and underscores.</param>
+    /// <param name="args">Hole values in order. Extra values are ignored. A missing value leaves the hole text.</param>
+    /// <returns>The rendered message and the bag. The bag is empty when there are no arguments or no holes.</returns>
+    /// <remarks>
+    /// Does not throw for a null argument value. A throwing value becomes a format-error placeholder.
+    /// Templates up to <see cref="MaxCachedTemplateLength"/> characters are stored until <see cref="MaxCachedTemplates"/>
+    /// entries exist. After that, or when the text is longer, the template is compiled for this call and not stored.
+    /// The hot path is a lookup. The insert takes <c>CacheGate</c> so two threads cannot push the count past the cap.
+    /// Safe to call from several threads. The render buffer is thread-static and is not shared across a nested call.
+    /// </remarks>
     public static (string Rendered, IReadOnlyDictionary<string, object> Properties) Format(
         string template,
         params object?[] args)
@@ -37,7 +61,7 @@ public static class MessageTemplate
         if (args.Length == 0)
             return (template, EmptyProperties);
 
-        var compiled = TemplateCache.GetOrAdd(template, static text => Compile(text));
+        var compiled = Resolve(template);
         if (compiled.Holes == 0)
             return (template, EmptyProperties);
 
@@ -80,7 +104,45 @@ public static class MessageTemplate
         return (builder.ToString(), properties);
     }
 
+    /// <summary>
+    /// Returns a compiled template. A cache hit does not take the insert lock.
+    /// </summary>
+    /// <param name="template">Template text. Not null. The caller already rejected a null.</param>
+    /// <returns>A compiled template. It may be shared, or private to this call when it was not stored.</returns>
+    /// <remarks>
+    /// Does not throw. A template longer than <see cref="MaxCachedTemplateLength"/> is compiled and not stored.
+    /// When the cache is full the compile is still returned, so rendering does not change, and the count stays put.
+    /// Two threads inserting take <c>CacheGate</c>. The lookup does not. Safe to call from several threads.
+    /// </remarks>
+    private static CompiledTemplate Resolve(string template)
+    {
+        if (template.Length > MaxCachedTemplateLength)
+            return Compile(template);
+
+        if (TemplateCache.TryGetValue(template, out var cached))
+            return cached;
+
+        var compiled = Compile(template);
+        lock (CacheGate)
+        {
+            if (TemplateCache.TryGetValue(template, out cached))
+                return cached;
+
+            if (TemplateCache.Count >= MaxCachedTemplates)
+                return compiled;
+
+            TemplateCache[template] = compiled;
+            return compiled;
+        }
+    }
+
     /// <summary>Parses <paramref name="template"/> once. The result is immutable and safe to share.</summary>
+    /// <param name="template">Template text. Not null.</param>
+    /// <returns>Pieces and a hole count. Not stored by this method.</returns>
+    /// <remarks>
+    /// Does not throw. The match loop is bounded by the matches in the text, which cannot exceed the text length.
+    /// Safe to call from several threads. It does not touch the cache.
+    /// </remarks>
     private static CompiledTemplate Compile(string template)
     {
         var matches = HolePattern.Matches(template);

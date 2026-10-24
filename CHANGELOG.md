@@ -5,6 +5,7 @@
 - Changed: logging through the background queue is faster. Adding an event usually no longer takes a lock.
 - Changed: each logger with a background queue now uses one dedicated thread.
 - Changed: FileLogWriter writes simple events from PlainTextFormatter and JsonFormatter through a faster path. The written text stays the same.
+- Changed: message templates are cached, up to 1024 entries.
 
 ## 0.2.1
 
