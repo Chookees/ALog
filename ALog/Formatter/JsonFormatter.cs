@@ -238,7 +238,17 @@ public class JsonFormatter : ILogFormatter
         _ => level.ToString(),
     };
 
-    /// <summary>True when the serializer would write the text unchanged inside a JSON string.</summary>
+    /// <summary>
+    /// True when the default serializer would write <paramref name="text"/> unchanged inside a JSON string.
+    /// </summary>
+    /// <param name="text">A message, template, category, property name, or string property. Null and empty are safe.</param>
+    /// <returns>False when the hand-built line would differ from <see cref="JsonSerializer"/>.</returns>
+    /// <remarks>
+    /// Does not throw. The default encoder escapes <c>'</c> as <c>\u0027</c> and a backtick as <c>\u0060</c>,
+    /// plus quotes, backslashes, <c>&lt;</c>, <c>&gt;</c>, <c>&amp;</c>, <c>+</c>, and anything outside ASCII 0x20..0x7E.
+    /// Those characters take the serializer path so the bytes match the master library. Any thread may call this.
+    /// The loop is bounded by the string length.
+    /// </remarks>
     private static bool IsJsonSafe(string? text)
     {
         if (string.IsNullOrEmpty(text))
@@ -246,7 +256,7 @@ public class JsonFormatter : ILogFormatter
         for (var i = 0; i < text.Length; i++)
         {
             var ch = text[i];
-            if (ch < 0x20 || ch > 0x7E || ch is '"' or '\\' or '<' or '>' or '&' or '+')
+            if (ch < 0x20 || ch > 0x7E || ch is '"' or '\\' or '\'' or '`' or '<' or '>' or '&' or '+')
                 return false;
         }
 
