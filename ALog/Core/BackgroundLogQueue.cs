@@ -652,12 +652,18 @@ public partial class BackgroundLogQueue : IDisposable
 
     /// <summary>
     /// Cancels the idle wait so the processor looks at the channel.
-    /// The processor then hops to the pool, so this thread does not run the writer.
+    /// The logging thread does not run the writer. The dedicated processor thread does.
     /// </summary>
-    /// <remarks>Does not throw. Safe to call after the wait source has been replaced or disposed.</remarks>
+    /// <remarks>
+    /// Does not throw. Safe to call after the wait source has been replaced or disposed.
+    /// <see cref="Interlocked.Exchange(ref int, int)"/> both observes and clears <c>_idle</c>.
+    /// A separate read and write can miss a processor that enters the wait in between, and the event then sits until the flush interval.
+    /// A cancel that lands before the processor builds its linked token is still a wake: cancellation is sticky.
+    /// Any thread that has just queued an event may call this. The processor is the only thread that waits.
+    /// </remarks>
     private void WakeProcessor()
     {
-        if (Volatile.Read(ref _idle) == 0)
+        if (Interlocked.Exchange(ref _idle, 0) == 0)
             return;
 
         try
@@ -944,16 +950,19 @@ public partial class BackgroundLogQueue : IDisposable
     /// <param name="timer">Interval timer. Not null. Disposed by the caller when the processor exits.</param>
     /// <remarks>
     /// Does not throw. A cancelled wait is a wake or shutdown. The clock behind <paramref name="timer"/>
-    /// is the queue clock, so a frozen test clock does not release this wait until the test advances it.
-    /// If the channel already has an event, the method returns without waiting.
+    /// does not have to move: cancelling the linked token releases the wait on every clock, including a frozen test clock.
+    /// The idle flag is set before the queue is checked again. An enqueue that lands in that window either sees the flag and cancels,
+    /// or is observed by the recheck, so the event is not left until the flush interval.
+    /// The shutdown token is part of that recheck, so dispose wakes a processor that has not entered the wait yet.
+    /// Only the processor thread calls this. Other threads only cancel the tokens.
     /// </remarks>
     private void WaitForWork(PeriodicTimer timer)
     {
         Volatile.Write(ref _idleWaitEntered, 1);
-        Volatile.Write(ref _idle, 1);
+        Interlocked.Exchange(ref _idle, 1);
         try
         {
-            if (!_queue.IsEmpty || Volatile.Read(ref _stop) != 0)
+            if (!_queue.IsEmpty || Volatile.Read(ref _stop) != 0 || _shutdownSignal.IsCancellationRequested)
                 return;
 
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
@@ -970,7 +979,7 @@ public partial class BackgroundLogQueue : IDisposable
         }
         finally
         {
-            Volatile.Write(ref _idle, 0);
+            Interlocked.Exchange(ref _idle, 0);
         }
     }
 
@@ -1098,34 +1107,27 @@ public partial class BackgroundLogQueue : IDisposable
     /// <see cref="WriterGate.EndWriterCall"/>, which disposes that writer only after the call returns.
     /// The first call waits at most <see cref="ShutdownDeadline"/> on the injected clock. A second call does not wait
     /// and does not emit another ALOG0071. Events offered after the close are counted, and the first one reports ALOG0072.
+    /// Every clock takes this path, including an idle <see cref="ProductionClock"/>. The processor is always signalled,
+    /// so its dedicated thread leaves the idle timer instead of staying blocked until the flush interval.
+    /// Cancelling that wait does not advance a frozen test clock and does not set the stop flag, so events already queued are still written.
+    /// When the processor has stopped, <see cref="PublishOutcome"/> disposes the shutdown and wake sources.
     /// </remarks>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
             return;
 
-        bool idle;
         lock (_gate)
         {
             _closed = true;
             // Published before the outstanding read. An accept that already incremented is visible.
             // An accept that has not incremented observes this flag and does not queue.
             Volatile.Write(ref _closedFast, 1);
-            idle = ReferenceEquals(_clock, ProductionClock.Default)
-                && _queue.IsEmpty
-                && Volatile.Read(ref _inflight) == 0
-                && Volatile.Read(ref _outstanding) == 0;
         }
 
         Volatile.Write(ref _disposeStartTimestamp, _clock.GetTimestamp());
-        // Cancelling the idle wait runs the processor callback on this thread.
-        // That costs several milliseconds in a cold process, and an empty queue has nothing to drain.
-        if (!idle)
-        {
-            SignalProcessor();
-            DrainUntilDeadline();
-        }
-
+        SignalProcessor();
+        DrainUntilDeadline();
         PublishOutcome();
     }
 
