@@ -16,16 +16,17 @@ namespace ALog.Tests;
 public sealed class BkpExternalRotationTests
 {
     /// <summary>
-    /// On Windows, <c>File.ReadAllText</c> reads the file after <see cref="FileLogWriter.Flush"/> while the writer is still alive.
+    /// On Windows, <c>File.ReadAllText</c> reads each line at flush interval 0 while the writer is still alive.
     /// </summary>
     /// <remarks>
-    /// A zero flush interval keeps the write handle across appends. That handle rejects <c>File.ReadAllText</c>,
-    /// which asks for <see cref="FileShare.Read"/>. Flush replaces it with a read handle, so the same call succeeds.
-    /// The writer is not disposed between the read and the second line. Other systems skip this test:
+    /// A zero flush interval writes the line and then replaces the write handle with a read handle.
+    /// <c>File.ReadAllText</c> asks for <see cref="FileShare.Read"/>, which succeeds against that read handle.
+    /// The test does not call <see cref="FileLogWriter.Flush"/> and does not wait for an idle timer.
+    /// The writer is not disposed between the two lines. Other systems skip this test:
     /// Linux and macOS do not enforce the share mode, so the assertion would not prove the Windows contract.
     /// </remarks>
     [SkippableFact(Timeout = 30000)]
-    public async Task File_ReadAllTextSucceedsAfterFlushWhileTheWriterIsAlive()
+    public async Task File_ReadAllTextSucceedsAfterEachZeroIntervalLine()
     {
         await Task.CompletedTask;
         Skip.IfNot(OperatingSystem.IsWindows(), "FileShare is not enforced on this operating system.");
@@ -35,11 +36,9 @@ public sealed class BkpExternalRotationTests
             var path = Path.Combine(directory, "readers.log");
             using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
             writer.Write(Event("first-line"));
-            writer.Flush();
-            var afterFlush = File.ReadAllText(path);
-            Assert.Contains("first-line", afterFlush, StringComparison.Ordinal);
+            var afterFirst = File.ReadAllText(path);
+            Assert.Contains("first-line", afterFirst, StringComparison.Ordinal);
             writer.Write(Event("second-line"));
-            writer.Flush();
             var afterSecond = File.ReadAllText(path);
             Assert.Contains("first-line", afterSecond, StringComparison.Ordinal);
             Assert.Contains("second-line", afterSecond, StringComparison.Ordinal);
