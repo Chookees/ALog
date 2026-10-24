@@ -7,6 +7,10 @@ every event reached the file, and stores the raw values. It does not decide winn
 The project is not packable and is not part of the ALog packages. Only this project references NLog, Serilog
 and log4net.
 
+The ranked speed tests are `tests/RankedSpeedTests.cs`. They run only when `ALOG_SPEED=1` and are not part of required CI.
+Each scenario uses the median of 3 runs. ALog async may be up to 5% slower than the fastest valid competitor; the output states the reason.
+Fails if ALog async is slower than the fastest valid competitor in any scenario, or if a competitor's output is invalid.
+
 ## Quick start
 
 ```bash
@@ -33,10 +37,12 @@ Requirements: Linux, bash, `flock` (util-linux), git, Python 3 (merge only), the
 | `Scenarios.cs` | T1 to T7: counts, messages, values, category, 3-level exception chain |
 | `Adapters.cs` | one adapter per library, configuration with documentation links |
 | `Cell.cs` | one cell in one process: warm-up, timed run incl. flush + dispose, metrics, check |
-| `Verify.cs` | file check: exact event count, fields in the first, a middle and the last event |
+| `Verify.cs` | file check: every record is UTC and in order, exact event count, fields in three samples |
+| `HarnessChecks.cs` | `verify-self` and the Serilog time-zone matrix |
 | `Runner.cs` | process runner: shuffled order, child processes, `raw.csv`, `details.jsonl`, `env.json` |
 | `Micro.cs` | BenchmarkDotNet benchmarks |
-| `Program.cs` | command line: `run`, `cell`, `micro`, `versions` |
+| `Program.cs` | command line: `run`, `cell`, `micro`, `versions`, `verify-self`, `tz-matrix` |
+| `tests/` | ranked speed tests (`ALOG_SPEED=1` only) and the harness self-checks |
 | `run.sh` | build, lock, process runs, BenchmarkDotNet run |
 | `merge.sh`, `merge.py` | merge all result directories, per-agent and overall statistics |
 

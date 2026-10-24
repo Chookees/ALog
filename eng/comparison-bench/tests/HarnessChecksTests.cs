@@ -26,6 +26,27 @@ public sealed class HarnessChecksTests
     }
 
     /// <summary>
+    /// The 5% tie accepts an equal median and a median on the limit, and rejects a slower one.
+    /// </summary>
+    /// <returns>A task that finishes after the comparisons.</returns>
+    /// <remarks>Does not throw. Does not start a cell. The wait is 5 seconds. Safe for the test thread.</remarks>
+    [Fact(Timeout = 5000)]
+    public async Task TieMargin_AllowsFivePercentAndRejectsMore()
+    {
+        await Task.CompletedTask;
+        Assert.Equal(2d, RankedSpeedTests.Median(3, 1, 2));
+        Assert.Equal(5d, RankedSpeedTests.Median(5, 1, 5));
+        var fastest = 100.0;
+        var limit = fastest * RankedSpeedTests.TieFactor;
+        Assert.Null(RankedSpeedTests.RankProblem(limit, fastest, "nlog"));
+        Assert.Null(RankedSpeedTests.RankProblem(fastest, fastest, "nlog"));
+        Assert.NotNull(RankedSpeedTests.RankProblem(limit + 0.001, fastest, "nlog"));
+        Assert.Contains("within the 5% tie", RankedSpeedTests.RankReason(limit, fastest, "nlog"), StringComparison.Ordinal);
+        Assert.Contains("at least as fast", RankedSpeedTests.RankReason(fastest - 1, fastest, "nlog"), StringComparison.Ordinal);
+        Assert.Contains("slower than the 5% tie", RankedSpeedTests.RankReason(limit + 0.001, fastest, "nlog"), StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Each zone's child writes a UTC plain stamp and a UTC JSON stamp.
     /// </summary>
     /// <returns>A task that finishes after the four children exit.</returns>
