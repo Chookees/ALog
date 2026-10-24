@@ -62,8 +62,6 @@ public partial class BackgroundLogQueue : IDisposable
     private readonly object _reportGate = new();
     private readonly WriterGate _writerGate;
     private readonly ManualResetEventSlim _stopped = new(false);
-    /// <summary>Held only while the first file or console event is written on the caller. Not the hot path.</summary>
-    private readonly object _handoff = new();
 
     private CancellationTokenSource _wakeCts = new();
     private int _idle;
@@ -77,8 +75,6 @@ public partial class BackgroundLogQueue : IDisposable
     private int _shutdownReported;
     private int _closedReported;
     private int _processorEntered;
-    /// <summary>One after the caller has written the first direct event. Later events stay on the processor.</summary>
-    private int _callerWrote;
     private int _idleWaitEntered;
     private int _disposeWaitsStarted;
     private static int _deadlineWaitEntries;
@@ -158,8 +154,8 @@ public partial class BackgroundLogQueue : IDisposable
     /// The processor starts before this returns, so the clock cannot be changed afterwards.
     /// Does not throw for a writer failure. A flush interval the timer rejects still leaves the
     /// stopped signal unset, so <see cref="Dispose"/> waits out <see cref="ShutdownDeadline"/>.
-    /// The first event runs on the caller only when every writer is a file or console writer.
-    /// Async off still leaves a waiting writer on the processor, so a later enqueue can return.
+    /// Every event is queued. The processor writes it. A file or console writer is called
+    /// synchronously on that processor thread, which does not capture a caller context.
     /// The full-drop report timer is created on this clock before the method returns.
     /// Its due time and period are infinite, so the callback does not run until a full drop changes the due time.
     /// </remarks>
@@ -176,7 +172,7 @@ public partial class BackgroundLogQueue : IDisposable
         _newWriteBudget = LogOptionRules.DeriveCutoff(_shutdownDeadline);
 
         var writerList = CopyWriters(writers);
-        // File and console writers return inside Write, so the first event may run on this caller.
+        // File and console writers return inside Write, so the processor calls Write and skips the async state machine.
         // Async off is not enough: a writer that waits must stay on the processor or the log call never returns.
         _directDispatch = WritersCompleteOnCaller(writerList);
         _writerGate = new WriterGate(writerList);
@@ -314,15 +310,13 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw for a full or closed queue. Does not emit ALOG0070 for a cancelled entry.
     /// Safe to call from several threads. The task does not capture a caller context.
-    /// The first file or console event may be written on this caller when the channel is empty.
+    /// The event is queued. The processor writes it. This call does not write on the caller,
+    /// so a dispose that races this call cannot treat an in-progress write as an empty queue.
     /// </remarks>
     internal ValueTask EnqueueAsync(LogEvent logEvent, CancellationToken cancellationToken)
     {
         if (cancellationToken.IsCancellationRequested)
             return ValueTask.FromCanceled(cancellationToken);
-
-        if (TryWriteOnCaller(logEvent))
-            return ValueTask.CompletedTask;
 
         if (TryFastAccept(logEvent))
         {
@@ -350,14 +344,11 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. Safe to call from several threads.
     /// A false return is a drop. Drop mode does not wait. Block mode can wait while the queue is open.
-    /// The first file or console event is written here when the channel is empty, so that call waits for the writer.
-    /// Every later event returns before the writer runs. <see cref="QueueFullMode.Block"/> is unchanged for those events.
+    /// The event is queued and the processor writes it. This call does not write on the caller.
+    /// <see cref="QueueFullMode.Block"/> still waits only while the queue is open and this thread is not the processor.
     /// </remarks>
     public bool TryEnqueue(LogEvent logEvent)
     {
-        if (TryWriteOnCaller(logEvent))
-            return true;
-
         if (TryFastAccept(logEvent) || Offer(logEvent, CancellationToken.None) == OfferResult.Accepted)
         {
             WakeProcessor();
@@ -365,42 +356,6 @@ public partial class BackgroundLogQueue : IDisposable
         }
 
         return false;
-    }
-
-    /// <summary>
-    /// Writes one event on this thread when the processor has nothing queued and the writers finish inside <c>Write</c>.
-    /// Only the first such event takes this path. A burst stays on the processor so the caller and the writer overlap.
-    /// </summary>
-    /// <param name="logEvent">Event to write. Not inspected.</param>
-    /// <returns>True when this thread finished the writer call. False when the caller must queue the event.</returns>
-    /// <remarks>
-    /// Does not throw. Does not run for HTTP, SQL, or cloud writers, and does not run once the channel is in use.
-    /// The constructor still starts the processor.
-    /// A full queue is not empty, so <see cref="QueueFullMode.Block"/> never waits on this path.
-    /// </remarks>
-    private bool TryWriteOnCaller(LogEvent logEvent)
-    {
-        if (!_directDispatch || Volatile.Read(ref _callerWrote) != 0 || Volatile.Read(ref _closedFast) != 0)
-            return false;
-
-        lock (_handoff)
-        {
-            if (_callerWrote != 0 || _closed || Volatile.Read(ref _closedFast) != 0)
-                return false;
-            if (!_queue.IsEmpty || Volatile.Read(ref _inflight) != 0)
-                return false;
-
-            _callerWrote = 1;
-            DispatchOne(logEvent);
-            Interlocked.Increment(ref _accepted);
-            lock (_gate)
-            {
-                if (!_frozen)
-                    _written++;
-            }
-
-            return true;
-        }
     }
 
     /// <summary>
@@ -1496,14 +1451,14 @@ public partial class BackgroundLogQueue : IDisposable
 
     /// <summary>
     /// True when every writer finishes inside <see cref="ILogWriter.Write"/>.
-    /// The queue then calls that method on the caller and skips the async state machine.
+    /// The processor then calls that method and skips the async state machine.
     /// </summary>
     /// <param name="writers">The copied writer list. Not null.</param>
     /// <returns>True for a file or console writer, or an empty list. False when any writer is neither.</returns>
     /// <remarks>
     /// Does not throw. File and console <c>WriteAsync</c> only call <c>Write</c> and return a completed task.
-    /// Any other writer stays on the processor, including when async is off.
-    /// A waiting <c>Write</c> on the caller would not return, so the log call could not release it.
+    /// The caller still only queues the event. The processor runs <c>Write</c>.
+    /// Any other writer stays on the async path, including when async is off.
     /// HTTP, SQL, and cloud writers stay on the async path.
     /// </remarks>
     private static bool WritersCompleteOnCaller(List<ILogWriter> writers)

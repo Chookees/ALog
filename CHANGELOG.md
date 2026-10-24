@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Changed: logging through the background queue is faster. Adding an event usually no longer takes a lock.
+
 ## 0.2.1
 
 - Breaking (dependency): `Microsoft.Data.SqlClient` moves from 6.0.2 to 7.1.1. If your app references `Microsoft.Data.SqlClient` directly, upgrade it to 7.x as well.
