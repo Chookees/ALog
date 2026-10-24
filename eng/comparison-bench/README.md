@@ -74,7 +74,7 @@ are inside the timed span.
 | ALog `async` | `LoggerEngine` + `FileLogWriter` (file kept open, 64 KiB buffer, flush every 1 s), `UseBackgroundQueue(capacity 10000, batch 10, 100 ms)`, `QueueFullMode.Block`, `FlushTimeout` 5 s; Close flushes once, then disposes; `PlainTextFormatter("yyyy-MM-dd'T'HH:mm:ss.fff'Z'")` (standard exception format) / `JsonFormatter` | README "Step 3: Background Queue" https://github.com/Chookees/ALog#step-3-background-queue-optional |
 | ALog `sync` | the same writer without the queue (writes on the caller thread); extra row, **not ranked** | same |
 | NLog `async` | `FileTarget(KeepFileOpen=true, AutoFlush=false)` in `AsyncTargetWrapper(QueueLimit=10000, OverflowAction=Block)`; `${exception}` with its default format; `JsonLayout` for T7 | https://github.com/NLog/NLog/wiki/Exception-Layout-Renderer, https://github.com/NLog/NLog/wiki/Performance ("File Logging Performance"), https://github.com/NLog/NLog/wiki/AsyncWrapper-target, https://github.com/NLog/NLog/wiki/File-target, https://github.com/NLog/NLog/wiki/JsonLayout |
-| Serilog `async` | `WriteTo.Async(bufferSize: 10000, blockWhenFull: true)` → `File(buffered: true)`, `{NewLine}{Exception}` as in the default output template; `Serilog.Formatting.Json.JsonFormatter(renderMessage: true)` for T7 | https://github.com/serilog/serilog-sinks-async/blob/dev/README.md, https://github.com/serilog/serilog-sinks-file/blob/dev/README.md#performance, https://github.com/serilog/serilog/wiki/Formatting-Output |
+| Serilog `async` | `WriteTo.Async(bufferSize: 10000, blockWhenFull: true)` → `File(buffered: true)`, `ExpressionTemplate` with `UtcDateTime(@t)` for plain and JSON (Serilog.Expressions, bench project only) | https://github.com/serilog/serilog-sinks-async/blob/dev/README.md, https://github.com/serilog/serilog-sinks-file/blob/dev/README.md#performance, https://github.com/serilog/serilog/wiki/Formatting-Output |
 | log4net `buffered` | `BufferingForwardingAppender(lossy=false, Fix=Partial, bufferSize 512 default)` → `FileAppender(ImmediateFlush=false, ExclusiveLock)`, standard `%exception`; flush + repository shutdown at the end | https://logging.apache.org/log4net/manual/configuration/appenders/bufferingforwardingappender.html, https://logging.apache.org/log4net/manual/configuration/appenders/fileappender.html, `ImmediateFlush`: https://github.com/apache/logging-log4net/blob/master/src/log4net/Appender/TextWriterAppender.cs |
 
 Deviations from defaults, recorded in `details.jsonl` (`notes`) and `env.json` (`libraries`):
@@ -85,8 +85,8 @@ Deviations from defaults, recorded in `details.jsonl` (`notes`) and `env.json` (
 - **Serilog file sink.** The default `buffered: false` flushes every event; set to `true` so it does not.
 - **NLog file target.** `AutoFlush=false` so the target does not flush per batch.
 - **log4net `Fix=Partial`.** The default `All` captures location info per event; the log4net page recommends `Partial`.
-- **Serilog JSON timestamp.** `JsonFormatter` writes the local offset; `run.sh` and the runner set `TZ=UTC`,
-  so the value ends in `+00:00`.
+- **Serilog timestamp.** Plain and JSON use `ExpressionTemplate` and `UtcDateTime(@t)` from Serilog.Expressions,
+  so the stamp is UTC (`Z`) in any time zone. That package is a dependency of this bench project only.
 
 ## Fairness decisions (2026-10-22)
 
@@ -104,8 +104,8 @@ Deviations from defaults, recorded in `details.jsonl` (`notes`) and `env.json` (
    and on flush, rotation, and dispose.
 5. **T3: every library writes its standard exception format, as users get it.** ALog: `PlainTextFormatter`
    default (one-line form with the inner chain and the source frame, no forced stack). NLog: `${exception}`
-   without format (default `ToString,Data`). Serilog: `{Exception}` as in the default output template
-   (`ToString()`). log4net: `%exception` (`ToString()`). The check requires all three exception types of the chain
+   without format (default `ToString,Data`). Serilog: `{@x}` in the `ExpressionTemplate` (`ToString()`), the
+   same text `{Exception}` writes. log4net: `%exception` (`ToString()`). The check requires all three exception types of the chain
    in the record; stack frames are not required.
 6. **log4net T2 = n/a.** log4net has no message templates or named properties; `ILog.InfoFormat` formats with
    `String.Format` only. T7 stays n/a.
@@ -117,7 +117,7 @@ Deviations from defaults, recorded in `details.jsonl` (`notes`) and `env.json` (
    `./merge.sh` writes `eng/comparison-bench/results/merged-<YYYY-MM-DD>/` (`merged.csv` and `summary.csv`, UTC date).
    `--out` overrides that directory.
 9. **BenchmarkDotNet** keeps fixed invocation counts per class (needed for `IterationSetup`).
-10. **Serilog JSON timestamps** end in `+00:00` (TZ=UTC) instead of `Z`.
+10. **Serilog timestamps** are UTC (`Z`) via `UtcDateTime(@t)`, including when the process time zone is not UTC.
 
 ## n/a cells
 
@@ -207,6 +207,6 @@ run's `env.json` records `QueueFullMode=Block` for `alog-async`. The files are:
 
 ## Licenses and names
 
-NLog (BSD-3-Clause), Serilog, Serilog.Sinks.File, Serilog.Sinks.Async and log4net (Apache-2.0) are referenced
-only by this benchmark project and are not redistributed. BenchmarkDotNet (MIT) is a build-time and run-time
-dependency of this project only. Product names are used only to identify the libraries.
+NLog (BSD-3-Clause), Serilog, Serilog.Sinks.File, Serilog.Sinks.Async, Serilog.Expressions and log4net
+(Apache-2.0) are referenced only by this benchmark project and are not redistributed. BenchmarkDotNet (MIT) is a
+build-time and run-time dependency of this project only. Product names are used only to identify the libraries.
