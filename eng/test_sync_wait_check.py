@@ -127,6 +127,18 @@ class SyncWaitCheckTests(unittest.TestCase):
             problems = CHECK.evaluate(root)
         self.assertTrue(any("matches nothing" in item for item in problems))
 
+    def test_queue_entries_name_the_consumer_thread(self) -> None:
+        """The queue allowlist covers both waits and names the consumer thread."""
+        text = (REPO / "eng" / "sync-wait-allowlist.txt").read_text(encoding="utf-8")
+        self.assertNotIn("void GetResult", text)
+        entries, problems = CHECK.parse_allowlist(text)
+        self.assertEqual(problems, [])
+        queue = [item for item in entries if item[0].endswith("BackgroundLogQueue.cs")]
+        self.assertEqual(len(queue), 2)
+        for _path, _pattern, reason in queue:
+            self.assertIn("Timeout:", reason)
+            self.assertIn("consumer thread", reason)
+
     def test_task_run_in_file_writer_fails(self) -> None:
         """Task.Run in the file writer is a failure even when no sync wait exists."""
         with tempfile.TemporaryDirectory() as tmp:

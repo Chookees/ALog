@@ -2,5 +2,6 @@
 # The reason names the timeout and why the caller SynchronizationContext is not captured.
 # eng/sync-wait-check.py fails when a library hit is missing here, or a line here matches nothing.
 
-ALog/Core/BackgroundLogQueue.cs:void GetResult\( # Awaiter method required by ICriticalNotifyCompletion. It returns immediately and waits on nothing. Timeout: not applicable, because this declaration is not a wait; a call to GetResult is still rejected.
+ALog/Core/BackgroundLogQueue.cs:task\.GetAwaiter\(\)\.GetResult\(\) # Only the queue's own consumer thread blocks here, after DispatchAsync returns an incomplete task. A log call never reaches this line and no caller SynchronizationContext is captured. Timeout: the writer task itself; FlushTimeout stops new writer calls and does not cancel a call that has already started.
+ALog/Core/BackgroundLogQueue.cs:WaitForNextTickAsync\(linked\.Token\)\.AsTask\(\)\.GetAwaiter\(\)\.GetResult\(\) # Only the queue's own consumer thread waits out the idle interval. A log call cancels this wait and does not run it, so the caller SynchronizationContext is not captured. Timeout: the configured flush interval, or sooner when the wake token or the shutdown token is cancelled.
 ALog/Writers/Cloud/AwsCloudWatchWriter.cs:GetResult\( # The AWS SDK has no synchronous API. The put starts on the thread pool, so the caller SynchronizationContext is not captured. Timeout: 100 seconds, the default HTTP client timeout used when the SDK client timeout is unset.
