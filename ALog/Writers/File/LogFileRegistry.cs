@@ -49,6 +49,70 @@ internal static class LogFileRegistry
         Interlocked.Increment(ref _identityChecks);
     }
 
+    private static FileOpen? _openFactory;
+
+    /// <summary>
+    /// The sentence for a write handle that could not be opened again. The line is not dropped.
+    /// </summary>
+    internal const string ReopenBlockedLine =
+        "ALOG0073: could not reopen the log file for writing. The line stays queued and will be tried again on the next flush.";
+
+    /// <summary>
+    /// The sentence when the direct retry buffer cannot take another line.
+    /// </summary>
+    internal const string ReopenBufferFullLine =
+        "ALOG0073: could not reopen the log file for writing. The retry buffer is full, so this line was dropped.";
+
+    /// <summary>
+    /// Builds the sentence for lines still held when the file closes.
+    /// </summary>
+    /// <param name="count">How many lines were still waiting. Greater than zero.</param>
+    /// <returns>The catalog sentence, including the count in invariant digits.</returns>
+    /// <remarks>Does not throw. Does not write the line.</remarks>
+    internal static string ReopenDisposeLine(int count)
+        => "ALOG0073: could not reopen the log file for writing. "
+            + count.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            + " lines were still waiting when the file closed.";
+
+    /// <summary>
+    /// Opens one file the way <see cref="SharedLogFile"/> does. Tests replace it and restore null.
+    /// </summary>
+    /// <param name="path">Full path. Not null.</param>
+    /// <param name="mode">Append for a write handle, open for a read handle.</param>
+    /// <param name="access">Write or read.</param>
+    /// <param name="share">Read and delete. Not write.</param>
+    /// <returns>The open stream. The caller owns it.</returns>
+    /// <remarks>
+    /// A null factory uses <see cref="FileStream"/> with no internal buffer.
+    /// Tests are not parallel. A factory that throws is not an open and is not counted.
+    /// Safe to replace from one test thread. Opens read it once.
+    /// </remarks>
+    internal delegate FileStream FileOpen(string path, FileMode mode, FileAccess access, FileShare share);
+
+    /// <summary>Test replacement for file opens. Null uses <see cref="FileStream"/>.</summary>
+    /// <remarks>Does not throw. A test restores null in finally. Not shared across parallel tests.</remarks>
+    internal static FileOpen? OpenFactory
+    {
+        get => Volatile.Read(ref _openFactory);
+        set => Volatile.Write(ref _openFactory, value);
+    }
+
+    /// <summary>Opens <paramref name="path"/> through <see cref="OpenFactory"/> or <see cref="FileStream"/>.</summary>
+    /// <param name="path">Full path. Not null.</param>
+    /// <param name="mode">Append or open.</param>
+    /// <param name="access">Write or read.</param>
+    /// <param name="share">The share mode passed to the stream.</param>
+    /// <returns>The open stream. The caller owns it.</returns>
+    /// <remarks>May throw the factory's exception or an I/O exception. Does not count the open. Called under the file lock.</remarks>
+    internal static FileStream OpenNew(string path, FileMode mode, FileAccess access, FileShare share)
+    {
+        var factory = OpenFactory;
+        if (factory is not null)
+            return factory(path, mode, access, share);
+
+        return new FileStream(path, mode, access, share, bufferSize: 1, FileOptions.None);
+    }
+
     /// <summary>
     /// Returns the shared file for <paramref name="path"/> and keeps it alive.
     /// </summary>
@@ -131,7 +195,13 @@ internal sealed class SharedLogFile
     private int _closed;
     private FileStream? _stream;
     private ITimer? _timer;
+    private ITimer? _retryTimer;
+    private readonly Queue<byte[]> _held = new();
+    private int _reopenBlocked;
     private DateTimeOffset _lastIdentityCheck;
+
+    /// <summary>Most lines kept when a direct write cannot reopen the file. The queue path does not use this cap.</summary>
+    private const int MaxHeldLines = 100_000;
 
     /// <summary>Stores the first opener's settings. The stream stays closed until the first append.</summary>
     /// <param name="path">Normalized full path. Not null.</param>
@@ -209,7 +279,8 @@ internal sealed class SharedLogFile
     /// <param name="line">The line plus its newline, in UTF-8 without a BOM. Not null.</param>
     /// <param name="maxBytes">Rotate before this line when the logical length is above zero and at least this value. Null never rotates.</param>
     /// <remarks>
-    /// Does not throw. A failure is the caller's to report. The line is copied or written whole under the file lock.
+    /// Throws <see cref="WriteDeferredException"/> when the processor cannot reopen the write handle.
+    /// Any other failure is reported and does not throw. The line is copied or written whole under the file lock.
     /// The loop that copies the line is bounded by <paramref name="line"/>'s length.
     /// </remarks>
     internal void Append(byte[] line, long? maxBytes)
@@ -222,8 +293,11 @@ internal sealed class SharedLogFile
     /// <param name="line">The line plus its newline, in UTF-8 without a BOM.</param>
     /// <param name="maxBytes">Rotate before this line when the logical length is above zero and at least this value. Null never rotates.</param>
     /// <remarks>
-    /// Does not throw. A failure is the caller's to report. The copy is bounded by <paramref name="line"/>'s length.
-    /// The caller may reuse the span after this returns.
+    /// Throws <see cref="WriteDeferredException"/> when the processor cannot reopen the write handle.
+    /// The queue keeps that event. A direct caller does not see the exception: the line is copied into a bounded buffer
+    /// and retried on the file clock, at least one second later. Any other failure is reported and does not throw.
+    /// The copy is bounded by <paramref name="line"/>'s length. The caller may reuse the span after this returns.
+    /// The file lock is not held across the caller's stack once this returns or throws.
     /// </remarks>
     internal void Append(ReadOnlySpan<byte> line, long? maxBytes)
     {
@@ -233,7 +307,26 @@ internal sealed class SharedLogFile
             if (_closed != 0)
                 return;
 
-            EnsureWritable();
+            if (EnsureWritable() == WriteOpen.Blocked)
+            {
+                // The queue keeps the event and retries on its flush tick.
+                // A direct caller has no queue, so the line stays in this file's bounded buffer.
+                if (BackgroundLogQueue.IsOnProcessor)
+                    throw new WriteDeferredException();
+
+                HoldDirect(line);
+                return;
+            }
+
+            if (_held.Count > 0 && !TryWriteHeld())
+            {
+                if (BackgroundLogQueue.IsOnProcessor)
+                    throw new WriteDeferredException();
+
+                HoldDirect(line);
+                return;
+            }
+
             if (_stream is null)
                 TryReopen();
             if (_stream is null)
@@ -265,6 +358,7 @@ internal sealed class SharedLogFile
             if (_closed != 0 && _stream is null)
                 return;
 
+            TryWriteHeld();
             Reconcile(force: true);
             FlushPending();
             // A second writer may still be alive. File.ReadAllText cannot open a path
@@ -285,8 +379,10 @@ internal sealed class SharedLogFile
     /// </remarks>
     internal void Close()
     {
-        ITimer? timer;
-        FileStream? stream;
+        ITimer? timer = null;
+        ITimer? retry = null;
+        FileStream? stream = null;
+        var stranded = 0;
         lock (_fileLock)
         {
             if (_closed != 0)
@@ -295,7 +391,10 @@ internal sealed class SharedLogFile
             try
             {
                 Reconcile(force: true);
+                TryWriteHeld();
                 FlushPending();
+                stranded = _held.Count;
+                _held.Clear();
             }
             catch (Exception ex)
             {
@@ -306,11 +405,17 @@ internal sealed class SharedLogFile
 
             timer = _timer;
             _timer = null;
+            retry = _retryTimer;
+            _retryTimer = null;
             stream = _stream;
             _stream = null;
         }
 
+        if (stranded > 0)
+            ALog.SelfLog.ReportLine(LogFileRegistry.ReopenDisposeLine(stranded));
+
         timer?.Dispose();
+        retry?.Dispose();
         try
         {
             stream?.Dispose();
@@ -349,13 +454,11 @@ internal sealed class SharedLogFile
     /// </remarks>
     private void OpenStream()
     {
-        _stream = new FileStream(
+        _stream = LogFileRegistry.OpenNew(
             _path,
             FileMode.Append,
             FileAccess.Write,
-            FileShare.Read | FileShare.Delete,
-            bufferSize: 1,
-            FileOptions.None);
+            FileShare.Read | FileShare.Delete);
         _logicalLength = _stream.Length;
         _pending = 0;
         Volatile.Write(ref _opened, 1);
@@ -392,6 +495,7 @@ internal sealed class SharedLogFile
             try
             {
                 Reconcile(force: true);
+                TryWriteHeld();
                 FlushPending();
                 HoldForReaders();
             }
@@ -561,29 +665,180 @@ internal sealed class SharedLogFile
         }
     }
 
+    /// <summary>Whether the append stream can take a line, or the write handle could not be opened this time.</summary>
+    private enum WriteOpen
+    {
+        /// <summary>The stream is open for write, or there was no read handle to replace.</summary>
+        Ready = 0,
+
+        /// <summary>The open failed. The caller keeps the line and does not try again in this call.</summary>
+        Blocked = 1
+    }
+
     /// <summary>
     /// Switches a read handle back to an append handle. A write handle is left as it is.
+    /// A failed reopen stays blocked until a later call opens it, and does not call <see cref="TryReopen"/> in this call.
     /// </summary>
+    /// <returns><see cref="WriteOpen.Ready"/> when a line may be written. <see cref="WriteOpen.Blocked"/> when the line must stay queued.</returns>
     /// <remarks>
     /// The caller holds the file lock. Does not throw. The read handle is closed before the append opens,
     /// because <see cref="FileShare.Read"/> does not allow a second write. A failed open leaves the stream unset
-    /// so <see cref="TryReopen"/> can report it. A successful open increments <see cref="LogFileRegistry.OpenCount"/>.
+    /// and reports <see cref="LogFileRegistry.ReopenBlockedLine"/> plus the write-failed line.
+    /// A successful open increments <see cref="LogFileRegistry.OpenCount"/>. One attempt per call.
     /// </remarks>
-    private void EnsureWritable()
+    private WriteOpen EnsureWritable()
     {
+        if (_reopenBlocked != 0)
+            return OpenWriteAgain();
+
         if (_stream is null || _stream.CanWrite)
-            return;
+            return WriteOpen.Ready;
 
         var parked = _stream;
         _stream = null;
         DisposeDetached(parked);
+        var opened = OpenWriteAgain();
+        if (opened == WriteOpen.Blocked)
+            _reopenBlocked = 1;
+        return opened;
+    }
+
+    /// <summary>Opens the append stream once. A failure leaves the stream unset and keeps the line.</summary>
+    /// <returns><see cref="WriteOpen.Ready"/> when the stream can accept a line. <see cref="WriteOpen.Blocked"/> when this attempt failed.</returns>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. One attempt per call, so a blocked reader cannot spin.
+    /// The error stream keeps the write-failed line. <see cref="LogFileRegistry.ReopenBlockedLine"/> is the catalog line.
+    /// </remarks>
+    private WriteOpen OpenWriteAgain()
+    {
         try
         {
             OpenStream();
+            _reopenBlocked = 0;
+            return WriteOpen.Ready;
         }
         catch (Exception ex)
         {
             System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+            ALog.SelfLog.ReportLine(LogFileRegistry.ReopenBlockedLine);
+            return WriteOpen.Blocked;
+        }
+    }
+
+    /// <summary>Copies <paramref name="line"/> into the direct retry buffer and arms the retry timer once.</summary>
+    /// <param name="line">The encoded line, including its newline. Not empty is not required.</param>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. The copy is bounded by the line length.
+    /// The buffer stops at <see cref="MaxHeldLines"/>. A full buffer reports <see cref="LogFileRegistry.ReopenBufferFullLine"/> and drops that line.
+    /// The queue path does not call this. The timer is the file clock and is at least one second.
+    /// </remarks>
+    private void HoldDirect(ReadOnlySpan<byte> line)
+    {
+        if (_held.Count >= MaxHeldLines)
+        {
+            ALog.SelfLog.ReportLine(LogFileRegistry.ReopenBufferFullLine);
+            return;
+        }
+
+        var copy = new byte[line.Length];
+        line.CopyTo(copy);
+        _held.Enqueue(copy);
+        ArmRetry();
+    }
+
+    /// <summary>Writes held lines when the write handle can be opened. Stops at the first line that does not land.</summary>
+    /// <returns>True when no held line remains. False when the handle is still blocked or a write failed.</returns>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. The loop is bounded by <see cref="MaxHeldLines"/>.
+    /// A blocked open reports once inside <see cref="EnsureWritable"/> and does not retry in this call.
+    /// </remarks>
+    private bool TryWriteHeld()
+    {
+        if (_held.Count == 0)
+            return true;
+
+        if (EnsureWritable() == WriteOpen.Blocked)
+            return false;
+
+        if (_stream is null)
+            TryReopen();
+
+        var guard = 0;
+        while (_held.Count > 0 && _stream is not null && guard < MaxHeldLines)
+        {
+            guard++;
+            var line = _held.Peek();
+            try
+            {
+                WriteLine(line);
+            }
+            catch (Exception ex)
+            {
+                System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+                return false;
+            }
+
+            if (_stream is null)
+                return false;
+
+            _held.Dequeue();
+        }
+
+        return _held.Count == 0;
+    }
+
+    /// <summary>Starts the direct retry timer. A second call leaves the existing timer in place.</summary>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. The first fire and the period are <see cref="ReopenDelay"/>.
+    /// The callback takes the file lock. A zero flush interval still waits one second, because there is no idle timer.
+    /// </remarks>
+    private void ArmRetry()
+    {
+        if (_retryTimer is not null)
+            return;
+
+        var delay = ReopenDelay();
+        _retryTimer = _clock.CreateTimer(
+            static state => ((SharedLogFile)state!).OnRetry(),
+            this,
+            delay,
+            delay);
+    }
+
+    /// <summary>How long a direct caller waits before the next reopen. At least one second.</summary>
+    /// <returns>The file flush interval when it is longer than one second. Otherwise one second.</returns>
+    /// <remarks>Does not throw. Does not read the clock. Called under the file lock.</remarks>
+    private TimeSpan ReopenDelay()
+    {
+        if (_interval > TimeSpan.FromSeconds(1))
+            return _interval;
+
+        return TimeSpan.FromSeconds(1);
+    }
+
+    /// <summary>Writes held lines when the retry timer fires. A closed file returns.</summary>
+    /// <remarks>
+    /// Does not throw. Does not dispose the timer. The callback and <see cref="Close"/> share the file lock.
+    /// One fire tries the open once. The next period tries again, so this is not a per-line spin.
+    /// </remarks>
+    private void OnRetry()
+    {
+        if (Volatile.Read(ref _closed) != 0)
+            return;
+
+        lock (_fileLock)
+        {
+            if (_closed != 0)
+                return;
+
+            try
+            {
+                TryWriteHeld();
+            }
+            catch (Exception ex)
+            {
+                System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+            }
         }
     }
 
@@ -610,18 +865,16 @@ internal sealed class SharedLogFile
         DisposeDetached(writing);
         try
         {
-            _stream = new FileStream(
+            _stream = LogFileRegistry.OpenNew(
                 _path,
                 FileMode.Open,
                 FileAccess.Read,
-                FileShare.Read | FileShare.Delete,
-                bufferSize: 1,
-                FileOptions.None);
+                FileShare.Read | FileShare.Delete);
             LogFileRegistry.NoteOpen();
         }
         catch (Exception ex)
         {
-            System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+            System.Console.Error.WriteLine($"[FileLogWriter] Could not reopen the log file for readers: {ex}");
         }
     }
 

@@ -48,7 +48,12 @@ public partial class BackgroundLogQueue : IDisposable
     /// <summary>Most events read in one pass. The channel never holds more than its capacity.</summary>
     private const int MaxRead = 100_000;
 
+    /// <summary>Shortest wait before a file that could not reopen is tried again. A longer flush interval waits that long instead.</summary>
+    private static readonly TimeSpan MinimumReopenRetry = TimeSpan.FromSeconds(1);
+
     private readonly ConcurrentQueue<LogEvent> _queue = new();
+    private readonly Queue<LogEvent> _front = new();
+    private readonly ManualResetEventSlim _releaseRetry = new(false);
     private readonly LogDispatcher _dispatcher;
     private readonly CancellationTokenSource _shutdownSignal = new();
     private readonly Task _backgroundTask;
@@ -76,6 +81,8 @@ public partial class BackgroundLogQueue : IDisposable
     private int _closedReported;
     private int _processorEntered;
     private int _idleWaitEntered;
+    private int _reopenWaitsStarted;
+    private long _retryNotBeforeTicks;
     private int _disposeWaitsStarted;
     private static int _deadlineWaitEntries;
     private int _flushWaitsStarted;
@@ -231,6 +238,10 @@ public partial class BackgroundLogQueue : IDisposable
 
     /// <summary>True after the processor has entered the idle timer wait at least once.</summary>
     internal bool IsIdleWaitEntered => Volatile.Read(ref _idleWaitEntered) != 0;
+
+    /// <summary>How many times a deferred file write has armed its retry wait. Zero until the first blocked reopen.</summary>
+    /// <remarks>Does not throw. The count moves before the processor blocks, so a test can advance the clock after it changes.</remarks>
+    internal int ReopenWaitsStarted => Volatile.Read(ref _reopenWaitsStarted);
 
     /// <summary>The source cancelled to wake the processor. A wake replaces this instance.</summary>
     internal CancellationTokenSource WakeTokenSource => _wakeCts;
@@ -715,6 +726,12 @@ public partial class BackgroundLogQueue : IDisposable
         {
             while (Volatile.Read(ref _stop) == 0 && !_writerGate.DeadlineReached)
             {
+                if (FrontBlocked())
+                {
+                    WaitForRetry();
+                    continue;
+                }
+
                 var count = ReadBatch(batch);
                 if (count > 0)
                 {
@@ -780,12 +797,22 @@ public partial class BackgroundLogQueue : IDisposable
     /// Moves up to one batch from the channel into <paramref name="batch"/>.
     /// </summary>
     /// <param name="batch">Destination. Cleared by the caller before the next read. Not null.</param>
-    /// <returns>How many events were added. Zero when the channel has nothing ready.</returns>
-    /// <remarks>Does not throw. Does not write. The loop stops at the batch size or at <see cref="MaxRead"/>.</remarks>
+    /// <returns>How many events were added. Zero when the channel and the parked front have nothing ready.</returns>
+    /// <remarks>
+    /// Does not throw. Does not write. The loop stops at the batch size or at <see cref="MaxRead"/>.
+    /// Parked events are taken first so a deferred line stays ahead of a line that arrived later.
+    /// Only the processor calls this.
+    /// </remarks>
     private int ReadBatch(List<LogEvent> batch)
     {
         var limit = ReadLimit();
         var count = 0;
+        while (count < limit && _front.Count > 0)
+        {
+            batch.Add(_front.Dequeue());
+            count++;
+        }
+
         while (count < limit && _queue.TryDequeue(out var logEvent))
         {
             batch.Add(logEvent);
@@ -817,8 +844,15 @@ public partial class BackgroundLogQueue : IDisposable
                 if (Volatile.Read(ref _stop) != 0 || NewWritesBudgetSpent() || _writerGate.DeadlineReached)
                     return;
 
-                var completed = DispatchOne(batch[i]);
-                if (!completed)
+                var result = DispatchOne(batch[i]);
+                if (result == DispatchResult.Deferred)
+                {
+                    ParkFront(batch, i, count);
+                    ArmRetryDelay();
+                    return;
+                }
+
+                if (result == DispatchResult.Skipped)
                     return;
 
                 committed++;
@@ -863,9 +897,9 @@ public partial class BackgroundLogQueue : IDisposable
     /// Hands one event to every writer. A writer failure stays on the dispatcher error path.
     /// </summary>
     /// <param name="logEvent">The event. May be the default record value.</param>
-    /// <returns>False when the deadline skipped a writer. That event stays unwritten and is part of ALOG0071.</returns>
+    /// <returns><see cref="DispatchResult.Skipped"/> when the deadline skipped a writer. That event stays unwritten and is part of ALOG0071. <see cref="DispatchResult.Deferred"/> when the file could not reopen and the event must stay queued.</returns>
     /// <remarks>Does not throw. Allocates nothing beyond what the dispatcher allocates. One event, so the deadline can be checked between events.</remarks>
-    private bool DispatchOne(LogEvent logEvent)
+    private DispatchResult DispatchOne(LogEvent logEvent)
     {
         var previousQueue = ConsumerQueue.Value;
         var previousThread = Volatile.Read(ref _consumerThread);
@@ -885,18 +919,126 @@ public partial class BackgroundLogQueue : IDisposable
                         task.GetAwaiter().GetResult();
                 }
             }
+            catch (WriteDeferredException)
+            {
+                return DispatchResult.Deferred;
+            }
             catch (Exception ex)
             {
                 Console.Error.WriteLine("[BackgroundLogQueue] Batch processing error: " + ex.GetType().Name);
             }
 
-            return !_writerGate.EventSkipped;
+            return _writerGate.EventSkipped ? DispatchResult.Skipped : DispatchResult.Written;
         }
         finally
         {
             ConsumerQueue.Value = previousQueue;
             Volatile.Write(ref _consumerThread, previousThread);
         }
+    }
+
+    /// <summary>What one processor write did with an event.</summary>
+    private enum DispatchResult
+    {
+        /// <summary>The writer call returned. The event can be committed.</summary>
+        Written = 0,
+
+        /// <summary>The file could not reopen. The event and the rest of the batch go back to the front.</summary>
+        Deferred = 1,
+
+        /// <summary>The shutdown deadline skipped the writer. The event stays in the unwritten count.</summary>
+        Skipped = 2
+    }
+
+    /// <summary>
+    /// Puts <paramref name="batch"/> entries from <paramref name="start"/> back in front of anything already parked.
+    /// </summary>
+    /// <param name="batch">The batch just read. Not null. Entries at and after <paramref name="start"/> are not committed.</param>
+    /// <param name="start">The first event that was not written. Not negative.</param>
+    /// <param name="count">How many entries in the batch are live. Greater than <paramref name="start"/>.</param>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this. The copy is bounded by <see cref="MaxRead"/>.
+    /// Events already accepted stay in the outstanding count, so a full queue still rejects a new event.
+    /// </remarks>
+    private void ParkFront(List<LogEvent> batch, int start, int count)
+    {
+        if (_front.Count == 0)
+        {
+            for (var i = start; i < count; i++)
+                _front.Enqueue(batch[i]);
+            return;
+        }
+
+        var pending = new Queue<LogEvent>(_front.Count + (count - start));
+        for (var i = start; i < count; i++)
+            pending.Enqueue(batch[i]);
+
+        while (_front.Count > 0)
+            pending.Enqueue(_front.Dequeue());
+
+        while (pending.Count > 0)
+            _front.Enqueue(pending.Dequeue());
+    }
+
+    /// <summary>Records the earliest time a parked file event may be tried again.</summary>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this. The delay is one second, or the queue flush interval when that is longer.
+    /// The clock is the queue clock, so a test moves the wait with <see cref="TimeProvider.GetUtcNow"/>.
+    /// </remarks>
+    private void ArmRetryDelay()
+    {
+        var delay = _flushInterval > MinimumReopenRetry ? _flushInterval : MinimumReopenRetry;
+        var due = _clock.GetUtcNow().UtcTicks + delay.Ticks;
+        Volatile.Write(ref _retryNotBeforeTicks, due);
+    }
+
+    /// <summary>True when parked events must wait for the retry time.</summary>
+    /// <returns>True when the front has events and the clock has not reached the retry time.</returns>
+    /// <remarks>Does not throw. Only the processor calls this. An empty front is never blocked.</remarks>
+    private bool FrontBlocked()
+    {
+        if (_front.Count == 0)
+            return false;
+
+        return _clock.GetUtcNow().UtcTicks < Volatile.Read(ref _retryNotBeforeTicks);
+    }
+
+    /// <summary>How long remains before a parked event may be written.</summary>
+    /// <returns>Zero when the retry time has passed. Otherwise the remainder on the queue clock.</returns>
+    /// <remarks>Does not throw. Only the processor calls this.</remarks>
+    private TimeSpan RetryRemaining()
+    {
+        var due = Volatile.Read(ref _retryNotBeforeTicks);
+        var now = _clock.GetUtcNow().UtcTicks;
+        if (now >= due)
+            return TimeSpan.Zero;
+
+        return TimeSpan.FromTicks(due - now);
+    }
+
+    /// <summary>
+    /// Blocks until the retry time or until shutdown releases the processor.
+    /// A wake from a new event does not shorten the wait.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this. The timer uses the queue clock.
+    /// The count moves before the wait, so a test can advance the clock after <see cref="ReopenWaitsStarted"/> changes.
+    /// Shutdown sets <see cref="_releaseRetry"/> so a frozen clock cannot leave the processor blocked past the deadline.
+    /// </remarks>
+    private void WaitForRetry()
+    {
+        var remaining = RetryRemaining();
+        if (remaining <= TimeSpan.Zero || _releaseRetry.IsSet)
+            return;
+
+        using var ready = new ManualResetEventSlim(false);
+        using var timer = _clock.CreateTimer(
+            static state => ((ManualResetEventSlim)state!).Set(),
+            ready,
+            remaining,
+            Timeout.InfiniteTimeSpan);
+        Interlocked.Increment(ref _reopenWaitsStarted);
+        WaitHandle.WaitAny(new[] { ready.WaitHandle, _releaseRetry.WaitHandle });
     }
 
     /// <summary>
@@ -931,7 +1073,7 @@ public partial class BackgroundLogQueue : IDisposable
         if (!IsGateClosed())
             return false;
 
-        if (!_queue.IsEmpty)
+        if (!_queue.IsEmpty || _front.Count > 0)
             return false;
 
         return Volatile.Read(ref _inflight) == 0;
@@ -1003,7 +1145,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>Does not throw. Does not emit ALOG0071. A flush that expires is completed by <see cref="FlushAsync"/> itself.</remarks>
     private void TryCompleteFlushIfIdle()
     {
-        if (!_queue.IsEmpty || Volatile.Read(ref _inflight) > 0)
+        if (!_queue.IsEmpty || _front.Count > 0 || Volatile.Read(ref _inflight) > 0)
             return;
 
         var tcs = Interlocked.Exchange(ref _flushTcs, null);
@@ -1183,6 +1325,7 @@ public partial class BackgroundLogQueue : IDisposable
 
         _writerGate.MarkDeadline();
         Volatile.Write(ref _stop, 1);
+        _releaseRetry.Set();
         SignalProcessor();
     }
 
@@ -1381,6 +1524,7 @@ public partial class BackgroundLogQueue : IDisposable
 
         DisposeQuiet(_shutdownSignal);
         DisposeQuiet(_wakeCts);
+        _releaseRetry.Dispose();
         _stopped.Dispose();
     }
 

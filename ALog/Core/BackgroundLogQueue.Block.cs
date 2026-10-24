@@ -13,6 +13,13 @@ public partial class BackgroundLogQueue
     /// <summary>The queue whose writer is running on this execution context. Null on every other context.</summary>
     private static readonly AsyncLocal<BackgroundLogQueue?> ConsumerQueue = new();
 
+    /// <summary>
+    /// True when this call is the queue processor writing an event.
+    /// A file that cannot reopen throws <see cref="WriteDeferredException"/> only in that case.
+    /// </summary>
+    /// <remarks>Does not throw. False on an application thread. The async-local value is set for the processor call and cleared after it.</remarks>
+    internal static bool IsOnProcessor => ConsumerQueue.Value is not null;
+
     private readonly List<BlockWaiter> _registered = new();
     private int _registeredCount;
     private readonly Stack<BlockWaiter> _freeWaiters = new();

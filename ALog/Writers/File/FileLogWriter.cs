@@ -180,6 +180,8 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     /// <remarks>
     /// The lock covers rotation and append so two callers cannot split a line.
     /// A formatting or I/O failure is reported and does not leave the lock held.
+    /// <see cref="WriteDeferredException"/> is rethrown so the background queue can keep the event.
+    /// A direct caller does not see that exception: the file holds the line and retries on its clock.
     /// </remarks>
     private void WriteCore(LogEvent logEvent)
     {
@@ -199,6 +201,10 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
             var bytes = Utf8.GetBytes(lineWithNewline);
             lock (_writeLock)
                 _shared.Append(bytes, _maxFileSizeInBytes);
+        }
+        catch (WriteDeferredException)
+        {
+            throw;
         }
         catch (Exception ex)
         {
