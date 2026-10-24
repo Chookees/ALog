@@ -26,7 +26,10 @@ internal static class LogFileRegistry
     /// <summary>The lock around <see cref="Files"/>. Callers must not take it while they hold a file lock.</summary>
     internal static object Gate { get; } = new();
 
-    /// <summary>How many times a stream was opened, including a reopen after rotation.</summary>
+    /// <summary>
+    /// How many times a stream was opened. Every successful open counts, including a reopen after rotation,
+    /// the read handle opened by an explicit flush or the idle interval, and the write handle that replaces it.
+    /// </summary>
     internal static int OpenCount => Volatile.Read(ref _openCount);
 
     /// <summary>Records one successful open.</summary>
@@ -104,8 +107,9 @@ internal static class LogFileRegistry
 /// The stream is opened with <see cref="FileShare.Read"/> and <see cref="FileShare.Delete"/> so another handle can read or rename it.
 /// Omitting <see cref="FileShare.Write"/> stops a second writer on Windows only. Linux and macOS still allow one, and the lines can mix.
 /// A write handle cannot be opened together with <c>File.ReadAllText</c> on Windows: that call uses <see cref="FileShare.Read"/>,
-/// which rejects an existing write. After a zero-interval write the bytes are already in the file, and the handle is reopened
-/// for read until the next append. A positive interval keeps the write handle so a burst does not open the file per line.
+/// which rejects an existing write. The write handle stays open across appends, including when the flush interval is zero.
+/// <see cref="SharedLogFile.Flush"/> and the idle interval replace it with a read handle until the next append.
+/// <see cref="SharedLogFile.Close"/> closes the handle. A burst does not open the file again on every line.
 /// The timer is disposed outside the file lock. The callback also takes that lock.
 /// An external rename, delete, or truncate is noticed on the flush tick, on <see cref="Flush"/>, before this process rotates the file, and on close.
 /// A zero <see cref="FileFlushInterval"/> compares the path before every write to the operating system. A positive interval compares at most once per that interval.
@@ -250,7 +254,8 @@ internal sealed class SharedLogFile
     /// <remarks>
     /// Does not throw. A closed file returns. Safe to call before the first write.
     /// After the bytes are written the handle is read-only so <c>File.ReadAllText</c> can open the path
-    /// while another writer in this process still holds the shared file.
+    /// while this logger is still alive. The next append closes that read handle and opens a write handle.
+    /// A write by itself does not swap, even when the flush interval is zero.
     /// </remarks>
     internal void Flush()
     {
@@ -337,19 +342,11 @@ internal sealed class SharedLogFile
     /// <summary>Creates the append stream and, when the interval is positive, the flush timer.</summary>
     /// <remarks>
     /// The caller holds the file lock. Does not dispose the timer. A failure leaves the stream unset and throws.
+    /// Every successful open, including a switch from the read handle back to write, increments <see cref="LogFileRegistry.OpenCount"/>.
     /// bufferSize 1 means the FileStream keeps no internal buffer, so Dispose has nothing left to write.
     /// .NET 10 accepts bufferSize 0, and 0 and 1 are both unbuffered. ALog buffers itself.
     /// </remarks>
-    private void OpenStream() => OpenStream(recordOpen: true);
-
-    /// <summary>Creates the append stream. <paramref name="recordOpen"/> is false when a read handle is switching back to write.</summary>
-    /// <param name="recordOpen">True for the first open and for a path reopen. False does not move <see cref="LogFileRegistry.OpenCount"/>.</param>
-    /// <remarks>
-    /// The caller holds the file lock. Does not dispose the timer. A failure leaves the stream unset and throws.
-    /// bufferSize 1 means the FileStream keeps no internal buffer, so Dispose has nothing left to write.
-    /// .NET 10 accepts bufferSize 0, and 0 and 1 are both unbuffered. ALog buffers itself.
-    /// </remarks>
-    private void OpenStream(bool recordOpen)
+    private void OpenStream()
     {
         _stream = new FileStream(
             _path,
@@ -360,12 +357,8 @@ internal sealed class SharedLogFile
             FileOptions.None);
         _logicalLength = _stream.Length;
         _pending = 0;
-
-        if (recordOpen)
-        {
-            Volatile.Write(ref _opened, 1);
-            LogFileRegistry.NoteOpen();
-        }
+        Volatile.Write(ref _opened, 1);
+        LogFileRegistry.NoteOpen();
 
         _lastIdentityCheck = _clock.GetUtcNow();
         if (_timer is null && _interval > TimeSpan.Zero)
@@ -379,7 +372,11 @@ internal sealed class SharedLogFile
     }
 
     /// <summary>Flushes when the interval elapses. A closed file returns before taking the lock for long.</summary>
-    /// <remarks>Does not throw. Does not dispose the timer. The callback and <see cref="Close"/> share the file lock.</remarks>
+    /// <remarks>
+    /// Does not throw. Does not dispose the timer. The callback and <see cref="Close"/> share the file lock.
+    /// After a successful flush the handle is read-only until the next append, so a quiet file can be read
+    /// with <c>File.ReadAllText</c> on Windows while this logger is still alive.
+    /// </remarks>
     private void OnInterval()
     {
         if (Volatile.Read(ref _closed) != 0)
@@ -394,6 +391,7 @@ internal sealed class SharedLogFile
             {
                 Reconcile(force: true);
                 FlushPending();
+                HoldForReaders();
             }
             catch (Exception ex)
             {
@@ -567,7 +565,7 @@ internal sealed class SharedLogFile
     /// <remarks>
     /// The caller holds the file lock. Does not throw. The read handle is closed before the append opens,
     /// because <see cref="FileShare.Read"/> does not allow a second write. A failed open leaves the stream unset
-    /// so <see cref="TryReopen"/> can report it. <see cref="LogFileRegistry.OpenCount"/> does not move.
+    /// so <see cref="TryReopen"/> can report it. A successful open increments <see cref="LogFileRegistry.OpenCount"/>.
     /// </remarks>
     private void EnsureWritable()
     {
@@ -579,7 +577,7 @@ internal sealed class SharedLogFile
         DisposeDetached(parked);
         try
         {
-            OpenStream(recordOpen: false);
+            OpenStream();
         }
         catch (Exception ex)
         {
@@ -591,11 +589,14 @@ internal sealed class SharedLogFile
     /// Replaces the write handle with a read handle so <c>File.ReadAllText</c> can open the same path.
     /// </summary>
     /// <remarks>
-    /// The caller holds the file lock. Does not throw. Used only after a zero-interval write, which has already
-    /// flushed the line. <c>File.ReadAllText</c> asks for <see cref="FileShare.Read"/>. Windows rejects that request
+    /// The caller holds the file lock. Does not throw. Called from an explicit <see cref="Flush"/> and from the idle
+    /// interval, after the bytes are already in the file. A plain append does not call this, including when the flush
+    /// interval is zero. <c>File.ReadAllText</c> asks for <see cref="FileShare.Read"/>. Windows rejects that request
     /// while any handle still has write access, including when this handle's share mode is <see cref="FileShare.ReadWrite"/>.
     /// The read handle keeps <see cref="FileShare.Delete"/> and still omits <see cref="FileShare.Write"/>, so a rename works
     /// and a second writer is still rejected. The next append closes this handle first.
+    /// A successful open increments <see cref="LogFileRegistry.OpenCount"/>. <see cref="Close"/> closes the handle instead of swapping.
+    /// Safe only on the thread that holds the file lock.
     /// </remarks>
     private void HoldForReaders()
     {
@@ -614,6 +615,7 @@ internal sealed class SharedLogFile
                 FileShare.Read | FileShare.Delete,
                 bufferSize: 1,
                 FileOptions.None);
+            LogFileRegistry.NoteOpen();
         }
         catch (Exception ex)
         {
@@ -638,8 +640,6 @@ internal sealed class SharedLogFile
             _stream.Write(line);
             _stream.Flush();
             _logicalLength += line.Length;
-            if (_interval <= TimeSpan.Zero)
-                HoldForReaders();
             return;
         }
 

@@ -187,7 +187,7 @@ When the queue is full, ALog drops the new event by default and counts it (SelfL
 - `FileBufferSize`: how much `FileLogWriter` collects before it writes to the file. Default 64 KiB, 4 KiB to 16 MiB.
 - `FileFlushInterval`: how often buffered lines are written even if the buffer is not full. Default 1 s, 0 to 60 s. `0` writes every event right away.
 - `FlushTimeout`: how long `Flush`, `Dispose`, and `Shutdown` wait for queued events. Default 5 s, 0 to 60 s. Events still unwritten after that are counted (ALOG0071).
-- Each log file has one writer process: give each process its own file. Other programs can read, tail, and rotate it.
+- Each log file has one writer process: give each process its own file. Other programs can read, tail, and rotate it. On Windows, `File.ReadAllText` can open the file after `Flush`, after the flush interval, and after dispose. A zero flush interval does not reopen the file after every line.
 
 If the process crashes, the file can miss up to one `FileFlushInterval` or one `FileBufferSize` of lines, whichever comes first. Set `FileFlushInterval` to `0` if every line must reach the operating system immediately.
 
