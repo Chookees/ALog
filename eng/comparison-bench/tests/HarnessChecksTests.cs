@@ -4,7 +4,7 @@ using System.Globalization;
 namespace AlogComparison.SpeedTests;
 
 /// <summary>
-/// The verifier's self-check and the Serilog time-zone matrix. These run without <c>ALOG_SPEED</c>.
+/// The verifier's self-check, the strict mean rule, and the Serilog time-zone matrix.
 /// </summary>
 public sealed class HarnessChecksTests
 {
@@ -26,24 +26,27 @@ public sealed class HarnessChecksTests
     }
 
     /// <summary>
-    /// The 5% tie accepts an equal median and a median on the limit, and rejects a slower one.
+    /// An equal mean passes. A greater mean fails. The reason names both means and the runs.
     /// </summary>
     /// <returns>A task that finishes after the comparisons.</returns>
-    /// <remarks>Does not throw. Does not start a cell. The wait is 5 seconds. Safe for the test thread.</remarks>
+    /// <remarks>Does not throw. Does not start a cell. There is no tie margin. The wait is 5 seconds. Safe for the test thread.</remarks>
     [Fact(Timeout = 5000)]
-    public async Task TieMargin_AllowsFivePercentAndRejectsMore()
+    public async Task StrictMean_RejectsAnySlowerMean()
     {
         await Task.CompletedTask;
-        Assert.Equal(2d, RankedSpeedTests.Median(3, 1, 2));
-        Assert.Equal(5d, RankedSpeedTests.Median(5, 1, 5));
+        Assert.Equal(2d, RankedSpeedTests.Mean(1, 2, 3));
+        Assert.Equal(4d, RankedSpeedTests.Mean(2, 4, 6));
         var fastest = 100.0;
-        var limit = fastest * RankedSpeedTests.TieFactor;
-        Assert.Null(RankedSpeedTests.RankProblem(limit, fastest, "nlog"));
         Assert.Null(RankedSpeedTests.RankProblem(fastest, fastest, "nlog"));
-        Assert.NotNull(RankedSpeedTests.RankProblem(limit + 0.001, fastest, "nlog"));
-        Assert.Contains("within the 5% tie", RankedSpeedTests.RankReason(limit, fastest, "nlog"), StringComparison.Ordinal);
-        Assert.Contains("at least as fast", RankedSpeedTests.RankReason(fastest - 1, fastest, "nlog"), StringComparison.Ordinal);
-        Assert.Contains("slower than the 5% tie", RankedSpeedTests.RankReason(limit + 0.001, fastest, "nlog"), StringComparison.Ordinal);
+        Assert.Null(RankedSpeedTests.RankProblem(fastest - 0.001, fastest, "nlog"));
+        Assert.NotNull(RankedSpeedTests.RankProblem(fastest + 0.001, fastest, "nlog"));
+        var runs = "alog-async#1 total_ms=100.000; alog-async#2 total_ms=100.000; alog-async#3 total_ms=100.000";
+        Assert.Contains("no slower", RankedSpeedTests.RankReason(fastest, fastest, "nlog", runs), StringComparison.Ordinal);
+        var slower = RankedSpeedTests.RankReason(fastest + 0.001, fastest, "nlog", runs);
+        Assert.Contains("slower", slower, StringComparison.Ordinal);
+        Assert.Contains("alog-async mean", slower, StringComparison.Ordinal);
+        Assert.Contains("fastest nlog mean", slower, StringComparison.Ordinal);
+        Assert.Contains(runs, slower, StringComparison.Ordinal);
     }
 
     /// <summary>

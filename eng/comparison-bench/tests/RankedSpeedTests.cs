@@ -1,7 +1,7 @@
 // Full-N ranked speed checks. One fresh comparison process per cell.
-// ALog async median total_ms of 3 runs must be <= the fastest valid competitor, with a 5% tie.
+// ALog async mean total_ms of 3 runs must be <= the fastest valid competitor. An equal mean passes.
 // An invalid competitor fails the scenario and does not produce a rank.
-// The cells run only when ALOG_SPEED=1. Required CI builds this project and does not run them.
+// These facts run from a normal dotnet test of this project. They are not in ALog.sln and not a CI job.
 // Next file: eng/comparison-bench/Cell.cs (the RESULT line these tests parse).
 
 using System.Diagnostics;
@@ -18,11 +18,8 @@ namespace AlogComparison.SpeedTests;
 /// </summary>
 public sealed class RankedSpeedTests
 {
-    /// <summary>How many timed runs make one median. The acceptance rule uses this count.</summary>
+    /// <summary>How many timed runs make one mean. The acceptance rule uses this count.</summary>
     public const int Runs = 3;
-
-    /// <summary>ALog may be this factor times the fastest competitor and still tie.</summary>
-    public const double TieFactor = 1.05;
 
     private static readonly TimeSpan CellTimeout = TimeSpan.FromSeconds(1800);
 
@@ -31,81 +28,73 @@ public sealed class RankedSpeedTests
 
     /// <summary>AC-1. Plain 1,000,000 Info lines, including log4net.</summary>
     /// <returns>A task that finishes when the three runs of each library have been ranked.</returns>
-    /// <remarks>Skips unless <c>ALOG_SPEED=1</c>. The wait bound is eight hours. Not thread-safe.</remarks>
-    [SkippableFact(Timeout = 28_800_000)]
+    /// <remarks>Runs in a normal test session. The wait bound is eight hours. Not thread-safe.</remarks>
+    [Fact(Timeout = 28_800_000)]
     public async Task T1_AlogAsync_TotalMs_AtMostFastest()
     {
-        SkipUnlessSpeed();
         await AssertRank("T1", includeLog4Net: true);
     }
 
     /// <summary>AC-2. Structured 1,000,000 Info lines. log4net is not a competitor.</summary>
     /// <returns>A task that finishes when the three runs of each library have been ranked.</returns>
-    /// <remarks>Skips unless <c>ALOG_SPEED=1</c>. The wait bound is eight hours. Not thread-safe.</remarks>
-    [SkippableFact(Timeout = 28_800_000)]
+    /// <remarks>Runs in a normal test session. The wait bound is eight hours. Not thread-safe.</remarks>
+    [Fact(Timeout = 28_800_000)]
     public async Task T2_AlogAsync_TotalMs_AtMostFastest()
     {
-        SkipUnlessSpeed();
         await AssertRank("T2", includeLog4Net: false);
     }
 
     /// <summary>AC-3. 100,000 errors with a three-level exception chain.</summary>
     /// <returns>A task that finishes when the three runs of each library have been ranked.</returns>
-    /// <remarks>Skips unless <c>ALOG_SPEED=1</c>. The wait bound is eight hours. Not thread-safe.</remarks>
-    [SkippableFact(Timeout = 28_800_000)]
+    /// <remarks>Runs in a normal test session. The wait bound is eight hours. Not thread-safe.</remarks>
+    [Fact(Timeout = 28_800_000)]
     public async Task T3_AlogAsync_TotalMs_AtMostFastest()
     {
-        SkipUnlessSpeed();
         await AssertRank("T3", includeLog4Net: true);
     }
 
     /// <summary>AC-4. Eight threads writing 125,000 plain Info lines each.</summary>
     /// <returns>A task that finishes when the three runs of each library have been ranked.</returns>
-    /// <remarks>Skips unless <c>ALOG_SPEED=1</c>. The wait bound is eight hours. Not thread-safe.</remarks>
-    [SkippableFact(Timeout = 28_800_000)]
+    /// <remarks>Runs in a normal test session. The wait bound is eight hours. Not thread-safe.</remarks>
+    [Fact(Timeout = 28_800_000)]
     public async Task T4_AlogAsync_TotalMs_AtMostFastest()
     {
-        SkipUnlessSpeed();
         await AssertRank("T4", includeLog4Net: true);
     }
 
     /// <summary>AC-5. 10,000,000 calls below Warn, then one Warn sentinel.</summary>
     /// <returns>A task that finishes when the three runs of each library have been ranked.</returns>
-    /// <remarks>Skips unless <c>ALOG_SPEED=1</c>. The wait bound is eight hours. Not thread-safe.</remarks>
-    [SkippableFact(Timeout = 28_800_000)]
+    /// <remarks>Runs in a normal test session. The wait bound is eight hours. Not thread-safe.</remarks>
+    [Fact(Timeout = 28_800_000)]
     public async Task T5_AlogAsync_TotalMs_AtMostFastest()
     {
-        SkipUnlessSpeed();
         await AssertRank("T5", includeLog4Net: true);
     }
 
     /// <summary>AC-6. Cold process: init, one event, flush, dispose.</summary>
     /// <returns>A task that finishes when the three runs of each library have been ranked.</returns>
-    /// <remarks>Skips unless <c>ALOG_SPEED=1</c>. The wait bound is eight hours. Not thread-safe.</remarks>
-    [SkippableFact(Timeout = 28_800_000)]
+    /// <remarks>Runs in a normal test session. The wait bound is eight hours. Not thread-safe.</remarks>
+    [Fact(Timeout = 28_800_000)]
     public async Task T6_AlogAsync_TotalMs_AtMostFastest()
     {
-        SkipUnlessSpeed();
         await AssertRank("T6", includeLog4Net: true);
     }
 
     /// <summary>AC-7. Structured 1,000,000 lines as JSON. log4net is not a competitor.</summary>
     /// <returns>A task that finishes when the three runs of each library have been ranked.</returns>
-    /// <remarks>Skips unless <c>ALOG_SPEED=1</c>. The wait bound is eight hours. Not thread-safe.</remarks>
-    [SkippableFact(Timeout = 28_800_000)]
+    /// <remarks>Runs in a normal test session. The wait bound is eight hours. Not thread-safe.</remarks>
+    [Fact(Timeout = 28_800_000)]
     public async Task T7_AlogAsync_TotalMs_AtMostFastest()
     {
-        SkipUnlessSpeed();
         await AssertRank("T7", includeLog4Net: false);
     }
 
     /// <summary>AC-8 neighbour. One alog-sync T1 cell must stay valid. It has no speed rank.</summary>
     /// <returns>A task that finishes when that one cell has been checked.</returns>
-    /// <remarks>Skips unless <c>ALOG_SPEED=1</c>. The wait bound is one hour. Not thread-safe.</remarks>
-    [SkippableFact(Timeout = 3_600_000)]
+    /// <remarks>Runs in a normal test session. The wait bound is one hour. Not thread-safe.</remarks>
+    [Fact(Timeout = 3_600_000)]
     public async Task Neighbor_AlogSync_T1_Valid()
     {
-        SkipUnlessSpeed();
         var root = RepoRoot();
         var dll = ComparisonDll(root);
         var row = await RunCell(root, dll, "alog-sync", "T1", 1);
@@ -114,72 +103,46 @@ public sealed class RankedSpeedTests
             "alog-sync T1 must be valid at full N. " + row.Describe());
     }
 
-    /// <summary>The middle of three totals. The rank uses this, not the mean.</summary>
+    /// <summary>The arithmetic mean of three totals. The rank uses this.</summary>
     /// <param name="a">One run. Any finite total.</param>
     /// <param name="b">One run. Any finite total.</param>
     /// <param name="c">One run. Any finite total.</param>
-    /// <returns>The middle value.</returns>
+    /// <returns>The sum of the three totals divided by three.</returns>
     /// <remarks>Does not throw. No allocation. Safe for any thread.</remarks>
-    public static double Median(double a, double b, double c)
-    {
-        if (a > b)
-            (a, b) = (b, a);
-        if (b > c)
-            (b, c) = (c, b);
-        if (a > b)
-            (a, b) = (b, a);
-        return b;
-    }
+    public static double Mean(double a, double b, double c) => (a + b + c) / 3d;
 
     /// <summary>
-    /// Why the median fails the 5% tie, or null when ALog is within the tie.
+    /// Why the mean is slower than the fastest competitor, or null when ALog is no slower.
     /// </summary>
-    /// <param name="alogMedian">Median <c>total_ms</c> of the ALog async runs.</param>
-    /// <param name="fastestMedian">Median <c>total_ms</c> of the fastest valid competitor.</param>
+    /// <param name="alogMean">Mean <c>total_ms</c> of the three ALog async runs.</param>
+    /// <param name="fastestMean">Mean <c>total_ms</c> of the fastest valid competitor.</param>
     /// <param name="fastestLib">That competitor's id. Not null.</param>
-    /// <returns>Null when <paramref name="alogMedian"/> is at most <see cref="TieFactor"/> times the fastest median.</returns>
-    /// <remarks>Does not throw. Does not rank an invalid file; the caller must not call this then. Safe for any thread.</remarks>
-    public static string? RankProblem(double alogMedian, double fastestMedian, string fastestLib)
+    /// <returns>Null when <paramref name="alogMean"/> is less than or equal to <paramref name="fastestMean"/>.</returns>
+    /// <remarks>Does not throw. There is no tie margin. Does not rank an invalid file; the caller must not call this then. Safe for any thread.</remarks>
+    public static string? RankProblem(double alogMean, double fastestMean, string fastestLib)
     {
-        var limit = fastestMedian * TieFactor;
-        if (alogMedian <= limit)
+        if (alogMean <= fastestMean)
             return null;
         return FormattableString.Invariant(
-            $"alog-async median {alogMedian:0.000} ms > fastest {fastestLib} median {fastestMedian:0.000} ms * {TieFactor:0.00} = {limit:0.000} ms");
+            $"alog-async mean {alogMean:0.000} ms > fastest {fastestLib} mean {fastestMean:0.000} ms");
     }
 
-    /// <summary>The sentence printed for a computed rank, including a pass inside the 5% tie.</summary>
-    /// <param name="alogMedian">Median <c>total_ms</c> of the ALog async runs.</param>
-    /// <param name="fastestMedian">Median <c>total_ms</c> of the fastest valid competitor.</param>
+    /// <summary>The sentence printed for a computed rank. A slower mean says so. An equal mean passes.</summary>
+    /// <param name="alogMean">Mean <c>total_ms</c> of the three ALog async runs.</param>
+    /// <param name="fastestMean">Mean <c>total_ms</c> of the fastest valid competitor.</param>
     /// <param name="fastestLib">That competitor's id. Not null.</param>
-    /// <returns>One sentence. It names both medians, the limit, and why the comparison passed or failed.</returns>
+    /// <param name="runs">Every run's total, already formatted. Not null.</param>
+    /// <returns>One sentence. It names both means, whether ALog is slower, and each run.</returns>
     /// <remarks>Does not throw. Safe for any thread.</remarks>
-    public static string RankReason(double alogMedian, double fastestMedian, string fastestLib)
+    public static string RankReason(double alogMean, double fastestMean, string fastestLib, string runs)
     {
-        var limit = fastestMedian * TieFactor;
-        var how = alogMedian > limit
-            ? "slower than the 5% tie"
-            : alogMedian <= fastestMedian
-                ? "at least as fast"
-                : "within the 5% tie";
+        var how = alogMean > fastestMean ? "slower" : "no slower";
         return FormattableString.Invariant(
-            $"alog-async median {alogMedian:0.000} ms, fastest {fastestLib} median {fastestMedian:0.000} ms, limit {limit:0.000} ms (5% tie), {how}");
-    }
-
-    /// <summary>Skips the test unless the operator set <c>ALOG_SPEED=1</c>.</summary>
-    /// <remarks>
-    /// Does not return when the variable is anything else. Required CI does not set it, so these cells stay skipped.
-    /// Not thread-safe. Call it before any cell starts.
-    /// </remarks>
-    private static void SkipUnlessSpeed()
-    {
-        Skip.IfNot(
-            string.Equals(Environment.GetEnvironmentVariable("ALOG_SPEED"), "1", StringComparison.Ordinal),
-            "Set ALOG_SPEED=1 to run the ranked speed checks. They are not part of required CI.");
+            $"alog-async mean {alogMean:0.000} ms, fastest {fastestLib} mean {fastestMean:0.000} ms, {how}; runs {runs}");
     }
 
     /// <summary>
-    /// Median of three <c>total_ms</c> values. An equal median passes. A median inside 5% passes and says so.
+    /// Mean of three <c>total_ms</c> values. An equal mean passes. A greater mean fails.
     /// A competitor whose <c>valid</c> is not true fails the scenario. The rank is not computed in that case.
     /// </summary>
     /// <param name="scenario">T1 through T7. Not null.</param>
@@ -221,45 +184,45 @@ public sealed class RankedSpeedTests
             }
         }
 
+        var runs = FormatRuns(rows);
         string verdict;
         if (problems.Count > 0)
         {
-            verdict = "rank not computed";
+            verdict = "rank not computed; runs " + runs;
         }
         else
         {
-            var alogMedian = MedianOf(rows, "alog-async");
+            var alogMean = MeanOf(rows, "alog-async");
             var fastestLib = "";
             var fastest = double.MaxValue;
             for (var i = 0; i < libs.Count; i++)
             {
                 if (libs[i] == "alog-async")
                     continue;
-                var median = MedianOf(rows, libs[i]);
-                if (median < fastest)
+                var mean = MeanOf(rows, libs[i]);
+                if (mean < fastest)
                 {
-                    fastest = median;
+                    fastest = mean;
                     fastestLib = libs[i];
                 }
             }
 
-            verdict = RankReason(alogMedian, fastest, fastestLib);
-            var problem = RankProblem(alogMedian, fastest, fastestLib);
+            verdict = RankReason(alogMean, fastest, fastestLib, runs);
+            var problem = RankProblem(alogMean, fastest, fastestLib);
             if (problem is not null)
                 problems.Add(problem);
         }
 
         Note(scenario + " " + verdict);
-        var detail = string.Join("; ", rows.Select(r => r.Describe())) + " || " + verdict;
-        Assert.True(problems.Count == 0, scenario + " " + string.Join(" | ", problems) + " || " + detail);
+        Assert.True(problems.Count == 0, scenario + " " + string.Join(" | ", problems) + " || " + verdict);
     }
 
-    /// <summary>The middle <c>total_ms</c> of the three runs of <paramref name="lib"/>.</summary>
+    /// <summary>The mean <c>total_ms</c> of the three runs of <paramref name="lib"/>.</summary>
     /// <param name="rows">Every run of the scenario. Not null. Contains three rows for the library.</param>
     /// <param name="lib">Library id. Not null.</param>
-    /// <returns>The median.</returns>
-    /// <remarks>Does not throw when the three rows are present. Only the ranking thread calls this.</remarks>
-    private static double MedianOf(List<CellRow> rows, string lib)
+    /// <returns>The arithmetic mean of those three totals.</returns>
+    /// <remarks>Throws when the three rows are not present. Only the ranking thread calls this.</remarks>
+    private static double MeanOf(List<CellRow> rows, string lib)
     {
         double a = 0, b = 0, c = 0;
         var seen = 0;
@@ -278,7 +241,24 @@ public sealed class RankedSpeedTests
 
         if (seen != Runs)
             throw new InvalidOperationException(lib + " has " + seen.ToString(CultureInfo.InvariantCulture) + " runs");
-        return Median(a, b, c);
+        return Mean(a, b, c);
+    }
+
+    /// <summary>Every library's three <c>total_ms</c> values, in run order.</summary>
+    /// <param name="rows">Every run of the scenario. Not null.</param>
+    /// <returns>One string. Not null.</returns>
+    /// <remarks>Does not throw. Only the ranking thread calls this.</remarks>
+    private static string FormatRuns(List<CellRow> rows)
+    {
+        var text = new System.Text.StringBuilder();
+        for (var i = 0; i < rows.Count; i++)
+        {
+            if (i > 0)
+                text.Append("; ");
+            text.Append(rows[i].Describe());
+        }
+
+        return text.ToString();
     }
 
     /// <summary>Full scenario size when BENCH_N and BENCH_N_SCALE are unset. Matches <c>Scenario.Get</c>.</summary>

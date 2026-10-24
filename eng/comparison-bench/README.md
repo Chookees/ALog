@@ -7,8 +7,8 @@ every event reached the file, and stores the raw values. It does not decide winn
 The project is not packable and is not part of the ALog packages. Only this project references NLog, Serilog
 and log4net.
 
-The ranked speed tests are `tests/RankedSpeedTests.cs`. They run only when `ALOG_SPEED=1` and are not part of required CI.
-Each scenario uses the median of 3 runs. ALog async may be up to 5% slower than the fastest valid competitor; the output states the reason.
+The ranked speed tests are `tests/RankedSpeedTests.cs`. A normal `dotnet test` of that project runs them. They are not in `ALog.sln` and they are not a CI job.
+Each scenario uses the mean of 3 runs. ALog async must be no slower than the fastest valid competitor. An equal mean passes. There is no tie margin. A failure names the scenario, the ALog mean, the fastest competitor and its mean, and all three run values.
 Fails if ALog async is slower than the fastest valid competitor in any scenario, or if a competitor's output is invalid.
 
 ## Quick start
@@ -42,7 +42,7 @@ Requirements: Linux, bash, `flock` (util-linux), git, Python 3 (merge only), the
 | `Runner.cs` | process runner: shuffled order, child processes, `raw.csv`, `details.jsonl`, `env.json` |
 | `Micro.cs` | BenchmarkDotNet benchmarks |
 | `Program.cs` | command line: `run`, `cell`, `micro`, `versions`, `verify-self`, `tz-matrix` |
-| `tests/` | ranked speed tests (`ALOG_SPEED=1` only) and the harness self-checks |
+| `tests/` | ranked speed tests (mean of 3, strict, normal `dotnet test`) and the harness self-checks |
 | `run.sh` | build, lock, process runs, BenchmarkDotNet run |
 | `merge.sh`, `merge.py` | merge all result directories, per-agent and overall statistics |
 

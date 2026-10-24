@@ -301,11 +301,6 @@ jobs:
     - name: Build comparison harness
       run: dotnet build eng/comparison-bench -c Release --nologo
 
-    # Build only. The rank assert runs when ALOG_SPEED=1, on a machine that asks for it.
-    # This job is not a required check, and this step does not add one.
-    - name: Build ranked speed tests
-      run: dotnet build eng/comparison-bench/tests/ALog.Comparison.SpeedTests.csproj -c Release --nologo
-
     - name: Queue mode is read back from the built configuration
       working-directory: eng/comparison-bench
       run: |
