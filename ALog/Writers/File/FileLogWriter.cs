@@ -199,24 +199,19 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     }
 
     /// <summary>
-    /// Renders the line used when no formatter was attached.
-    /// The exception segment comes from <see cref="ExceptionReport"/>, the same helper the other text sinks use.
-    /// </summary>
-    /// <param name="logEvent">Event to render. Not null.</param>
-    /// <returns>One line, without a trailing newline.</returns>
-    /// <remarks>
-    /// Does not throw. The message is always included, including when it is empty, matching the previous file fallback.
-    /// The category is not written here. The message, context keys, and context values are escaped so none of them can forge a <c>|</c> separator or a second line.
-    /// </remarks>
-    /// <summary>
-    /// Writes one ASCII line straight into the file buffer when the formatter can.
+    /// Writes one ASCII line straight into the file buffer when the formatter is exactly <see cref="PlainTextFormatter"/>.
     /// </summary>
     /// <param name="logEvent">Event to append. Not null.</param>
     /// <returns>True when the line is in the file buffer. False when the caller uses the string path.</returns>
-    /// <remarks>Does not throw. The scratch buffer is per thread. The file lock covers only the copy.</remarks>
+    /// <remarks>
+    /// Does not throw. The scratch buffer is per thread. The file lock covers only the copy.
+    /// <see cref="object.GetType"/> must be <see cref="PlainTextFormatter"/> itself. A subclass can replace
+    /// <see cref="ILogFormatter.Format"/>, and <c>is</c> would still match, so the base fast path would hide that text.
+    /// Safe to call from several threads. Each thread keeps its own scratch buffer.
+    /// </remarks>
     private bool TryWriteFast(LogEvent logEvent)
     {
-        if (Formatter is not PlainTextFormatter plain)
+        if (Formatter is not PlainTextFormatter plain || plain.GetType() != typeof(PlainTextFormatter))
             return false;
 
         var buffer = _utf8Scratch ??= new byte[1024];
@@ -268,6 +263,17 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
         return true;
     }
 
+    /// <summary>
+    /// Renders the line used when no formatter was attached.
+    /// The exception segment comes from <see cref="ExceptionReport"/>, the same helper the other text sinks use.
+    /// </summary>
+    /// <param name="logEvent">Event to render. Not null.</param>
+    /// <returns>One line, without a trailing newline.</returns>
+    /// <remarks>
+    /// Does not throw. The message is always included, including when it is empty, matching the previous file fallback.
+    /// The category is not written here. The message, context keys, and context values are escaped so none of them can forge a <c>|</c> separator or a second line.
+    /// Safe to call from the thread that holds the writer lock. It does not touch shared formatter state.
+    /// </remarks>
     private string FormatFallback(LogEvent logEvent)
     {
         var head = "[" + logEvent.Timestamp.ToString("yyyy-MM-dd HH:mm:ss") + "] [" + logEvent.Level + "]";
