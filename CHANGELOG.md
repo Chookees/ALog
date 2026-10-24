@@ -4,7 +4,8 @@
 
 - Changed: logging through the background queue is faster. Adding an event usually no longer takes a lock.
 - Changed: each logger with a background queue now uses one dedicated thread.
-- Changed: FileLogWriter writes simple events from PlainTextFormatter and JsonFormatter through a faster path. The written text stays the same. With FileFlushInterval 0, each drained line leaves the file readable by Windows File.ReadAllText while the writer is alive. A longer interval keeps the write handle until Flush or dispose.
+- Changed: FileLogWriter writes simple events from PlainTextFormatter and JsonFormatter through a faster path. The written text stays the same.
+- Added: on Windows, `File.ReadAllText` can read the log file while the logger is running: after `Flush`, when the flush interval passes with no new lines (not with `FileFlushInterval` 0), and after dispose. While lines are being written, the write handle stays open, also with `FileFlushInterval` 0. To read the file at any time, open it with `FileShare.ReadWrite`.
 - Changed: message templates are cached, up to 1024 entries.
 
 ## 0.2.1
