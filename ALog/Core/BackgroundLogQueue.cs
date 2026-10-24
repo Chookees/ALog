@@ -738,15 +738,15 @@ public partial class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// How many slots to reserve for one read. At least 1 and at most <see cref="MaxRead"/>.
-    /// </summary>
-    /// <returns>The list capacity used for a batch.</returns>
-    /// <remarks>Does not throw. No side effects.</remarks>
-    /// <summary>
-    /// How many events to take before the next wait. File and console writers take a larger chunk so a full queue wakes once per chunk.
+    /// How many events to take before the next wait.
+    /// File and console writers take a larger chunk so a full queue wakes once per chunk.
     /// </summary>
     /// <returns>At least one. At most <see cref="MaxRead"/>.</returns>
-    /// <remarks>Does not throw. The configured batch size still applies to writers that do real async I/O.</remarks>
+    /// <remarks>
+    /// Does not throw. The configured batch size still applies to writers that do real async I/O.
+    /// A direct-dispatch writer raises a small batch to 512 so one wake covers more lines.
+    /// Only the processor thread calls this. The batch size does not change after construction.
+    /// </remarks>
     private int ReadLimit()
     {
         var limit = BatchCapacity();
@@ -757,6 +757,14 @@ public partial class BackgroundLogQueue : IDisposable
         return limit;
     }
 
+    /// <summary>
+    /// How many slots to reserve for one read. At least 1 and at most <see cref="MaxRead"/>.
+    /// </summary>
+    /// <returns>The list capacity used for a batch, and the cap <see cref="ReadLimit"/> starts from.</returns>
+    /// <remarks>
+    /// Does not throw. No side effects. A batch size below 1 becomes 1 so a mis-set value still reads.
+    /// Only the processor thread calls this. The batch size does not change after construction.
+    /// </remarks>
     private int BatchCapacity()
     {
         if (_batchSize < 1)
@@ -892,19 +900,14 @@ public partial class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Records that one accepted event finished its writer call, unless the shutdown snapshot already froze the counts.
-    /// </summary>
-    /// <remarks>
-    /// Does not throw. Takes <see cref="_gate"/>. A frozen count leaves the event inside the unwritten snapshot
-    /// so a call that returns after the deadline cannot change the reported number.
-    /// </remarks>
-    /// <summary>
     /// Records <paramref name="written"/> finished events and wakes blocked callers once.
     /// </summary>
     /// <param name="written">Events whose writer call returned. Greater than zero.</param>
     /// <remarks>
     /// Does not throw. One signal per batch, not per event, so a full queue does not wake every caller for every line.
-    /// The snapshot lock still decides whether these events count as written.
+    /// Takes <see cref="_gate"/>. A frozen shutdown snapshot leaves these events inside the unwritten count,
+    /// so a call that returns after the deadline cannot change the reported number.
+    /// Only the processor thread calls this. Waiters may run on other threads after the signal.
     /// </remarks>
     private void CommitBatch(int written)
     {
