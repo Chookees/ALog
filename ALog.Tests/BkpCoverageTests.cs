@@ -145,9 +145,10 @@ public sealed class BkpCoverageTests
 
     /// <summary>A failed move reports the rolling error and opens the same file again, so the next line is still whole.</summary>
     /// <remarks>
-    /// The flush interval is zero. The first line opens a write handle and a read handle.
-    /// The second line opens a write handle, rotation cannot move the file, and the same path opens again.
-    /// That append then opens the read handle. Five successful opens are the whole delta.
+    /// The flush interval is zero, so the write handle stays open across the first line.
+    /// The second line tries to rotate, the move fails, and the same path opens again.
+    /// The append does not open a read handle. Two successful opens are the whole delta.
+    /// Swapping after every write would add a read handle per line and fail this test.
     /// Linux only: the directory lock is a Unix mode. Not thread-safe. The wait bound is 30 seconds.
     /// </remarks>
     [Fact(Timeout = 30000)]
@@ -178,7 +179,7 @@ public sealed class BkpCoverageTests
                 RestoreDirectory(directory, mode);
             }
 
-            Assert.Equal(before + 5, LogFileRegistry.OpenCount);
+            Assert.Equal(before + 2, LogFileRegistry.OpenCount);
             var text = ReadShared(path);
             Assert.Contains("first-line", text, StringComparison.Ordinal);
             Assert.Contains("second-line", text, StringComparison.Ordinal);

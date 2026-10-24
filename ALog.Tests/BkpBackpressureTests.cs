@@ -136,13 +136,15 @@ public sealed class BkpBackpressureTests : IDisposable
     }
 
     /// <summary>
-    /// BKP-03. A zero flush interval opens a write handle and a read handle for every line.
+    /// BKP-03. A zero flush interval opens the file once. The read handle opens on Flush, not on each write.
     /// </summary>
     /// <remarks>
-    /// Every successful open is counted. Ten thousand lines are 20000 opens: each line opens the write
-    /// handle and then the read handle that lets Windows <c>File.ReadAllText</c> succeed.
-    /// <see cref="FileLogWriter.Flush"/> finds that read handle already in place and does not open again.
-    /// The following line opens both handles once more. The counter is a delta because other tests share the process.
+    /// Every successful open is counted, including a read-handle swap and the write handle that replaces it.
+    /// Ten thousand lines with no <see cref="FileLogWriter.Flush"/> are one open.
+    /// One hundred Flush calls after those lines open the read handle on the first call and leave it in place,
+    /// so the count stays at most 101. The next line opens the write handle again.
+    /// Swapping after every write makes the no-Flush count about 20000 and fails this test.
+    /// The counter is a delta because other tests share the process.
     /// Not thread-safe. The wait bound is 120 seconds.
     /// </remarks>
     [Fact(Timeout = 120000)]
@@ -159,14 +161,17 @@ public sealed class BkpBackpressureTests : IDisposable
                 for (var i = 0; i < 10000; i++)
                     writer.Write(Event("n" + i.ToString(CultureInfo.InvariantCulture)));
 
-                Assert.Equal(before + 20000, LogFileRegistry.OpenCount);
-                writer.Flush();
-                Assert.Equal(before + 20000, LogFileRegistry.OpenCount);
+                Assert.Equal(before + 1, LogFileRegistry.OpenCount);
+                for (var i = 0; i < 100; i++)
+                    writer.Flush();
+
+                Assert.True(LogFileRegistry.OpenCount - before <= 101);
+                Assert.Equal(before + 2, LogFileRegistry.OpenCount);
                 writer.Write(Event("after-flush"));
-                Assert.Equal(before + 20002, LogFileRegistry.OpenCount);
+                Assert.Equal(before + 3, LogFileRegistry.OpenCount);
             }
 
-            Assert.Equal(before + 20002, LogFileRegistry.OpenCount);
+            Assert.Equal(before + 3, LogFileRegistry.OpenCount);
             Assert.Equal(10001, File.ReadAllLines(path).Length);
         }
         finally
@@ -176,17 +181,18 @@ public sealed class BkpBackpressureTests : IDisposable
     }
 
     /// <summary>
-    /// A positive flush interval keeps the write handle. The timer writes the bytes and does not open another handle.
+    /// A positive flush interval opens the read handle when the interval elapses, not on each write.
     /// </summary>
     /// <remarks>
-    /// The buffer is larger than the line, so only the timer writes the bytes. The write handle stays open,
-    /// which is why Windows <c>File.ReadAllText</c> still needs <see cref="FileLogWriter.Flush"/> or dispose.
-    /// This test reads with <see cref="FileShare.ReadWrite"/>, so it can see those bytes while the handle is held for write.
+    /// The buffer is larger than the line, so only the timer writes the bytes. That callback then replaces the
+    /// write handle with a read handle. The next append opens a write handle again.
+    /// A zero interval creates no timer, so this swap does not run for <see cref="TimeSpan.Zero"/>.
+    /// This test reads with <see cref="FileShare.ReadWrite"/>, so it can see the bytes with either handle.
     /// The clock is a <see cref="FakeTimeProvider"/>, so the timer runs on <c>Advance</c> and does not wait a wall-clock second.
     /// Not thread-safe. The wait bound is 30 seconds.
     /// </remarks>
     [Fact(Timeout = 30000)]
-    public async Task File_IdleIntervalKeepsTheWriteHandle()
+    public async Task File_IdleIntervalOpensTheReadHandle()
     {
         await Task.CompletedTask;
         var directory = NewDirectory();
@@ -200,10 +206,10 @@ public sealed class BkpBackpressureTests : IDisposable
             Assert.Equal(before + 1, LogFileRegistry.OpenCount);
             Assert.DoesNotContain("held", ReadShared(path), StringComparison.Ordinal);
             clock.Advance(TimeSpan.FromSeconds(1));
-            Assert.Equal(before + 1, LogFileRegistry.OpenCount);
+            Assert.Equal(before + 2, LogFileRegistry.OpenCount);
             Assert.Contains("held", ReadShared(path), StringComparison.Ordinal);
             writer.Write(Event("again"));
-            Assert.Equal(before + 1, LogFileRegistry.OpenCount);
+            Assert.Equal(before + 3, LogFileRegistry.OpenCount);
         }
         finally
         {
@@ -214,9 +220,10 @@ public sealed class BkpBackpressureTests : IDisposable
     /// <summary>Two writers for one path share one stream and never tear a line.</summary>
     /// <remarks>
     /// Not thread-safe beyond the two writer tasks. The 120 s wait is a hang guard.
-    /// Each zero-interval write opens a write handle and then a read handle, so eighty writes are 160 opens.
-    /// The first dispose is not the last reference. It flushes a handle that is already read-only and does not open another.
-    /// The last dispose closes the handle.
+    /// Eighty zero-interval writes open the file once. The read handle is not opened per line.
+    /// The first dispose is not the last reference. It flushes and opens the read handle.
+    /// The last dispose closes the handle. Two opens are the whole delta.
+    /// Swapping after every write would count about 160 opens and fail this test.
     /// </remarks>
     [Fact(Timeout = 120000)]
     public async Task File_TwoWritersShareOneStreamAndKeepWholeLines()
@@ -242,7 +249,7 @@ public sealed class BkpBackpressureTests : IDisposable
                 await DeadlineClock.WaitForCompletion(Task.WhenAll(first, second), "writers hung");
             }
 
-            Assert.Equal(before + 160, LogFileRegistry.OpenCount);
+            Assert.Equal(before + 2, LogFileRegistry.OpenCount);
             var lines = File.ReadAllLines(path);
             Assert.Equal(80, lines.Length);
             for (var i = 0; i < 40; i++)

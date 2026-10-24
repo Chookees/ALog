@@ -107,11 +107,10 @@ internal static class LogFileRegistry
 /// The stream is opened with <see cref="FileShare.Read"/> and <see cref="FileShare.Delete"/> so another handle can read or rename it.
 /// Omitting <see cref="FileShare.Write"/> stops a second writer on Windows only. Linux and macOS still allow one, and the lines can mix.
 /// A write handle cannot be opened together with <c>File.ReadAllText</c> on Windows: that call uses <see cref="FileShare.Read"/>,
-/// which rejects an existing write. After a zero-interval write the bytes are already in the file, and the handle is reopened
-/// for read until the next append, so <c>File.ReadAllText</c> succeeds without <see cref="SharedLogFile.Flush"/>.
-/// A positive interval keeps the write handle across appends and across the idle flush, so a burst does not open the file per line.
-/// <see cref="SharedLogFile.Flush"/> replaces that handle with a read handle until the next append.
-/// <see cref="SharedLogFile.Close"/> closes the handle.
+/// which rejects an existing write. Appends keep that write handle, including when <see cref="FileFlushInterval"/> is zero.
+/// The handle is replaced with a read handle only from <see cref="SharedLogFile.Flush"/>, from the idle timer when the interval
+/// is greater than zero, and it is closed by <see cref="SharedLogFile.Close"/>. A zero interval creates no timer, so it does not swap on idle.
+/// The next append closes the read handle and opens a write handle again.
 /// The timer is disposed outside the file lock. The callback also takes that lock.
 /// An external rename, delete, or truncate is noticed on the flush tick, on <see cref="Flush"/>, before this process rotates the file, and on close.
 /// A zero <see cref="FileFlushInterval"/> compares the path before every write to the operating system. A positive interval compares at most once per that interval.
@@ -257,7 +256,7 @@ internal sealed class SharedLogFile
     /// Does not throw. A closed file returns. Safe to call before the first write.
     /// After the bytes are written the handle is read-only so <c>File.ReadAllText</c> can open the path
     /// while this logger is still alive. The next append closes that read handle and opens a write handle.
-    /// A zero-interval write already did this swap. A positive-interval write does not.
+    /// A write, including a zero-interval write, does not swap. Only this method, the idle timer, and close do.
     /// </remarks>
     internal void Flush()
     {
@@ -376,8 +375,9 @@ internal sealed class SharedLogFile
     /// <summary>Flushes when the interval elapses. A closed file returns before taking the lock for long.</summary>
     /// <remarks>
     /// Does not throw. Does not dispose the timer. The callback and <see cref="Close"/> share the file lock.
-    /// The write handle stays open. <c>File.ReadAllText</c> on Windows still needs <see cref="Flush"/> or
-    /// <see cref="Close"/>, because this callback does not swap the handle.
+    /// Created only when <see cref="FileFlushInterval"/> is greater than zero, so a zero interval never runs this callback.
+    /// After the bytes are written the handle becomes read-only. <c>File.ReadAllText</c> on Windows can then open the path.
+    /// The next append opens a write handle again.
     /// </remarks>
     private void OnInterval()
     {
@@ -393,6 +393,7 @@ internal sealed class SharedLogFile
             {
                 Reconcile(force: true);
                 FlushPending();
+                HoldForReaders();
             }
             catch (Exception ex)
             {
@@ -590,9 +591,9 @@ internal sealed class SharedLogFile
     /// Replaces the write handle with a read handle so <c>File.ReadAllText</c> can open the same path.
     /// </summary>
     /// <remarks>
-    /// The caller holds the file lock. Does not throw. Called after a zero-interval write and from an explicit
-    /// <see cref="Flush"/>, after the bytes are already in the file. A positive-interval append does not call this,
-    /// and neither does the idle timer. <c>File.ReadAllText</c> asks for <see cref="FileShare.Read"/>. Windows rejects that request
+    /// The caller holds the file lock. Does not throw. Called from an explicit <see cref="Flush"/> and from the idle
+    /// timer when the interval is greater than zero, after the bytes are already in the file. An append does not call this,
+    /// including when the interval is zero. <c>File.ReadAllText</c> asks for <see cref="FileShare.Read"/>. Windows rejects that request
     /// while any handle still has write access, including when this handle's share mode is <see cref="FileShare.ReadWrite"/>.
     /// The read handle keeps <see cref="FileShare.Delete"/> and still omits <see cref="FileShare.Write"/>, so a rename works
     /// and a second writer is still rejected. The next append closes this handle first.
@@ -628,8 +629,9 @@ internal sealed class SharedLogFile
     /// <param name="line">One whole line. Not null. May be longer than the buffer.</param>
     /// <remarks>
     /// The caller holds the file lock. A null stream returns. The copy is bounded by the line length.
-    /// A zero interval writes the line and then calls <see cref="HoldForReaders"/>, so Windows <c>File.ReadAllText</c>
-    /// can open the path before the next append. A positive interval leaves the write handle in place.
+    /// A zero interval writes and flushes the line and leaves the write handle open.
+    /// A positive interval buffers the line until the buffer fills, <see cref="Flush"/>, or the idle timer.
+    /// Neither path calls <see cref="HoldForReaders"/>.
     /// </remarks>
     private void WriteLine(ReadOnlySpan<byte> line)
     {
@@ -645,8 +647,6 @@ internal sealed class SharedLogFile
             _stream.Write(line);
             _stream.Flush();
             _logicalLength += line.Length;
-            if (_interval <= TimeSpan.Zero)
-                HoldForReaders();
             return;
         }
 

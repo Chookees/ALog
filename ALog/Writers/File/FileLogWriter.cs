@@ -47,10 +47,10 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     /// <remarks>
     /// Does not open the file. The first write does. Two writers in this process for the same normalized path share one stream.
     /// On Windows a second process writing the same file gets a sharing violation. On Linux and macOS that second writer is not detected.
-    /// A zero <paramref name="fileFlushInterval"/> writes each line and then holds the file for read, so Windows
-    /// <c>File.ReadAllText</c> can open the path while this writer is still alive, without <see cref="Flush"/>.
-    /// A positive interval keeps the write handle across appends and across the idle flush. <see cref="Flush"/>
-    /// replaces that handle with a read handle. The next append opens a write handle again. Dispose closes the handle.
+    /// A zero <paramref name="fileFlushInterval"/> writes each line immediately and keeps the write handle.
+    /// Windows <c>File.ReadAllText</c> can open the path while this writer is alive only after <see cref="Flush"/>,
+    /// after a positive interval elapses with no further append, or after dispose. <see cref="Flush"/> and that idle
+    /// timer replace the write handle with a read handle. The next append opens a write handle again. Dispose closes the handle.
     /// An explicit buffer or interval is kept when the <see cref="LoggerConfig"/> never calls
     /// <see cref="LoggerConfig.SetFileBufferSize"/> or <see cref="LoggerConfig.SetFileFlushInterval"/>.
     /// A configuration that does call the setter replaces this constructor value.
@@ -152,7 +152,7 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     /// Does not throw. Safe to call before the first event and after dispose.
     /// After a successful flush the file is held for read, so <c>File.ReadAllText</c> can open the path on Windows
     /// while this writer is still alive. The next append closes that read handle and opens a write handle.
-    /// A zero-interval write already holds the file for read. A positive-interval write does not.
+    /// A write does not hold the file for read, including when the flush interval is zero.
     /// </remarks>
     public void Flush()
     {
