@@ -57,8 +57,8 @@ internal static class LogFileRegistry
     /// <summary>Most lines in the direct reopen buffer. The byte budget can stop it sooner.</summary>
     internal const int DirectReopenLineBudget = 100_000;
 
-    /// <summary>Prefix of the only ALOG0073 sentence. The line is the reopen failure, not a drop.</summary>
-    internal const string ReopenFailedPrefix = "ALOG0073: reopen failed.";
+    /// <summary>Prefix of the only ALOG0073 sentence. The line is the reopen failure, not a drop. The code number is not part of the text.</summary>
+    internal const string ReopenFailedPrefix = "The log file could not be reopened (";
 
     /// <summary>
     /// The first event written after the file has closed. Later events are counted and not reported. ALOG0072.
@@ -67,32 +67,30 @@ internal static class LogFileRegistry
         "Event dropped: ALog is shut down (the log file was closed by Shutdown or Dispose). Later events are counted, not reported. Stop logging before you call Shutdown or Dispose.";
 
     /// <summary>
-    /// Builds the ALOG0073 sentence. It only says the reopen failed, plus how many attempts that window saw.
+    /// Builds the ALOG0073 sentence. It says the reopen failed, how many attempts that window saw, and that ALog retries once a second.
     /// </summary>
     /// <param name="attempts">Attempts since the previous line. Greater than zero.</param>
-    /// <returns>The catalog sentence. No stack trace.</returns>
+    /// <returns>The catalog sentence. No code prefix and no stack trace.</returns>
     /// <remarks>Does not throw. Does not write the line. One attempt uses the singular word.</remarks>
     internal static string ReopenFailedLine(int attempts)
     {
         var label = attempts == 1 ? "attempt" : "attempts";
         return ReopenFailedPrefix
-            + " "
             + attempts.ToString(System.Globalization.CultureInfo.InvariantCulture)
             + " "
             + label
-            + ".";
+            + " since the last report). ALog retries once per second. Check that no other program locks the file and that its folder is writable.";
     }
 
     /// <summary>
-    /// Builds the ALOG0070 sentence for a direct buffer that cannot take another line.
+    /// Builds the ALOG0070 sentence for lines that did not fit in the reopen hold.
     /// </summary>
     /// <param name="count">Lines dropped since the previous line. Greater than zero.</param>
-    /// <returns>The catalog sentence, including the count.</returns>
-    /// <remarks>Does not throw. Does not write the line.</remarks>
+    /// <returns>The catalog sentence, including the count and no code prefix.</returns>
+    /// <remarks>Does not throw. Does not write the line. The queue uses the same sentence for a parked batch that is past 4 MiB.</remarks>
     internal static string BufferFullLine(int count)
-        => "ALOG0070: "
-            + count.ToString(System.Globalization.CultureInfo.InvariantCulture)
-            + " events dropped: the reopen buffer is full.";
+        => count.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            + " events dropped: the log file could not be reopened and the lines waiting for it reached the limit. Check that no other program locks the file and that its folder is writable.";
 
     /// <summary>
     /// Builds the ALOG0071 sentence for lines still held when the file closes.
