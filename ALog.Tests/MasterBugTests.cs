@@ -1363,13 +1363,12 @@ public sealed class MasterBugTests : IDisposable
     /// <summary>Reads a log file. A missing file is empty text, which is what a dropped line looks like.</summary>
     /// <param name="path">File the writer was given. Not null.</param>
     /// <returns>The file text, or empty when the writer never created it.</returns>
+    /// <remarks>
+    /// Uses <see cref="TestFiles.ReadShared"/> so a zero flush interval with a live writer does not
+    /// throw on Windows. Safe for every caller: after dispose and before <c>Log.Shutdown</c>.
+    /// </remarks>
     private static string ReadFileOrEmpty(string path)
-    {
-        if (!File.Exists(path))
-            return string.Empty;
-
-        return File.ReadAllText(path);
-    }
+        => TestFiles.ReadShared(path);
 
     /// <summary>One physical line of captured text, capped so a stack trace cannot flood the assert.</summary>
     /// <param name="text">Captured output. Not null.</param>

@@ -159,7 +159,7 @@ public sealed class SyncWriteContractTests
             Assert.True(pending.IsCompleted);
             Assert.Same(Task.CompletedTask, pending);
             Assert.Equal(caller, formatter.ThreadId);
-            Assert.Contains("inline-line", File.ReadAllText(path), StringComparison.Ordinal);
+            Assert.Contains("inline-line", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -194,7 +194,7 @@ public sealed class SyncWriteContractTests
                     new Dictionary<string, object> { ["User"] = "ada" }));
             });
             Assert.Contains("[FileLogWriter]", error, StringComparison.Ordinal);
-            var text = File.ReadAllText(path);
+            var text = TestFiles.ReadShared(path);
             Assert.Contains("InvalidOperationException: boom", text, StringComparison.Ordinal);
             Assert.DoesNotContain("EX:", text, StringComparison.Ordinal);
             Assert.Contains("User=ada", text, StringComparison.Ordinal);
