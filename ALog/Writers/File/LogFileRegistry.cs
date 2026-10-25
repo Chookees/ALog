@@ -827,6 +827,7 @@ internal sealed class SharedLogFile
     /// <param name="ex">The open failure. Not null. The stack trace is written only the first time.</param>
     /// <remarks>
     /// The caller holds the file lock. Does not throw. Later failures in the same minute only add to the next count.
+    /// The first failure also writes the exception to stderr, and that line says the log file could not be reopened.
     /// The SelfLog line does not include the stack trace.
     /// </remarks>
     private void NoteReopenFailed(Exception ex)
@@ -842,7 +843,7 @@ internal sealed class SharedLogFile
         if (_reopenStackReported == 0)
         {
             _reopenStackReported = 1;
-            System.Console.Error.WriteLine("[FileLogWriter] Write failed: " + ex);
+            System.Console.Error.WriteLine("[FileLogWriter] Could not reopen the log file: " + ex);
         }
 
         ALog.SelfLog.ReportLine(LogFileRegistry.ReopenFailedLine(attempts));
