@@ -1,5 +1,6 @@
 ﻿namespace ALog.Formatters;
 
+using System.Globalization;
 using ALog.Core;
 using ALog.Public.Interfaces;
 
@@ -12,6 +13,12 @@ public class PlainTextFormatter : ILogFormatter
 {
     private readonly string _dateTimeFormat;
     private readonly bool _includeStackTrace;
+    private readonly bool _utcPattern;
+    private readonly CultureInfo _probedCulture;
+    private readonly bool _probedFastOk;
+
+    /// <summary>The only format the hand-written stamp implements. Anything else uses <see cref="DateTime.ToString(string)"/>.</summary>
+    private const string UtcMillisPattern = "yyyy-MM-dd'T'HH:mm:ss.fff'Z'";
 
     /// <summary>How many lines of <see cref="Exception.ToString"/> are indented. The rest are dropped.</summary>
     private const int MaxStackLines = 256;
@@ -68,11 +75,66 @@ public class PlainTextFormatter : ILogFormatter
     /// When true, <see cref="Exception.ToString"/> is appended after the line, each of its lines indented
     /// by four spaces. When false, <see cref="Exception.ToString"/> is not called.
     /// </param>
-    /// <remarks>Both values are stored. Neither is validated; an unusable format fails when a line is rendered.</remarks>
+    /// <remarks>
+    /// Both values are stored. Neither is validated; an unusable format fails when a line is rendered.
+    /// The current culture is probed once here. <see cref="TryWriteUtf8"/> uses that result only while the same
+    /// culture is still current, and probes again when a later write sees a different culture.
+    /// The probe is stored before the constructor returns. After that the fields are not written.
+    /// Any thread may construct a formatter. The probe reads only the constructing thread's culture.
+    /// </remarks>
     public PlainTextFormatter(string dateTimeFormat, bool includeStackTrace)
     {
         _dateTimeFormat = dateTimeFormat;
         _includeStackTrace = includeStackTrace;
+        _utcPattern = dateTimeFormat == UtcMillisPattern;
+        _probedCulture = CultureInfo.CurrentCulture;
+        _probedFastOk = _utcPattern && AllowsFastStamp(_probedCulture);
+    }
+
+    /// <summary>
+    /// True when the hand-written stamp matches <see cref="DateTime.ToString(string)"/> for <paramref name="culture"/>.
+    /// </summary>
+    /// <param name="culture">The culture of the thread that is about to write. Not null.</param>
+    /// <returns>
+    /// True only for a Gregorian calendar whose time separator is <c>:</c> and whose negative sign is <c>-</c>.
+    /// </returns>
+    /// <remarks>
+    /// Does not throw. The stamp always uses <c>:</c> and a dot before the milliseconds, which is what
+    /// <see cref="DateTime.ToString(string)"/> writes for this pattern when the time separator is <c>:</c>.
+    /// The dot is a literal in that pattern, not <see cref="System.Globalization.NumberFormatInfo.NumberDecimalSeparator"/>.
+    /// A different time separator, a non-Gregorian calendar, or a negative sign other than <c>-</c> would make an integer
+    /// property or the clock differ, so the whole fast path stays off and <see cref="Format"/> is used.
+    /// Does not allocate. Safe to call from any thread. The culture object is not stored.
+    /// </remarks>
+    private static bool AllowsFastStamp(CultureInfo culture)
+    {
+        if (culture.Calendar is not GregorianCalendar)
+            return false;
+        if (culture.DateTimeFormat.TimeSeparator != ":")
+            return false;
+        if (culture.NumberFormat.NegativeSign != "-")
+            return false;
+        return true;
+    }
+
+    /// <summary>
+    /// True when this formatter's pattern is the UTC millisecond stamp and the writing thread's culture can use it.
+    /// </summary>
+    /// <returns>False when <see cref="Format"/> must render the line.</returns>
+    /// <remarks>
+    /// Does not throw. The constructor's probe is reused when <see cref="CultureInfo.CurrentCulture"/> is the same instance.
+    /// A culture changed after construction is probed again. Safe to call from several threads: the probe fields are not written here.
+    /// </remarks>
+    private bool FastStampAllowed()
+    {
+        if (!_utcPattern)
+            return false;
+
+        var culture = CultureInfo.CurrentCulture;
+        if (ReferenceEquals(culture, _probedCulture))
+            return _probedFastOk;
+
+        return AllowsFastStamp(culture);
     }
 
     /// <summary>
@@ -112,6 +174,233 @@ public class PlainTextFormatter : ILogFormatter
         if (stack == null)
             return line;
         return line + "\n" + stack;
+    }
+
+    /// <summary>
+    /// Writes the plain line as UTF-8, without a trailing newline, when it matches <see cref="Format"/>.
+    /// </summary>
+    /// <param name="logEvent">Event to render. Not null.</param>
+    /// <param name="destination">Buffer filled from the start. Ignored when the result is false.</param>
+    /// <param name="written">Byte count when the result is true. Zero when false.</param>
+    /// <returns>
+    /// False when the line has an exception, a context bag, an escape, a non-ASCII character,
+    /// a value this writer does not render, or the buffer is too small. The caller then uses <see cref="Format"/>.
+    /// </returns>
+    /// <remarks>
+    /// Does not throw. The timestamp pattern is <c>yyyy-MM-dd'T'HH:mm:ss.fff'Z'</c>.
+    /// The clock digits use <c>:</c> and a dot. That matches <see cref="Format"/> only when
+    /// <see cref="FastStampAllowed"/> is true for the culture of this thread at the call.
+    /// A false return does not promise that <paramref name="destination"/> is unchanged.
+    /// Safe to call from several threads.
+    /// </remarks>
+    internal bool TryWriteUtf8(LogEvent logEvent, Span<byte> destination, out int written)
+    {
+        written = 0;
+        if (!FastStampAllowed() || logEvent.Exception != null || logEvent.Context is { Count: > 0 })
+            return false;
+
+        var index = 0;
+        if (!WriteByte(destination, ref index, (byte)'['))
+            return false;
+        if (!WriteUtcStamp(destination, logEvent.Timestamp, ref index))
+            return false;
+        if (!WriteAscii(destination, ref index, "] ["))
+            return false;
+        if (!WriteAscii(destination, ref index, LevelName(logEvent.Level)))
+            return false;
+        if (!WriteByte(destination, ref index, (byte)']'))
+            return false;
+
+        if (!string.IsNullOrEmpty(logEvent.Category))
+        {
+            if (!WriteAscii(destination, ref index, " ["))
+                return false;
+            if (!WritePlain(destination, ref index, logEvent.Category))
+                return false;
+            if (!WriteByte(destination, ref index, (byte)']'))
+                return false;
+        }
+
+        if (!string.IsNullOrWhiteSpace(logEvent.Message))
+        {
+            if (!WriteByte(destination, ref index, (byte)' '))
+                return false;
+            if (!WritePlain(destination, ref index, logEvent.Message))
+                return false;
+        }
+
+        if (logEvent.Properties is { Count: > 0 })
+        {
+            if (!WriteAscii(destination, ref index, " | props: "))
+                return false;
+            if (!WriteProps(destination, logEvent.Properties, ref index))
+                return false;
+        }
+
+        written = index;
+        return true;
+    }
+
+    /// <summary>Enum name. Matches <see cref="LogLevel.ToString"/> for the known levels.</summary>
+    private static string LevelName(LogLevel level) => level switch
+    {
+        LogLevel.Trace => "Trace",
+        LogLevel.Debug => "Debug",
+        LogLevel.Info => "Info",
+        LogLevel.Warn => "Warn",
+        LogLevel.Error => "Error",
+        LogLevel.Fatal => "Fatal",
+        _ => level.ToString(),
+    };
+
+    /// <summary>
+    /// Writes <c>yyyy-MM-ddTHH:mm:ss.fffZ</c> with a colon and a dot, never the culture's separators.
+    /// </summary>
+    /// <param name="destination">Buffer. Not checked for null. The caller passes a span.</param>
+    /// <param name="timestamp">Clock fields. The year is the Gregorian year on <see cref="DateTime"/>.</param>
+    /// <param name="index">Start index. Advanced by 24 when the stamp fits.</param>
+    /// <returns>False when fewer than 24 bytes remain. <paramref name="index"/> is then unchanged.</returns>
+    /// <remarks>
+    /// Does not throw. Called only after <see cref="FastStampAllowed"/> so these separators match <see cref="Format"/>.
+    /// Does not read the culture. Safe to call from any thread.
+    /// </remarks>
+    private static bool WriteUtcStamp(Span<byte> destination, DateTime timestamp, ref int index)
+    {
+        if (index + 24 > destination.Length)
+            return false;
+        Write4(destination, index, timestamp.Year);
+        destination[index + 4] = (byte)'-';
+        Write2(destination, index + 5, timestamp.Month);
+        destination[index + 7] = (byte)'-';
+        Write2(destination, index + 8, timestamp.Day);
+        destination[index + 10] = (byte)'T';
+        Write2(destination, index + 11, timestamp.Hour);
+        destination[index + 13] = (byte)':';
+        Write2(destination, index + 14, timestamp.Minute);
+        destination[index + 16] = (byte)':';
+        Write2(destination, index + 17, timestamp.Second);
+        destination[index + 19] = (byte)'.';
+        Write3(destination, index + 20, timestamp.Millisecond);
+        destination[index + 23] = (byte)'Z';
+        index += 24;
+        return true;
+    }
+
+    private static void Write4(Span<byte> destination, int index, int value)
+    {
+        destination[index] = (byte)('0' + value / 1000);
+        destination[index + 1] = (byte)('0' + (value / 100) % 10);
+        destination[index + 2] = (byte)('0' + (value / 10) % 10);
+        destination[index + 3] = (byte)('0' + value % 10);
+    }
+
+    private static void Write3(Span<byte> destination, int index, int value)
+    {
+        destination[index] = (byte)('0' + value / 100);
+        destination[index + 1] = (byte)('0' + (value / 10) % 10);
+        destination[index + 2] = (byte)('0' + value % 10);
+    }
+
+    private static void Write2(Span<byte> destination, int index, int value)
+    {
+        destination[index] = (byte)('0' + value / 10);
+        destination[index + 1] = (byte)('0' + value % 10);
+    }
+
+    private static bool WriteAscii(Span<byte> destination, ref int index, string text)
+    {
+        if (index + text.Length > destination.Length)
+            return false;
+        for (var i = 0; i < text.Length; i++)
+            destination[index++] = (byte)text[i];
+        return true;
+    }
+
+    private static bool WriteByte(Span<byte> destination, ref int index, byte value)
+    {
+        if (index >= destination.Length)
+            return false;
+        destination[index++] = value;
+        return true;
+    }
+
+    /// <summary>False when the text needs the escaping rules or is not ASCII.</summary>
+    private static bool WritePlain(Span<byte> destination, ref int index, string text)
+    {
+        if (index + text.Length > destination.Length)
+            return false;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (ch is '\\' or '|' or '\r' or '\n' || ch > 127)
+                return false;
+            if (ch == '-' && i + 2 < text.Length && text[i + 1] == '-' && text[i + 2] == '>')
+                return false;
+            destination[index++] = (byte)ch;
+        }
+
+        return true;
+    }
+
+    private static bool WriteProps(Span<byte> destination, IReadOnlyDictionary<string, object> properties, ref int index)
+    {
+        var first = true;
+        foreach (var pair in properties)
+        {
+            if (!first)
+            {
+                if (!WriteAscii(destination, ref index, ", "))
+                    return false;
+            }
+
+            first = false;
+            if (!WritePlain(destination, ref index, pair.Key))
+                return false;
+            if (!WriteByte(destination, ref index, (byte)'='))
+                return false;
+            if (!WriteValue(destination, ref index, pair.Value))
+                return false;
+        }
+
+        return true;
+    }
+
+    private static bool WriteValue(Span<byte> destination, ref int index, object? value)
+    {
+        if (value is null)
+            return true;
+        if (value is string text)
+            return WritePlain(destination, ref index, text);
+        if (value is int number)
+            return WriteInt(destination, ref index, number);
+        return false;
+    }
+
+    private static bool WriteInt(Span<byte> destination, ref int index, int value)
+    {
+        if (value == int.MinValue)
+            return false;
+        if (value < 0)
+        {
+            if (!WriteByte(destination, ref index, (byte)'-'))
+                return false;
+            value = -value;
+        }
+
+        Span<byte> digits = stackalloc byte[10];
+        var count = 0;
+        do
+        {
+            digits[count++] = (byte)('0' + (value % 10));
+            value /= 10;
+        }
+        while (value > 0);
+
+        if (index + count > destination.Length)
+            return false;
+        for (var i = count - 1; i >= 0; i--)
+            destination[index++] = digits[i];
+        return true;
     }
 
     /// <summary>Joins time, level, category, and message with spaces. Blank pieces are left out.</summary>

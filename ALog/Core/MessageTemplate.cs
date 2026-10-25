@@ -4,7 +4,9 @@
 // Next: LoggerEngine.cs.
 namespace ALog.Core;
 
+using System.Collections.Concurrent;
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 
 /// <summary>
@@ -16,35 +18,183 @@ public static class MessageTemplate
         @"\{(?<name>[A-Za-z_][A-Za-z0-9_]*)(?<format>:[^}]*)?\}",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    private static readonly ConcurrentDictionary<string, CompiledTemplate> TemplateCache = new(StringComparer.Ordinal);
+    private static readonly object CacheGate = new();
+
+    /// <summary>Most compiled templates kept. A further template is compiled and not stored.</summary>
+    internal const int MaxCachedTemplates = 1024;
+
+    /// <summary>Longest template text that may be stored. A longer template is compiled and not stored.</summary>
+    internal const int MaxCachedTemplateLength = 4096;
+
+    /// <summary>How many templates are stored. Does not include compiles that were not stored.</summary>
+    /// <remarks>Does not throw. The count can change as soon as another thread stores a template.</remarks>
+    internal static int CachedTemplateCount => TemplateCache.Count;
+
+    private static readonly IReadOnlyDictionary<string, object> EmptyProperties = EmptyPropertyBag.Instance;
+
+    /// <summary>Largest render buffer kept on the thread. A bigger one is dropped after the call.</summary>
+    internal const int MaxRetainedBuilder = 4096;
+
+    /// <summary>Capacity of the render buffer still kept on this thread. Zero when none is kept.</summary>
+    /// <remarks>Does not throw. Another call on this thread can change it. Other threads have their own buffer.</remarks>
+    internal static int RetainedRenderCapacity => _render?.Capacity ?? 0;
+
+    [ThreadStatic]
+    private static StringBuilder? _render;
+
+    [ThreadStatic]
+    private static int _rendering;
+
+    /// <summary>
+    /// Renders <paramref name="template"/> and builds the property bag for its holes.
+    /// </summary>
+    /// <param name="template">Template text. Not null. Hole names are letters, digits, and underscores.</param>
+    /// <param name="args">Hole values in order. Extra values are ignored. A missing value leaves the hole text.</param>
+    /// <returns>The rendered message and the bag. The bag is empty when there are no arguments or no holes.</returns>
+    /// <remarks>
+    /// Does not throw for a null argument value. A throwing value becomes a format-error placeholder.
+    /// Templates up to <see cref="MaxCachedTemplateLength"/> characters are stored until <see cref="MaxCachedTemplates"/>
+    /// entries exist. After that, or when the text is longer, the template is compiled for this call and not stored.
+    /// The hot path is a lookup. The insert takes <c>CacheGate</c> so two threads cannot push the count past the cap.
+    /// Safe to call from several threads. The render buffer is thread-static and is not shared across a nested call.
+    /// </remarks>
     public static (string Rendered, IReadOnlyDictionary<string, object> Properties) Format(
         string template,
         params object?[] args)
     {
         ArgumentNullException.ThrowIfNull(template);
 
-        var properties = new Dictionary<string, object>(StringComparer.Ordinal);
         if (args.Length == 0)
-            return (template, properties);
+            return (template, EmptyProperties);
 
-        var argIndex = 0;
-        var rendered = HolePattern.Replace(template, match =>
+        var compiled = Resolve(template);
+        if (compiled.Holes == 0)
+            return (template, EmptyProperties);
+
+        var properties = new Dictionary<string, object>(compiled.Holes, StringComparer.Ordinal);
+        var nested = _rendering++ > 0;
+        var builder = nested ? new StringBuilder(64) : _render ??= new StringBuilder(128);
+        if (!nested)
+            builder.Clear();
+        try
         {
-            if (argIndex >= args.Length)
-                return match.Value;
+            var argIndex = 0;
+            var pieces = compiled.Pieces;
+            for (var i = 0; i < pieces.Length; i++)
+            {
+                var piece = pieces[i];
+                if (!piece.IsHole)
+                {
+                    builder.Append(piece.Literal);
+                    continue;
+                }
 
-            var name = match.Groups["name"].Value;
-            var value = args[argIndex];
-            argIndex++;
-            properties[name] = value ?? string.Empty;
+                if (argIndex >= args.Length)
+                {
+                    builder.Append(piece.Raw);
+                    continue;
+                }
+
+                var value = args[argIndex];
+                argIndex++;
+                properties[piece.Name!] = value ?? string.Empty;
+                builder.Append(RenderArgument(piece.Name!, value, piece.Format));
+            }
+        }
+        finally
+        {
+            _rendering--;
+            if (!nested && builder.Capacity > MaxRetainedBuilder)
+                _render = null;
+        }
+
+        // Positional leftovers (no holes left) are ignored; unused holes keep raw text.
+        return (builder.ToString(), properties);
+    }
+
+    /// <summary>
+    /// Returns a compiled template. A cache hit does not take the insert lock.
+    /// </summary>
+    /// <param name="template">Template text. Not null. The caller already rejected a null.</param>
+    /// <returns>A compiled template. It may be shared, or private to this call when it was not stored.</returns>
+    /// <remarks>
+    /// Does not throw. A template longer than <see cref="MaxCachedTemplateLength"/> is compiled and not stored.
+    /// When the cache is full the compile is still returned, so rendering does not change, and the count stays put.
+    /// Two threads inserting take <c>CacheGate</c>. The lookup does not. Safe to call from several threads.
+    /// </remarks>
+    private static CompiledTemplate Resolve(string template)
+    {
+        if (template.Length > MaxCachedTemplateLength)
+            return Compile(template);
+
+        if (TemplateCache.TryGetValue(template, out var cached))
+            return cached;
+
+        var compiled = Compile(template);
+        lock (CacheGate)
+        {
+            if (TemplateCache.TryGetValue(template, out cached))
+                return cached;
+
+            if (TemplateCache.Count >= MaxCachedTemplates)
+                return compiled;
+
+            TemplateCache[template] = compiled;
+            return compiled;
+        }
+    }
+
+    /// <summary>Parses <paramref name="template"/> once. The result is immutable and safe to share.</summary>
+    /// <param name="template">Template text. Not null.</param>
+    /// <returns>Pieces and a hole count. Not stored by this method.</returns>
+    /// <remarks>
+    /// Does not throw. The match loop is bounded by the matches in the text, which cannot exceed the text length.
+    /// Safe to call from several threads. It does not touch the cache.
+    /// </remarks>
+    private static CompiledTemplate Compile(string template)
+    {
+        var matches = HolePattern.Matches(template);
+        var pieces = new Piece[matches.Count == 0 ? 1 : matches.Count * 2 + 1];
+        var count = 0;
+        var index = 0;
+        var holes = 0;
+        for (var i = 0; i < matches.Count; i++)
+        {
+            var match = matches[i];
+            if (match.Index > index)
+                pieces[count++] = new Piece(template.Substring(index, match.Index - index), null, null, null);
 
             var format = match.Groups["format"].Success
                 ? match.Groups["format"].Value.TrimStart(':')
                 : null;
-            return RenderArgument(name, value, format);
-        });
+            pieces[count++] = new Piece(null, match.Groups["name"].Value, format, match.Value);
+            holes++;
+            index = match.Index + match.Length;
+        }
 
-        // Positional leftovers (no holes left) are ignored; unused holes keep raw text.
-        return (rendered, properties);
+        if (index < template.Length || count == 0)
+            pieces[count++] = new Piece(index == 0 ? template : template.Substring(index), null, null, null);
+
+        if (count != pieces.Length)
+            Array.Resize(ref pieces, count);
+
+        return new CompiledTemplate(pieces, holes);
+    }
+
+    private sealed class CompiledTemplate(Piece[] pieces, int holes)
+    {
+        public Piece[] Pieces { get; } = pieces;
+        public int Holes { get; } = holes;
+    }
+
+    private readonly struct Piece(string? literal, string? name, string? format, string? raw)
+    {
+        public string? Literal { get; } = literal;
+        public string? Name { get; } = name;
+        public string? Format { get; } = format;
+        public string? Raw { get; } = raw;
+        public bool IsHole => Name is not null;
     }
 
     private static string RenderArgument(string name, object? value, string? format)

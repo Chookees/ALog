@@ -72,6 +72,14 @@ internal static class ExceptionReport
         typeof(Exception).GetField("_message", BindingFlags.Instance | BindingFlags.NonPublic);
 
     /// <summary>
+    /// Frames already read for the exception being formatted on this thread.
+    /// Compared by reference, so two exceptions that claim to be equal still keep their own frames.
+    /// Cleared when the format call returns, including when it throws, so an exception is not pinned here.
+    /// </summary>
+    [ThreadStatic]
+    private static Dictionary<Exception, List<FrameView>>? _frameCache;
+
+    /// <summary>
     /// Renders one exception as the plain-text segment shared by every text sink.
     /// The segment is <c>Type: Message</c>, then at most three chain nodes joined by
     /// <c> --&gt; </c>, then <c> (+n more)</c> or <c> (+n+ more)</c>, then <c>at Type.Method in File.cs:line</c>
@@ -84,10 +92,17 @@ internal static class ExceptionReport
     /// Does not call <see cref="Exception.ToString"/>. Does not throw.
     /// Message text and only message text is escaped and cut to 500 characters.
     /// A throwing message getter becomes <c>[capture failed: Type]</c> in the message slot.
-    /// A throwing frame read omits <c>at</c> and keeps the rest.
+    /// A throwing stack getter omits <c>at</c> and keeps the rest. The getter still runs:
+    /// a throw means there is no origin, and a second stack walk is not a substitute for that.
+    /// When the getter's text already names a user frame, that text is the origin and
+    /// <see cref="ReadFrames"/> is not called again.
+    /// The frame cache is cleared before the walk and again when this returns, so a failure cannot leave the exception on the thread.
+    /// Only this thread reads the cache. Two calls on one thread do not overlap.
     /// </remarks>
     internal static string FormatText(Exception exception)
     {
+        EnsureFrameCache();
+        _frameCache!.Clear();
         try
         {
             return FormatTextCore(exception);
@@ -96,6 +111,20 @@ internal static class ExceptionReport
         {
             return Capture(failure);
         }
+        finally
+        {
+            _frameCache.Clear();
+        }
+    }
+
+    /// <summary>Creates the per-thread frame cache on first use. Later calls keep that dictionary.</summary>
+    /// <remarks>
+    /// Does not throw. The comparer is <see cref="ReferenceEqualityComparer"/>, so <see cref="object.Equals(object?)"/> on the exception is not used.
+    /// Only this thread calls it. The dictionary is empty until a frame walk stores into it.
+    /// </remarks>
+    private static void EnsureFrameCache()
+    {
+        _frameCache ??= new Dictionary<Exception, List<FrameView>>(4, ReferenceEqualityComparer.Instance);
     }
 
     /// <summary>
@@ -108,9 +137,13 @@ internal static class ExceptionReport
     /// <remarks>
     /// Does not escape or truncate the message. Does not call <see cref="Exception.ToString"/>.
     /// Does not throw. A throwing message getter stores the capture placeholder instead of a raw message.
+    /// The frame cache is cleared when this returns, including on failure, so the exception is not pinned to the thread.
+    /// Only this thread uses that cache.
     /// </remarks>
     internal static ExceptionBody CreateBody(Exception exception)
     {
+        EnsureFrameCache();
+        _frameCache!.Clear();
         try
         {
             return CreateBodyCore(exception);
@@ -122,6 +155,10 @@ internal static class ExceptionReport
                 Type = SafeTypeName(exception),
                 Message = Capture(failure)
             };
+        }
+        finally
+        {
+            _frameCache.Clear();
         }
     }
 
@@ -565,13 +602,296 @@ internal static class ExceptionReport
         var text = string.Join(" --> ", parts);
         if (total > MaxTextSegments)
             text += MoreSuffix(total - MaxTextSegments, capped);
-        var origin = FindOrigin(exception);
-        if (origin == null)
-            return text;
-        var at = FormatAt(ReadFrames(origin));
+        var at = FormatOriginAt(exception);
         if (at == null)
             return text;
         return text + " | " + at;
+    }
+
+    /// <summary>
+    /// The <c>at</c> segment for plain text.
+    /// A linear chain reads <see cref="Exception.StackTrace"/> from the inside out and stops at the first user frame.
+    /// An aggregate, a cycle, or a stack line this parser cannot classify uses <see cref="FindOrigin"/> and <see cref="ReadFrames"/>.
+    /// </summary>
+    /// <param name="exception">Outermost exception. Not null.</param>
+    /// <returns>The segment, or null when no stack can be shown.</returns>
+    /// <remarks>
+    /// Does not throw. The stack getter stays on the path that is shown: a throw skips that exception.
+    /// When every getter throws, the segment is omitted. The parser does not build a second <see cref="StackTrace"/>.
+    /// </remarks>
+    private static string? FormatOriginAt(Exception exception)
+    {
+        if (TryLinearOriginAt(exception, out var at))
+            return at;
+
+        var origin = FindOrigin(exception);
+        if (origin == null)
+            return null;
+        return FormatAt(ReadFrames(origin));
+    }
+
+    /// <summary>Slots for one plain-text chain walk. Cleared before the method returns so a logged exception can be collected.</summary>
+    [ThreadStatic]
+    private static Exception?[]? _chainSlots;
+
+    /// <summary>
+    /// Origin text for a chain that is only <see cref="Exception.InnerException"/> links.
+    /// </summary>
+    /// <param name="exception">Outermost exception. Not null.</param>
+    /// <param name="at">The segment, or null when the chain has no readable stack. Valid only when the result is true.</param>
+    /// <returns>False when the caller must use <see cref="FindOrigin"/>. True when <paramref name="at"/> is the answer.</returns>
+    /// <remarks>
+    /// Does not throw. An <see cref="AggregateException"/>, a cycle, or an unparsed stack line returns false.
+    /// The walk stops at 16. The innermost exception is read first so a user frame does not also read the outer getters.
+    /// </remarks>
+    private static bool TryLinearOriginAt(Exception exception, out string? at)
+    {
+        at = null;
+        var slots = _chainSlots ??= new Exception?[MaxChain];
+        var count = 0;
+        try
+        {
+            var current = exception;
+            while (current != null && count < MaxChain)
+            {
+                if (current is AggregateException)
+                    return false;
+
+                for (var seen = 0; seen < count; seen++)
+                {
+                    if (ReferenceEquals(slots[seen], current))
+                        return false;
+                }
+
+                slots[count++] = current;
+                if (!TryInner(current, out current))
+                    break;
+            }
+
+            string? fallback = null;
+            var sawStack = false;
+            for (var i = count - 1; i >= 0; i--)
+            {
+                var stack = ReadStackProperty(slots[i]!);
+                if (string.IsNullOrWhiteSpace(stack))
+                    continue;
+
+                sawStack = true;
+                if (!TryAtFromTrace(stack, out var parsed, out var userFrame))
+                    return false;
+
+                if (userFrame)
+                {
+                    at = parsed;
+                    return true;
+                }
+
+                fallback ??= parsed;
+            }
+
+            if (!sawStack)
+                return true;
+
+            at = fallback;
+            return fallback != null;
+        }
+        finally
+        {
+            for (var i = 0; i < count; i++)
+                slots[i] = null;
+        }
+    }
+
+    /// <summary>
+    /// Reads an <see cref="Exception.StackTrace"/> string from the top until a user frame or an unclassified line.
+    /// </summary>
+    /// <param name="stack">Raw getter text. Not null or blank.</param>
+    /// <param name="at">The segment for the selected frame. Null when no line could be shown.</param>
+    /// <param name="userFrame">True when <paramref name="at"/> is an application frame.</param>
+    /// <returns>False when a line is not the runtime's <c>at</c> shape, or the frame needs the reflection walk.</returns>
+    /// <remarks>
+    /// Does not throw. Framework namespaces are skipped. A name that starts with <c>ALog</c>, a missing namespace,
+    /// or a compiler mark (<c>&lt;</c>, <c>`</c>, <c>+</c>, <c>[</c>) returns false so <see cref="ReadFrames"/> keeps the old choice.
+    /// The file is the name only, matching <see cref="Describe"/>.
+    /// </remarks>
+    private static bool TryAtFromTrace(string stack, out string? at, out bool userFrame)
+    {
+        at = null;
+        userFrame = false;
+        string? first = null;
+        var start = 0;
+        while (start <= stack.Length)
+        {
+            var end = stack.IndexOf('\n', start);
+            if (end < 0)
+                end = stack.Length;
+            var length = end - start;
+            if (length > 0 && stack[end - 1] == '\r')
+                length--;
+
+            if (length > 0)
+            {
+                var line = stack.AsSpan(start, length);
+                if (!line.StartsWith("   at ", StringComparison.Ordinal))
+                    return false;
+                if (!TryParseFrame(line, out var typeFull, out var method, out var file, out var lineNo))
+                    return false;
+                if (!TryClassifyType(typeFull, out var typeNamespace, out var shortName, out var ambiguous))
+                    return false;
+                if (ambiguous)
+                    return false;
+
+                var skipped = IsFrameworkNamespace(typeNamespace);
+                if (!skipped && (typeNamespace.Length == 0
+                    || typeNamespace == "Interop"
+                    || typeNamespace.StartsWith("ALog", StringComparison.Ordinal)))
+                    return false;
+
+                var label = skipped ? typeFull : shortName;
+                var text = FormatParsedFrame(label, method, file, lineNo);
+                if (!skipped)
+                {
+                    at = text;
+                    userFrame = true;
+                    return true;
+                }
+
+                first ??= text;
+            }
+
+            if (end >= stack.Length)
+                break;
+            start = end + 1;
+        }
+
+        if (first == null)
+            return false;
+
+        at = first;
+        return true;
+    }
+
+    /// <summary>Splits one <c>at</c> line into type, method, file name, and line.</summary>
+    /// <param name="line">One stack line, including the <c>at</c> prefix. Not empty.</param>
+    /// <param name="typeFull">Text before the method. Empty when the line is not a frame.</param>
+    /// <param name="method">Method name. Empty when the line is not a frame.</param>
+    /// <param name="file">File name without a directory. Null when the line has no <c>in</c> path.</param>
+    /// <param name="lineNo">PDB line. Zero when the line has none.</param>
+    /// <returns>False when the line has no <c>Type.Method(</c> shape or the method is a compiler name.</returns>
+    /// <remarks>Does not throw. Argument lists are ignored. A path is cut at <c>:line </c>.</remarks>
+    private static bool TryParseFrame(ReadOnlySpan<char> line, out string typeFull, out string method, out string? file, out int lineNo)
+    {
+        typeFull = string.Empty;
+        method = string.Empty;
+        file = null;
+        lineNo = 0;
+        if (line.Length <= 6)
+            return false;
+
+        var body = line[6..];
+        var paren = body.IndexOf('(');
+        if (paren <= 0)
+            return false;
+
+        var head = body[..paren];
+        var dot = head.LastIndexOf('.');
+        if (dot <= 0 || dot >= head.Length - 1)
+            return false;
+
+        var methodSpan = head[(dot + 1)..];
+        if (methodSpan.IndexOf('<') >= 0 || methodSpan.IndexOf('`') >= 0 || methodSpan.IndexOf('[') >= 0)
+            return false;
+
+        var close = body.IndexOf(')');
+        if (close < paren)
+            return false;
+
+        typeFull = head[..dot].ToString();
+        method = methodSpan.ToString();
+        var tail = body[(close + 1)..];
+        if (tail.IsEmpty)
+            return true;
+        if (!tail.StartsWith(" in ", StringComparison.Ordinal))
+            return false;
+
+        var location = tail[4..];
+        var marker = location.IndexOf(":line ", StringComparison.Ordinal);
+        if (marker >= 0)
+        {
+            var number = location[(marker + 6)..];
+            if (!int.TryParse(number, NumberStyles.None, CultureInfo.InvariantCulture, out lineNo) || lineNo < 0)
+                return false;
+            file = FileNameOnly(location[..marker]);
+            return true;
+        }
+
+        file = FileNameOnly(location);
+        return true;
+    }
+
+    /// <summary>File name from a stack path. A blank result is null.</summary>
+    /// <param name="path">Path text from the stack line. Not empty.</param>
+    /// <returns>The name, or null when the path has no name.</returns>
+    /// <remarks>Does not throw. Matches <see cref="Path.GetFileName"/>.</remarks>
+    private static string? FileNameOnly(ReadOnlySpan<char> path)
+    {
+        var name = Path.GetFileName(path.ToString());
+        return string.IsNullOrEmpty(name) ? null : name;
+    }
+
+    /// <summary>Splits a stack type into a namespace and a short name, or marks it for the reflection walk.</summary>
+    /// <param name="typeFull">Type text before the method. Not null.</param>
+    /// <param name="typeNamespace">Namespace. Empty when the result is ambiguous.</param>
+    /// <param name="shortName">Text after the last dot. Empty when the result is ambiguous.</param>
+    /// <param name="ambiguous">True when the reflection walk must choose the frame.</param>
+    /// <returns>True. The flag carries the decision.</returns>
+    /// <remarks>
+    /// Does not throw. A compiler character, a missing dot, or a global type is ambiguous.
+    /// The assembly name is not in the stack string, so those frames stay on <see cref="ReadFrames"/>.
+    /// </remarks>
+    private static bool TryClassifyType(string typeFull, out string typeNamespace, out string shortName, out bool ambiguous)
+    {
+        typeNamespace = string.Empty;
+        shortName = string.Empty;
+        ambiguous = false;
+        for (var i = 0; i < typeFull.Length; i++)
+        {
+            var ch = typeFull[i];
+            if (ch == '<' || ch == '`' || ch == '+' || ch == '[')
+            {
+                ambiguous = true;
+                return true;
+            }
+        }
+
+        var dot = typeFull.LastIndexOf('.');
+        if (dot <= 0 || dot >= typeFull.Length - 1)
+        {
+            ambiguous = true;
+            return true;
+        }
+
+        typeNamespace = typeFull[..dot];
+        shortName = typeFull[(dot + 1)..];
+        return true;
+    }
+
+    /// <summary>Same text as <see cref="FormatFrame"/> for one parsed frame.</summary>
+    /// <param name="typeLabel">Short name, or the full name when the frame is a framework fallback.</param>
+    /// <param name="method">Method name. Not null.</param>
+    /// <param name="file">File name. Null omits <c>in</c>.</param>
+    /// <param name="lineNo">PDB line. Zero omits the colon.</param>
+    /// <returns>The <c>at</c> segment.</returns>
+    /// <remarks>Does not throw. A missing type label still writes the method.</remarks>
+    private static string FormatParsedFrame(string typeLabel, string method, string? file, int lineNo)
+    {
+        var text = typeLabel.Length == 0 ? "at " + method : "at " + typeLabel + "." + method;
+        if (string.IsNullOrEmpty(file))
+            return text;
+        text += " in " + file;
+        if (lineNo > 0)
+            text += ":" + lineNo.ToString(CultureInfo.InvariantCulture);
+        return text;
     }
 
     /// <summary>The <c>(+N more)</c> suffix, with an extra plus when the walk stopped at a limit.</summary>
@@ -1641,15 +1961,19 @@ internal static class ExceptionReport
     /// which drops <c>at</c> and <c>source</c> and leaves the rest of the line.
     /// </summary>
     /// <param name="exception">Exception whose stack frames are needed. Not null.</param>
+    /// <param name="fileInfo">When false, file names and lines are omitted. The origin check uses that faster walk.</param>
     /// <returns>Cleaned frames from the top down. Empty when the stack cannot be read.</returns>
     /// <remarks>Does not throw. File paths are reduced to the file name here.</remarks>
-    private static List<FrameView> ReadFrames(Exception exception)
+    private static List<FrameView> ReadFrames(Exception exception, bool fileInfo = true)
     {
+        if (fileInfo && _frameCache != null && _frameCache.TryGetValue(exception, out var cached))
+            return cached;
+
         var list = new List<FrameView>(8);
         StackTrace trace;
         try
         {
-            trace = new StackTrace(exception, true);
+            trace = new StackTrace(exception, fileInfo);
         }
         catch
         {
@@ -1676,6 +2000,8 @@ internal static class ExceptionReport
             }
         }
 
+        if (fileInfo && _frameCache != null)
+            _frameCache[exception] = list;
         return list;
     }
 

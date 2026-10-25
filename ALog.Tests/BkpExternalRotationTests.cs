@@ -16,6 +16,80 @@ namespace ALog.Tests;
 public sealed class BkpExternalRotationTests
 {
     /// <summary>
+    /// On Windows, <c>File.ReadAllText</c> reads flushed lines while the writer is still alive.
+    /// </summary>
+    /// <remarks>
+    /// A zero flush interval writes each line and keeps the write handle. <see cref="FileLogWriter.Flush"/>
+    /// replaces that handle with a read handle. <c>File.ReadAllText</c> asks for <see cref="FileShare.Read"/>,
+    /// which succeeds against that read handle and throws while the write handle is still open.
+    /// The writer is not disposed. Other systems skip this test: Linux and macOS do not enforce the share mode,
+    /// so the assertion would not prove the Windows contract. Not thread-safe. The wait bound is 30 seconds.
+    /// </remarks>
+    [SkippableFact(Timeout = 30000)]
+    public async Task File_ReadAllTextSucceedsAfterFlushWhileAlive()
+    {
+        await Task.CompletedTask;
+        Skip.IfNot(OperatingSystem.IsWindows(), "FileShare is not enforced on this operating system.");
+        var directory = NewDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "readers.log");
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
+            writer.Write(Event("first-line"));
+            writer.Write(Event("second-line"));
+            writer.Flush();
+            var text = File.ReadAllText(path);
+            Assert.Contains("first-line", text, StringComparison.Ordinal);
+            Assert.Contains("second-line", text, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// On Windows, lines written while a <see cref="FileShare.Read"/> reader holds the file appear after that reader closes.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="FileLogWriter.Flush"/> parks a read handle. The reader then opens with <see cref="FileShare.Read"/>,
+    /// so the next write cannot reopen the write handle. The lines stay buffered and the file clock retries.
+    /// The writer is not disposed before the lines appear. Other systems skip this test: they do not enforce the share mode.
+    /// Not thread-safe. The wait bound is 30 seconds.
+    /// </remarks>
+    [SkippableFact(Timeout = 60000)]
+    public async Task File_LinesAppearAfterAReadShareIsReleased()
+    {
+        Skip.IfNot(OperatingSystem.IsWindows(), "FileShare is not enforced on this operating system.");
+        var directory = NewDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "share.log");
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
+            writer.Write(Event("first-line"));
+            writer.Flush();
+            using (var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                writer.Write(Event("second-line"));
+                writer.Write(Event("third-line"));
+            }
+
+            await DeadlineClock.WaitFor(
+                () => TestFiles.ReadShared(path).Contains("third-line", StringComparison.Ordinal),
+                "lines did not appear after the reader closed");
+            var text = TestFiles.ReadShared(path);
+            var first = text.IndexOf("first-line", StringComparison.Ordinal);
+            var second = text.IndexOf("second-line", StringComparison.Ordinal);
+            var third = text.IndexOf("third-line", StringComparison.Ordinal);
+            Assert.True(first >= 0 && first < second && second < third);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
     /// A rename leaves the first line in the old file and the next line in a new file at the configured path.
     /// </summary>
     /// <remarks>
@@ -111,14 +185,14 @@ public sealed class BkpExternalRotationTests
             var interval = TimeSpan.FromSeconds(60);
             using var writer = new FileLogWriter(path, fileFlushInterval: interval, clock: clock);
             writer.Write(Event("buffered-line"));
-            Assert.DoesNotContain("buffered-line", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("buffered-line", TestFiles.ReadShared(path), StringComparison.Ordinal);
             File.Move(path, rotated);
             clock.Advance(interval);
             AssertOneHandle(path);
 
             AssertNoNul(rotated);
             Assert.Contains("buffered-line", File.ReadAllText(rotated), StringComparison.Ordinal);
-            Assert.DoesNotContain("buffered-line", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("buffered-line", TestFiles.ReadShared(path), StringComparison.Ordinal);
             Assert.True(File.Exists(path));
         }
         finally
@@ -291,7 +365,7 @@ public sealed class BkpExternalRotationTests
                 new LoggerConfig().AddWriter(new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock)),
                 clock);
             engine.Log("on-disk");
-            Assert.Contains("on-disk", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("on-disk", TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Dispose();
         }
         finally
@@ -320,9 +394,9 @@ public sealed class BkpExternalRotationTests
                 clock);
             var payload = new string('B', 3000);
             engine.Log(payload);
-            Assert.DoesNotContain(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Log(payload);
-            Assert.Contains(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Dispose();
         }
         finally
@@ -348,7 +422,7 @@ public sealed class BkpExternalRotationTests
                     .SetFileFlushInterval(TimeSpan.Zero),
                 clock);
             engine.Log("from-config");
-            Assert.Contains("from-config", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("from-config", TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Dispose();
         }
         finally
@@ -375,9 +449,9 @@ public sealed class BkpExternalRotationTests
                 clock);
             var payload = new string('C', 3000);
             engine.Log(payload);
-            Assert.DoesNotContain(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Log(payload);
-            Assert.Contains(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Dispose();
         }
         finally
@@ -537,7 +611,7 @@ public sealed class BkpExternalRotationTests
             Assert.Contains("Write failed", buffer.ToString(), StringComparison.Ordinal);
             writer.Write(Event("after-failure"));
             clock.Advance(TimeSpan.FromSeconds(60));
-            Assert.Contains("after-failure", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("after-failure", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -573,7 +647,7 @@ public sealed class BkpExternalRotationTests
             writer.Write(Event("second"));
             Assert.Equal(1, LogFileRegistry.IdentityCheckCount - before);
             writer.Flush();
-            Assert.Contains("second", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("second", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -896,15 +970,6 @@ public sealed class BkpExternalRotationTests
     private static void RestoreDirectory(string directory, UnixFileMode mode)
         => File.SetUnixFileMode(directory, mode);
 
-    private static string ReadShared(string path)
-    {
-        if (!File.Exists(path))
-            return string.Empty;
-
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
-    }
 
     /// <summary>Writes <paramref name="count"/> plain lines before ALog opens the file.</summary>
     /// <param name="path">File to create. Not null.</param>

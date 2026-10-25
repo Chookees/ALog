@@ -36,14 +36,14 @@ public sealed class BkpCoverageTests
             writer.ApplyStartup(4096, TimeSpan.FromSeconds(60), clock);
             var wide = new string('W', 5000);
             writer.Write(Event(wide));
-            Assert.Contains(wide, ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains(wide, TestFiles.ReadShared(path), StringComparison.Ordinal);
 
             writer.ApplyStartup(4096, TimeSpan.Zero, clock);
-            var beforeShort = ReadShared(path).Length;
+            var beforeShort = TestFiles.ReadShared(path).Length;
             writer.Write(Event("short-line"));
-            Assert.Equal(beforeShort, ReadShared(path).Length);
+            Assert.Equal(beforeShort, TestFiles.ReadShared(path).Length);
             writer.Flush();
-            Assert.Contains("short-line", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("short-line", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -144,6 +144,13 @@ public sealed class BkpCoverageTests
     }
 
     /// <summary>A failed move reports the rolling error and opens the same file again, so the next line is still whole.</summary>
+    /// <remarks>
+    /// The flush interval is zero, so the write handle stays open across the first line.
+    /// The second line tries to rotate, the move fails, and the same path opens again.
+    /// The append does not open a read handle. Two successful opens are the whole delta.
+    /// Swapping after every write would add a read handle per line and fail this test.
+    /// Linux only: the directory lock is a Unix mode. Not thread-safe. The wait bound is 30 seconds.
+    /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task File_ReopensAfterRotationCannotMove()
     {
@@ -173,7 +180,7 @@ public sealed class BkpCoverageTests
             }
 
             Assert.Equal(before + 2, LogFileRegistry.OpenCount);
-            var text = ReadShared(path);
+            var text = TestFiles.ReadShared(path);
             Assert.Contains("first-line", text, StringComparison.Ordinal);
             Assert.Contains("second-line", text, StringComparison.Ordinal);
             Assert.Contains("Rolling failed", buffer.ToString(), StringComparison.Ordinal);
@@ -447,13 +454,6 @@ public sealed class BkpCoverageTests
         _ = await Task.WhenAny(dispose, Task.Delay(TimeSpan.FromSeconds(30)));
     }
 
-    /// <summary>Reads the file while a writer may still hold it.</summary>
-    private static string ReadShared(string path)
-    {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
-    }
 
     /// <summary>The file length while a writer may still hold it.</summary>
     private static long LengthShared(string path)

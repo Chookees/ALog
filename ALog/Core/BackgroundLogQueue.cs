@@ -1,6 +1,7 @@
 // Background queue for UseBackgroundQueue (C4).
 // One opt-in queue. Drop counts a full queue (ALOG0070). Block waits for room.
-// Shutdown, flush, and the new-write cutoff use the injected TimeProvider (ALOG0071).
+// Shutdown, flush, the new-write cutoff, and the full-drop report use the injected TimeProvider (ALOG0071).
+// The report timer is created on that clock before the constructor returns. A drop only changes its due time.
 // The static 5000 ms and 4900 ms bounds stay. The instance flush timeout is the real wait.
 // Production uses ProductionClock.Default. Tests pass a clock they can move.
 // The open ALOG0070 window is written at shutdown. The first event after close is ALOG0072.
@@ -9,11 +10,15 @@
 
 namespace ALog.Core;
 
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading.Channels;
 using ALog.Config;
 using ALog.Public.Interfaces;
+using ALog.Writers.Console;
+using ALog.Writers.File;
 
 /// <summary>
 /// Accepts log events on a bounded channel and writes them on a pool thread.
@@ -44,22 +49,38 @@ public partial class BackgroundLogQueue : IDisposable
     /// <summary>Most events read in one pass. The channel never holds more than its capacity.</summary>
     private const int MaxRead = 100_000;
 
-    private readonly Channel<LogEvent> _channel;
+    /// <summary>
+    /// Bytes charged when a parked event has no file writer: a short plain prefix plus the newline.
+    /// A file writer charges the formatter's UTF-8 instead. This is not a multiplier.
+    /// </summary>
+    private const int PlainLineOverhead = 36;
+
+    /// <summary>Shortest wait before a file that could not reopen is tried again. A longer flush interval waits that long instead.</summary>
+    private static readonly TimeSpan MinimumReopenRetry = TimeSpan.FromSeconds(1);
+
+    private readonly ConcurrentQueue<LogEvent> _queue = new();
+    private readonly Queue<LogEvent> _front = new();
+    private readonly ManualResetEventSlim _releaseRetry = new(false);
+    private readonly ManualResetEventSlim _wake = new(false);
+    private int _wakeSignals;
+    private readonly List<ILogWriter> _writers;
+    private readonly ConditionalWeakTable<LogEvent, HeldLines> _held = new();
     private readonly LogDispatcher _dispatcher;
     private readonly CancellationTokenSource _shutdownSignal = new();
     private readonly Task _backgroundTask;
     private readonly int _capacity;
     private readonly int _batchSize;
     private readonly TimeSpan _flushInterval;
-    private readonly bool _asyncEnabled;
+    private readonly bool _directDispatch;
     private readonly TimeProvider _clock;
-    private readonly ITimer _reportTimer;
+    private ITimer? _reportTimer;
     private readonly object _gate = new();
     private readonly object _reportGate = new();
     private readonly WriterGate _writerGate;
     private readonly ManualResetEventSlim _stopped = new(false);
 
-    private CancellationTokenSource _wakeCts = new();
+    private int _idle;
+    private int _closedFast;
     private TaskCompletionSource<bool>? _flushTcs;
     private int _inflight;
     private int _outstanding;
@@ -69,13 +90,22 @@ public partial class BackgroundLogQueue : IDisposable
     private int _shutdownReported;
     private int _closedReported;
     private int _processorEntered;
+    private int _processorLeft;
     private int _idleWaitEntered;
+    private Action? _beforeEnqueue;
+    private Action? _beforeRead;
+    private int _reopenWaitsStarted;
+    private long _retryNotBeforeTicks;
     private int _disposeWaitsStarted;
     private static int _deadlineWaitEntries;
     private int _flushWaitsStarted;
     private int _shutdownDeadlineElapsed;
     private int _flushDeadlineElapsed;
     private int _cutoffElapsed;
+    private int _writeDeferred;
+    private int _frontBytes;
+    private int _holdDrops;
+    private long _holdReportedTicks;
     private int _cutoffReached;
     private long _accepted;
     private long _written;
@@ -88,6 +118,8 @@ public partial class BackgroundLogQueue : IDisposable
     private long _disposeStartTimestamp;
     private bool _closed;
     private bool _frozen;
+    /// <summary>Value of <see cref="_accepted"/> observed by <see cref="FreezeUnwritten"/>. Meaningful only after <see cref="_frozen"/> is set.</summary>
+    private long _frozenAccepted;
     private bool _reportSealed;
 
     /// <summary>
@@ -145,9 +177,14 @@ public partial class BackgroundLogQueue : IDisposable
     /// <param name="settings">Capacity, batch, interval, async flag, and clock. The clock is not null.</param>
     /// <exception cref="ArgumentNullException"><paramref name="settings"/> has a null clock.</exception>
     /// <remarks>
-    /// The processor starts before this returns, so the clock cannot be changed afterwards.
+    /// The processor starts before this returns. It does not wait for the first idle wake, and a wake does not throw.
+    /// The clock cannot be changed afterwards.
     /// Does not throw for a writer failure. A flush interval the timer rejects still leaves the
     /// stopped signal unset, so <see cref="Dispose"/> waits out <see cref="ShutdownDeadline"/>.
+    /// Every event is queued. The processor writes it. A file or console writer is called
+    /// synchronously on that processor thread, which does not capture a caller context.
+    /// The full-drop report timer is created on this clock before the method returns.
+    /// Its due time and period are infinite, so the callback does not run until a full drop changes the due time.
     /// </remarks>
     internal BackgroundLogQueue(IReadOnlyList<ILogWriter> writers, QueueSettings settings)
     {
@@ -155,34 +192,39 @@ public partial class BackgroundLogQueue : IDisposable
         _capacity = settings.Capacity;
         _batchSize = settings.BatchSize;
         _flushInterval = settings.FlushInterval;
-        _asyncEnabled = settings.AsyncEnabled;
         _clock = settings.Clock;
         _fullMode = LogOptionRules.RequireMode(settings.FullMode);
         _shutdownDeadline = settings.FlushTimeout;
         LogOptionRules.RequireDuration(_shutdownDeadline, LogOptionRules.PathOf("FlushTimeout"));
         _newWriteBudget = LogOptionRules.DeriveCutoff(_shutdownDeadline);
 
-        _channel = Channel.CreateBounded<LogEvent>(new BoundedChannelOptions(settings.Capacity)
-        {
-            FullMode = BoundedChannelFullMode.Wait,
-            SingleReader = true,
-            SingleWriter = false
-        });
         var writerList = CopyWriters(writers);
+        _writers = writerList;
+        // File and console writers return inside Write, so the processor calls Write and skips the async state machine.
+        // Async off is not enough: a writer that waits must stay on the processor or the log call never returns.
+        _directDispatch = WritersCompleteOnCaller(writerList);
         _writerGate = new WriterGate(writerList);
         _dispatcher = new LogDispatcher(writerList, settings.AsyncEnabled, _writerGate);
+        // Before any enqueue. A full drop only changes the due time; it must not be the first CreateTimer.
+        // Infinite due and period: the callback does not run until ArmReportTimer calls Change.
         _reportTimer = _clock.CreateTimer(
             static state => ((BackgroundLogQueue)state!).DeliverFullDropReport(),
             this,
             Timeout.InfiniteTimeSpan,
             Timeout.InfiniteTimeSpan);
-        _backgroundTask = ProcessLogsAsync();
+        // Dedicated thread: the idle wait must not occupy a pool thread, or a frozen test clock
+        // cannot deliver its timer callback. LongRunning is a background thread.
+        _backgroundTask = Task.Factory.StartNew(
+            ProcessLogs,
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
     }
 
     /// <summary>Events the queue accepted before the close point. Not full drops and not closed drops.</summary>
     internal long AcceptedCount
     {
-        get { lock (_gate) return _accepted; }
+        get { return Interlocked.Read(ref _accepted); }
     }
 
     /// <summary>Accepted events whose writer call returned before the shutdown snapshot.</summary>
@@ -200,7 +242,9 @@ public partial class BackgroundLogQueue : IDisposable
     /// <summary>Events dropped because the queue was already at capacity. Counted with an interlocked increment.</summary>
     internal long FullDropCount => Interlocked.Read(ref _fullDrops);
 
-    /// <summary>Events offered after the close point. They were not queued.</summary>
+    /// <summary>
+    /// Events reported as ALOG0072. An offer after the close, and an accept the shutdown snapshot did not include.
+    /// </summary>
     internal long ClosedDropCount => Interlocked.Read(ref _closedDrops);
 
     /// <summary>
@@ -218,8 +262,57 @@ public partial class BackgroundLogQueue : IDisposable
     /// <summary>True after the processor has entered the idle timer wait at least once.</summary>
     internal bool IsIdleWaitEntered => Volatile.Read(ref _idleWaitEntered) != 0;
 
-    /// <summary>The source cancelled to wake the processor. A wake replaces this instance.</summary>
-    internal CancellationTokenSource WakeTokenSource => _wakeCts;
+    /// <summary>True after the processor has left its loop. Published before the stopped signal.</summary>
+    /// <remarks>Does not throw. An accept reads this after enqueue when the gate is already closed.</remarks>
+    internal bool ProcessorHasLeft => Volatile.Read(ref _processorLeft) != 0;
+
+    /// <summary>
+    /// Runs after a fast accept reserves a slot and before that event is placed on the channel.
+    /// </summary>
+    /// <remarks>
+    /// Production leaves this null, so the logging path is one volatile read. A test sets it to hold
+    /// the caller in that gap until <see cref="Dispose"/> has finished. The hook must not throw.
+    /// It runs on the logging thread and must not take the queue lock or call <see cref="Dispose"/>.
+    /// </remarks>
+    internal Action? BeforeEnqueue
+    {
+        get => Volatile.Read(ref _beforeEnqueue);
+        set => Volatile.Write(ref _beforeEnqueue, value);
+    }
+
+    /// <summary>
+    /// Runs on the processor immediately before the next batch is taken from the channel.
+    /// </summary>
+    /// <remarks>
+    /// Production leaves this null, so a batch is one volatile read. A test holds the processor here
+    /// until the channel contains the events that batch must see together.
+    /// The hook must not throw, take the queue lock, or call <see cref="Dispose"/>.
+    /// It runs on the processor thread. The logging thread does not.
+    /// </remarks>
+    internal Action? BeforeRead
+    {
+        get => Volatile.Read(ref _beforeRead);
+        set => Volatile.Write(ref _beforeRead, value);
+    }
+
+    /// <summary>
+    /// Encoded bytes parked outside the channel because the log file could not be reopened.
+    /// Each parked file line is the UTF-8 the configured formatter produced, including the newline.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. The processor updates the count. A reader may observe a stale value.
+    /// The count stays at or below <see cref="LogFileRegistry.DirectReopenByteBudget"/>.
+    /// Events still inside the channel are not included. Those are bounded by the queue capacity.
+    /// </remarks>
+    internal int DeferredHoldBytes => Volatile.Read(ref _frontBytes);
+
+    /// <summary>How many times a deferred file write has armed its retry wait. Zero until the first blocked reopen.</summary>
+    /// <remarks>Does not throw. The count moves before the processor blocks, so a test can advance the clock after it changes.</remarks>
+    internal int ReopenWaitsStarted => Volatile.Read(ref _reopenWaitsStarted);
+
+    /// <summary>How many times a caller signalled an idle processor. A wake that finds the processor busy does not count.</summary>
+    /// <remarks>Does not throw. The count moves on the thread that queued the event, before that call returns.</remarks>
+    internal int WakeSignals => Volatile.Read(ref _wakeSignals);
 
     /// <summary>How many shutdown waits have been registered on the clock. Zero before <see cref="Dispose"/> waits.</summary>
     internal int DisposeWaitsStarted => Volatile.Read(ref _disposeWaitsStarted);
@@ -296,9 +389,20 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw for a full or closed queue. Does not emit ALOG0070 for a cancelled entry.
     /// Safe to call from several threads. The task does not capture a caller context.
+    /// The event is queued. The processor writes it. This call does not write on the caller,
+    /// so a dispose that races this call cannot treat an in-progress write as an empty queue.
     /// </remarks>
     internal ValueTask EnqueueAsync(LogEvent logEvent, CancellationToken cancellationToken)
     {
+        if (cancellationToken.IsCancellationRequested)
+            return ValueTask.FromCanceled(cancellationToken);
+
+        if (TryFastAccept(logEvent))
+        {
+            WakeProcessor();
+            return ValueTask.CompletedTask;
+        }
+
         var result = Offer(logEvent, cancellationToken);
         if (result == OfferResult.Cancelled)
             return ValueTask.FromCanceled(cancellationToken);
@@ -317,16 +421,107 @@ public partial class BackgroundLogQueue : IDisposable
     /// <param name="logEvent">Event to write. Not inspected.</param>
     /// <returns>True when the event was accepted. False when it was dropped or the queue is closed.</returns>
     /// <remarks>
-    /// Does not throw. Does not wait for a writer to finish the event. Safe to call from several threads.
+    /// Does not throw. Safe to call from several threads.
     /// A false return is a drop. Drop mode does not wait. Block mode can wait while the queue is open.
+    /// The event is queued and the processor writes it. This call does not write on the caller.
+    /// <see cref="QueueFullMode.Block"/> still waits only while the queue is open and this thread is not the processor.
     /// </remarks>
     public bool TryEnqueue(LogEvent logEvent)
     {
-        if (Offer(logEvent, CancellationToken.None) != OfferResult.Accepted)
-            return false;
+        if (TryFastAccept(logEvent) || Offer(logEvent, CancellationToken.None) == OfferResult.Accepted)
+        {
+            WakeProcessor();
+            return true;
+        }
 
-        WakeProcessor();
+        return false;
+    }
+
+    /// <summary>
+    /// Accepts <paramref name="logEvent"/> without the gate lock when the queue is open, not full, and nobody is waiting.
+    /// </summary>
+    /// <param name="logEvent">Event to place on the channel.</param>
+    /// <returns>True when the channel holds the event. False when <see cref="Offer"/> must decide.</returns>
+    /// <remarks>
+    /// Does not throw. Does not wait. A closed queue returns false before the event is queued, so the locked path can count the drop.
+    /// The outstanding count moves before the close flag is read, so dispose cannot miss an accept that has started.
+    /// After the event is queued, a processor that has already finished cannot leave it uncounted: the caller reports it.
+    /// Block waiters stay on the locked path, so a waiting caller is not skipped by this one.
+    /// Any logging thread may call this. The processor does not.
+    /// </remarks>
+    private bool TryFastAccept(LogEvent logEvent)
+    {
+        // The increment is first so Dispose can see an accept that has started
+        // and so an accept that has not started observes the close flag.
+        var next = Interlocked.Increment(ref _outstanding);
+        if (Volatile.Read(ref _closedFast) != 0 || Volatile.Read(ref _registeredCount) != 0)
+        {
+            Interlocked.Decrement(ref _outstanding);
+            return false;
+        }
+
+        if (next > _capacity)
+        {
+            Interlocked.Decrement(ref _outstanding);
+            return false;
+        }
+
+        Volatile.Read(ref _beforeEnqueue)?.Invoke();
+        _queue.Enqueue(logEvent);
+        AccountQueuedAccept();
         return true;
+    }
+
+    /// <summary>
+    /// Counts an event that <see cref="TryFastAccept"/> has just placed on the channel.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Does not take the queue lock while the queue is open and the processor is still in its loop.
+    /// That path is the accepted increment plus two volatile reads.
+    /// After the queue has closed, <see cref="CountIfSnapshotMissed"/> reports the event when the
+    /// shutdown snapshot did not include it. That report is ALOG0072, including when a writer call
+    /// is still running and the processor has not left. The logging thread calls this. The processor does not.
+    /// </remarks>
+    private void AccountQueuedAccept()
+    {
+        var ticket = Interlocked.Increment(ref _accepted);
+        // Both flags are read after the increment. A dispose that has not published the close yet
+        // still observes this ticket. A close that is already visible is reconciled under the lock.
+        if (Volatile.Read(ref _processorLeft) == 0 && Volatile.Read(ref _closedFast) == 0)
+            return;
+
+        CountIfSnapshotMissed(ticket);
+    }
+
+    /// <summary>
+    /// Reports <paramref name="ticket"/> when the shutdown snapshot did not include it.
+    /// </summary>
+    /// <param name="ticket">The accepted count after this event was added. Greater than zero.</param>
+    /// <remarks>
+    /// Does not throw. Takes the queue lock to compare the ticket with the snapshot, then reports outside the lock.
+    /// A ticket the snapshot already includes stays in the accepted count. Dispose owns that ALOG0071 line.
+    /// A ticket accepted after the snapshot is removed from the accepted count and reported as ALOG0072.
+    /// It is not added to ALOG0071, so the deadline line stays one line.
+    /// The processor does not write that event: <see cref="PublishOutcome"/> sets the stop flag before the snapshot,
+    /// and this method runs only after the event is already queued. Called from the logging thread.
+    /// An event that was already inside a writer stays in the snapshot even when that write later finishes.
+    /// </remarks>
+    private void CountIfSnapshotMissed(long ticket)
+    {
+        var reportClosed = false;
+        lock (_gate)
+        {
+            // The snapshot includes this ticket, or Dispose has not frozen it yet and will.
+            if (!_closed || !_frozen || ticket <= _frozenAccepted)
+                return;
+
+            Interlocked.Decrement(ref _accepted);
+            Interlocked.Decrement(ref _outstanding);
+            NoteClosed(ref reportClosed);
+        }
+
+        if (reportClosed)
+            SelfLog.ReportLine(ClosedDropLine);
     }
 
     /// <summary>
@@ -402,8 +597,10 @@ public partial class BackgroundLogQueue : IDisposable
             return OfferResult.Closed;
         }
 
-        if (_outstanding >= _capacity || !_channel.Writer.TryWrite(logEvent))
+        var next = Interlocked.Increment(ref _outstanding);
+        if (next > _capacity)
         {
+            Interlocked.Decrement(ref _outstanding);
             if (_fullMode == QueueFullMode.Block && !OnConsumer())
                 return OfferResult.NeedWait;
 
@@ -411,8 +608,9 @@ public partial class BackgroundLogQueue : IDisposable
             return OfferResult.Full;
         }
 
-        _outstanding++;
-        _accepted++;
+        _queue.Enqueue(logEvent);
+
+        Interlocked.Increment(ref _accepted);
         return OfferResult.Accepted;
     }
 
@@ -432,6 +630,8 @@ public partial class BackgroundLogQueue : IDisposable
 
     /// <summary>
     /// Arms the report timer when no fire is already pending.
+    /// The constructor already created the timer on the injected clock with an infinite due time and period.
+    /// This method changes the due time. If the field is empty and dispose has not started, it creates that same timer first.
     /// The first line in a quiet period waits 1 ms so a burst becomes one count.
     /// A line inside an open 60 s window waits until that window ends.
     /// </summary>
@@ -442,8 +642,21 @@ public partial class BackgroundLogQueue : IDisposable
             return;
 
         var due = DueForReport();
+        var timer = _reportTimer;
+        if (timer is null)
+        {
+            if (Volatile.Read(ref _disposeOnce) != 0)
+                return;
+            timer = _clock.CreateTimer(
+                static state => ((BackgroundLogQueue)state!).DeliverFullDropReport(),
+                this,
+                Timeout.InfiniteTimeSpan,
+                Timeout.InfiniteTimeSpan);
+            _reportTimer = timer;
+        }
+
         // A false result means Dispose already disposed the timer. The count stays on the counter.
-        _ = _reportTimer.Change(due, Timeout.InfiniteTimeSpan);
+        _ = timer.Change(due, Timeout.InfiniteTimeSpan);
     }
 
     /// <summary>
@@ -521,7 +734,10 @@ public partial class BackgroundLogQueue : IDisposable
     /// </summary>
     /// <param name="count">Accepted events that were not written when the deadline won. Greater than zero.</param>
     /// <returns>The catalog sentence, with no extra prefix.</returns>
-    /// <remarks>Does not throw. Allocates the line. Called only from <see cref="Dispose"/>.</remarks>
+    /// <remarks>
+    /// Does not throw. Allocates the line.
+    /// <see cref="Dispose"/> calls this once for the snapshot. An accept after that snapshot is ALOG0072, not another line.
+    /// </remarks>
     private string FormatShutdown(long count)
     {
         return string.Concat(
@@ -572,26 +788,47 @@ public partial class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Cancels the idle wait so the processor looks at the channel.
-    /// The processor then hops to the pool, so this thread does not run the writer.
+    /// Signals the idle wait so the processor looks at the channel.
+    /// The logging thread does not run the writer. The dedicated processor thread does.
     /// </summary>
-    /// <remarks>Does not throw. Safe to call after the wait source has been replaced or disposed.</remarks>
+    /// <remarks>
+    /// Does not throw. Does not cancel a token and does not catch an exception on the normal path.
+    /// <see cref="Interlocked.Exchange(ref int, int)"/> both observes and clears <c>_idle</c>.
+    /// A separate read and write can miss a processor that enters the wait in between, and the event then sits until the flush interval.
+    /// Any thread that has just queued an event may call this. The processor is the only thread that waits.
+    /// </remarks>
     private void WakeProcessor()
+    {
+        if (Interlocked.Exchange(ref _idle, 0) == 0)
+            return;
+
+        Interlocked.Increment(ref _wakeSignals);
+        SignalWake();
+    }
+
+    /// <summary>
+    /// Sets the idle-wait event. A disposed event means the processor has already left.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Safe after <see cref="PublishOutcome"/> disposes the event.
+    /// The timer callback and <see cref="WakeProcessor"/> both call this. Neither path throws to wake the processor.
+    /// </remarks>
+    private void SignalWake()
     {
         try
         {
-            _wakeCts.Cancel();
+            _wake.Set();
         }
         catch (ObjectDisposedException)
         {
-            // Teardown already replaced or disposed the source. The processor is leaving or has left.
+            // PublishOutcome disposed the event after the processor left the wait.
         }
     }
 
     /// <summary>
-    /// Wakes the processor for shutdown. Cancels the idle wait and the shutdown signal together.
+    /// Wakes the processor for shutdown. The shutdown flag and the idle signal are both published.
     /// </summary>
-    /// <remarks>Does not throw. Cancel does not abandon a writer call that has already started.</remarks>
+    /// <remarks>Does not throw. The signal does not abandon a writer call that has already started.</remarks>
     private void SignalProcessor()
     {
         try
@@ -614,25 +851,51 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Writer failures are handled inside the dispatcher and do not stop the loop.
     /// A bad flush interval throws before the loop, so the stopped signal stays unset and
-    /// <see cref="Dispose"/> still waits out the deadline. The method runs on the pool after its first await,
-    /// so it is not a foreground thread. It ends when the stop flag is set, the deadline flag is set, or the gate is closed and idle.
+    /// <see cref="Dispose"/> still waits out the deadline. The constructor does not wait for that.
+    /// The method runs on a background thread, so it does not keep the process alive.
+    /// It ends when the stop flag is set, the deadline flag is set, or the gate is closed and idle.
+    /// The left flag is published before the stopped signal, and only after the loop was entered,
+    /// so a rejected flush interval does not look like a finished processor.
+    /// This thread is stored in <c>_consumerThread</c> before any wait, so a writer wait can reject every other thread.
     /// </remarks>
-    private async Task ProcessLogsAsync()
+    private void ProcessLogs()
     {
+        _consumerThread = Thread.CurrentThread;
         Volatile.Write(ref _processorEntered, 1);
-        var batch = new List<LogEvent>(BatchCapacity());
-        // Constructed before the loop so a rejected interval never sets the stopped signal.
-        using var timer = new PeriodicTimer(_flushInterval, _clock);
+        var batch = new List<LogEvent>(ReadLimit());
+        // Rejected before the loop so a bad interval never sets the stopped signal.
+        RequireFlushInterval(_flushInterval);
+        using var intervalTimer = _clock.CreateTimer(
+            static state => ((BackgroundLogQueue)state!).SignalWake(),
+            this,
+            _flushInterval,
+            _flushInterval);
         try
         {
             while (Volatile.Read(ref _stop) == 0 && !_writerGate.DeadlineReached)
             {
+                if (FrontBlocked())
+                {
+                    WaitForRetry();
+                    continue;
+                }
+
                 var count = ReadBatch(batch);
                 if (count > 0)
                 {
-                    await WriteAcceptedAsync(batch, count).ConfigureAwait(false);
+                    WriteAccepted(batch, count);
                     batch.Clear();
                     TryCompleteFlushIfIdle();
+                    continue;
+                }
+
+                // The hold is full and the channel still has events. Wait out the retry instead of spinning.
+                // Those events stay in the channel, bounded by its capacity, until the file can be written again.
+                if (Volatile.Read(ref _writeDeferred) != 0 && !_queue.IsEmpty)
+                {
+                    if (_clock.GetUtcNow().UtcTicks >= Volatile.Read(ref _retryNotBeforeTicks))
+                        ArmRetryDelay();
+                    WaitForRetry();
                     continue;
                 }
 
@@ -640,20 +903,61 @@ public partial class BackgroundLogQueue : IDisposable
                 if (IsClosedAndIdle())
                     break;
 
-                await WaitForWorkAsync(timer).ConfigureAwait(false);
+                WaitForWork();
             }
         }
         finally
         {
+            Volatile.Write(ref _processorLeft, 1);
             _stopped.Set();
         }
     }
 
     /// <summary>
+    /// Rejects a flush interval <see cref="PeriodicTimer"/> would reject.
+    /// </summary>
+    /// <param name="interval">The configured idle interval.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="interval"/> is below 1 ms or above 4294967295 ms.</exception>
+    /// <remarks>
+    /// Does not throw for a positive interval that fits in an unsigned millisecond count.
+    /// Called on the processor before the idle timer is created, so a rejected interval leaves the stopped signal unset.
+    /// Does not read the wall clock. Does not wait.
+    /// </remarks>
+    private static void RequireFlushInterval(TimeSpan interval)
+    {
+        var milliseconds = (long)interval.TotalMilliseconds;
+        if (milliseconds < 1 || milliseconds > uint.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(interval), interval, "Flush interval must be from 1 ms through 4294967295 ms.");
+    }
+
+    /// <summary>
+    /// How many events to take before the next wait.
+    /// File and console writers take a larger chunk so a full queue wakes once per chunk.
+    /// </summary>
+    /// <returns>At least one. At most <see cref="MaxRead"/>.</returns>
+    /// <remarks>
+    /// Does not throw. The configured batch size still applies to writers that do real async I/O.
+    /// A direct-dispatch writer raises a small batch to 512 so one wake covers more lines.
+    /// Only the processor thread calls this. The batch size does not change after construction.
+    /// </remarks>
+    private int ReadLimit()
+    {
+        var limit = BatchCapacity();
+        if (_directDispatch && limit < 512)
+            limit = 512;
+        if (limit > MaxRead)
+            return MaxRead;
+        return limit;
+    }
+
+    /// <summary>
     /// How many slots to reserve for one read. At least 1 and at most <see cref="MaxRead"/>.
     /// </summary>
-    /// <returns>The list capacity used for a batch.</returns>
-    /// <remarks>Does not throw. No side effects.</remarks>
+    /// <returns>The list capacity used for a batch, and the cap <see cref="ReadLimit"/> starts from.</returns>
+    /// <remarks>
+    /// Does not throw. No side effects. A batch size below 1 becomes 1 so a mis-set value still reads.
+    /// Only the processor thread calls this. The batch size does not change after construction.
+    /// </remarks>
     private int BatchCapacity()
     {
         if (_batchSize < 1)
@@ -669,19 +973,124 @@ public partial class BackgroundLogQueue : IDisposable
     /// Moves up to one batch from the channel into <paramref name="batch"/>.
     /// </summary>
     /// <param name="batch">Destination. Cleared by the caller before the next read. Not null.</param>
-    /// <returns>How many events were added. Zero when the channel has nothing ready.</returns>
-    /// <remarks>Does not throw. Does not write. The loop stops at the batch size or at <see cref="MaxRead"/>.</remarks>
+    /// <returns>How many events were added. Zero when the channel and the parked front have nothing ready.</returns>
+    /// <remarks>
+    /// Does not throw. Does not write. The loop stops at the batch size or at <see cref="MaxRead"/>.
+    /// <see cref="BeforeRead"/> runs first when a test set it. Production does not.
+    /// Parked events are taken first so a deferred line stays ahead of a line that arrived later.
+    /// While a reopen is failing, events still in the channel are taken only until the parked batch
+    /// would pass <see cref="LogFileRegistry.DirectReopenByteBudget"/>. The rest stay in the channel.
+    /// A formatter that throws on that path is removed and counted as ALOG0070. It is not written.
+    /// Only the processor calls this.
+    /// </remarks>
     private int ReadBatch(List<LogEvent> batch)
     {
-        var limit = BatchCapacity();
+        Volatile.Read(ref _beforeRead)?.Invoke();
+        var limit = ReadLimit();
         var count = 0;
-        while (count < limit && _channel.Reader.TryRead(out var logEvent))
+        var deferred = Volatile.Read(ref _writeDeferred) != 0;
+        var bytes = 0;
+        while (count < limit && _front.Count > 0)
         {
-            batch.Add(logEvent);
+            var parked = _front.Dequeue();
+            var size = HoldBytes(parked);
+            _frontBytes -= size;
+            if (deferred)
+                bytes += size;
+            batch.Add(parked);
             count++;
         }
 
+        if (_frontBytes < 0)
+            _frontBytes = 0;
+        Volatile.Write(ref _frontBytes, _frontBytes);
+
+        if (!deferred)
+        {
+            while (count < limit && _queue.TryDequeue(out var logEvent))
+            {
+                batch.Add(logEvent);
+                count++;
+            }
+
+            return count;
+        }
+
+        if (bytes >= LogFileRegistry.DirectReopenByteBudget)
+            return count;
+
+        return TakeDeferredChannel(batch, count, bytes, limit);
+    }
+
+    /// <summary>
+    /// Appends channel events that still fit in the reopen hold. A formatter that throws is dropped and counted.
+    /// </summary>
+    /// <param name="batch">Destination. Not null. Already holds any parked events.</param>
+    /// <param name="count">How many events <paramref name="batch"/> already holds. Not negative.</param>
+    /// <param name="bytes">Bytes already counted toward the hold. Not negative.</param>
+    /// <param name="limit">Most events this read may return. At least <paramref name="count"/>.</param>
+    /// <returns>The new event count. At least <paramref name="count"/> and at most <paramref name="limit"/>.</returns>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this, and only while a reopen has failed.
+    /// A throwing formatter is ALOG0070 and is not written. A line larger than the budget is still taken
+    /// when it is the first event of this read, so a later park can drop it if the write fails.
+    /// The loop stops at <paramref name="limit"/> or after <see cref="MaxRead"/> examinations.
+    /// </remarks>
+    private int TakeDeferredChannel(List<LogEvent> batch, int count, int bytes, int limit)
+    {
+        var examined = 0;
+        while (count < limit && examined < MaxRead)
+        {
+            examined++;
+            if (!_queue.TryPeek(out var peeked))
+                break;
+
+            var size = HoldBytes(peeked);
+            if (HoldCaptureFailed(peeked))
+            {
+                if (!_queue.TryDequeue(out var failed))
+                    break;
+
+                DropFailedHold(failed);
+                continue;
+            }
+
+            // One event that is itself over the budget is still attempted. Parking drops it if the write fails.
+            if (count > 0 && (long)bytes + size > LogFileRegistry.DirectReopenByteBudget)
+                break;
+
+            if (!_queue.TryDequeue(out var taken))
+                break;
+
+            batch.Add(taken);
+            bytes += size;
+            count++;
+            if (bytes >= LogFileRegistry.DirectReopenByteBudget)
+                break;
+        }
+
         return count;
+    }
+
+    /// <summary>True when the hold cache records that the formatter threw for <paramref name="logEvent"/>.</summary>
+    /// <param name="logEvent">The event just measured. Not null.</param>
+    /// <returns>True when the line must be dropped instead of written. False when the bytes are usable or not cached.</returns>
+    /// <remarks>Does not throw. Only the processor calls this, on the reopen-failure path. A healthy batch does not.</remarks>
+    private bool HoldCaptureFailed(LogEvent logEvent)
+        => _held.TryGetValue(logEvent, out var held) && held.Failed;
+
+    /// <summary>
+    /// Removes a line whose formatter threw and counts it as ALOG0070.
+    /// </summary>
+    /// <param name="logEvent">The event. Not null. The hold cache marks the capture as failed.</param>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this, on the reopen-failure path.
+    /// The line is not written. It is removed from the accepted count so dispose does not report it again.
+    /// </remarks>
+    private void DropFailedHold(LogEvent logEvent)
+    {
+        _held.Remove(logEvent);
+        NoteReopenHoldDropped(1);
     }
 
     /// <summary>
@@ -693,29 +1102,81 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. A writer exception is handled inside the dispatcher.
     /// The in-flight flag keeps <see cref="FlushAsync"/> from completing during the call.
+    /// A failed reopen stays deferred when shutdown stops the retry, so the Block caller is part of the ALOG0071 remainder.
+    /// A batch that started as a retry writes the bytes captured at hold time and does not format those lines again.
     /// </remarks>
-    private async Task WriteAcceptedAsync(List<LogEvent> batch, int count)
+    private void WriteAccepted(List<LogEvent> batch, int count)
     {
         Interlocked.Increment(ref _inflight);
+        var committed = 0;
+        var deferredNow = false;
+        // Captured before a shutdown stop can empty the front. The finally must not clear it in that window.
+        // replaying stays true for the whole batch so every line formatted at hold time is written as those bytes.
+        var replaying = Volatile.Read(ref _writeDeferred) != 0;
+        var retrying = replaying;
         try
         {
             var limit = count;
             for (var i = 0; i < limit; i++)
             {
                 if (Volatile.Read(ref _stop) != 0 || NewWritesBudgetSpent() || _writerGate.DeadlineReached)
+                {
+                    HoldDeferred(batch, i, count, retrying);
                     return;
+                }
 
-                var completed = await DispatchOneAsync(batch[i]).ConfigureAwait(false);
-                if (!completed)
+                var result = DispatchOne(batch[i], replaying);
+                if (result == DispatchResult.Deferred)
+                {
+                    ParkFront(batch, i, count);
+                    ArmRetryDelay();
+                    // Published before the retry wait, so Dispose can see a parked batch and free Block callers.
+                    deferredNow = true;
+                    Volatile.Write(ref _writeDeferred, 1);
                     return;
+                }
 
-                CommitWritten();
+                if (result == DispatchResult.Skipped)
+                {
+                    HoldDeferred(batch, i, count, retrying);
+                    return;
+                }
+
+                committed++;
+                retrying = false;
             }
         }
         finally
         {
+            if (committed > 0)
+                CommitBatch(committed);
+            // A failed reopen that dropped every parked line still has to retry. Clearing the flag here
+            // would pull the rest of the channel immediately and drop it.
+            if (_front.Count == 0 && !retrying && !deferredNow)
+                Volatile.Write(ref _writeDeferred, 0);
             Interlocked.Decrement(ref _inflight);
         }
+    }
+
+    /// <summary>
+    /// Puts a deferred batch back on the front when shutdown stops the retry before the write returns.
+    /// </summary>
+    /// <param name="batch">The batch just read. Not null.</param>
+    /// <param name="start">The first event that was not written.</param>
+    /// <param name="count">How many entries in the batch are live.</param>
+    /// <param name="retrying">True when this call was already a failed-reopen retry.</param>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this. A normal shutdown, where the file is not deferred, leaves the batch as it was.
+    /// The deferred flag stays set so a Block caller released at the flush timeout is counted in the ALOG0071 remainder.
+    /// The copy is bounded by <see cref="MaxRead"/>.
+    /// </remarks>
+    private void HoldDeferred(List<LogEvent> batch, int start, int count, bool retrying)
+    {
+        if (!retrying)
+            return;
+
+        ParkFront(batch, start, count);
+        Volatile.Write(ref _writeDeferred, 1);
     }
 
     /// <summary>
@@ -749,57 +1210,513 @@ public partial class BackgroundLogQueue : IDisposable
     /// Hands one event to every writer. A writer failure stays on the dispatcher error path.
     /// </summary>
     /// <param name="logEvent">The event. May be the default record value.</param>
-    /// <returns>False when the deadline skipped a writer. That event stays unwritten and is part of ALOG0071.</returns>
-    /// <remarks>Does not throw. Allocates nothing beyond what the dispatcher allocates. One event, so the deadline can be checked between events.</remarks>
-    private async Task<bool> DispatchOneAsync(LogEvent logEvent)
+    /// <param name="replaying">True when this batch started as a failed-reopen retry. The cached formatter bytes are written, and the line is not formatted again.</param>
+    /// <returns><see cref="DispatchResult.Skipped"/> when the deadline skipped a writer. That event stays unwritten and is part of ALOG0071. <see cref="DispatchResult.Deferred"/> when the file could not reopen and the event must stay queued.</returns>
+    /// <remarks>
+    /// Does not throw. A healthy batch passes false and does not look up a cached line.
+    /// One event, so the deadline can be checked between events. Only the processor calls this.
+    /// </remarks>
+    private DispatchResult DispatchOne(LogEvent logEvent, bool replaying)
     {
         var previousQueue = ConsumerQueue.Value;
-        var previousThread = Volatile.Read(ref _consumerThread);
+        var previousThread = Volatile.Read(ref _consumerThreadId);
         ConsumerQueue.Value = this;
-        Volatile.Write(ref _consumerThread, Environment.CurrentManagedThreadId);
+        Volatile.Write(ref _consumerThreadId, Environment.CurrentManagedThreadId);
         try
         {
             _writerGate.PrepareEvent();
             try
             {
-                if (!_asyncEnabled)
-                    _dispatcher.Dispatch(logEvent);
-                else
-                    await _dispatcher.DispatchAsync(logEvent).ConfigureAwait(false);
+                var wroteHeld = replaying && TryReplayHeld(logEvent);
+                if (!wroteHeld)
+                {
+                    if (_directDispatch)
+                        _dispatcher.Dispatch(logEvent);
+                    else
+                        WaitWriterOnConsumerThread(_dispatcher.DispatchAsync(logEvent));
+                }
+            }
+            catch (WriteDeferredException)
+            {
+                return DispatchResult.Deferred;
             }
             catch (Exception ex)
             {
                 Console.Error.WriteLine("[BackgroundLogQueue] Batch processing error: " + ex.GetType().Name);
             }
 
-            return !_writerGate.EventSkipped;
+            if (replaying && !_writerGate.EventSkipped)
+                _held.Remove(logEvent);
+
+            return _writerGate.EventSkipped ? DispatchResult.Skipped : DispatchResult.Written;
         }
         finally
         {
             ConsumerQueue.Value = previousQueue;
-            Volatile.Write(ref _consumerThread, previousThread);
+            Volatile.Write(ref _consumerThreadId, previousThread);
         }
     }
 
     /// <summary>
-    /// Records that one accepted event finished its writer call, unless the shutdown snapshot already froze the counts.
+    /// Writes the UTF-8 captured when this event was parked. A miss lets the caller format it.
     /// </summary>
+    /// <param name="logEvent">The event being retried. Not null.</param>
+    /// <returns>True when the cached lines were handed to the writers. False when there is no cached file line.</returns>
     /// <remarks>
-    /// Does not throw. Takes <see cref="_gate"/>. A frozen count leaves the event inside the unwritten snapshot
-    /// so a call that returns after the deadline cannot change the reported number.
+    /// Does not throw for a writer failure other than <see cref="WriteDeferredException"/>, which escapes.
+    /// Only the processor calls this, and only when the batch started as a failed-reopen retry.
+    /// A healthy batch does not call it, so the lookup stays off the success path.
     /// </remarks>
-    private void CommitWritten()
+    private bool TryReplayHeld(LogEvent logEvent)
+    {
+        if (!_held.TryGetValue(logEvent, out var held) || held.Lines is null || held.Lines.Length != _writers.Count)
+            return false;
+
+        WriteHeld(logEvent, held);
+        return true;
+    }
+
+    /// <summary>
+    /// Appends each cached file line and sends the event to every writer that has no cached line.
+    /// </summary>
+    /// <param name="logEvent">The event. Passed to a writer that is not a file writer.</param>
+    /// <param name="held">The lines captured for this event. <see cref="HeldLines.Lines"/> matches the writer list.</param>
+    /// <remarks>
+    /// Does not format. <see cref="WriteDeferredException"/> escapes after the writer is marked idle, so the queue can park the event again.
+    /// The loop is bounded by the writer list. Only the processor calls this, on a failed-reopen retry.
+    /// </remarks>
+    private void WriteHeld(LogEvent logEvent, HeldLines held)
+    {
+        var lines = held.Lines!;
+        var count = _writers.Count;
+        for (var i = 0; i < count; i++)
+        {
+            if (!_writerGate.BeginWriterCall(i))
+                continue;
+
+            try
+            {
+                var prepared = lines[i];
+                if (prepared is not null && _writers[i] is FileLogWriter file)
+                    file.WritePrepared(prepared);
+                else
+                    WriteReplayOther(_writers[i], logEvent);
+            }
+            finally
+            {
+                _writerGate.EndWriterCall(i);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Writes one non-file writer during a replay. A file writer uses its cached bytes instead.
+    /// </summary>
+    /// <param name="writer">The destination. Not null. Not a file writer with a cached line.</param>
+    /// <param name="logEvent">The event. Passed through.</param>
+    /// <remarks>
+    /// Does not throw except <see cref="WriteDeferredException"/>. The file and console path calls <see cref="ILogWriter.Write"/>.
+    /// Any other writer uses the async method and waits on this processor thread. Only a failed-reopen retry calls this.
+    /// </remarks>
+    private void WriteReplayOther(ILogWriter writer, LogEvent logEvent)
+    {
+        if (_directDispatch)
+        {
+            writer.Write(logEvent);
+            return;
+        }
+
+        // A faulted task can already be completed. The wait surfaces WriteDeferredException.
+        WaitWriterOnConsumerThread(writer.WriteAsync(logEvent));
+    }
+
+    /// <summary>
+    /// Waits until <paramref name="task"/> finishes. A faulted task throws here, including when it is already complete.
+    /// </summary>
+    /// <param name="task">The writer task. Not null. It may already be completed.</param>
+    /// <exception cref="InvalidOperationException">This thread is not the queue's consumer thread.</exception>
+    /// <remarks>
+    /// Throws <see cref="InvalidOperationException"/> when the caller is not the processor thread stored at start.
+    /// The message is "WaitWriterOnConsumerThread runs only on the queue's consumer thread."
+    /// Does not throw otherwise except the task's own exception. Only the processor calls this.
+    /// A log call does not, and no caller SynchronizationContext is captured.
+    /// The check is this method's first line. The file and console path does not call this method.
+    /// The timeout is the writer task itself. FlushTimeout stops a new writer call and does not cancel one that has started.
+    /// </remarks>
+    internal void WaitWriterOnConsumerThread(Task task)
+    {
+        if (Thread.CurrentThread != _consumerThread)
+            throw new InvalidOperationException("WaitWriterOnConsumerThread runs only on the queue's consumer thread.");
+
+        task.GetAwaiter().GetResult(); // WaitWriterOnConsumerThread
+    }
+
+    /// <summary>What one processor write did with an event.</summary>
+    private enum DispatchResult
+    {
+        /// <summary>The writer call returned. The event can be committed.</summary>
+        Written = 0,
+
+        /// <summary>The file could not reopen. The event and the rest of the batch go back to the front.</summary>
+        Deferred = 1,
+
+        /// <summary>The shutdown deadline skipped the writer. The event stays in the unwritten count.</summary>
+        Skipped = 2
+    }
+
+    /// <summary>
+    /// Puts <paramref name="batch"/> entries from <paramref name="start"/> back in front of anything already parked.
+    /// </summary>
+    /// <param name="batch">The batch just read. Not null. Entries at and after <paramref name="start"/> are not committed.</param>
+    /// <param name="start">The first event that was not written. Not negative.</param>
+    /// <param name="count">How many entries in the batch are live. Greater than <paramref name="start"/>.</param>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this. The copy is bounded by <see cref="MaxRead"/>.
+    /// Lines that do not fit in <see cref="LogFileRegistry.DirectReopenByteBudget"/> are not parked.
+    /// They are counted with ALOG0070 and are no longer accepted, so dispose does not report them again.
+    /// Events that were not read stay in the channel and are bounded only by the queue capacity.
+    /// </remarks>
+    private void ParkFront(List<LogEvent> batch, int start, int count)
+    {
+        var dropped = 0;
+        var bytes = _frontBytes;
+        var room = LogFileRegistry.DirectReopenLineBudget - _front.Count;
+        if (room < 0)
+            room = 0;
+
+        var kept = new Queue<LogEvent>(count > start ? count - start : 0);
+        for (var i = start; i < count; i++)
+        {
+            var size = HoldBytes(batch[i]);
+            if (room <= 0 || (long)bytes + size > LogFileRegistry.DirectReopenByteBudget)
+            {
+                _held.Remove(batch[i]);
+                dropped++;
+                continue;
+            }
+
+            kept.Enqueue(batch[i]);
+            bytes += size;
+            room--;
+        }
+
+        if (_front.Count == 0)
+        {
+            while (kept.Count > 0)
+                _front.Enqueue(kept.Dequeue());
+        }
+        else
+        {
+            while (_front.Count > 0)
+                kept.Enqueue(_front.Dequeue());
+
+            while (kept.Count > 0)
+                _front.Enqueue(kept.Dequeue());
+        }
+
+        Volatile.Write(ref _frontBytes, bytes);
+        if (dropped > 0)
+            NoteReopenHoldDropped(dropped);
+    }
+
+    /// <summary>
+    /// Bytes this event adds to the parked batch. A file writer contributes the UTF-8 of its formatted line, including the newline.
+    /// </summary>
+    /// <param name="logEvent">The event. The message may be empty.</param>
+    /// <returns>The cached size when this event was already measured. Otherwise the formatter size. At most <see cref="int.MaxValue"/>.</returns>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this, and only while a reopen has failed
+    /// or a parked batch is being put back. A healthy queue does not call it.
+    /// The formatted bytes are kept so the retry writes those exact bytes and does not format again.
+    /// A formatter that throws counts as one byte past the budget, so the line is dropped and counted as ALOG0070.
+    /// There is no multiplier. A queue with no file writer charges the message UTF-8 plus <see cref="PlainLineOverhead"/>.
+    /// </remarks>
+    private int HoldBytes(LogEvent logEvent)
+    {
+        if (_held.TryGetValue(logEvent, out var cached))
+            return cached.Bytes;
+
+        return CaptureHold(logEvent);
+    }
+
+    /// <summary>
+    /// Formats <paramref name="logEvent"/> for each file writer and remembers the total.
+    /// </summary>
+    /// <param name="logEvent">The event. Not null. Not already in the cache.</param>
+    /// <returns>The byte count stored for this event. One past the budget when a formatter throws.</returns>
+    /// <remarks>
+    /// Does not throw. The loop is bounded by the writer list. Only <see cref="HoldBytes"/> calls this, on the reopen-failure path.
+    /// A line larger than the budget remembers the size and not the bytes, so a dropped line does not keep the array.
+    /// A formatter that throws is marked failed. The queue counts that line as ALOG0070 and does not write it.
+    /// </remarks>
+    private int CaptureHold(LogEvent logEvent)
+    {
+        var count = _writers.Count;
+        var lines = new byte[]?[count];
+        long total = 0;
+        var anyFile = false;
+        for (var i = 0; i < count; i++)
+        {
+            if (_writers[i] is not FileLogWriter file)
+                continue;
+
+            anyFile = true;
+            if (!TryCapture(file, logEvent, out var captured))
+                return RememberSize(logEvent, null, OverBudgetHold(), failed: true);
+
+            lines[i] = captured;
+            total += captured.Length;
+            if (total > LogFileRegistry.DirectReopenByteBudget)
+                return RememberSize(logEvent, null, SaturatingHold(total), failed: false);
+        }
+
+        if (!anyFile)
+            return RememberSize(logEvent, null, SaturatingHold(PlainHold(logEvent)), failed: false);
+
+        return RememberSize(logEvent, lines, SaturatingHold(total), failed: false);
+    }
+
+    /// <summary>
+    /// Stores <paramref name="size"/> for <paramref name="logEvent"/> and returns it.
+    /// </summary>
+    /// <param name="logEvent">The event. Not null.</param>
+    /// <param name="lines">Cached file lines, or null when the line will not be replayed from those bytes.</param>
+    /// <param name="size">The count the budget uses. Not negative.</param>
+    /// <param name="failed">True when the formatter threw. The line is then dropped and counted, not written.</param>
+    /// <returns><paramref name="size"/>, or the size already stored for this event.</returns>
+    /// <remarks>Does not throw. Only the processor calls this, on the reopen-failure path. A second store keeps the first size.</remarks>
+    private int RememberSize(LogEvent logEvent, byte[]?[]? lines, int size, bool failed)
+    {
+        if (!_held.TryAdd(logEvent, new HeldLines(lines, size, failed)) && _held.TryGetValue(logEvent, out var existing))
+            return existing.Bytes;
+
+        return size;
+    }
+
+    /// <summary>One byte past the reopen budget, so a line of that size is not parked.</summary>
+    /// <returns>The budget plus one, or <see cref="int.MaxValue"/> if that sum does not fit.</returns>
+    /// <remarks>Does not throw. No lock. Only the reopen-failure path calls this.</remarks>
+    private static int OverBudgetHold()
+        => SaturatingHold((long)LogFileRegistry.DirectReopenByteBudget + 1);
+
+    /// <summary>
+    /// UTF-8 size of the message plus <see cref="PlainLineOverhead"/>. Used when no writer is a file writer.
+    /// </summary>
+    /// <param name="logEvent">The event. The message may be empty.</param>
+    /// <returns>At least <see cref="PlainLineOverhead"/>.</returns>
+    /// <remarks>Does not throw. Does not allocate. Only the reopen-failure path calls this. Not a multiplier.</remarks>
+    private static long PlainHold(LogEvent logEvent)
+    {
+        var message = logEvent.Message;
+        var body = string.IsNullOrEmpty(message) ? 0 : Encoding.UTF8.GetByteCount(message);
+        return body + PlainLineOverhead;
+    }
+
+    /// <summary>Reads one file writer's formatted line. A throw is a failed capture.</summary>
+    /// <param name="file">The writer. Not null.</param>
+    /// <param name="logEvent">The event. Not null.</param>
+    /// <param name="captured">The UTF-8 line, including the newline, when the result is true. Empty when false.</param>
+    /// <returns>False when the formatter throws. The caller then drops the line and counts it as ALOG0070.</returns>
+    /// <remarks>Does not throw. Only the processor calls this, on the reopen-failure path.</remarks>
+    private static bool TryCapture(FileLogWriter file, LogEvent logEvent, out byte[] captured)
+    {
+        try
+        {
+            captured = file.CaptureLine(logEvent);
+            return true;
+        }
+        catch (Exception)
+        {
+            captured = Array.Empty<byte>();
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Clamps a parked-byte total into an int. A sum past <see cref="int.MaxValue"/> becomes that maximum.
+    /// </summary>
+    /// <param name="total">Message bytes, the plain prefix, and any attachment. Not negative for a real event.</param>
+    /// <returns><paramref name="total"/> when it fits in an int. <see cref="int.MaxValue"/> when it does not.</returns>
+    /// <remarks>
+    /// Does not throw. No lock. <see cref="HoldBytes"/> calls this on the processor, and only on the reopen-failure path.
+    /// A message whose UTF-8 size is near <see cref="int.MaxValue"/> plus the attachment can pass that maximum.
+    /// The caller then treats the line as too large to park.
+    /// </remarks>
+    internal static int SaturatingHold(long total)
+    {
+        if (total > int.MaxValue)
+            return int.MaxValue;
+
+        return (int)total;
+    }
+
+    /// <summary>
+    /// One parked event's formatted file lines and the byte count the reopen budget charges.
+    /// </summary>
+    private sealed class HeldLines
+    {
+        /// <summary>Stores the lines, the count, and whether the formatter threw.</summary>
+        /// <param name="lines">One slot per writer, or null when the bytes are not kept. A null slot is not a file line.</param>
+        /// <param name="bytes">The count. Not negative.</param>
+        /// <param name="failed">True when the formatter threw. The queue then counts the line as ALOG0070.</param>
+        /// <remarks>Does not throw. The processor creates this on the reopen-failure path. The array is not copied.</remarks>
+        internal HeldLines(byte[]?[]? lines, int bytes, bool failed)
+        {
+            Lines = lines;
+            Bytes = bytes;
+            Failed = failed;
+        }
+
+        /// <summary>Cached UTF-8 lines, including newlines. Null when only the count is kept.</summary>
+        internal byte[]?[]? Lines { get; }
+
+        /// <summary>Bytes charged against the reopen budget.</summary>
+        internal int Bytes { get; }
+
+        /// <summary>True when the formatter threw. The line is dropped and counted, not written.</summary>
+        internal bool Failed { get; }
+    }
+
+    /// <summary>
+    /// Counts lines that did not fit in the parked batch and reports them at most once a minute.
+    /// </summary>
+    /// <param name="count">Lines dropped by this park. Greater than zero.</param>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this. The first drop in a quiet period reports immediately.
+    /// Later drops in the same minute stay in the count until the minute ends or dispose writes them.
+    /// The sentence is the file-buffer ALOG0070 line.
+    /// The accepted count loses these lines so a later ALOG0071 does not include them.
+    /// A formatter that throws is one of these drops. It is not a silent loss.
+    /// </remarks>
+    private void NoteReopenHoldDropped(int count)
+    {
+        if (!ForgetDropped(count))
+            return;
+
+        lock (_reportGate)
+        {
+            _holdDrops += count;
+            var now = _clock.GetUtcNow();
+            var windowOpen = _holdReportedTicks != 0 && now.UtcTicks - _holdReportedTicks < TimeSpan.TicksPerMinute;
+            if (windowOpen && !_reportSealed)
+                return;
+
+            var reported = _holdDrops;
+            _holdDrops = 0;
+            if (!_reportSealed)
+                _holdReportedTicks = now.UtcTicks;
+            if (reported > 0)
+                SelfLog.ReportLine(LogFileRegistry.BufferFullLine(reported));
+        }
+    }
+
+    /// <summary>
+    /// Removes <paramref name="count"/> events from the accepted and outstanding counts.
+    /// </summary>
+    /// <param name="count">How many parked lines were dropped. Greater than zero.</param>
+    /// <returns>False when the shutdown snapshot already includes the events. True when they were removed.</returns>
+    /// <remarks>
+    /// Does not throw. Takes the queue lock so a shutdown snapshot cannot miss the removal halfway.
+    /// A snapshot that already ran keeps the events in that remainder instead. Only the processor calls this.
+    /// </remarks>
+    private bool ForgetDropped(int count)
     {
         lock (_gate)
         {
-            if (_outstanding > 0)
-            {
-                _outstanding--;
-                SignalWaiters();
-            }
+            if (_frozen)
+                return false;
 
+            Interlocked.Add(ref _accepted, -count);
+        }
+
+        Interlocked.Add(ref _outstanding, -count);
+        return true;
+    }
+
+    /// <summary>Records the earliest time a parked file event may be tried again.</summary>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this. The delay is one second, or the queue flush interval when that is longer.
+    /// The clock is the queue clock, so a test moves the wait with <see cref="TimeProvider.GetUtcNow"/>.
+    /// </remarks>
+    private void ArmRetryDelay()
+    {
+        var delay = _flushInterval > MinimumReopenRetry ? _flushInterval : MinimumReopenRetry;
+        var due = _clock.GetUtcNow().UtcTicks + delay.Ticks;
+        Volatile.Write(ref _retryNotBeforeTicks, due);
+    }
+
+    /// <summary>True when a failed reopen must wait for the retry time.</summary>
+    /// <returns>True when the clock has not reached the retry time and a batch is parked or a drop left the retry active.</returns>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this.
+    /// An empty front with no failed reopen is not blocked. A failed reopen waits even when every parked line was dropped,
+    /// so the processor does not pull the rest of the channel in a loop.
+    /// </remarks>
+    private bool FrontBlocked()
+    {
+        if (_front.Count == 0 && Volatile.Read(ref _writeDeferred) == 0)
+            return false;
+
+        return _clock.GetUtcNow().UtcTicks < Volatile.Read(ref _retryNotBeforeTicks);
+    }
+
+    /// <summary>How long remains before a parked event may be written.</summary>
+    /// <returns>Zero when the retry time has passed. Otherwise the remainder on the queue clock.</returns>
+    /// <remarks>Does not throw. Only the processor calls this.</remarks>
+    private TimeSpan RetryRemaining()
+    {
+        var due = Volatile.Read(ref _retryNotBeforeTicks);
+        var now = _clock.GetUtcNow().UtcTicks;
+        if (now >= due)
+            return TimeSpan.Zero;
+
+        return TimeSpan.FromTicks(due - now);
+    }
+
+    /// <summary>
+    /// Blocks until the retry time or until shutdown releases the processor.
+    /// A wake from a new event does not shorten the wait.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this. The timer uses the queue clock.
+    /// The count moves before the wait, so a test can advance the clock after <see cref="ReopenWaitsStarted"/> changes.
+    /// Shutdown sets <see cref="_releaseRetry"/> so a frozen clock cannot leave the processor blocked past the deadline.
+    /// </remarks>
+    private void WaitForRetry()
+    {
+        var remaining = RetryRemaining();
+        if (remaining <= TimeSpan.Zero || _releaseRetry.IsSet)
+            return;
+
+        using var ready = new ManualResetEventSlim(false);
+        using var timer = _clock.CreateTimer(
+            static state => ((ManualResetEventSlim)state!).Set(),
+            ready,
+            remaining,
+            Timeout.InfiniteTimeSpan);
+        Interlocked.Increment(ref _reopenWaitsStarted);
+        WaitHandle.WaitAny(new[] { ready.WaitHandle, _releaseRetry.WaitHandle });
+    }
+
+    /// <summary>
+    /// Records <paramref name="written"/> finished events and wakes blocked callers once.
+    /// </summary>
+    /// <param name="written">Events whose writer call returned. Greater than zero.</param>
+    /// <remarks>
+    /// Does not throw. One signal per batch, not per event, so a full queue does not wake every caller for every line.
+    /// Takes <see cref="_gate"/>. A frozen shutdown snapshot leaves these events inside the unwritten count,
+    /// so a call that returns after the deadline cannot change the reported number.
+    /// Only the processor thread calls this. Waiters may run on other threads after the signal.
+    /// </remarks>
+    private void CommitBatch(int written)
+    {
+        Interlocked.Add(ref _outstanding, -written);
+        lock (_gate)
+        {
             if (!_frozen)
-                _written++;
+                _written += written;
+            if (_registeredCount > 0)
+                SignalWaiters();
         }
     }
 
@@ -813,7 +1730,7 @@ public partial class BackgroundLogQueue : IDisposable
         if (!IsGateClosed())
             return false;
 
-        if (_channel.Reader.Count > 0)
+        if (!_queue.IsEmpty || _front.Count > 0)
             return false;
 
         return Volatile.Read(ref _inflight) == 0;
@@ -829,112 +1746,30 @@ public partial class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Waits for a wake, a shutdown signal, or the flush interval.
-    /// A wake hops to the pool so the thread that queued the event does not run the writer.
+    /// Blocks this processor thread until a wake, a shutdown signal, or the flush interval.
+    /// The wait stays on this thread, so a signal from the logging thread does not run the writer there.
     /// </summary>
-    /// <param name="timer">Interval timer. Not null. Disposed by the caller when the processor exits.</param>
     /// <remarks>
-    /// Does not throw. A cancelled wait is a wake or shutdown. The hop keeps the writer off the thread that queued the event.
-    /// A tick that is not cancelled returns so the caller can read the channel.
+    /// Does not throw on the normal path. The wait is an event, not a cancelled timer, so the first wake does not throw.
+    /// The flush-interval timer sets the same event. A frozen test clock does not have to move for a log call to release the wait.
+    /// The idle flag is set before the queue is checked again. An enqueue that lands in that window either sees the flag and signals,
+    /// or is observed by the recheck, so the event is not left until the flush interval.
+    /// The shutdown token is part of that recheck, so dispose wakes a processor that has not entered the wait yet.
+    /// Only the processor thread calls this. Other threads only set the event.
     /// </remarks>
-    private async Task WaitForWorkAsync(PeriodicTimer timer)
+    private void WaitForWork()
     {
         Volatile.Write(ref _idleWaitEntered, 1);
-        try
+        Interlocked.Exchange(ref _idle, 1);
+        _wake.Reset();
+        if (!_queue.IsEmpty || Volatile.Read(ref _stop) != 0 || _shutdownSignal.IsCancellationRequested)
         {
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-                _wakeCts.Token,
-                _shutdownSignal.Token);
-            await timer.WaitForNextTickAsync(linked.Token).ConfigureAwait(false);
+            Interlocked.Exchange(ref _idle, 0);
+            return;
         }
-        catch (OperationCanceledException)
-        {
-            ReplaceWakeCts();
-            // The cancel can resume on the thread that queued the event. This hop is never complete,
-            // so the writer call cannot run on that thread.
-            await new PoolHop().ConfigureAwait(false);
-        }
-    }
 
-    /// <summary>
-    /// Awaitable that always resumes on the thread pool and never on a caller context.
-    /// </summary>
-    /// <remarks>
-    /// <c>Task.Yield</c> cannot take <c>ConfigureAwait</c>. A completed <see cref="Task"/>
-    /// would resume on the enqueue thread. <see cref="PoolHopAwaiter.IsCompleted"/> is false,
-    /// so the await always queues the continuation.
-    /// </remarks>
-    private readonly struct PoolHop
-    {
-        /// <summary>
-        /// Returns the awaiter used when a caller forgets <see cref="ConfigureAwait"/>.
-        /// </summary>
-        /// <returns>An awaiter that is never already complete.</returns>
-        public PoolHopAwaiter GetAwaiter() => default;
-
-        /// <summary>
-        /// Returns the same pool hop. The flag is accepted so call sites can say
-        /// <c>ConfigureAwait(false)</c>. The hop never resumes on a captured context.
-        /// </summary>
-        /// <param name="continueOnCapturedContext">Ignored. False is the only intended value.</param>
-        /// <returns>An awaitable that resumes on the thread pool.</returns>
-        public ConfiguredPoolHop ConfigureAwait(bool continueOnCapturedContext) => default;
-    }
-
-    /// <summary>
-    /// The result of <see cref="PoolHop.ConfigureAwait"/>. Same hop, named so the call is visible.
-    /// </summary>
-    private readonly struct ConfiguredPoolHop
-    {
-        /// <summary>
-        /// Returns the pool awaiter.
-        /// </summary>
-        /// <returns>An awaiter that is never already complete.</returns>
-        public PoolHopAwaiter GetAwaiter() => default;
-    }
-
-    /// <summary>
-    /// Schedules the continuation on the thread pool. <see cref="IsCompleted"/> is always false.
-    /// </summary>
-    private readonly struct PoolHopAwaiter : ICriticalNotifyCompletion
-    {
-        /// <summary>Always false, so the await cannot continue inline on the enqueue thread.</summary>
-        public bool IsCompleted => false;
-
-        /// <summary>
-        /// Queues <paramref name="continuation"/> on the thread pool.
-        /// </summary>
-        /// <param name="continuation">The rest of the processor loop. Not null.</param>
-        /// <remarks>One work item is allocated. The enqueue thread does not run it.</remarks>
-        public void OnCompleted(Action continuation)
-            => ThreadPool.QueueUserWorkItem(static state => ((Action)state!).Invoke(), continuation);
-
-        /// <summary>
-        /// Queues <paramref name="continuation"/> without flowing the caller execution context.
-        /// </summary>
-        /// <param name="continuation">The rest of the processor loop. Not null.</param>
-        /// <remarks>
-        /// The compiler prefers this method. Skipping the context flow keeps the caller
-        /// <see cref="SynchronizationContext"/> off the processor.
-        /// </remarks>
-        public void UnsafeOnCompleted(Action continuation)
-            => ThreadPool.UnsafeQueueUserWorkItem(static state => ((Action)state!).Invoke(), continuation);
-
-        /// <summary>Nothing to return. The hop has no result and no failure of its own.</summary>
-        public void GetResult()
-        {
-        }
-    }
-
-    /// <summary>
-    /// Replaces the wake source so the next wait is not already cancelled.
-    /// </summary>
-    /// <remarks>Does not throw. The old source is disposed. Called only on the processor after a wake.</remarks>
-    private void ReplaceWakeCts()
-    {
-        var old = _wakeCts;
-        _wakeCts = new CancellationTokenSource();
-        old.Dispose();
+        _wake.Wait();
+        Interlocked.Exchange(ref _idle, 0);
     }
 
     /// <summary>
@@ -943,7 +1778,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>Does not throw. Does not emit ALOG0071. A flush that expires is completed by <see cref="FlushAsync"/> itself.</remarks>
     private void TryCompleteFlushIfIdle()
     {
-        if (_channel.Reader.Count > 0 || Volatile.Read(ref _inflight) > 0)
+        if (!_queue.IsEmpty || _front.Count > 0 || Volatile.Read(ref _inflight) > 0)
             return;
 
         var tcs = Interlocked.Exchange(ref _flushTcs, null);
@@ -958,23 +1793,56 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. Does not dispose writers. A closed queue returns without waiting.
     /// The deadline timer uses the injected clock and does not capture a caller context.
+    /// A queue that is already idle returns a completed task and does not arm that timer.
+    /// That return does not include an event whose accept has not happened yet.
     /// </remarks>
-    public async Task FlushAsync()
+    public Task FlushAsync()
+    {
+        if (_shutdownDeadline > TimeSpan.Zero
+            && _queue.IsEmpty
+            && Volatile.Read(ref _inflight) == 0
+            && Volatile.Read(ref _outstanding) == 0
+            && !IsGateClosed())
+            return Task.CompletedTask;
+
+        return FlushAsyncCore();
+    }
+
+    /// <summary>The flush used when the channel is not already idle. Keeps the deadline timer off the idle path.</summary>
+    /// <returns>A task that finishes when the queue is idle, the deadline passes, or the queue is already closed.</returns>
+    /// <remarks>Does not throw. An idle call never enters this method, so a cold process does not compile it.</remarks>
+    private Task FlushAsyncCore()
     {
         if (IsGateClosed())
-            return;
+            return Task.CompletedTask;
 
         if (_shutdownDeadline <= TimeSpan.Zero)
         {
             TryCompleteFlushIfIdle();
-            return;
+            return Task.CompletedTask;
         }
 
         var idle = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         Interlocked.Exchange(ref _flushTcs, idle);
         WakeProcessor();
         TryCompleteFlushIfIdle();
+        if (idle.Task.IsCompleted)
+            return Task.CompletedTask;
 
+        return WaitForFlushAsync(idle);
+    }
+
+    /// <summary>
+    /// Waits for <paramref name="idle"/> or the flush deadline. Called only when the queue was not idle at the check.
+    /// </summary>
+    /// <param name="idle">The task the processor completes. Not null. Already published in <see cref="_flushTcs"/>.</param>
+    /// <returns>A task that finishes when the queue is idle or the deadline passes.</returns>
+    /// <remarks>
+    /// Does not throw. Arms one deadline timer on the injected clock. An idle queue never enters this method,
+    /// so a cold process does not compile the timer wait. The deadline still releases a blocked writer.
+    /// </remarks>
+    private async Task WaitForFlushAsync(TaskCompletionSource<bool> idle)
+    {
         var deadline = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         // The timer keeps a one-tick remainder. A millisecond-truncated delay would fire that tick early.
         using var timer = _clock.CreateTimer(
@@ -1017,32 +1885,28 @@ public partial class BackgroundLogQueue : IDisposable
     /// <see cref="WriterGate.EndWriterCall"/>, which disposes that writer only after the call returns.
     /// The first call waits at most <see cref="ShutdownDeadline"/> on the injected clock. A second call does not wait
     /// and does not emit another ALOG0071. Events offered after the close are counted, and the first one reports ALOG0072.
+    /// Every clock takes this path, including an idle <see cref="ProductionClock"/>. The processor is always signalled,
+    /// so its dedicated thread leaves the idle timer instead of staying blocked until the flush interval.
+    /// Cancelling that wait does not advance a frozen test clock and does not set the stop flag, so events already queued are still written.
+    /// When the processor has stopped, <see cref="PublishOutcome"/> disposes the shutdown and wake sources.
     /// </remarks>
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposeOnce, 1) != 0)
             return;
 
-        CloseGate();
-        DrainUntilDeadline();
-        PublishOutcome();
-    }
-
-    /// <summary>
-    /// Closes the gate, records the provider timestamp, and wakes the processor.
-    /// </summary>
-    /// <remarks>
-    /// Does not throw. The channel complete result is ignored when the channel was already completed.
-    /// Called once from the winning <see cref="Dispose"/>.
-    /// </remarks>
-    private void CloseGate()
-    {
         lock (_gate)
+        {
             _closed = true;
+            // Published before the outstanding read. An accept that already incremented is visible.
+            // An accept that has not incremented observes this flag and does not queue.
+            Volatile.Write(ref _closedFast, 1);
+        }
 
         Volatile.Write(ref _disposeStartTimestamp, _clock.GetTimestamp());
-        // The channel stays open until PublishOutcome so a Block waiter can still write before the deadline.
         SignalProcessor();
+        DrainUntilDeadline();
+        PublishOutcome();
     }
 
     /// <summary>
@@ -1052,6 +1916,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. A processor that already stopped returns without registering a timer.
     /// Both timers are disposed before this returns so a late callback cannot touch a published outcome.
+    /// A Block caller still waiting when this returns is released here, at the latest when the flush timeout wins.
     /// </remarks>
     private void DrainUntilDeadline()
     {
@@ -1059,26 +1924,45 @@ public partial class BackgroundLogQueue : IDisposable
         {
             OnNewWriteCutoff(this);
             MarkShutdownDeadline();
+            ReleaseBlockedCallersAfterDrain();
             return;
         }
 
-        if (_stopped.IsSet)
-            return;
-
-        if (_newWriteBudget <= TimeSpan.Zero)
+        if (!_stopped.IsSet)
         {
-            OnNewWriteCutoff(this);
-            WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, _shutdownDeadline, ref _disposeWaitsStarted);
-            return;
+            if (_newWriteBudget <= TimeSpan.Zero)
+            {
+                OnNewWriteCutoff(this);
+                WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, _shutdownDeadline, ref _disposeWaitsStarted);
+            }
+            else
+            {
+                // Both timers are registered before the wait is visible, so one clock step can hit either bound.
+                using var cutoff = _clock.CreateTimer(
+                    static state => OnNewWriteCutoff(state),
+                    this,
+                    _newWriteBudget,
+                    Timeout.InfiniteTimeSpan);
+                WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, _shutdownDeadline, ref _disposeWaitsStarted);
+            }
         }
 
-        // Both timers are registered before the wait is visible, so one clock step can hit either bound.
-        using var cutoff = _clock.CreateTimer(
-            static state => OnNewWriteCutoff(state),
-            this,
-            _newWriteBudget,
-            Timeout.InfiniteTimeSpan);
-        WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, _shutdownDeadline, ref _disposeWaitsStarted);
+        ReleaseBlockedCallersAfterDrain();
+    }
+
+    /// <summary>
+    /// Releases Block callers when the flush wait ended without the deadline callback.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. The deadline callback already released them when <see cref="_shutdownDeadlineElapsed"/> is set.
+    /// Called once from <see cref="DrainUntilDeadline"/> on the disposing thread, before the unwritten snapshot.
+    /// </remarks>
+    private void ReleaseBlockedCallersAfterDrain()
+    {
+        if (Volatile.Read(ref _shutdownDeadlineElapsed) != 0)
+            return;
+
+        ReleaseBlockedCallers();
     }
 
     /// <summary>
@@ -1094,6 +1978,7 @@ public partial class BackgroundLogQueue : IDisposable
 
         _writerGate.MarkDeadline();
         Volatile.Write(ref _stop, 1);
+        _releaseRetry.Set();
         SignalProcessor();
     }
 
@@ -1118,15 +2003,11 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. Called on the clock callback before the waiter is released.
     /// The count is visible to the thread that advanced the clock before this callback returns.
+    /// Callers blocked on a full queue are released here, including when a file reopen is still failing.
     /// </remarks>
     private void MarkShutdownDeadline()
     {
-        lock (_gate)
-        {
-            _blockRelease = true;
-            SignalWaiters();
-        }
-
+        ReleaseBlockedCallers();
         Interlocked.Increment(ref _shutdownDeadlineElapsed);
     }
 
@@ -1272,11 +2153,14 @@ public partial class BackgroundLogQueue : IDisposable
     /// Does not throw. A processor that is still inside a writer call keeps its wait sources,
     /// because disposing them would race that call. ALOG0071 is not emitted for a clean drain.
     /// ALOG0070 for the open window is written before ALOG0071, even when the 60 s window has not ended.
+    /// The stop flag is set before the snapshot so a processor still inside a writer does not read an event
+    /// accepted after that snapshot. The caller counts that event as ALOG0072.
+    /// A rejected flush interval leaves the stopped flag unset. The task has already finished.
     /// </remarks>
     private void PublishOutcome()
     {
-        // Block waiters have already been released. Completing the channel here stops a late write.
-        _ = _channel.Writer.TryComplete();
+        // Before the snapshot. A writer that returns after this must not start another event.
+        Volatile.Write(ref _stop, 1);
         var ended = _stopped.IsSet;
         var unwritten = FreezeUnwritten();
         PublishReports(unwritten);
@@ -1286,14 +2170,15 @@ public partial class BackgroundLogQueue : IDisposable
         if (_backgroundTask.IsFaulted)
             _ = _backgroundTask.Exception;
 
-        _reportTimer.Dispose();
+        _reportTimer?.Dispose();
         _writerGate.DisposeIdleWriters();
 
         if (!ended)
             return;
 
         DisposeQuiet(_shutdownSignal);
-        DisposeQuiet(_wakeCts);
+        _releaseRetry.Dispose();
+        _wake.Dispose();
         _stopped.Dispose();
     }
 
@@ -1301,13 +2186,18 @@ public partial class BackgroundLogQueue : IDisposable
     /// Snapshots accepted events that have not been committed. Later commits do not change the snapshot.
     /// </summary>
     /// <returns>The unwritten count. Zero when every accepted event was committed before the snapshot.</returns>
-    /// <remarks>Does not throw. Takes <see cref="_gate"/>. Called once from the winning <see cref="Dispose"/>.</remarks>
+    /// <remarks>
+    /// Does not throw. Takes <see cref="_gate"/>. Called once from the winning <see cref="Dispose"/>.
+    /// Stores the accepted value it read so a later accept can see whether this snapshot included it.
+    /// </remarks>
     private long FreezeUnwritten()
     {
         lock (_gate)
         {
+            var accepted = Interlocked.Read(ref _accepted);
+            _frozenAccepted = accepted;
             _frozen = true;
-            var unwritten = _accepted - _written;
+            var unwritten = accepted - _written;
             _unwritten = unwritten;
             return unwritten;
         }
@@ -1319,7 +2209,8 @@ public partial class BackgroundLogQueue : IDisposable
     /// </summary>
     /// <param name="unwritten">Accepted events still outstanding. Zero writes no ALOG0071. Negative is treated as zero.</param>
     /// <remarks>
-    /// Does not throw. Holds <see cref="_reportGate"/> across both lines so they cannot be reordered.
+    /// Does not throw. Holds <see cref="_reportGate"/> across the lines so they cannot be reordered.
+    /// A reopen-hold count still inside its minute is written here, before ALOG0071.
     /// A second <see cref="Dispose"/> does not call this. No drops writes no ALOG0070.
     /// </remarks>
     private void PublishReports(long unwritten)
@@ -1327,6 +2218,7 @@ public partial class BackgroundLogQueue : IDisposable
         lock (_reportGate)
         {
             _reportSealed = true;
+            PublishPendingHoldDrops();
             PublishPendingFullDrops();
             if (unwritten > 0 && Interlocked.Exchange(ref _shutdownReported, 1) == 0)
                 SelfLog.ReportLine(FormatShutdown(unwritten));
@@ -1334,6 +2226,23 @@ public partial class BackgroundLogQueue : IDisposable
 
         // Covers the sealed callback path and drops a callback that lost the race for the lock.
         DeliverFullDropReport();
+    }
+
+    /// <summary>
+    /// Writes one ALOG0070 line for reopen-hold drops still waiting in the open minute. Zero writes nothing.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. The caller holds <see cref="_reportGate"/>. Dispose calls this so a formatter throw
+    /// counted after the first report of that minute is still written. The count is cleared here.
+    /// </remarks>
+    private void PublishPendingHoldDrops()
+    {
+        var count = _holdDrops;
+        _holdDrops = 0;
+        if (count <= 0)
+            return;
+
+        SelfLog.ReportLine(LogFileRegistry.BufferFullLine(count));
     }
 
     /// <summary>
@@ -1365,6 +2274,29 @@ public partial class BackgroundLogQueue : IDisposable
             copy.Add(writers[i]);
 
         return copy;
+    }
+
+    /// <summary>
+    /// True when every writer finishes inside <see cref="ILogWriter.Write"/>.
+    /// The processor then calls that method and skips the async state machine.
+    /// </summary>
+    /// <param name="writers">The copied writer list. Not null.</param>
+    /// <returns>True for a file or console writer, or an empty list. False when any writer is neither.</returns>
+    /// <remarks>
+    /// Does not throw. File and console <c>WriteAsync</c> only call <c>Write</c> and return a completed task.
+    /// The caller still only queues the event. The processor runs <c>Write</c>.
+    /// Any other writer stays on the async path, including when async is off.
+    /// HTTP, SQL, and cloud writers stay on the async path.
+    /// </remarks>
+    private static bool WritersCompleteOnCaller(List<ILogWriter> writers)
+    {
+        for (var i = 0; i < writers.Count; i++)
+        {
+            if (writers[i] is not FileLogWriter and not ConsoleLogWriter)
+                return false;
+        }
+
+        return true;
     }
 
     /// <summary>

@@ -26,6 +26,17 @@
     <AlogSrc Condition="'$(AlogSrc)' == ''">$(MSBuildThisFileDirectory)../..</AlogSrc>
   </PropertyGroup>
 
+  <!--
+    tests/ is the ranked speed project. This harness compiles every .cs file under its directory.
+    Leave that tree out so the harness does not compile the xunit sources or their generated files.
+  -->
+  <ItemGroup>
+    <Compile Remove="tests/**" />
+    <None Remove="tests/**" />
+    <Content Remove="tests/**" />
+    <EmbeddedResource Remove="tests/**" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="$(AlogSrc)/ALog/ALog.csproj" />
   </ItemGroup>
@@ -34,6 +45,7 @@
   <ItemGroup>
     <PackageReference Include="NLog" Version="6.2.2" />
     <PackageReference Include="Serilog" Version="4.4.0" />
+    <PackageReference Include="Serilog.Expressions" Version="5.0.0" />
     <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
     <PackageReference Include="Serilog.Sinks.Async" Version="2.1.0" />
     <PackageReference Include="log4net" Version="3.5.0" />

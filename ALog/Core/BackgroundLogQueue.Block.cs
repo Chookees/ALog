@@ -13,15 +13,28 @@ public partial class BackgroundLogQueue
     /// <summary>The queue whose writer is running on this execution context. Null on every other context.</summary>
     private static readonly AsyncLocal<BackgroundLogQueue?> ConsumerQueue = new();
 
+    /// <summary>
+    /// True when this call is the queue processor writing an event.
+    /// A file that cannot reopen throws <see cref="WriteDeferredException"/> only in that case.
+    /// </summary>
+    /// <remarks>Does not throw. False on an application thread. The async-local value is set for the processor call and cleared after it.</remarks>
+    internal static bool IsOnProcessor => ConsumerQueue.Value is not null;
+
     private readonly List<BlockWaiter> _registered = new();
+    private int _registeredCount;
     private readonly Stack<BlockWaiter> _freeWaiters = new();
 
     private QueueFullMode _fullMode;
     private TimeSpan _shutdownDeadline;
     private TimeSpan _newWriteBudget;
-    private int _consumerThread;
+    /// <summary>The processor thread. Set when that thread starts. Null until then.</summary>
+    private Thread? _consumerThread;
+
+    /// <summary>Managed id of the thread inside a writer call. Zero when no writer call is marked.</summary>
+    private int _consumerThreadId;
     private int _blockWaitsStarted;
     private bool _blockRelease;
+    private int _blockedReleaseUnwritten;
 
     /// <summary>How many Block callers have reached the wait. A drop that returns immediately does not increment it.</summary>
     internal int BlockWaitsStarted => Volatile.Read(ref _blockWaitsStarted);
@@ -36,7 +49,7 @@ public partial class BackgroundLogQueue
         if (ReferenceEquals(ConsumerQueue.Value, this))
             return true;
 
-        var id = Volatile.Read(ref _consumerThread);
+        var id = Volatile.Read(ref _consumerThreadId);
         return id != 0 && id == Environment.CurrentManagedThreadId;
     }
 
@@ -60,6 +73,7 @@ public partial class BackgroundLogQueue
 
             waiter = RentWaiter();
             _registered.Add(waiter);
+            Volatile.Write(ref _registeredCount, _registered.Count);
         }
 
         waiter.Signal.Reset();
@@ -82,24 +96,31 @@ public partial class BackgroundLogQueue
     /// <returns>Accepted, Closed, or <see cref="OfferResult.NeedWait"/>.</returns>
     /// <remarks>
     /// The caller holds <see cref="_gate"/>. Ignores <see cref="_closed"/> until <see cref="_blockRelease"/>.
-    /// A new call uses <see cref="DecideUnderGate"/> and never reaches this method after the gate is shut.
+    /// A parked file batch returns Accepted because the disposing thread already counted the event as unwritten.
+    /// Any other release is a closed drop. A new call uses <see cref="DecideUnderGate"/> and never reaches this method after the gate is shut.
     /// </remarks>
     private OfferResult TryAcceptReserved(LogEvent logEvent, ref bool firstClosed)
     {
         if (_blockRelease)
         {
+            // Counted with the shutdown remainder before the signal. Not a closed drop.
+            if (_blockedReleaseUnwritten > 0)
+                return OfferResult.Accepted;
+
             NoteClosed(ref firstClosed);
             return OfferResult.Closed;
         }
 
-        if (_outstanding < _capacity && _channel.Writer.TryWrite(logEvent))
+        var next = Interlocked.Increment(ref _outstanding);
+        if (next > _capacity)
         {
-            _outstanding++;
-            _accepted++;
-            return OfferResult.Accepted;
+            Interlocked.Decrement(ref _outstanding);
+            return OfferResult.NeedWait;
         }
 
-        return OfferResult.NeedWait;
+        _queue.Enqueue(logEvent);
+        Interlocked.Increment(ref _accepted);
+        return OfferResult.Accepted;
     }
 
     /// <summary>Counts one closed drop and reports whether it is the first.</summary>
@@ -109,6 +130,34 @@ public partial class BackgroundLogQueue
     {
         Interlocked.Increment(ref _closedDrops);
         firstClosed = Interlocked.CompareExchange(ref _closedReported, 1, 0) == 0;
+    }
+
+    /// <summary>
+    /// Wakes every Block caller still registered. A parked file batch counts those events as unwritten.
+    /// A slow writer that is still inside its call counts them as closed drops instead.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Takes <see cref="_gate"/>. Safe to call again after the first release.
+    /// The accepted count moves before the signal, so the disposing thread can snapshot it after this returns.
+    /// The loop inside the signal is bounded by <see cref="MaxWaiters"/>.
+    /// </remarks>
+    private void ReleaseBlockedCallers()
+    {
+        lock (_gate)
+        {
+            if (_blockRelease)
+                return;
+
+            _blockRelease = true;
+            var waiting = _registered.Count;
+            if (waiting > 0 && Volatile.Read(ref _writeDeferred) != 0)
+            {
+                Interlocked.Add(ref _accepted, waiting);
+                _blockedReleaseUnwritten = waiting;
+            }
+
+            SignalWaiters();
+        }
     }
 
     /// <summary>Wakes every registered Block caller. The caller has already published the state those callers recheck.</summary>
@@ -142,6 +191,7 @@ public partial class BackgroundLogQueue
 
             _registered.RemoveAt(i);
             _freeWaiters.Push(waiter);
+            Volatile.Write(ref _registeredCount, _registered.Count);
             return;
         }
     }

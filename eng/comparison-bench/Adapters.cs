@@ -5,6 +5,7 @@
 using System.Diagnostics;
 using System.Reflection;
 using Serilog; // WriteTo.Async / WriteTo.File extension methods
+using Serilog.Templates;
 
 namespace AlogComparison;
 
@@ -107,6 +108,7 @@ public static class Libs
         ["Serilog"] = PackageVersion("Serilog"),
         ["Serilog.Sinks.File"] = PackageVersion("Serilog.Sinks.File"),
         ["Serilog.Sinks.Async"] = PackageVersion("Serilog.Sinks.Async"),
+        ["Serilog.Expressions"] = PackageVersion("Serilog.Expressions"),
         ["log4net"] = PackageVersion("log4net"),
         ["BenchmarkDotNet"] = PackageVersion("BenchmarkDotNet"),
         ["ALog.informational"] = FullVersion(typeof(ALog.Core.LoggerEngine)),
@@ -354,7 +356,8 @@ public sealed class NLogLib : ILib
 /// File README, section Performance: https://github.com/serilog/serilog-sinks-file/blob/dev/README.md
 /// ("By default, the file sink will flush each event ... specifying buffered: true"). buffered: true is set so no
 /// library flushes per event (BEN-03); the deviation from the default is in Notes.
-/// JSON: Serilog.Formatting.Json.JsonFormatter from the Serilog package (no extra package).
+/// Plain and JSON both use <c>ExpressionTemplate</c> from Serilog.Expressions so <c>UtcDateTime(@t)</c> is UTC
+/// even when the process time zone is not UTC. That package is referenced only by this bench project.
 /// Output template: https://github.com/serilog/serilog/wiki/Formatting-Output.
 /// </summary>
 public sealed class SerilogLib : ILib
@@ -371,10 +374,20 @@ public sealed class SerilogLib : ILib
 
     public bool Ranked => true;
 
-    public string Notes => "Serilog WriteTo.Async(bufferSize=10000, blockWhenFull=true) -> File(buffered=true; default false flushes per event, changed so it does not flush every event); README https://github.com/serilog/serilog-sinks-async/blob/dev/README.md and https://github.com/serilog/serilog-sinks-file/blob/dev/README.md#performance; JSON = Serilog.Formatting.Json.JsonFormatter(renderMessage=true); timestamps in JSON are DateTimeOffset local, run with TZ=UTC";
+    public string Notes => "Serilog WriteTo.Async(bufferSize=10000, blockWhenFull=true) -> File(buffered=true; default false flushes per event, changed so it does not flush every event); README https://github.com/serilog/serilog-sinks-async/blob/dev/README.md and https://github.com/serilog/serilog-sinks-file/blob/dev/README.md#performance; plain and JSON use ExpressionTemplate with UtcDateTime(@t) from Serilog.Expressions so the stamp is UTC in any time zone";
 
     public string? NotSupported(string scenario) => null;
 
+    /// <summary>
+    /// Builds a Serilog logger whose plain and JSON stamps are UTC.
+    /// </summary>
+    /// <param name="config">Output path, format, and minimum level. Not null. The directory already exists.</param>
+    /// <remarks>
+    /// Both formats use <c>ExpressionTemplate</c> and <c>UtcDateTime(@t)</c>. That is UTC even when the
+    /// process time zone is not. The default <c>JsonFormatter</c> wrote the local offset, which made a
+    /// JSON cell invalid off UTC. Serilog.Expressions is a reference of this bench project only.
+    /// Not thread-safe. Call once, then write, then <see cref="Close"/>.
+    /// </remarks>
     public void Init(LibConfig config)
     {
         monitor = new Monitor();
@@ -382,15 +395,21 @@ public sealed class SerilogLib : ILib
         lc = config.Filtered ? lc.MinimumLevel.Warning() : lc.MinimumLevel.Information();
         if (config.Format == Fmt.Json)
         {
-            var formatter = new Serilog.Formatting.Json.JsonFormatter(renderMessage: true);
+            // UtcDateTime(@t) is UTC. The default JsonFormatter wrote the local offset, which failed when TZ was not UTC.
+            var formatter = new ExpressionTemplate(
+                "{ {timestamp: UtcDateTime(@t), level: @l, message: @m, renderedMessage: @m, ..@p} }\n",
+                System.Globalization.CultureInfo.InvariantCulture);
             lc = lc.WriteTo.Async(a => a.File(formatter, config.Path, buffered: true), bufferSize: Libs.QueueCapacity, blockWhenFull: true, monitor: monitor);
         }
         else
         {
-            // {NewLine}{Exception} as in Serilog's default output template: the exception is rendered with its standard ToString().
-            const string template = "[{UtcTimestamp:yyyy-MM-dd'T'HH:mm:ss.fff'Z'}] [{Level}] [{SourceContext:l}] {Message:lj}{NewLine}{Exception}";
+            // {@x} is the exception ToString(), the same text Serilog's {Exception} writes.
+            // ExpressionTemplate does not treat {NewLine} as a newline, so the break is a real line feed.
+            var formatter = new ExpressionTemplate(
+                "[{UtcDateTime(@t):yyyy-MM-dd'T'HH:mm:ss.fff'Z'}] [{@l}] [{SourceContext}] {@m}\n{@x}",
+                System.Globalization.CultureInfo.InvariantCulture);
             lc = lc.WriteTo.Async(
-                a => a.File(config.Path, outputTemplate: template, buffered: true, formatProvider: System.Globalization.CultureInfo.InvariantCulture),
+                a => a.File(formatter, config.Path, buffered: true),
                 bufferSize: Libs.QueueCapacity,
                 blockWhenFull: true,
                 monitor: monitor);

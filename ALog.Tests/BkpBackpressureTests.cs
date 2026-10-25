@@ -135,8 +135,18 @@ public sealed class BkpBackpressureTests : IDisposable
         }
     }
 
-    /// <summary>Ten thousand events open the file once.</summary>
-    /// <remarks>The flush interval is zero so each line is durable. The open counter is a delta because other tests share the process.</remarks>
+    /// <summary>
+    /// BKP-03. A zero flush interval opens the file once. The read handle opens on Flush, not on each write.
+    /// </summary>
+    /// <remarks>
+    /// Every successful open is counted, including a read-handle swap and the write handle that replaces it.
+    /// Ten thousand lines with no <see cref="FileLogWriter.Flush"/> are one open.
+    /// One hundred Flush calls after those lines open the read handle on the first call and leave it in place,
+    /// so the count stays at most 101. The next line opens the write handle again.
+    /// Swapping after every write makes the no-Flush count about 20000 and fails this test.
+    /// The counter is a delta because other tests share the process.
+    /// Not thread-safe. The wait bound is 120 seconds.
+    /// </remarks>
     [Fact(Timeout = 120000)]
     public async Task File_OpensOnceForManyEvents()
     {
@@ -150,10 +160,96 @@ public sealed class BkpBackpressureTests : IDisposable
             {
                 for (var i = 0; i < 10000; i++)
                     writer.Write(Event("n" + i.ToString(CultureInfo.InvariantCulture)));
+
+                Assert.Equal(before + 1, LogFileRegistry.OpenCount);
+                for (var i = 0; i < 100; i++)
+                    writer.Flush();
+
+                Assert.True(LogFileRegistry.OpenCount - before <= 101);
+                Assert.Equal(before + 2, LogFileRegistry.OpenCount);
+                writer.Write(Event("after-flush"));
+                Assert.Equal(before + 3, LogFileRegistry.OpenCount);
             }
 
+            Assert.Equal(before + 3, LogFileRegistry.OpenCount);
+            Assert.Equal(10001, File.ReadAllLines(path).Length);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// A positive flush interval opens the read handle when the interval elapses, not on each write.
+    /// </summary>
+    /// <remarks>
+    /// The buffer is larger than the line, so only the timer writes the bytes. That callback then replaces the
+    /// write handle with a read handle. The next append opens a write handle again.
+    /// A zero interval creates no timer, so this swap does not run for <see cref="TimeSpan.Zero"/>.
+    /// This test reads with <see cref="FileShare.ReadWrite"/>, so it can see the bytes with either handle.
+    /// The clock is a <see cref="FakeTimeProvider"/>, so the timer runs on <c>Advance</c> and does not wait a wall-clock second.
+    /// Not thread-safe. The wait bound is 30 seconds.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task File_IdleIntervalOpensTheReadHandle()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "idle-open.log");
+            var clock = NewClock();
+            var before = LogFileRegistry.OpenCount;
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(1), clock: clock);
+            writer.Write(Event("held"));
             Assert.Equal(before + 1, LogFileRegistry.OpenCount);
-            Assert.Equal(10000, File.ReadAllLines(path).Length);
+            Assert.DoesNotContain("held", TestFiles.ReadShared(path), StringComparison.Ordinal);
+            clock.Advance(TimeSpan.FromSeconds(1));
+            Assert.Equal(before + 2, LogFileRegistry.OpenCount);
+            Assert.Contains("held", TestFiles.ReadShared(path), StringComparison.Ordinal);
+            writer.Write(Event("again"));
+            Assert.Equal(before + 3, LogFileRegistry.OpenCount);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// The idle swap waits for a full interval with no new line. A tick during writing does not swap.
+    /// </summary>
+    /// <remarks>
+    /// The interval is 200 ms. A line every 5 ms for 2 s is 400 writes. Each step checks the open count,
+    /// so a swap on a tick fails at that step. The count stays at the first write.
+    /// 200 ms after the burst the next tick swaps once. The tick after that does not swap again.
+    /// Not thread-safe. The wait bound is 30 seconds. The clock is a <see cref="FakeTimeProvider"/>.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task Idle_SwapOnlyWhenNoNewLines_DuringContinuousWriting()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "burst.log");
+            var clock = NewClock();
+            var interval = TimeSpan.FromMilliseconds(200);
+            var before = LogFileRegistry.OpenCount;
+            using var writer = new FileLogWriter(path, fileFlushInterval: interval, clock: clock);
+            const int steps = 400;
+            for (var i = 0; i < steps; i++)
+            {
+                writer.Write(Event("b" + i.ToString(CultureInfo.InvariantCulture)));
+                clock.Advance(TimeSpan.FromMilliseconds(5));
+                Assert.Equal(before + 1, LogFileRegistry.OpenCount);
+            }
+
+            clock.Advance(interval);
+            Assert.Equal(before + 2, LogFileRegistry.OpenCount);
+            clock.Advance(interval);
+            Assert.Equal(before + 2, LogFileRegistry.OpenCount);
         }
         finally
         {
@@ -162,7 +258,13 @@ public sealed class BkpBackpressureTests : IDisposable
     }
 
     /// <summary>Two writers for one path share one stream and never tear a line.</summary>
-    /// <remarks>Not thread-safe beyond the two writer tasks. The 30 s wait is a hang guard.</remarks>
+    /// <remarks>
+    /// Not thread-safe beyond the two writer tasks. The 120 s wait is a hang guard.
+    /// Eighty zero-interval writes open the file once. The read handle is not opened per line.
+    /// The first dispose is not the last reference. It flushes and opens the read handle.
+    /// The last dispose closes the handle. Two opens are the whole delta.
+    /// Swapping after every write would count about 160 opens and fail this test.
+    /// </remarks>
     [Fact(Timeout = 120000)]
     public async Task File_TwoWritersShareOneStreamAndKeepWholeLines()
     {
@@ -187,7 +289,7 @@ public sealed class BkpBackpressureTests : IDisposable
                 await DeadlineClock.WaitForCompletion(Task.WhenAll(first, second), "writers hung");
             }
 
-            Assert.Equal(before + 1, LogFileRegistry.OpenCount);
+            Assert.Equal(before + 2, LogFileRegistry.OpenCount);
             var lines = File.ReadAllLines(path);
             Assert.Equal(80, lines.Length);
             for (var i = 0; i < 40; i++)
@@ -254,13 +356,13 @@ public sealed class BkpBackpressureTests : IDisposable
                 clock: clock);
             var payload = new string('B', 3000);
             writer.Write(Event(payload));
-            Assert.DoesNotContain(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
             writer.Write(Event(payload));
-            Assert.Contains(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
 
             var wide = new string('W', 5000);
             writer.Write(Event(wide));
-            Assert.Contains(wide, ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains(wide, TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -282,11 +384,11 @@ public sealed class BkpBackpressureTests : IDisposable
             var interval = TimeSpan.FromSeconds(1);
             using var writer = new FileLogWriter(path, fileFlushInterval: interval, clock: clock);
             writer.Write(Event("later"));
-            Assert.DoesNotContain("later", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("later", TestFiles.ReadShared(path), StringComparison.Ordinal);
             clock.Advance(interval - DeadlineClock.Tick);
-            Assert.DoesNotContain("later", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("later", TestFiles.ReadShared(path), StringComparison.Ordinal);
             clock.Advance(DeadlineClock.Tick);
-            Assert.Contains("later", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("later", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -307,9 +409,9 @@ public sealed class BkpBackpressureTests : IDisposable
             using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60), clock: clock);
             writer.Flush();
             writer.Write(Event("held"));
-            Assert.DoesNotContain("held", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("held", TestFiles.ReadShared(path), StringComparison.Ordinal);
             writer.Flush();
-            Assert.Contains("held", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("held", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -329,7 +431,7 @@ public sealed class BkpBackpressureTests : IDisposable
             var clock = NewClock();
             var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60), clock: clock);
             writer.Write(Event("held"));
-            Assert.DoesNotContain("held", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("held", TestFiles.ReadShared(path), StringComparison.Ordinal);
             writer.Dispose();
             Assert.Contains("held", File.ReadAllText(path), StringComparison.Ordinal);
         }
@@ -703,7 +805,7 @@ public sealed class BkpBackpressureTests : IDisposable
                 clock);
             directEngine.Log("direct-line");
             await directEngine.FlushAsync();
-            Assert.Contains("direct-line", ReadShared(direct), StringComparison.Ordinal);
+            Assert.Contains("direct-line", TestFiles.ReadShared(direct), StringComparison.Ordinal);
             directEngine.Dispose();
 
             var queued = Path.Combine(directory, "queued.log");
@@ -715,7 +817,7 @@ public sealed class BkpBackpressureTests : IDisposable
                 clock);
             queuedEngine.Log("queued-line");
             await queuedEngine.FlushAsync();
-            Assert.Contains("queued-line", ReadShared(queued), StringComparison.Ordinal);
+            Assert.Contains("queued-line", TestFiles.ReadShared(queued), StringComparison.Ordinal);
             queuedEngine.Dispose();
         }
         finally
@@ -791,15 +893,6 @@ public sealed class BkpBackpressureTests : IDisposable
         return error is null ? "(no exception)" : error.Message;
     }
 
-    private static string ReadShared(string path)
-    {
-        if (!File.Exists(path))
-            return string.Empty;
-
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
-    }
 
     private static FakeTimeProvider NewClock()
         => new(new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero));

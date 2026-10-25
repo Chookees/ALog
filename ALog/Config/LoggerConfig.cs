@@ -6,9 +6,20 @@ public class LoggerConfig : ILogConfiguration
 {
     private readonly List<ILogWriter> _writers = new();
     private readonly List<ILogEnricher> _enrichers = new();
+    private IReadOnlyList<ILogWriter>? _writersView;
+    private IReadOnlyList<ILogEnricher>? _enrichersView;
 
-    public IReadOnlyList<ILogWriter> Writers => _writers.AsReadOnly();
-    public IReadOnlyList<ILogEnricher> Enrichers => _enrichers.AsReadOnly();
+    /// <summary>
+    /// Writers in add order. The wrapper is cached so a log call does not allocate one.
+    /// </summary>
+    /// <remarks>The list stays live. An <see cref="AddWriter"/> after the first read is visible.</remarks>
+    public IReadOnlyList<ILogWriter> Writers => _writersView ??= _writers.AsReadOnly();
+
+    /// <summary>
+    /// Enrichers in add order. The wrapper is cached so a log call does not allocate one.
+    /// </summary>
+    /// <remarks>The list stays live. An <see cref="AddEnricher"/> after the first read is visible.</remarks>
+    public IReadOnlyList<ILogEnricher> Enrichers => _enrichersView ??= _enrichers.AsReadOnly();
 
     // Volatile so a reload on another thread is visible to the level gate.
     private volatile int _minimumLevel = (int)LogLevel.Info;
@@ -17,6 +28,14 @@ public class LoggerConfig : ILogConfiguration
     {
         get => (LogLevel)_minimumLevel;
         private set => _minimumLevel = (int)value;
+    }
+
+    /// <summary>The same value as <see cref="MinimumLevel"/>, as an int, for the log gate.</summary>
+    /// <remarks>A volatile read. A <see cref="SetMinimumLevel"/> on another thread is visible to the next call.</remarks>
+    internal int MinimumLevelValue
+    {
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        get => _minimumLevel;
     }
 
     public ILogFilter? Filter { get; private set; }
