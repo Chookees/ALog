@@ -181,12 +181,14 @@ Log.Shutdown();
 
 When the queue is full, ALog drops the new event by default and counts it (SelfLog ALOG0070). To make the caller wait instead, set `QueueFullMode = Block` (in JSON: `"ALog": { "QueueFullMode": "Block" }`). Even with `Block`, a call from the queue's own writer thread or after shutdown has started is dropped and counted, so logging can never deadlock.
 
+If the log file can't be reopened, ALog retries at most once per second and reports it once a minute (SelfLog ALOG0073). Without a background queue it keeps up to 4 MiB of lines. With a queue, those lines stay in the queue, bounded by the queue capacity.
+
 #### Queue, file buffer, and shutdown options
 
 - `QueueFullMode`: `Drop` (default) drops and counts new events while the queue is full. `Block` makes the caller wait until there is room.
 - `FileBufferSize`: how much `FileLogWriter` collects before it writes to the file. Default 64 KiB, 4 KiB to 16 MiB.
 - `FileFlushInterval`: how often buffered lines are written even if the buffer is not full. Default 1 s, 0 to 60 s. `0` writes every event right away.
-- `FlushTimeout`: how long `Flush`, `Dispose`, and `Shutdown` wait for queued events. Default 5 s, 0 to 60 s. Events still unwritten after that are counted (ALOG0071).
+- `FlushTimeout`: how long `Flush`, `Dispose`, and `Shutdown` wait for queued events. Default 5 s, 0 to 60 s. Events still unwritten after that are counted (ALOG0071). On Windows, `Flush` also closes and reopens the log file so readers can open it, which makes each call slower. Don't call `Flush` after every line.
 - Each log file has one writer process: give each process its own file. Other programs can read, tail, and rotate it. On Windows, `File.ReadAllText` asks for `FileShare.Read`, so it can open the file only after `Flush`, when the flush interval passes with no new lines (not with `FileFlushInterval` 0), or after dispose. To read while lines are being written, open the file with `new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)`.
 
 If the process crashes, the file can miss up to one `FileFlushInterval` or one `FileBufferSize` of lines, whichever comes first. Set `FileFlushInterval` to `0` if every line must reach the operating system immediately.
