@@ -81,7 +81,9 @@ public partial class BackgroundLogQueue : IDisposable
     private int _shutdownReported;
     private int _closedReported;
     private int _processorEntered;
+    private int _processorLeft;
     private int _idleWaitEntered;
+    private Action? _beforeEnqueue;
     private int _reopenWaitsStarted;
     private long _retryNotBeforeTicks;
     private int _disposeWaitsStarted;
@@ -103,6 +105,8 @@ public partial class BackgroundLogQueue : IDisposable
     private long _disposeStartTimestamp;
     private bool _closed;
     private bool _frozen;
+    /// <summary>Value of <see cref="_accepted"/> observed by <see cref="FreezeUnwritten"/>. Meaningful only after <see cref="_frozen"/> is set.</summary>
+    private long _frozenAccepted;
     private bool _reportSealed;
 
     /// <summary>
@@ -242,6 +246,24 @@ public partial class BackgroundLogQueue : IDisposable
     /// <summary>True after the processor has entered the idle timer wait at least once.</summary>
     internal bool IsIdleWaitEntered => Volatile.Read(ref _idleWaitEntered) != 0;
 
+    /// <summary>True after the processor has left its loop. Published before the stopped signal.</summary>
+    /// <remarks>Does not throw. An accept reads this after enqueue when the gate is already closed.</remarks>
+    internal bool ProcessorHasLeft => Volatile.Read(ref _processorLeft) != 0;
+
+    /// <summary>
+    /// Runs after a fast accept reserves a slot and before that event is placed on the channel.
+    /// </summary>
+    /// <remarks>
+    /// Production leaves this null, so the logging path is one volatile read. A test sets it to hold
+    /// the caller in that gap until <see cref="Dispose"/> has finished. The hook must not throw.
+    /// It runs on the logging thread and must not take the queue lock or call <see cref="Dispose"/>.
+    /// </remarks>
+    internal Action? BeforeEnqueue
+    {
+        get => Volatile.Read(ref _beforeEnqueue);
+        set => Volatile.Write(ref _beforeEnqueue, value);
+    }
+
     /// <summary>How many times a deferred file write has armed its retry wait. Zero until the first blocked reopen.</summary>
     /// <remarks>Does not throw. The count moves before the processor blocks, so a test can advance the clock after it changes.</remarks>
     internal int ReopenWaitsStarted => Volatile.Read(ref _reopenWaitsStarted);
@@ -379,9 +401,11 @@ public partial class BackgroundLogQueue : IDisposable
     /// <param name="logEvent">Event to place on the channel.</param>
     /// <returns>True when the channel holds the event. False when <see cref="Offer"/> must decide.</returns>
     /// <remarks>
-    /// Does not throw. Does not wait. A closed queue returns false so the locked path can count the drop.
+    /// Does not throw. Does not wait. A closed queue returns false before the event is queued, so the locked path can count the drop.
     /// The outstanding count moves before the close flag is read, so dispose cannot miss an accept that has started.
+    /// After the event is queued, a processor that has already finished cannot leave it uncounted: the caller reports it.
     /// Block waiters stay on the locked path, so a waiting caller is not skipped by this one.
+    /// Any logging thread may call this. The processor does not.
     /// </remarks>
     private bool TryFastAccept(LogEvent logEvent)
     {
@@ -400,9 +424,66 @@ public partial class BackgroundLogQueue : IDisposable
             return false;
         }
 
+        Volatile.Read(ref _beforeEnqueue)?.Invoke();
         _queue.Enqueue(logEvent);
-        Interlocked.Increment(ref _accepted);
+        AccountQueuedAccept();
         return true;
+    }
+
+    /// <summary>
+    /// Counts an event that <see cref="TryFastAccept"/> has just placed on the channel.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Does not take the queue lock while the queue is open and the processor is still in its loop.
+    /// That path is the accepted increment plus two volatile reads.
+    /// After the queue has closed, <see cref="CountIfSnapshotMissed"/> reports the event when the processor
+    /// has left and the shutdown snapshot did not include it. The logging thread calls this. The processor does not.
+    /// </remarks>
+    private void AccountQueuedAccept()
+    {
+        var ticket = Interlocked.Increment(ref _accepted);
+        // Both flags are read after the increment. A dispose that has not published the close yet
+        // still observes this ticket. A close that is already visible is reconciled under the lock.
+        if (Volatile.Read(ref _processorLeft) == 0 && Volatile.Read(ref _closedFast) == 0)
+            return;
+
+        CountIfSnapshotMissed(ticket);
+    }
+
+    /// <summary>
+    /// Reports <paramref name="ticket"/> when the processor has left and the shutdown snapshot missed it.
+    /// </summary>
+    /// <param name="ticket">The accepted count after this event was added. Greater than zero.</param>
+    /// <remarks>
+    /// Does not throw. Takes the queue lock to compare the ticket with the snapshot, then reports outside the lock.
+    /// A ticket the snapshot already includes is left in the accepted count and is not reported again.
+    /// A missed ticket is removed from that count. The caller then reports ALOG0071 when the snapshot was empty,
+    /// or ALOG0072 when <see cref="Dispose"/> already owns ALOG0071. Called from the logging thread.
+    /// </remarks>
+    private void CountIfSnapshotMissed(long ticket)
+    {
+        var reportShutdown = false;
+        var reportClosed = false;
+        lock (_gate)
+        {
+            // Leave the increment in place when Dispose can still see it, or already did.
+            if (!_closed || Volatile.Read(ref _processorLeft) == 0 || !_frozen || ticket <= _frozenAccepted)
+                return;
+
+            Interlocked.Decrement(ref _accepted);
+            Interlocked.Decrement(ref _outstanding);
+            // A positive snapshot already owns ALOG0071. Do not take that flag from Dispose.
+            if (_unwritten > 0 || Interlocked.Exchange(ref _shutdownReported, 1) != 0)
+                NoteClosed(ref reportClosed);
+            else
+                reportShutdown = true;
+        }
+
+        if (reportShutdown)
+            SelfLog.ReportLine(FormatShutdown(1));
+
+        if (reportClosed)
+            SelfLog.ReportLine(ClosedDropLine);
     }
 
     /// <summary>
@@ -615,7 +696,10 @@ public partial class BackgroundLogQueue : IDisposable
     /// </summary>
     /// <param name="count">Accepted events that were not written when the deadline won. Greater than zero.</param>
     /// <returns>The catalog sentence, with no extra prefix.</returns>
-    /// <remarks>Does not throw. Allocates the line. Called only from <see cref="Dispose"/>.</remarks>
+    /// <remarks>
+    /// Does not throw. Allocates the line.
+    /// <see cref="Dispose"/> calls this for the snapshot. An accept that lands after that snapshot calls it for the one event.
+    /// </remarks>
     private string FormatShutdown(long count)
     {
         return string.Concat(
@@ -732,6 +816,8 @@ public partial class BackgroundLogQueue : IDisposable
     /// <see cref="Dispose"/> still waits out the deadline. The constructor does not wait for that.
     /// The method runs on a background thread, so it does not keep the process alive.
     /// It ends when the stop flag is set, the deadline flag is set, or the gate is closed and idle.
+    /// The left flag is published before the stopped signal, and only after the loop was entered,
+    /// so a rejected flush interval does not look like a finished processor.
     /// </remarks>
     private void ProcessLogs()
     {
@@ -772,6 +858,7 @@ public partial class BackgroundLogQueue : IDisposable
         }
         finally
         {
+            Volatile.Write(ref _processorLeft, 1);
             _stopped.Set();
         }
     }
@@ -1599,13 +1686,18 @@ public partial class BackgroundLogQueue : IDisposable
     /// Snapshots accepted events that have not been committed. Later commits do not change the snapshot.
     /// </summary>
     /// <returns>The unwritten count. Zero when every accepted event was committed before the snapshot.</returns>
-    /// <remarks>Does not throw. Takes <see cref="_gate"/>. Called once from the winning <see cref="Dispose"/>.</remarks>
+    /// <remarks>
+    /// Does not throw. Takes <see cref="_gate"/>. Called once from the winning <see cref="Dispose"/>.
+    /// Stores the accepted value it read so a later accept can see whether this snapshot included it.
+    /// </remarks>
     private long FreezeUnwritten()
     {
         lock (_gate)
         {
+            var accepted = Interlocked.Read(ref _accepted);
+            _frozenAccepted = accepted;
             _frozen = true;
-            var unwritten = Interlocked.Read(ref _accepted) - _written;
+            var unwritten = accepted - _written;
             _unwritten = unwritten;
             return unwritten;
         }

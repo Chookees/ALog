@@ -630,6 +630,80 @@ public sealed partial class C4QueueFixTests
         await Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Two accepts held between the slot reservation and the enqueue are counted by the caller
+    /// after dispose has finished. The first is ALOG0071. The second is ALOG0072. Neither is written.
+    /// </summary>
+    /// <returns>A task that finishes after both accepts return.</returns>
+    /// <remarks>
+    /// The hook blocks both callers until <see cref="BackgroundLogQueue.Dispose"/> returns and the processor has left.
+    /// The 20 second waits are hang guards. Not thread-safe. The finally block releases the hook and restores SelfLog.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task FastAccept_AfterProcessorExit_CallerCountsTheEvent()
+    {
+        const string ClosedLine =
+            "Event dropped: ALog is shut down (the background queue was closed by Shutdown or Dispose). Later events are counted, not reported. Stop logging before you call Shutdown or Dispose.";
+        var lines = new List<string>();
+        var previous = SelfLog.Target;
+        SelfLog.Enable(line =>
+        {
+            lock (lines)
+                lines.Add(line);
+        });
+        var writer = new RecordingWriter();
+        var queue = new BackgroundLogQueue(
+            new ILogWriter[] { writer },
+            capacity: 8,
+            batchSize: 1,
+            flushInterval: TimeSpan.FromHours(1));
+        var waiting = 0;
+        using var bothWaiting = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+        queue.BeforeEnqueue = () =>
+        {
+            if (Interlocked.Increment(ref waiting) == 2)
+                bothWaiting.Set();
+
+            if (!release.Wait(TimeSpan.FromSeconds(20)))
+                throw new TimeoutException("Dispose did not finish while the accept was held.");
+        };
+        try
+        {
+            var first = Task.Run(() => queue.TryEnqueue(Event("race-a")));
+            var second = Task.Run(() => queue.TryEnqueue(Event("race-b")));
+            var started = Stopwatch.StartNew();
+            while (!bothWaiting.IsSet && started.Elapsed < TimeSpan.FromSeconds(20))
+                await Task.Delay(1);
+
+            Assert.True(bothWaiting.IsSet, "both accepts did not reach the hook");
+            queue.Dispose();
+            Assert.True(queue.ProcessorHasLeft);
+            release.Set();
+            var both = Task.WhenAll(first, second);
+            var finished = await Task.WhenAny(both, Task.Delay(TimeSpan.FromSeconds(20))) == both;
+            Assert.True(finished, "accepts did not return");
+            var accepted = await both;
+            Assert.True(accepted[0]);
+            Assert.True(accepted[1]);
+            Assert.Empty(writer.Events);
+            Assert.Equal(1, queue.ClosedDropCount);
+            Assert.Equal(0, queue.UnwrittenCount);
+            string joined;
+            lock (lines)
+                joined = string.Join('\n', lines);
+
+            Assert.Contains("1 queued events were not written", joined, StringComparison.Ordinal);
+            Assert.Contains(ClosedLine, joined, StringComparison.Ordinal);
+        }
+        finally
+        {
+            release.Set();
+            queue.Dispose();
+            SelfLog.Target = previous;
+        }
+    }
+
     /// <summary>Builds an info event. The timestamp is fixed so tests do not depend on the clock.</summary>
     /// <param name="message">Rendered message. Not null.</param>
     /// <returns>An event with no exception.</returns>
