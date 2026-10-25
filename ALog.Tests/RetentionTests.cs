@@ -43,7 +43,7 @@ public sealed class RetentionTests
     /// <returns>A task that finishes after the document is compared with the serializer.</returns>
     /// <remarks>The bag is the shared empty instance. A non-empty custom bag is not what this checks. Not thread-safe.</remarks>
     [Fact(Timeout = 30000)]
-    public async Task EmptyPropertyBag_StaysOnTheJsonDirectPath()
+    public async Task EmptyPropertyBag_StaysOnTheCompactJsonPath()
     {
         await Task.CompletedTask;
         var when = new DateTime(2026, 10, 23, 20, 17, 35, 268, DateTimeKind.Utc);

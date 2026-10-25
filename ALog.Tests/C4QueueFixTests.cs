@@ -680,7 +680,7 @@ public sealed partial class C4QueueFixTests
     /// The 20 second waits are hang guards. Not thread-safe. The finally block releases the hook and restores SelfLog.
     /// </remarks>
     [Fact(Timeout = 30000)]
-    public async Task DirectAccept_AfterProcessorExit_CallerCountsTheEvent()
+    public async Task CallerAccept_AfterProcessorExit_CountsTheEventAsAlog0072()
     {
         const string ClosedLine =
             "Event dropped: ALog is shut down (the background queue was closed by Shutdown or Dispose). Later events are counted, not reported. Stop logging before you call Shutdown or Dispose.";
@@ -757,7 +757,7 @@ public sealed partial class C4QueueFixTests
     /// Not thread-safe. The finally block releases the hook, the writer, and SelfLog.
     /// </remarks>
     [Fact(Timeout = 30000)]
-    public async Task DirectAccept_WhileDisposeWaits_StaysInTheSnapshot()
+    public async Task CallerAccept_WhileDisposeWaits_StaysInTheSnapshot()
     {
         var lines = new List<string>();
         var previous = SelfLog.Target;
