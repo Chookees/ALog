@@ -1,5 +1,6 @@
 ﻿namespace ALog.Formatters;
 
+using System.Buffers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ALog.Core;
@@ -56,6 +57,41 @@ public class JsonFormatter : ILogFormatter
     [ThreadStatic]
     private static System.Text.StringBuilder? _json;
 
+    /// <summary>Largest JSON builder kept on the thread. A bigger one is dropped after the call.</summary>
+    private const int MaxRetainedJson = 4096;
+
+    /// <summary>Capacity of the JSON builder still kept on this thread. Zero when none is kept.</summary>
+    /// <remarks>Does not throw. Another call on this thread can change it. Other threads have their own builder.</remarks>
+    internal static int RetainedJsonCapacity => _json?.Capacity ?? 0;
+
+    /// <summary>The thread's JSON builder, replaced when the one still kept is larger than <see cref="MaxRetainedJson"/>.</summary>
+    /// <returns>A cleared builder. Not null.</returns>
+    /// <remarks>Does not throw. Only this thread reads and writes <see cref="_json"/>.</remarks>
+    private static System.Text.StringBuilder TakeJson()
+    {
+        var builder = _json;
+        if (builder == null || builder.Capacity > MaxRetainedJson)
+        {
+            builder = new System.Text.StringBuilder(256);
+            _json = builder;
+        }
+        else
+        {
+            builder.Clear();
+        }
+
+        return builder;
+    }
+
+    /// <summary>Drops the builder when it grew past <see cref="MaxRetainedJson"/>.</summary>
+    /// <param name="builder">The builder <see cref="TakeJson"/> returned. Not null.</param>
+    /// <remarks>Does not throw. Only this thread calls it. A small builder stays for the next event.</remarks>
+    private static void ReleaseJson(System.Text.StringBuilder builder)
+    {
+        if (builder.Capacity > MaxRetainedJson)
+            _json = null;
+    }
+
     /// <summary>
     /// Builds the compact document for an event with no exception and only string or int properties.
     /// </summary>
@@ -69,19 +105,69 @@ public class JsonFormatter : ILogFormatter
     private static bool TryWriteSimple(LogEvent logEvent, out string json)
     {
         json = string.Empty;
-        if (logEvent.Message is null || logEvent.Timestamp.Kind != DateTimeKind.Utc)
-            return false;
-        if (logEvent.Properties is not null && logEvent.Properties is not Dictionary<string, object>)
-            return false;
-        if (logEvent.Context is { Count: > 0 } && logEvent.Context is not Dictionary<string, object>)
-            return false;
-        if (!IsJsonSafe(logEvent.Message)
-            || !IsJsonSafe(logEvent.MessageTemplate)
-            || !IsJsonSafe(logEvent.Category))
+        if (!TryAppendSimple(logEvent, out var builder))
             return false;
 
-        var builder = _json ??= new System.Text.StringBuilder(256);
-        builder.Clear();
+        json = builder.ToString();
+        ReleaseJson(builder);
+        return true;
+    }
+
+    /// <summary>
+    /// Writes the compact document as UTF-8, without a trailing newline, when it matches <see cref="Format"/>.
+    /// </summary>
+    /// <param name="logEvent">Event to render. Not null.</param>
+    /// <param name="destination">Buffer filled from the start. Ignored when the result is false.</param>
+    /// <param name="written">Byte count when the result is true. Zero when false.</param>
+    /// <returns>
+    /// False when the document is pretty, has an exception, needs the serializer, or does not fit.
+    /// The caller then uses <see cref="Format"/>.
+    /// </returns>
+    /// <remarks>
+    /// Does not throw. The bytes are the UTF-8 of <see cref="Format"/> for the same event, with no newline.
+    /// The simple document is ASCII, so each character is one byte. A false return does not promise that
+    /// <paramref name="destination"/> is unchanged. Safe to call from several threads. The builder is thread-static.
+    /// </remarks>
+    internal bool TryWriteUtf8(LogEvent logEvent, Span<byte> destination, out int written)
+    {
+        written = 0;
+        if (_options.WriteIndented || logEvent.Exception != null)
+            return false;
+        if (!TryAppendSimple(logEvent, out var builder))
+            return false;
+
+        if (builder.Length > destination.Length)
+        {
+            ReleaseJson(builder);
+            return false;
+        }
+
+        CopyAscii(builder, destination);
+        written = builder.Length;
+        ReleaseJson(builder);
+        return true;
+    }
+
+    /// <summary>
+    /// Appends the compact document when <see cref="Format"/> would not call <see cref="JsonSerializer"/>.
+    /// </summary>
+    /// <param name="logEvent">Event to render. Not null.</param>
+    /// <param name="builder">The document when the result is true. Unspecified when false.</param>
+    /// <returns>False when the serializer must write the event.</returns>
+    /// <remarks>
+    /// Does not throw. The caller releases <paramref name="builder"/> after a true result.
+    /// A false return before any character does not use that builder. A false return after a partial document releases it.
+    /// Only this thread uses the builder. The checks are the same ones <see cref="TryWriteSimple"/> used.
+    /// </remarks>
+    private static bool TryAppendSimple(LogEvent logEvent, out System.Text.StringBuilder builder)
+    {
+        if (!CanWriteSimple(logEvent))
+        {
+            builder = UnusedBuilder;
+            return false;
+        }
+
+        builder = TakeJson();
         builder.Append("{\"timestamp\":\"");
         AppendUtcRoundTrip(builder, logEvent.Timestamp);
         builder.Append("\",\"level\":\"");
@@ -107,7 +193,10 @@ public class JsonFormatter : ILogFormatter
         {
             builder.Append(",\"properties\":{");
             if (!AppendBag(builder, logEvent.Properties))
+            {
+                ReleaseJson(builder);
                 return false;
+            }
             builder.Append('}');
         }
 
@@ -115,14 +204,70 @@ public class JsonFormatter : ILogFormatter
         {
             builder.Append(",\"context\":{");
             if (logEvent.Context.Count > 0 && !AppendBag(builder, logEvent.Context))
+            {
+                ReleaseJson(builder);
                 return false;
+            }
             builder.Append('}');
         }
 
         builder.Append('}');
-        json = builder.ToString();
         return true;
     }
+
+    /// <summary>True when the hand-built document matches <see cref="JsonSerializer"/> for this event.</summary>
+    /// <param name="logEvent">Event to test. Not null.</param>
+    /// <returns>False when the serializer must write it.</returns>
+    /// <remarks>Does not throw. Does not allocate. Any thread may call it. The checks match the compact path.</remarks>
+    private static bool CanWriteSimple(LogEvent logEvent)
+    {
+        if (logEvent.Message is null || logEvent.Timestamp.Kind != DateTimeKind.Utc)
+            return false;
+        if (logEvent.Properties is { Count: > 0 } && logEvent.Properties is not Dictionary<string, object>)
+            return false;
+        if (logEvent.Context is { Count: > 0 } && logEvent.Context is not Dictionary<string, object>)
+            return false;
+
+        return IsJsonSafe(logEvent.Message)
+            && IsJsonSafe(logEvent.MessageTemplate)
+            && IsJsonSafe(logEvent.Category);
+    }
+
+    /// <summary>Copies an ASCII document into <paramref name="destination"/>.</summary>
+    /// <param name="builder">The document. Not null. Every character is ASCII.</param>
+    /// <param name="destination">Buffer at least as long as <paramref name="builder"/>. The caller checked the length.</param>
+    /// <remarks>
+    /// Does not throw. A line of at most 1024 characters stays on the stack. A longer line rents a buffer and returns it.
+    /// Only this thread calls it. The bytes are the same as UTF-8 of the builder text.
+    /// </remarks>
+    private static void CopyAscii(System.Text.StringBuilder builder, Span<byte> destination)
+    {
+        var length = builder.Length;
+        if (length <= 1024)
+        {
+            Span<char> chars = stackalloc char[length];
+            builder.CopyTo(0, chars, length);
+            for (var i = 0; i < length; i++)
+                destination[i] = (byte)chars[i];
+            return;
+        }
+
+        var rented = ArrayPool<char>.Shared.Rent(length);
+        try
+        {
+            var slice = rented.AsSpan(0, length);
+            builder.CopyTo(0, slice, length);
+            for (var i = 0; i < length; i++)
+                destination[i] = (byte)slice[i];
+        }
+        finally
+        {
+            ArrayPool<char>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Out value when <see cref="TryAppendSimple"/> returns false. Not a document.</summary>
+    private static readonly System.Text.StringBuilder UnusedBuilder = new(0);
 
     private static bool AppendBag(System.Text.StringBuilder builder, IReadOnlyDictionary<string, object> bag)
     {
@@ -238,7 +383,17 @@ public class JsonFormatter : ILogFormatter
         _ => level.ToString(),
     };
 
-    /// <summary>True when the serializer would write the text unchanged inside a JSON string.</summary>
+    /// <summary>
+    /// True when the default serializer would write <paramref name="text"/> unchanged inside a JSON string.
+    /// </summary>
+    /// <param name="text">A message, template, category, property name, or string property. Null and empty are safe.</param>
+    /// <returns>False when the hand-built line would differ from <see cref="JsonSerializer"/>.</returns>
+    /// <remarks>
+    /// Does not throw. The default encoder escapes <c>'</c> as <c>\u0027</c> and a backtick as <c>\u0060</c>,
+    /// plus quotes, backslashes, <c>&lt;</c>, <c>&gt;</c>, <c>&amp;</c>, <c>+</c>, and anything outside ASCII 0x20..0x7E.
+    /// Those characters take the serializer path so the bytes match the master library. Any thread may call this.
+    /// The loop is bounded by the string length.
+    /// </remarks>
     private static bool IsJsonSafe(string? text)
     {
         if (string.IsNullOrEmpty(text))
@@ -246,7 +401,7 @@ public class JsonFormatter : ILogFormatter
         for (var i = 0; i < text.Length; i++)
         {
             var ch = text[i];
-            if (ch < 0x20 || ch > 0x7E || ch is '"' or '\\' or '<' or '>' or '&' or '+')
+            if (ch < 0x20 || ch > 0x7E || ch is '"' or '\\' or '\'' or '`' or '<' or '>' or '&' or '+')
                 return false;
         }
 

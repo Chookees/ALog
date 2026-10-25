@@ -42,11 +42,12 @@ public class LogDispatcher
 
     /// <summary>
     /// Writes <paramref name="logEvent"/> to each writer that the gate allows.
-    /// A writer that throws does not stop the later writers.
+    /// A writer that throws does not stop the later writers, except <see cref="WriteDeferredException"/>, which stops the dispatch so the queue can retry the event.
     /// </summary>
     /// <param name="logEvent">Event to write. Passed through. A null event is the writer's problem.</param>
     /// <remarks>
-    /// Does not throw. One error line per failed writer. The loop is bounded by the writer list captured at construction.
+    /// Does not throw for a writer failure. <see cref="WriteDeferredException"/> is rethrown so the queue can keep the event.
+    /// One error line per other failed writer. The loop is bounded by the writer list captured at construction.
     /// </remarks>
     public void Dispatch(LogEvent logEvent)
     {
@@ -59,6 +60,10 @@ public class LogDispatcher
             try
             {
                 _writers[i].Write(logEvent);
+            }
+            catch (WriteDeferredException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -78,7 +83,8 @@ public class LogDispatcher
     /// <param name="logEvent">Event to write. Passed through.</param>
     /// <returns>A task that finishes when every allowed writer has returned or failed.</returns>
     /// <remarks>
-    /// Does not throw. A writer exception stays on the error line. The await does not capture a caller context.
+    /// Does not throw for a writer failure. <see cref="WriteDeferredException"/> is rethrown so the queue can keep the event.
+    /// Any other writer exception stays on the error line. The await does not capture a caller context.
     /// The loop is bounded by the writer list.
     /// </remarks>
     public async Task DispatchAsync(LogEvent logEvent)
@@ -98,6 +104,10 @@ public class LogDispatcher
             try
             {
                 await _writers[i].WriteAsync(logEvent).ConfigureAwait(false);
+            }
+            catch (WriteDeferredException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -197,6 +207,19 @@ public class LogDispatcher
         {
             System.Console.Error.WriteLine($"[ALog Dispatcher] Batch write failed for {writer.GetType().Name}: {ex}");
         }
+    }
+}
+
+/// <summary>
+/// The file could not open its write handle. The queue keeps the event and tries again on a later flush tick.
+/// </summary>
+/// <remarks>Does not carry a message. Only the processor's dispatcher lets it escape. A direct write holds the line instead.</remarks>
+internal sealed class WriteDeferredException : Exception
+{
+    /// <summary>Creates the marker. There is no message because the file already reported ALOG0073.</summary>
+    /// <remarks>Does not throw. Safe to construct on the processor thread.</remarks>
+    internal WriteDeferredException()
+    {
     }
 }
 

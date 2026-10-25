@@ -72,6 +72,14 @@ internal static class ExceptionReport
         typeof(Exception).GetField("_message", BindingFlags.Instance | BindingFlags.NonPublic);
 
     /// <summary>
+    /// Frames already read for the exception being formatted on this thread.
+    /// Compared by reference, so two exceptions that claim to be equal still keep their own frames.
+    /// Cleared when the format call returns, including when it throws, so an exception is not pinned here.
+    /// </summary>
+    [ThreadStatic]
+    private static Dictionary<Exception, List<FrameView>>? _frameCache;
+
+    /// <summary>
     /// Renders one exception as the plain-text segment shared by every text sink.
     /// The segment is <c>Type: Message</c>, then at most three chain nodes joined by
     /// <c> --&gt; </c>, then <c> (+n more)</c> or <c> (+n+ more)</c>, then <c>at Type.Method in File.cs:line</c>
@@ -88,22 +96,35 @@ internal static class ExceptionReport
     /// a throw means there is no origin, and a second stack walk is not a substitute for that.
     /// When the getter's text already names a user frame, that text is the origin and
     /// <see cref="ReadFrames"/> is not called again.
+    /// The frame cache is cleared before the walk and again when this returns, so a failure cannot leave the exception on the thread.
+    /// Only this thread reads the cache. Two calls on one thread do not overlap.
     /// </remarks>
-    [ThreadStatic]
-    private static Dictionary<Exception, List<FrameView>>? _frameCache;
-
     internal static string FormatText(Exception exception)
     {
+        EnsureFrameCache();
+        _frameCache!.Clear();
         try
         {
-            _frameCache ??= new Dictionary<Exception, List<FrameView>>(4);
-            _frameCache.Clear();
             return FormatTextCore(exception);
         }
         catch (Exception failure)
         {
             return Capture(failure);
         }
+        finally
+        {
+            _frameCache.Clear();
+        }
+    }
+
+    /// <summary>Creates the per-thread frame cache on first use. Later calls keep that dictionary.</summary>
+    /// <remarks>
+    /// Does not throw. The comparer is <see cref="ReferenceEqualityComparer"/>, so <see cref="object.Equals(object?)"/> on the exception is not used.
+    /// Only this thread calls it. The dictionary is empty until a frame walk stores into it.
+    /// </remarks>
+    private static void EnsureFrameCache()
+    {
+        _frameCache ??= new Dictionary<Exception, List<FrameView>>(4, ReferenceEqualityComparer.Instance);
     }
 
     /// <summary>
@@ -116,9 +137,13 @@ internal static class ExceptionReport
     /// <remarks>
     /// Does not escape or truncate the message. Does not call <see cref="Exception.ToString"/>.
     /// Does not throw. A throwing message getter stores the capture placeholder instead of a raw message.
+    /// The frame cache is cleared when this returns, including on failure, so the exception is not pinned to the thread.
+    /// Only this thread uses that cache.
     /// </remarks>
     internal static ExceptionBody CreateBody(Exception exception)
     {
+        EnsureFrameCache();
+        _frameCache!.Clear();
         try
         {
             return CreateBodyCore(exception);
@@ -130,6 +155,10 @@ internal static class ExceptionReport
                 Type = SafeTypeName(exception),
                 Message = Capture(failure)
             };
+        }
+        finally
+        {
+            _frameCache.Clear();
         }
     }
 

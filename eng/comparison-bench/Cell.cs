@@ -9,7 +9,17 @@ namespace AlogComparison;
 /// <summary>Runs one library × scenario cell.</summary>
 public static class Cell
 {
-    /// <summary>Entry for <c>ALog.Comparison cell &lt;lib&gt; &lt;scenario&gt; &lt;workdir&gt;</c>.</summary>
+    /// <summary>
+    /// Measures one library and scenario, then checks the file.
+    /// </summary>
+    /// <param name="libId">Harness id such as <c>serilog</c>. Not null.</param>
+    /// <param name="scenarioId">T1 through T7. Not null.</param>
+    /// <param name="workDir">Directory for the output file. Not null. Created if missing.</param>
+    /// <returns>0 after the result line is written. A failed file check is still 0; <c>valid</c> is false in the JSON.</returns>
+    /// <remarks>
+    /// Does not throw for a normal cell. Structured warm-up and the measured run share one user-id sequence,
+    /// starting at 0, so <see cref="Verify"/> can see a gap. One process runs one cell. Not thread-safe.
+    /// </remarks>
     public static int Run(string libId, string scenarioId, string workDir)
     {
         var lib = Libs.Create(libId);
@@ -48,7 +58,7 @@ public static class Cell
         if (sc.Id != "T6")
         {
             lib.Init(config);
-            Body(lib, sc, sc.Warmup, warmup: true, mutantDrop: false);
+            Body(lib, sc, sc.Warmup, warmup: true, mutantDrop: false, indexBase: 0);
             lib.Drain();
         }
 
@@ -63,7 +73,7 @@ public static class Cell
         var sw = Stopwatch.StartNew();
         if (sc.Id == "T6")
             lib.Init(config);
-        Body(lib, sc, sc.N, warmup: false, mutantDrop);
+        Body(lib, sc, sc.N, warmup: false, mutantDrop, indexBase: sc.Warmup);
         if (sc.Filtered)
             lib.Sentinel();
         var writeMs = sw.Elapsed.TotalMilliseconds;
@@ -107,8 +117,21 @@ public static class Cell
 
     private static string Version(ILib lib) => Libs.PackageVersion(lib.Framework);
 
-    /// <summary>Writes <paramref name="count"/> calls of the scenario's shape.</summary>
-    private static void Body(ILib lib, Scenario sc, long count, bool warmup, bool mutantDrop)
+    /// <summary>
+    /// Writes <paramref name="count"/> calls of the scenario's shape.
+    /// Structured calls number from <paramref name="indexBase"/> so warm-up and the measured run are one sequence.
+    /// </summary>
+    /// <param name="lib">Library under test. Not null. Already initialised.</param>
+    /// <param name="sc">Scenario. Not null.</param>
+    /// <param name="count">How many calls. The loop stops at this count.</param>
+    /// <param name="warmup">True for the untimed warm-up. A multi-thread scenario still warms up on one thread.</param>
+    /// <param name="mutantDrop">True when one call in the middle is skipped, so the file is short on purpose.</param>
+    /// <param name="indexBase">First structured index. Warm-up uses 0. The measured run uses the warm-up count.</param>
+    /// <remarks>
+    /// Does not throw for a library call. The loops are bounded by <paramref name="count"/> and by the thread count.
+    /// Only the threads this method starts call the library. T4 does not share one index across threads.
+    /// </remarks>
+    private static void Body(ILib lib, Scenario sc, long count, bool warmup, bool mutantDrop, long indexBase)
     {
         var skip = mutantDrop ? count / 2 : -1;
         if (sc.Threads > 1 && !warmup)
@@ -149,7 +172,7 @@ public static class Cell
                     lib.Simple();
                     break;
                 case CallKind.Structured:
-                    lib.Structured((int)(i % int.MaxValue));
+                    lib.Structured((int)((indexBase + i) % int.MaxValue));
                     break;
                 default:
                     lib.Error(Texts.ThrowChain());

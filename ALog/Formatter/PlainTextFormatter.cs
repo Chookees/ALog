@@ -13,9 +13,12 @@ public class PlainTextFormatter : ILogFormatter
 {
     private readonly string _dateTimeFormat;
     private readonly bool _includeStackTrace;
-    private readonly bool _utcMillis;
-    private readonly byte _decimalSep;
-    private readonly byte _timeSep;
+    private readonly bool _utcPattern;
+    private readonly CultureInfo _probedCulture;
+    private readonly bool _probedFastOk;
+
+    /// <summary>The only format the hand-written stamp implements. Anything else uses <see cref="DateTime.ToString(string)"/>.</summary>
+    private const string UtcMillisPattern = "yyyy-MM-dd'T'HH:mm:ss.fff'Z'";
 
     /// <summary>How many lines of <see cref="Exception.ToString"/> are indented. The rest are dropped.</summary>
     private const int MaxStackLines = 256;
@@ -72,37 +75,66 @@ public class PlainTextFormatter : ILogFormatter
     /// When true, <see cref="Exception.ToString"/> is appended after the line, each of its lines indented
     /// by four spaces. When false, <see cref="Exception.ToString"/> is not called.
     /// </param>
-    /// <remarks>Both values are stored. Neither is validated; an unusable format fails when a line is rendered.</remarks>
+    /// <remarks>
+    /// Both values are stored. Neither is validated; an unusable format fails when a line is rendered.
+    /// The current culture is probed once here. <see cref="TryWriteUtf8"/> uses that result only while the same
+    /// culture is still current, and probes again when a later write sees a different culture.
+    /// The probe is stored before the constructor returns. After that the fields are not written.
+    /// Any thread may construct a formatter. The probe reads only the constructing thread's culture.
+    /// </remarks>
     public PlainTextFormatter(string dateTimeFormat, bool includeStackTrace)
     {
         _dateTimeFormat = dateTimeFormat;
         _includeStackTrace = includeStackTrace;
-        var utc = dateTimeFormat == "yyyy-MM-dd'T'HH:mm:ss.fff'Z'";
-        var decSep = (byte)'.';
-        var timeSep = (byte)':';
-        if (utc)
-        {
-            var culture = CultureInfo.CurrentCulture;
-            var dec = culture.NumberFormat.NumberDecimalSeparator;
-            var time = culture.DateTimeFormat.TimeSeparator;
-            if (culture.Calendar is not GregorianCalendar
-                || dec.Length != 1
-                || time.Length != 1
-                || dec[0] > 127
-                || time[0] > 127)
-            {
-                utc = false;
-            }
-            else
-            {
-                decSep = (byte)dec[0];
-                timeSep = (byte)time[0];
-            }
-        }
+        _utcPattern = dateTimeFormat == UtcMillisPattern;
+        _probedCulture = CultureInfo.CurrentCulture;
+        _probedFastOk = _utcPattern && AllowsFastStamp(_probedCulture);
+    }
 
-        _utcMillis = utc;
-        _decimalSep = decSep;
-        _timeSep = timeSep;
+    /// <summary>
+    /// True when the hand-written stamp matches <see cref="DateTime.ToString(string)"/> for <paramref name="culture"/>.
+    /// </summary>
+    /// <param name="culture">The culture of the thread that is about to write. Not null.</param>
+    /// <returns>
+    /// True only for a Gregorian calendar whose time separator is <c>:</c> and whose negative sign is <c>-</c>.
+    /// </returns>
+    /// <remarks>
+    /// Does not throw. The stamp always uses <c>:</c> and a dot before the milliseconds, which is what
+    /// <see cref="DateTime.ToString(string)"/> writes for this pattern when the time separator is <c>:</c>.
+    /// The dot is a literal in that pattern, not <see cref="System.Globalization.NumberFormatInfo.NumberDecimalSeparator"/>.
+    /// A different time separator, a non-Gregorian calendar, or a negative sign other than <c>-</c> would make an integer
+    /// property or the clock differ, so the whole fast path stays off and <see cref="Format"/> is used.
+    /// Does not allocate. Safe to call from any thread. The culture object is not stored.
+    /// </remarks>
+    private static bool AllowsFastStamp(CultureInfo culture)
+    {
+        if (culture.Calendar is not GregorianCalendar)
+            return false;
+        if (culture.DateTimeFormat.TimeSeparator != ":")
+            return false;
+        if (culture.NumberFormat.NegativeSign != "-")
+            return false;
+        return true;
+    }
+
+    /// <summary>
+    /// True when this formatter's pattern is the UTC millisecond stamp and the writing thread's culture can use it.
+    /// </summary>
+    /// <returns>False when <see cref="Format"/> must render the line.</returns>
+    /// <remarks>
+    /// Does not throw. The constructor's probe is reused when <see cref="CultureInfo.CurrentCulture"/> is the same instance.
+    /// A culture changed after construction is probed again. Safe to call from several threads: the probe fields are not written here.
+    /// </remarks>
+    private bool FastStampAllowed()
+    {
+        if (!_utcPattern)
+            return false;
+
+        var culture = CultureInfo.CurrentCulture;
+        if (ReferenceEquals(culture, _probedCulture))
+            return _probedFastOk;
+
+        return AllowsFastStamp(culture);
     }
 
     /// <summary>
@@ -155,14 +187,16 @@ public class PlainTextFormatter : ILogFormatter
     /// a value this writer does not render, or the buffer is too small. The caller then uses <see cref="Format"/>.
     /// </returns>
     /// <remarks>
-    /// Does not throw. The timestamp pattern is the constructor format
-    /// <c>yyyy-MM-dd'T'HH:mm:ss.fff'Z'</c>, with the current culture's separators.
+    /// Does not throw. The timestamp pattern is <c>yyyy-MM-dd'T'HH:mm:ss.fff'Z'</c>.
+    /// The clock digits use <c>:</c> and a dot. That matches <see cref="Format"/> only when
+    /// <see cref="FastStampAllowed"/> is true for the culture of this thread at the call.
     /// A false return does not promise that <paramref name="destination"/> is unchanged.
+    /// Safe to call from several threads.
     /// </remarks>
     internal bool TryWriteUtf8(LogEvent logEvent, Span<byte> destination, out int written)
     {
         written = 0;
-        if (!_utcMillis || logEvent.Exception != null || logEvent.Context is { Count: > 0 })
+        if (!FastStampAllowed() || logEvent.Exception != null || logEvent.Context is { Count: > 0 })
             return false;
 
         var index = 0;
@@ -219,7 +253,18 @@ public class PlainTextFormatter : ILogFormatter
         _ => level.ToString(),
     };
 
-    private bool WriteUtcStamp(Span<byte> destination, DateTime timestamp, ref int index)
+    /// <summary>
+    /// Writes <c>yyyy-MM-ddTHH:mm:ss.fffZ</c> with a colon and a dot, never the culture's separators.
+    /// </summary>
+    /// <param name="destination">Buffer. Not checked for null. The caller passes a span.</param>
+    /// <param name="timestamp">Clock fields. The year is the Gregorian year on <see cref="DateTime"/>.</param>
+    /// <param name="index">Start index. Advanced by 24 when the stamp fits.</param>
+    /// <returns>False when fewer than 24 bytes remain. <paramref name="index"/> is then unchanged.</returns>
+    /// <remarks>
+    /// Does not throw. Called only after <see cref="FastStampAllowed"/> so these separators match <see cref="Format"/>.
+    /// Does not read the culture. Safe to call from any thread.
+    /// </remarks>
+    private static bool WriteUtcStamp(Span<byte> destination, DateTime timestamp, ref int index)
     {
         if (index + 24 > destination.Length)
             return false;
@@ -230,11 +275,11 @@ public class PlainTextFormatter : ILogFormatter
         Write2(destination, index + 8, timestamp.Day);
         destination[index + 10] = (byte)'T';
         Write2(destination, index + 11, timestamp.Hour);
-        destination[index + 13] = _timeSep;
+        destination[index + 13] = (byte)':';
         Write2(destination, index + 14, timestamp.Minute);
-        destination[index + 16] = _timeSep;
+        destination[index + 16] = (byte)':';
         Write2(destination, index + 17, timestamp.Second);
-        destination[index + 19] = _decimalSep;
+        destination[index + 19] = (byte)'.';
         Write3(destination, index + 20, timestamp.Millisecond);
         destination[index + 23] = (byte)'Z';
         index += 24;

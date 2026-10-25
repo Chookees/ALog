@@ -16,6 +16,80 @@ namespace ALog.Tests;
 public sealed class BkpExternalRotationTests
 {
     /// <summary>
+    /// On Windows, <c>File.ReadAllText</c> reads flushed lines while the writer is still alive.
+    /// </summary>
+    /// <remarks>
+    /// A zero flush interval writes each line and keeps the write handle. <see cref="FileLogWriter.Flush"/>
+    /// replaces that handle with a read handle. <c>File.ReadAllText</c> asks for <see cref="FileShare.Read"/>,
+    /// which succeeds against that read handle and throws while the write handle is still open.
+    /// The writer is not disposed. Other systems skip this test: Linux and macOS do not enforce the share mode,
+    /// so the assertion would not prove the Windows contract. Not thread-safe. The wait bound is 30 seconds.
+    /// </remarks>
+    [SkippableFact(Timeout = 30000)]
+    public async Task File_ReadAllTextSucceedsAfterFlushWhileAlive()
+    {
+        await Task.CompletedTask;
+        Skip.IfNot(OperatingSystem.IsWindows(), "FileShare is not enforced on this operating system.");
+        var directory = NewDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "readers.log");
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
+            writer.Write(Event("first-line"));
+            writer.Write(Event("second-line"));
+            writer.Flush();
+            var text = File.ReadAllText(path);
+            Assert.Contains("first-line", text, StringComparison.Ordinal);
+            Assert.Contains("second-line", text, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// On Windows, lines written while a <see cref="FileShare.Read"/> reader holds the file appear after that reader closes.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="FileLogWriter.Flush"/> parks a read handle. The reader then opens with <see cref="FileShare.Read"/>,
+    /// so the next write cannot reopen the write handle. The lines stay buffered and the file clock retries.
+    /// The writer is not disposed before the lines appear. Other systems skip this test: they do not enforce the share mode.
+    /// Not thread-safe. The wait bound is 30 seconds.
+    /// </remarks>
+    [SkippableFact(Timeout = 60000)]
+    public async Task File_LinesAppearAfterAReadShareIsReleased()
+    {
+        Skip.IfNot(OperatingSystem.IsWindows(), "FileShare is not enforced on this operating system.");
+        var directory = NewDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "share.log");
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
+            writer.Write(Event("first-line"));
+            writer.Flush();
+            using (var reader = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                writer.Write(Event("second-line"));
+                writer.Write(Event("third-line"));
+            }
+
+            await DeadlineClock.WaitFor(
+                () => File.ReadAllText(path).Contains("third-line", StringComparison.Ordinal),
+                "lines did not appear after the reader closed");
+            var text = File.ReadAllText(path);
+            var first = text.IndexOf("first-line", StringComparison.Ordinal);
+            var second = text.IndexOf("second-line", StringComparison.Ordinal);
+            var third = text.IndexOf("third-line", StringComparison.Ordinal);
+            Assert.True(first >= 0 && first < second && second < third);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
     /// A rename leaves the first line in the old file and the next line in a new file at the configured path.
     /// </summary>
     /// <remarks>

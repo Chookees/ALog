@@ -144,6 +144,13 @@ public sealed class BkpCoverageTests
     }
 
     /// <summary>A failed move reports the rolling error and opens the same file again, so the next line is still whole.</summary>
+    /// <remarks>
+    /// The flush interval is zero, so the write handle stays open across the first line.
+    /// The second line tries to rotate, the move fails, and the same path opens again.
+    /// The append does not open a read handle. Two successful opens are the whole delta.
+    /// Swapping after every write would add a read handle per line and fail this test.
+    /// Linux only: the directory lock is a Unix mode. Not thread-safe. The wait bound is 30 seconds.
+    /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task File_ReopensAfterRotationCannotMove()
     {
