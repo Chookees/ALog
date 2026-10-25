@@ -978,6 +978,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// Parked events are taken first so a deferred line stays ahead of a line that arrived later.
     /// While a reopen is failing, events still in the channel are taken only until the parked batch
     /// would pass <see cref="LogFileRegistry.DirectReopenByteBudget"/>. The rest stay in the channel.
+    /// A formatter that throws on that path is removed and counted as ALOG0070. It is not written.
     /// Only the processor calls this.
     /// </remarks>
     private int ReadBatch(List<LogEvent> batch)
@@ -1016,12 +1017,42 @@ public partial class BackgroundLogQueue : IDisposable
         if (bytes >= LogFileRegistry.DirectReopenByteBudget)
             return count;
 
-        while (count < limit)
+        return TakeDeferredChannel(batch, count, bytes, limit);
+    }
+
+    /// <summary>
+    /// Appends channel events that still fit in the reopen hold. A formatter that throws is dropped and counted.
+    /// </summary>
+    /// <param name="batch">Destination. Not null. Already holds any parked events.</param>
+    /// <param name="count">How many events <paramref name="batch"/> already holds. Not negative.</param>
+    /// <param name="bytes">Bytes already counted toward the hold. Not negative.</param>
+    /// <param name="limit">Most events this read may return. At least <paramref name="count"/>.</param>
+    /// <returns>The new event count. At least <paramref name="count"/> and at most <paramref name="limit"/>.</returns>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this, and only while a reopen has failed.
+    /// A throwing formatter is ALOG0070 and is not written. A line larger than the budget is still taken
+    /// when it is the first event of this read, so a later park can drop it if the write fails.
+    /// The loop stops at <paramref name="limit"/> or after <see cref="MaxRead"/> examinations.
+    /// </remarks>
+    private int TakeDeferredChannel(List<LogEvent> batch, int count, int bytes, int limit)
+    {
+        var examined = 0;
+        while (count < limit && examined < MaxRead)
         {
+            examined++;
             if (!_queue.TryPeek(out var peeked))
                 break;
 
             var size = HoldBytes(peeked);
+            if (HoldCaptureFailed(peeked))
+            {
+                if (!_queue.TryDequeue(out var failed))
+                    break;
+
+                DropFailedHold(failed);
+                continue;
+            }
+
             // One event that is itself over the budget is still attempted. Parking drops it if the write fails.
             if (count > 0 && (long)bytes + size > LogFileRegistry.DirectReopenByteBudget)
                 break;
@@ -1037,6 +1068,27 @@ public partial class BackgroundLogQueue : IDisposable
         }
 
         return count;
+    }
+
+    /// <summary>True when the hold cache records that the formatter threw for <paramref name="logEvent"/>.</summary>
+    /// <param name="logEvent">The event just measured. Not null.</param>
+    /// <returns>True when the line must be dropped instead of written. False when the bytes are usable or not cached.</returns>
+    /// <remarks>Does not throw. Only the processor calls this, on the reopen-failure path. A healthy batch does not.</remarks>
+    private bool HoldCaptureFailed(LogEvent logEvent)
+        => _held.TryGetValue(logEvent, out var held) && held.Failed;
+
+    /// <summary>
+    /// Removes a line whose formatter threw and counts it as ALOG0070.
+    /// </summary>
+    /// <param name="logEvent">The event. Not null. The hold cache marks the capture as failed.</param>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this, on the reopen-failure path.
+    /// The line is not written. It is removed from the accepted count so dispose does not report it again.
+    /// </remarks>
+    private void DropFailedHold(LogEvent logEvent)
+    {
+        _held.Remove(logEvent);
+        NoteReopenHoldDropped(1);
     }
 
     /// <summary>
@@ -1179,7 +1231,7 @@ public partial class BackgroundLogQueue : IDisposable
                     if (_directDispatch)
                         _dispatcher.Dispatch(logEvent);
                     else
-                        _dispatcher.DispatchAsync(logEvent).GetAwaiter().GetResult();
+                        WaitWriterOnConsumerThread(_dispatcher.DispatchAsync(logEvent));
                 }
             }
             catch (WriteDeferredException)
@@ -1272,9 +1324,20 @@ public partial class BackgroundLogQueue : IDisposable
             return;
         }
 
-        // A faulted task can already be completed. GetResult is what surfaces WriteDeferredException.
-        writer.WriteAsync(logEvent).GetAwaiter().GetResult();
+        // A faulted task can already be completed. The wait surfaces WriteDeferredException.
+        WaitWriterOnConsumerThread(writer.WriteAsync(logEvent));
     }
+
+    /// <summary>
+    /// Waits until <paramref name="task"/> finishes. A faulted task throws here, including when it is already complete.
+    /// </summary>
+    /// <param name="task">The writer task. Not null. It may already be completed.</param>
+    /// <remarks>
+    /// Does not throw except the task's own exception. Only the processor calls this.
+    /// A log call does not, and no caller SynchronizationContext is captured.
+    /// The timeout is the writer task itself. FlushTimeout stops a new writer call and does not cancel one that has started.
+    /// </remarks>
+    private static void WaitWriterOnConsumerThread(Task task) => task.GetAwaiter().GetResult();
 
     /// <summary>What one processor write did with an event.</summary>
     private enum DispatchResult
@@ -1353,7 +1416,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// Does not throw. Only the processor calls this, and only while a reopen has failed
     /// or a parked batch is being put back. A healthy queue does not call it.
     /// The formatted bytes are kept so the retry writes those exact bytes and does not format again.
-    /// A formatter that throws counts as one byte past the budget, so the line is dropped instead of under-counted.
+    /// A formatter that throws counts as one byte past the budget, so the line is dropped and counted as ALOG0070.
     /// There is no multiplier. A queue with no file writer charges the message UTF-8 plus <see cref="PlainLineOverhead"/>.
     /// </remarks>
     private int HoldBytes(LogEvent logEvent)
@@ -1372,6 +1435,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. The loop is bounded by the writer list. Only <see cref="HoldBytes"/> calls this, on the reopen-failure path.
     /// A line larger than the budget remembers the size and not the bytes, so a dropped line does not keep the array.
+    /// A formatter that throws is marked failed. The queue counts that line as ALOG0070 and does not write it.
     /// </remarks>
     private int CaptureHold(LogEvent logEvent)
     {
@@ -1386,18 +1450,18 @@ public partial class BackgroundLogQueue : IDisposable
 
             anyFile = true;
             if (!TryCapture(file, logEvent, out var captured))
-                return RememberSize(logEvent, null, OverBudgetHold());
+                return RememberSize(logEvent, null, OverBudgetHold(), failed: true);
 
             lines[i] = captured;
             total += captured.Length;
             if (total > LogFileRegistry.DirectReopenByteBudget)
-                return RememberSize(logEvent, null, SaturatingHold(total));
+                return RememberSize(logEvent, null, SaturatingHold(total), failed: false);
         }
 
         if (!anyFile)
-            return RememberSize(logEvent, null, SaturatingHold(PlainHold(logEvent)));
+            return RememberSize(logEvent, null, SaturatingHold(PlainHold(logEvent)), failed: false);
 
-        return RememberSize(logEvent, lines, SaturatingHold(total));
+        return RememberSize(logEvent, lines, SaturatingHold(total), failed: false);
     }
 
     /// <summary>
@@ -1406,11 +1470,12 @@ public partial class BackgroundLogQueue : IDisposable
     /// <param name="logEvent">The event. Not null.</param>
     /// <param name="lines">Cached file lines, or null when the line will not be replayed from those bytes.</param>
     /// <param name="size">The count the budget uses. Not negative.</param>
+    /// <param name="failed">True when the formatter threw. The line is then dropped and counted, not written.</param>
     /// <returns><paramref name="size"/>, or the size already stored for this event.</returns>
     /// <remarks>Does not throw. Only the processor calls this, on the reopen-failure path. A second store keeps the first size.</remarks>
-    private int RememberSize(LogEvent logEvent, byte[]?[]? lines, int size)
+    private int RememberSize(LogEvent logEvent, byte[]?[]? lines, int size, bool failed)
     {
-        if (!_held.TryAdd(logEvent, new HeldLines(lines, size)) && _held.TryGetValue(logEvent, out var existing))
+        if (!_held.TryAdd(logEvent, new HeldLines(lines, size, failed)) && _held.TryGetValue(logEvent, out var existing))
             return existing.Bytes;
 
         return size;
@@ -1439,7 +1504,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// <param name="file">The writer. Not null.</param>
     /// <param name="logEvent">The event. Not null.</param>
     /// <param name="captured">The UTF-8 line, including the newline, when the result is true. Empty when false.</param>
-    /// <returns>False when the formatter throws. The caller then drops the line.</returns>
+    /// <returns>False when the formatter throws. The caller then drops the line and counts it as ALOG0070.</returns>
     /// <remarks>Does not throw. Only the processor calls this, on the reopen-failure path.</remarks>
     private static bool TryCapture(FileLogWriter file, LogEvent logEvent, out byte[] captured)
     {
@@ -1478,14 +1543,16 @@ public partial class BackgroundLogQueue : IDisposable
     /// </summary>
     private sealed class HeldLines
     {
-        /// <summary>Stores the lines and the count.</summary>
+        /// <summary>Stores the lines, the count, and whether the formatter threw.</summary>
         /// <param name="lines">One slot per writer, or null when the bytes are not kept. A null slot is not a file line.</param>
         /// <param name="bytes">The count. Not negative.</param>
+        /// <param name="failed">True when the formatter threw. The queue then counts the line as ALOG0070.</param>
         /// <remarks>Does not throw. The processor creates this on the reopen-failure path. The array is not copied.</remarks>
-        internal HeldLines(byte[]?[]? lines, int bytes)
+        internal HeldLines(byte[]?[]? lines, int bytes, bool failed)
         {
             Lines = lines;
             Bytes = bytes;
+            Failed = failed;
         }
 
         /// <summary>Cached UTF-8 lines, including newlines. Null when only the count is kept.</summary>
@@ -1493,6 +1560,9 @@ public partial class BackgroundLogQueue : IDisposable
 
         /// <summary>Bytes charged against the reopen budget.</summary>
         internal int Bytes { get; }
+
+        /// <summary>True when the formatter threw. The line is dropped and counted, not written.</summary>
+        internal bool Failed { get; }
     }
 
     /// <summary>
@@ -1501,24 +1571,31 @@ public partial class BackgroundLogQueue : IDisposable
     /// <param name="count">Lines dropped by this park. Greater than zero.</param>
     /// <remarks>
     /// Does not throw. Only the processor calls this. The first drop in a quiet period reports immediately.
-    /// Later drops in the same minute stay in the count. The sentence is the file-buffer ALOG0070 line.
+    /// Later drops in the same minute stay in the count until the minute ends or dispose writes them.
+    /// The sentence is the file-buffer ALOG0070 line.
     /// The accepted count loses these lines so a later ALOG0071 does not include them.
+    /// A formatter that throws is one of these drops. It is not a silent loss.
     /// </remarks>
     private void NoteReopenHoldDropped(int count)
     {
         if (!ForgetDropped(count))
             return;
 
-        _holdDrops += count;
-        var now = _clock.GetUtcNow();
-        if (_holdReportedTicks != 0 && now.UtcTicks - _holdReportedTicks < TimeSpan.TicksPerMinute)
-            return;
+        lock (_reportGate)
+        {
+            _holdDrops += count;
+            var now = _clock.GetUtcNow();
+            var windowOpen = _holdReportedTicks != 0 && now.UtcTicks - _holdReportedTicks < TimeSpan.TicksPerMinute;
+            if (windowOpen && !_reportSealed)
+                return;
 
-        var reported = _holdDrops;
-        _holdDrops = 0;
-        _holdReportedTicks = now.UtcTicks;
-        if (reported > 0)
-            SelfLog.ReportLine(LogFileRegistry.BufferFullLine(reported));
+            var reported = _holdDrops;
+            _holdDrops = 0;
+            if (!_reportSealed)
+                _holdReportedTicks = now.UtcTicks;
+            if (reported > 0)
+                SelfLog.ReportLine(LogFileRegistry.BufferFullLine(reported));
+        }
     }
 
     /// <summary>
@@ -2120,7 +2197,8 @@ public partial class BackgroundLogQueue : IDisposable
     /// </summary>
     /// <param name="unwritten">Accepted events still outstanding. Zero writes no ALOG0071. Negative is treated as zero.</param>
     /// <remarks>
-    /// Does not throw. Holds <see cref="_reportGate"/> across both lines so they cannot be reordered.
+    /// Does not throw. Holds <see cref="_reportGate"/> across the lines so they cannot be reordered.
+    /// A reopen-hold count still inside its minute is written here, before ALOG0071.
     /// A second <see cref="Dispose"/> does not call this. No drops writes no ALOG0070.
     /// </remarks>
     private void PublishReports(long unwritten)
@@ -2128,6 +2206,7 @@ public partial class BackgroundLogQueue : IDisposable
         lock (_reportGate)
         {
             _reportSealed = true;
+            PublishPendingHoldDrops();
             PublishPendingFullDrops();
             if (unwritten > 0 && Interlocked.Exchange(ref _shutdownReported, 1) == 0)
                 SelfLog.ReportLine(FormatShutdown(unwritten));
@@ -2135,6 +2214,23 @@ public partial class BackgroundLogQueue : IDisposable
 
         // Covers the sealed callback path and drops a callback that lost the race for the lock.
         DeliverFullDropReport();
+    }
+
+    /// <summary>
+    /// Writes one ALOG0070 line for reopen-hold drops still waiting in the open minute. Zero writes nothing.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. The caller holds <see cref="_reportGate"/>. Dispose calls this so a formatter throw
+    /// counted after the first report of that minute is still written. The count is cleared here.
+    /// </remarks>
+    private void PublishPendingHoldDrops()
+    {
+        var count = _holdDrops;
+        _holdDrops = 0;
+        if (count <= 0)
+            return;
+
+        SelfLog.ReportLine(LogFileRegistry.BufferFullLine(count));
     }
 
     /// <summary>
