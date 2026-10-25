@@ -2,7 +2,8 @@
 """Fail when a library sync-wait is not on the allowlist.
 
 Scans ``ALog`` and ``ALog.Extensions.Logging`` for ``.Result``, ``.Wait(``,
-and ``GetResult(``. Every hit must match one line in
+``GetResult(``, and ``WaitHandle.WaitAny`` / ``WaitAll`` / ``WaitOne`` calls
+that pass no timeout. Every hit must match one line in
 ``eng/sync-wait-allowlist.txt``. Every allowlist line must match a hit and
 must name a timeout. ``FileLogWriter.cs`` must not call ``Task.Run``.
 Next file: ``eng/sync-wait-allowlist.txt``.
@@ -18,6 +19,7 @@ LIBRARIES = ("ALog", "ALog.Extensions.Logging")
 ALLOWLIST_NAME = "eng/sync-wait-allowlist.txt"
 FILE_WRITER = "ALog/Writers/File/FileLogWriter.cs"
 HIT_RE = re.compile(r"\.Result\b|\.Wait\(|GetResult\(")
+WAIT_HANDLE_RE = re.compile(r"\bWaitHandle\s*\.\s*Wait(Any|All|One)\s*\(")
 TASK_RUN_RE = re.compile(r"\bTask\.Run\b")
 MAX_ALLOWLIST_LINES = 50
 MAX_FILES = 500
@@ -118,6 +120,104 @@ def iter_source_files(root: Path) -> list[Path]:
     return found
 
 
+def wait_handle_lacks_timeout(line: str) -> bool:
+    """True when a WaitHandle wait on this line has no timeout argument.
+
+    Args:
+        line: One source line.
+
+    Returns:
+        True when ``WaitAny`` or ``WaitAll`` has only the handles, or ``WaitOne``
+        has an empty argument list. A call that passes a timeout is false.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    for match in WAIT_HANDLE_RE.finditer(line):
+        kind = match.group(1)
+        open_paren = match.end() - 1
+        if kind == "WaitOne":
+            if not _call_has_argument(line, open_paren):
+                return True
+        elif not _call_has_timeout_argument(line, open_paren):
+            return True
+    return False
+
+
+def _call_has_argument(line: str, open_paren: int) -> bool:
+    """True when the call at ``open_paren`` has any argument.
+
+    Args:
+        line: One source line.
+        open_paren: Index of the opening parenthesis.
+
+    Returns:
+        True when a non-space character appears before the matching close paren.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    paren = 0
+    for index in range(open_paren, len(line)):
+        char = line[index]
+        if char == "(":
+            paren += 1
+        elif char == ")":
+            paren -= 1
+            if paren == 0:
+                return False
+        elif paren == 1 and not char.isspace():
+            return True
+    return False
+
+
+def _call_has_timeout_argument(line: str, open_paren: int) -> bool:
+    """True when a WaitAny or WaitAll call passes an argument after the handles.
+
+    Args:
+        line: One source line.
+        open_paren: Index of the opening parenthesis.
+
+    Returns:
+        True when a comma sits at the call's own argument depth. Commas inside
+        the handles array do not count.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    paren = 0
+    bracket = 0
+    brace = 0
+    for index in range(open_paren, len(line)):
+        char = line[index]
+        if char == "(":
+            paren += 1
+        elif char == ")":
+            paren -= 1
+            if paren == 0:
+                return False
+        elif char == "[":
+            bracket += 1
+        elif char == "]":
+            bracket -= 1
+        elif char == "{":
+            brace += 1
+        elif char == "}":
+            brace -= 1
+        elif char == "," and paren == 1 and bracket == 0 and brace == 0:
+            return True
+    return False
+
+
 def scan_hits(root: Path) -> tuple[list[tuple[str, str]], list[str]]:
     """Find sync-wait lines in the two libraries.
 
@@ -147,7 +247,7 @@ def scan_hits(root: Path) -> tuple[list[tuple[str, str]], list[str]]:
             if len(line) > MAX_LINE_CHARS:
                 problems.append(f"{relative} has a line longer than {MAX_LINE_CHARS} characters.")
                 break
-            if HIT_RE.search(line):
+            if HIT_RE.search(line) or wait_handle_lacks_timeout(line):
                 hits.append((relative, line))
     return hits, problems
 

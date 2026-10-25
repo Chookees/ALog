@@ -3,6 +3,7 @@
 
 A hit that is not listed fails. A listed line with no timeout fails.
 A listed line that matches nothing fails. ``Task.Run`` in the file writer fails.
+``WaitHandle.WaitAny``, ``WaitAll``, and ``WaitOne`` without a timeout fail the same way.
 """
 
 from __future__ import annotations
@@ -128,16 +129,42 @@ class SyncWaitCheckTests(unittest.TestCase):
         self.assertTrue(any("matches nothing" in item for item in problems))
 
     def test_queue_entries_name_the_consumer_thread(self) -> None:
-        """The queue allowlist covers both waits and names the consumer thread."""
+        """The consumer waits name that thread. Block and dispose waits name their own timeout."""
         text = (REPO / "eng" / "sync-wait-allowlist.txt").read_text(encoding="utf-8")
         self.assertNotIn("void GetResult", text)
         entries, problems = CHECK.parse_allowlist(text)
         self.assertEqual(problems, [])
         queue = [item for item in entries if item[0].endswith("BackgroundLogQueue.cs")]
-        self.assertEqual(len(queue), 2)
+        self.assertEqual(len(queue), 5)
+        consumer = [reason for _path, _pattern, reason in queue if "consumer thread" in reason]
+        self.assertEqual(len(consumer), 3)
         for _path, _pattern, reason in queue:
             self.assertIn("Timeout:", reason)
-            self.assertIn("consumer thread", reason)
+            self.assertGreaterEqual(len(reason), 20)
+
+    def test_waitany_without_timeout_is_flagged(self) -> None:
+        """WaitHandle.WaitAny with only the handles is a sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(new WaitHandle[] { left, right });\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_with_timeout_is_not_a_hit(self) -> None:
+        """A WaitAny call that passes a timeout is outside this rule."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(new WaitHandle[] { left, right }, 1000);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
 
     def test_task_run_in_file_writer_fails(self) -> None:
         """Task.Run in the file writer is a failure even when no sync wait exists."""
