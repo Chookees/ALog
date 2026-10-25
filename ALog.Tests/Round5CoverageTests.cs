@@ -108,7 +108,7 @@ public sealed class Round5CoverageTests
     /// The file is deleted. Not thread-safe.
     /// </remarks>
     [Fact(Timeout = 10000)]
-    public async Task FileScratch_SecondAsciiGrowth_StopsAtFourKiB()
+    public async Task FileScratch_RepeatedAsciiGrowth_StopsAtFourKiB()
     {
         var done = Task.Run(WriteTwoAsciiLines);
         var finished = await Task.WhenAny(done, Task.Delay(TimeSpan.FromSeconds(8))) == done;
