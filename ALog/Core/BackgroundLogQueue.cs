@@ -1179,11 +1179,7 @@ public partial class BackgroundLogQueue : IDisposable
                     if (_directDispatch)
                         _dispatcher.Dispatch(logEvent);
                     else
-                    {
-                        var task = _dispatcher.DispatchAsync(logEvent);
-                        if (!task.IsCompleted)
-                            task.GetAwaiter().GetResult();
-                    }
+                        _dispatcher.DispatchAsync(logEvent).GetAwaiter().GetResult();
                 }
             }
             catch (WriteDeferredException)
@@ -1276,9 +1272,8 @@ public partial class BackgroundLogQueue : IDisposable
             return;
         }
 
-        var task = writer.WriteAsync(logEvent);
-        if (!task.IsCompleted)
-            task.GetAwaiter().GetResult();
+        // A faulted task can already be completed. GetResult is what surfaces WriteDeferredException.
+        writer.WriteAsync(logEvent).GetAwaiter().GetResult();
     }
 
     /// <summary>What one processor write did with an event.</summary>
