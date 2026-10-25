@@ -870,18 +870,24 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. A writer exception is handled inside the dispatcher.
     /// The in-flight flag keeps <see cref="FlushAsync"/> from completing during the call.
+    /// A failed reopen stays deferred when shutdown stops the retry, so the Block caller is part of the ALOG0071 remainder.
     /// </remarks>
     private void WriteAccepted(List<LogEvent> batch, int count)
     {
         Interlocked.Increment(ref _inflight);
         var committed = 0;
+        // Captured before a shutdown stop can empty the front. The finally must not clear it in that window.
+        var retrying = Volatile.Read(ref _writeDeferred) != 0;
         try
         {
             var limit = count;
             for (var i = 0; i < limit; i++)
             {
                 if (Volatile.Read(ref _stop) != 0 || NewWritesBudgetSpent() || _writerGate.DeadlineReached)
+                {
+                    HoldDeferred(batch, i, count, retrying);
                     return;
+                }
 
                 var result = DispatchOne(batch[i]);
                 if (result == DispatchResult.Deferred)
@@ -894,19 +900,44 @@ public partial class BackgroundLogQueue : IDisposable
                 }
 
                 if (result == DispatchResult.Skipped)
+                {
+                    HoldDeferred(batch, i, count, retrying);
                     return;
+                }
 
                 committed++;
+                retrying = false;
             }
         }
         finally
         {
             if (committed > 0)
                 CommitBatch(committed);
-            if (_front.Count == 0)
+            if (_front.Count == 0 && !retrying)
                 Volatile.Write(ref _writeDeferred, 0);
             Interlocked.Decrement(ref _inflight);
         }
+    }
+
+    /// <summary>
+    /// Puts a deferred batch back on the front when shutdown stops the retry before the write returns.
+    /// </summary>
+    /// <param name="batch">The batch just read. Not null.</param>
+    /// <param name="start">The first event that was not written.</param>
+    /// <param name="count">How many entries in the batch are live.</param>
+    /// <param name="retrying">True when this call was already a failed-reopen retry.</param>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this. A normal shutdown, where the file is not deferred, leaves the batch as it was.
+    /// The deferred flag stays set so a Block caller released at the flush timeout is counted in the ALOG0071 remainder.
+    /// The copy is bounded by <see cref="MaxRead"/>.
+    /// </remarks>
+    private void HoldDeferred(List<LogEvent> batch, int start, int count, bool retrying)
+    {
+        if (!retrying)
+            return;
+
+        ParkFront(batch, start, count);
+        Volatile.Write(ref _writeDeferred, 1);
     }
 
     /// <summary>
