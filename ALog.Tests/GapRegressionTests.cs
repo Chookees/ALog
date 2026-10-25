@@ -360,7 +360,7 @@ public class GapRegressionTests : IDisposable
     /// <remarks>
     /// Parked means the processor has started and has entered the idle wait, with no writer call running.
     /// Those are internal signals, not compiler-generated type names.
-    /// After enqueue, the wake source must be a new instance, which only the wake path replaces.
+    /// After enqueue, the wake count must move, which only the idle-signal path increments.
     /// The 30 s waits are hang guards. Not thread-safe. The delegate releases the writer.
     /// A thread-id compare is not used. The pool may reuse the producer thread after the hop.
     /// </remarks>
@@ -379,7 +379,7 @@ public class GapRegressionTests : IDisposable
                 asyncEnabled: false);
 
             AssertProcessorIsParkedInIdleWait(queue);
-            var parkedWake = queue.WakeTokenSource;
+            var parkedWake = queue.WakeSignals;
             Assert.Equal(0, writer.EnteredCount);
 
             var enqueueDone = new ManualResetEventSlim(false);
@@ -401,7 +401,7 @@ public class GapRegressionTests : IDisposable
                 await Task.Delay(10).ConfigureAwait(false);
 
             Assert.True(writer.EnteredCount > 0, "processor never entered blocking writer");
-            Assert.False(ReferenceEquals(parkedWake, queue.WakeTokenSource), "wake path did not replace _wakeCts");
+            Assert.True(queue.WakeSignals > parkedWake, "wake path did not signal the idle processor");
             Assert.Empty(writer.Events);
 
             writer.Release();

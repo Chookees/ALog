@@ -54,9 +54,8 @@ public partial class BackgroundLogQueue : IDisposable
     private readonly ConcurrentQueue<LogEvent> _queue = new();
     private readonly Queue<LogEvent> _front = new();
     private readonly ManualResetEventSlim _releaseRetry = new(false);
-    private readonly ManualResetEventSlim _idlePulse = new(false);
-    private readonly ManualResetEventSlim _processorDone = new(false);
-    private int _idleEpoch;
+    private readonly ManualResetEventSlim _wake = new(false);
+    private int _wakeSignals;
     private readonly LogDispatcher _dispatcher;
     private readonly CancellationTokenSource _shutdownSignal = new();
     private readonly Task _backgroundTask;
@@ -71,7 +70,6 @@ public partial class BackgroundLogQueue : IDisposable
     private readonly WriterGate _writerGate;
     private readonly ManualResetEventSlim _stopped = new(false);
 
-    private CancellationTokenSource _wakeCts = new();
     private int _idle;
     private int _closedFast;
     private TaskCompletionSource<bool>? _flushTcs;
@@ -161,8 +159,8 @@ public partial class BackgroundLogQueue : IDisposable
     /// <param name="settings">Capacity, batch, interval, async flag, and clock. The clock is not null.</param>
     /// <exception cref="ArgumentNullException"><paramref name="settings"/> has a null clock.</exception>
     /// <remarks>
-    /// The processor starts before this returns, and the first idle wake is already paid when the processor reaches that wait.
-    /// A flush interval the timer rejects does not pay it. The clock cannot be changed afterwards.
+    /// The processor starts before this returns. It does not wait for the first idle wake, and a wake does not throw.
+    /// The clock cannot be changed afterwards.
     /// Does not throw for a writer failure. A flush interval the timer rejects still leaves the
     /// stopped signal unset, so <see cref="Dispose"/> waits out <see cref="ShutdownDeadline"/>.
     /// Every event is queued. The processor writes it. A file or console writer is called
@@ -202,57 +200,6 @@ public partial class BackgroundLogQueue : IDisposable
             CancellationToken.None,
             TaskCreationOptions.LongRunning,
             TaskScheduler.Default);
-        // The first cancel of the idle wait is expensive. Pay it here so the first real event does not.
-        // A test clock does not have to move: the processor publishes idle before it blocks on the timer.
-        PrimeFirstWake();
-    }
-
-    /// <summary>
-    /// Wakes the idle processor once and waits until it is idle again.
-    /// The first cancel sets up the wait; a later log then only cancels an existing wait.
-    /// </summary>
-    /// <remarks>
-    /// Does not throw. Called once from the constructor, on the constructing thread.
-    /// Returns without waiting out a clock interval when the processor has already left.
-    /// A rejected flush interval leaves before the first idle and does not set the stopped flag.
-    /// The two waits are the first idle and the idle after this prime wake.
-    /// </remarks>
-    private void PrimeFirstWake()
-    {
-        if (!WaitForIdleCount(1))
-            return;
-
-        WakeProcessor();
-        WaitForIdleCount(2);
-    }
-
-    /// <summary>Waits until the processor has entered the idle wait <paramref name="target"/> times, or has left.</summary>
-    /// <param name="target">The idle count to reach. Greater than zero.</param>
-    /// <returns>False when the processor left before the count. True when the count was reached.</returns>
-    /// <remarks>
-    /// Does not throw. Does not read the wall clock. The processor sets the idle pulse after it publishes the count.
-    /// A reset that loses one pulse reads the count again and does not wait.
-    /// The processor-done handle is set once and is not reset, including when the timer rejects the flush interval.
-    /// Only the constructing thread calls this.
-    /// </remarks>
-    private bool WaitForIdleCount(int target)
-    {
-        while (Volatile.Read(ref _idleEpoch) < target)
-        {
-            if (_processorDone.IsSet)
-                return false;
-
-            _idlePulse.Reset();
-            if (Volatile.Read(ref _idleEpoch) >= target)
-                return true;
-
-            if (_processorDone.IsSet)
-                return false;
-
-            WaitHandle.WaitAny(new[] { _idlePulse.WaitHandle, _processorDone.WaitHandle });
-        }
-
-        return true;
     }
 
     /// <summary>Events the queue accepted before the close point. Not full drops and not closed drops.</summary>
@@ -298,8 +245,9 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>Does not throw. The count moves before the processor blocks, so a test can advance the clock after it changes.</remarks>
     internal int ReopenWaitsStarted => Volatile.Read(ref _reopenWaitsStarted);
 
-    /// <summary>The source cancelled to wake the processor. A wake replaces this instance.</summary>
-    internal CancellationTokenSource WakeTokenSource => _wakeCts;
+    /// <summary>How many times a caller signalled an idle processor. A wake that finds the processor busy does not count.</summary>
+    /// <remarks>Does not throw. The count moves on the thread that queued the event, before that call returns.</remarks>
+    internal int WakeSignals => Volatile.Read(ref _wakeSignals);
 
     /// <summary>How many shutdown waits have been registered on the clock. Zero before <see cref="Dispose"/> waits.</summary>
     internal int DisposeWaitsStarted => Volatile.Read(ref _disposeWaitsStarted);
@@ -717,14 +665,13 @@ public partial class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Cancels the idle wait so the processor looks at the channel.
+    /// Signals the idle wait so the processor looks at the channel.
     /// The logging thread does not run the writer. The dedicated processor thread does.
     /// </summary>
     /// <remarks>
-    /// Does not throw. Safe to call after the wait source has been replaced or disposed.
+    /// Does not throw. Does not cancel a token and does not catch an exception on the normal path.
     /// <see cref="Interlocked.Exchange(ref int, int)"/> both observes and clears <c>_idle</c>.
     /// A separate read and write can miss a processor that enters the wait in between, and the event then sits until the flush interval.
-    /// A cancel that lands before the processor builds its linked token is still a wake: cancellation is sticky.
     /// Any thread that has just queued an event may call this. The processor is the only thread that waits.
     /// </remarks>
     private void WakeProcessor()
@@ -732,20 +679,33 @@ public partial class BackgroundLogQueue : IDisposable
         if (Interlocked.Exchange(ref _idle, 0) == 0)
             return;
 
+        Interlocked.Increment(ref _wakeSignals);
+        SignalWake();
+    }
+
+    /// <summary>
+    /// Sets the idle-wait event. A disposed event means the processor has already left.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. Safe after <see cref="PublishOutcome"/> disposes the event.
+    /// The timer callback and <see cref="WakeProcessor"/> both call this. Neither path throws to wake the processor.
+    /// </remarks>
+    private void SignalWake()
+    {
         try
         {
-            _wakeCts.Cancel();
+            _wake.Set();
         }
         catch (ObjectDisposedException)
         {
-            // Teardown already replaced or disposed the source. The processor is leaving or has left.
+            // PublishOutcome disposed the event after the processor left the wait.
         }
     }
 
     /// <summary>
-    /// Wakes the processor for shutdown. Cancels the idle wait and the shutdown signal together.
+    /// Wakes the processor for shutdown. The shutdown flag and the idle signal are both published.
     /// </summary>
-    /// <remarks>Does not throw. Cancel does not abandon a writer call that has already started.</remarks>
+    /// <remarks>Does not throw. The signal does not abandon a writer call that has already started.</remarks>
     private void SignalProcessor()
     {
         try
@@ -768,60 +728,68 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Writer failures are handled inside the dispatcher and do not stop the loop.
     /// A bad flush interval throws before the loop, so the stopped signal stays unset and
-    /// <see cref="Dispose"/> still waits out the deadline. That path still sets the processor-done handle,
-    /// so the constructor does not wait for an idle that never starts. The method runs on a background thread,
-    /// so it does not keep the process alive. It ends when the stop flag is set, the deadline flag is set, or the gate is closed and idle.
+    /// <see cref="Dispose"/> still waits out the deadline. The constructor does not wait for that.
+    /// The method runs on a background thread, so it does not keep the process alive.
+    /// It ends when the stop flag is set, the deadline flag is set, or the gate is closed and idle.
     /// </remarks>
     private void ProcessLogs()
     {
-        var enteredLoop = false;
+        Volatile.Write(ref _processorEntered, 1);
+        var batch = new List<LogEvent>(ReadLimit());
+        // Rejected before the loop so a bad interval never sets the stopped signal.
+        RequireFlushInterval(_flushInterval);
+        using var intervalTimer = _clock.CreateTimer(
+            static state => ((BackgroundLogQueue)state!).SignalWake(),
+            this,
+            _flushInterval,
+            _flushInterval);
         try
         {
-            Volatile.Write(ref _processorEntered, 1);
-            var batch = new List<LogEvent>(ReadLimit());
-            // Constructed before the loop so a rejected interval never sets the stopped signal.
-            using var timer = new PeriodicTimer(_flushInterval, _clock);
-            enteredLoop = true;
-            try
+            while (Volatile.Read(ref _stop) == 0 && !_writerGate.DeadlineReached)
             {
-                while (Volatile.Read(ref _stop) == 0 && !_writerGate.DeadlineReached)
+                if (FrontBlocked())
                 {
-                    if (FrontBlocked())
-                    {
-                        WaitForRetry();
-                        continue;
-                    }
-
-                    var count = ReadBatch(batch);
-                    if (count > 0)
-                    {
-                        WriteAccepted(batch, count);
-                        batch.Clear();
-                        TryCompleteFlushIfIdle();
-                        continue;
-                    }
-
-                    TryCompleteFlushIfIdle();
-                    if (IsClosedAndIdle())
-                        break;
-
-                    WaitForWork(timer);
+                    WaitForRetry();
+                    continue;
                 }
-            }
-            finally
-            {
-                // Done before stopped. Dispose waits on _stopped and may then dispose this handle.
-                _processorDone.Set();
-                _idlePulse.Set();
-                _stopped.Set();
+
+                var count = ReadBatch(batch);
+                if (count > 0)
+                {
+                    WriteAccepted(batch, count);
+                    batch.Clear();
+                    TryCompleteFlushIfIdle();
+                    continue;
+                }
+
+                TryCompleteFlushIfIdle();
+                if (IsClosedAndIdle())
+                    break;
+
+                WaitForWork();
             }
         }
         finally
         {
-            // The timer constructor threw. The inner finally did not run, and stopped stays unset.
-            if (!enteredLoop)
-                _processorDone.Set();
+            _stopped.Set();
         }
+    }
+
+    /// <summary>
+    /// Rejects a flush interval <see cref="PeriodicTimer"/> would reject.
+    /// </summary>
+    /// <param name="interval">The configured idle interval.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="interval"/> is below 1 ms or above 4294967295 ms.</exception>
+    /// <remarks>
+    /// Does not throw for a positive interval that fits in an unsigned millisecond count.
+    /// Called on the processor before the idle timer is created, so a rejected interval leaves the stopped signal unset.
+    /// Does not read the wall clock. Does not wait.
+    /// </remarks>
+    private static void RequireFlushInterval(TimeSpan interval)
+    {
+        var milliseconds = (long)interval.TotalMilliseconds;
+        if (milliseconds < 1 || milliseconds > uint.MaxValue)
+            throw new ArgumentOutOfRangeException(nameof(interval), interval, "Flush interval must be from 1 ms through 4294967295 ms.");
     }
 
     /// <summary>
@@ -1160,55 +1128,29 @@ public partial class BackgroundLogQueue : IDisposable
 
     /// <summary>
     /// Blocks this processor thread until a wake, a shutdown signal, or the flush interval.
-    /// The wait stays on this thread, so a cancel from the logging thread does not run the writer there.
+    /// The wait stays on this thread, so a signal from the logging thread does not run the writer there.
     /// </summary>
-    /// <param name="timer">Interval timer. Not null. Disposed by the caller when the processor exits.</param>
     /// <remarks>
-    /// Does not throw. A cancelled wait is a wake or shutdown. The clock behind <paramref name="timer"/>
-    /// does not have to move: cancelling the linked token releases the wait on every clock, including a frozen test clock.
-    /// The idle flag is set before the queue is checked again. An enqueue that lands in that window either sees the flag and cancels,
+    /// Does not throw on the normal path. The wait is an event, not a cancelled timer, so the first wake does not throw.
+    /// The flush-interval timer sets the same event. A frozen test clock does not have to move for a log call to release the wait.
+    /// The idle flag is set before the queue is checked again. An enqueue that lands in that window either sees the flag and signals,
     /// or is observed by the recheck, so the event is not left until the flush interval.
     /// The shutdown token is part of that recheck, so dispose wakes a processor that has not entered the wait yet.
-    /// Only the processor thread calls this. Other threads only cancel the tokens.
+    /// Only the processor thread calls this. Other threads only set the event.
     /// </remarks>
-    private void WaitForWork(PeriodicTimer timer)
+    private void WaitForWork()
     {
         Volatile.Write(ref _idleWaitEntered, 1);
         Interlocked.Exchange(ref _idle, 1);
-        Interlocked.Increment(ref _idleEpoch);
-        _idlePulse.Set();
-        try
-        {
-            if (!_queue.IsEmpty || Volatile.Read(ref _stop) != 0 || _shutdownSignal.IsCancellationRequested)
-                return;
-
-            using var linked = CancellationTokenSource.CreateLinkedTokenSource(
-                _wakeCts.Token,
-                _shutdownSignal.Token);
-            try
-            {
-                timer.WaitForNextTickAsync(linked.Token).AsTask().GetAwaiter().GetResult();
-            }
-            catch (OperationCanceledException)
-            {
-                ReplaceWakeCts();
-            }
-        }
-        finally
+        _wake.Reset();
+        if (!_queue.IsEmpty || Volatile.Read(ref _stop) != 0 || _shutdownSignal.IsCancellationRequested)
         {
             Interlocked.Exchange(ref _idle, 0);
+            return;
         }
-    }
 
-    /// <summary>
-    /// Replaces the wake source so the next wait is not already cancelled.
-    /// </summary>
-    /// <remarks>Does not throw. The old source is disposed. Called only on the processor after a wake.</remarks>
-    private void ReplaceWakeCts()
-    {
-        var old = _wakeCts;
-        _wakeCts = new CancellationTokenSource();
-        old.Dispose();
+        _wake.Wait();
+        Interlocked.Exchange(ref _idle, 0);
     }
 
     /// <summary>
@@ -1576,8 +1518,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// Does not throw. A processor that is still inside a writer call keeps its wait sources,
     /// because disposing them would race that call. ALOG0071 is not emitted for a clean drain.
     /// ALOG0070 for the open window is written before ALOG0071, even when the 60 s window has not ended.
-    /// A rejected flush interval leaves the stopped flag unset and still disposes the processor-done handle,
-    /// because that task has already finished.
+    /// A rejected flush interval leaves the stopped flag unset. The task has already finished.
     /// </remarks>
     private void PublishOutcome()
     {
@@ -1594,19 +1535,11 @@ public partial class BackgroundLogQueue : IDisposable
         _writerGate.DisposeIdleWriters();
 
         if (!ended)
-        {
-            // A rejected interval faults the task without setting stopped. The handle is already set.
-            if (_backgroundTask.IsCompleted)
-                _processorDone.Dispose();
-
             return;
-        }
 
         DisposeQuiet(_shutdownSignal);
-        DisposeQuiet(_wakeCts);
         _releaseRetry.Dispose();
-        _idlePulse.Dispose();
-        _processorDone.Dispose();
+        _wake.Dispose();
         _stopped.Dispose();
     }
 
