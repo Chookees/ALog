@@ -856,9 +856,11 @@ public partial class BackgroundLogQueue : IDisposable
     /// It ends when the stop flag is set, the deadline flag is set, or the gate is closed and idle.
     /// The left flag is published before the stopped signal, and only after the loop was entered,
     /// so a rejected flush interval does not look like a finished processor.
+    /// This thread is stored in <c>_consumerThread</c> before any wait, so a writer wait can reject every other thread.
     /// </remarks>
     private void ProcessLogs()
     {
+        _consumerThread = Thread.CurrentThread;
         Volatile.Write(ref _processorEntered, 1);
         var batch = new List<LogEvent>(ReadLimit());
         // Rejected before the loop so a bad interval never sets the stopped signal.
@@ -1217,9 +1219,9 @@ public partial class BackgroundLogQueue : IDisposable
     private DispatchResult DispatchOne(LogEvent logEvent, bool replaying)
     {
         var previousQueue = ConsumerQueue.Value;
-        var previousThread = Volatile.Read(ref _consumerThread);
+        var previousThread = Volatile.Read(ref _consumerThreadId);
         ConsumerQueue.Value = this;
-        Volatile.Write(ref _consumerThread, Environment.CurrentManagedThreadId);
+        Volatile.Write(ref _consumerThreadId, Environment.CurrentManagedThreadId);
         try
         {
             _writerGate.PrepareEvent();
@@ -1251,7 +1253,7 @@ public partial class BackgroundLogQueue : IDisposable
         finally
         {
             ConsumerQueue.Value = previousQueue;
-            Volatile.Write(ref _consumerThread, previousThread);
+            Volatile.Write(ref _consumerThreadId, previousThread);
         }
     }
 
@@ -1332,12 +1334,22 @@ public partial class BackgroundLogQueue : IDisposable
     /// Waits until <paramref name="task"/> finishes. A faulted task throws here, including when it is already complete.
     /// </summary>
     /// <param name="task">The writer task. Not null. It may already be completed.</param>
+    /// <exception cref="InvalidOperationException">This thread is not the queue's consumer thread.</exception>
     /// <remarks>
-    /// Does not throw except the task's own exception. Only the processor calls this.
+    /// Throws <see cref="InvalidOperationException"/> when the caller is not the processor thread stored at start.
+    /// The message is "WaitWriterOnConsumerThread runs only on the queue's consumer thread."
+    /// Does not throw otherwise except the task's own exception. Only the processor calls this.
     /// A log call does not, and no caller SynchronizationContext is captured.
+    /// The check is this method's first line. The file and console path does not call this method.
     /// The timeout is the writer task itself. FlushTimeout stops a new writer call and does not cancel one that has started.
     /// </remarks>
-    private static void WaitWriterOnConsumerThread(Task task) => task.GetAwaiter().GetResult();
+    internal void WaitWriterOnConsumerThread(Task task)
+    {
+        if (Thread.CurrentThread != _consumerThread)
+            throw new InvalidOperationException("WaitWriterOnConsumerThread runs only on the queue's consumer thread.");
+
+        task.GetAwaiter().GetResult(); // WaitWriterOnConsumerThread
+    }
 
     /// <summary>What one processor write did with an event.</summary>
     private enum DispatchResult

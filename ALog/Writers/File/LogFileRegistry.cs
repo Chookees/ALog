@@ -83,14 +83,15 @@ internal static class LogFileRegistry
     }
 
     /// <summary>
-    /// Builds the ALOG0070 sentence for lines that did not fit in the reopen hold.
+    /// Builds the ALOG0070 sentence for a parked line that did not fit, and for a line whose formatter threw.
+    /// Both use this one sentence and one count.
     /// </summary>
-    /// <param name="count">Lines dropped since the previous line. Greater than zero.</param>
+    /// <param name="count">Lines dropped since the previous line. Greater than zero. Invariant digits.</param>
     /// <returns>The catalog sentence, including the count and no code prefix.</returns>
     /// <remarks>Does not throw. Does not write the line. The queue uses the same sentence for a parked batch that is past 4 MiB.</remarks>
     internal static string BufferFullLine(int count)
         => count.ToString(System.Globalization.CultureInfo.InvariantCulture)
-            + " events dropped: the log file could not be reopened and the lines waiting for it reached the limit. Check that no other program locks the file and that its folder is writable.";
+            + " events dropped: the log file could not be reopened and the lines waiting for it reached the limit or could not be formatted. Check that no other program locks the file and that its folder is writable.";
 
     /// <summary>
     /// Builds the ALOG0071 sentence for lines still held when the file closes.
@@ -386,6 +387,70 @@ internal sealed class SharedLogFile
 
         if (reportClosed)
             ALog.SelfLog.ReportLine(LogFileRegistry.AfterDisposeLine);
+    }
+
+    /// <summary>
+    /// Appends one replay line straight to the stream. A failure leaves the line out of the buffer.
+    /// </summary>
+    /// <param name="line">The captured line plus its newline, in UTF-8 without a BOM.</param>
+    /// <param name="maxBytes">Rotate before this line when the logical length is already at least this value. Null never rotates.</param>
+    /// <exception cref="WriteDeferredException">The write handle is still blocked, or this call cannot finish the append.</exception>
+    /// <exception cref="IOException">The stream rejected the bytes. The caller keeps the line for the next retry.</exception>
+    /// <remarks>
+    /// The caller holds the writer lock. This method holds the file lock. It does not format.
+    /// Only <see cref="FileLogWriter.WritePrepared"/> calls this, on the processor, after a failed reopen.
+    /// The bytes go to the stream before the method returns, including when the flush interval is positive,
+    /// so a full device is seen here and the line is not counted written.
+    /// A thrown failure does not add <paramref name="line"/> to the buffer and does not change the logical length.
+    /// The normal append path does not call this.
+    /// </remarks>
+    internal void AppendReplay(ReadOnlySpan<byte> line, long? maxBytes)
+    {
+        EnsureOpen();
+        lock (_fileLock)
+        {
+            if (_closed != 0)
+                throw new WriteDeferredException();
+
+            NoteAppend();
+            if (EnsureWritable() == WriteOpen.Blocked || (_held.Count > 0 && !TryWriteHeld()))
+                throw new WriteDeferredException();
+
+            if (_stream is null)
+                TryReopen();
+            if (_stream is null)
+                throw new WriteDeferredException();
+
+            Reconcile(force: false);
+            if (_stream is null)
+                throw new WriteDeferredException();
+
+            RotateIfNeeded(maxBytes);
+            if (_stream is null)
+                throw new WriteDeferredException();
+
+            WriteThrough(line);
+        }
+    }
+
+    /// <summary>Writes <paramref name="line"/> to the stream and flushes it. Does not copy it into the buffer.</summary>
+    /// <param name="line">One whole line, including its newline.</param>
+    /// <exception cref="WriteDeferredException">The stream is gone after the pending flush.</exception>
+    /// <exception cref="IOException">The stream rejected the pending bytes or this line.</exception>
+    /// <remarks>
+    /// The caller holds the file lock. Pending bytes from an earlier append are written first.
+    /// If this line's write throws, the logical length does not include it and the buffer does not keep it.
+    /// Only <see cref="AppendReplay"/> calls this.
+    /// </remarks>
+    private void WriteThrough(ReadOnlySpan<byte> line)
+    {
+        FlushPending();
+        if (_stream is null)
+            throw new WriteDeferredException();
+
+        _stream.Write(line);
+        _stream.Flush();
+        _logicalLength += line.Length;
     }
 
     /// <summary>Counts one write that arrived after the file closed. The first one is reported.</summary>

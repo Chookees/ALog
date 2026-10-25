@@ -27,7 +27,11 @@ public partial class BackgroundLogQueue
     private QueueFullMode _fullMode;
     private TimeSpan _shutdownDeadline;
     private TimeSpan _newWriteBudget;
-    private int _consumerThread;
+    /// <summary>The processor thread. Set when that thread starts. Null until then.</summary>
+    private Thread? _consumerThread;
+
+    /// <summary>Managed id of the thread inside a writer call. Zero when no writer call is marked.</summary>
+    private int _consumerThreadId;
     private int _blockWaitsStarted;
     private bool _blockRelease;
     private int _blockedReleaseUnwritten;
@@ -45,7 +49,7 @@ public partial class BackgroundLogQueue
         if (ReferenceEquals(ConsumerQueue.Value, this))
             return true;
 
-        var id = Volatile.Read(ref _consumerThread);
+        var id = Volatile.Read(ref _consumerThreadId);
         return id != 0 && id == Environment.CurrentManagedThreadId;
     }
 

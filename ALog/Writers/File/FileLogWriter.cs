@@ -375,9 +375,13 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     /// Appends bytes already formatted for this file. Does not format the event again.
     /// </summary>
     /// <param name="line">The line plus its newline, in UTF-8 without a BOM.</param>
+    /// <exception cref="WriteDeferredException">The append did not land. The queue keeps the captured bytes and retries them.</exception>
     /// <remarks>
     /// <see cref="WriteDeferredException"/> escapes so the queue can keep the event.
-    /// Any other failure is reported and does not throw. Takes the writer lock for the append, the same lock <see cref="WriteCore"/> uses.
+    /// Any other failure is reported and then thrown as <see cref="WriteDeferredException"/>.
+    /// Stderr alone does not drop the line. The queue keeps counting it against the 4 MiB hold and retries the same bytes.
+    /// The line is counted written only after this method returns. A full device does not return.
+    /// Takes the writer lock for the append, the same lock <see cref="WriteCore"/> uses.
     /// Only the processor calls this, when it retries a line captured after a failed reopen. The success path does not.
     /// </remarks>
     internal void WritePrepared(ReadOnlySpan<byte> line)
@@ -385,7 +389,7 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
         try
         {
             lock (_writeLock)
-                _shared.Append(line, _maxFileSizeInBytes);
+                _shared.AppendReplay(line, _maxFileSizeInBytes);
         }
         catch (WriteDeferredException)
         {
@@ -394,6 +398,7 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
         catch (Exception ex)
         {
             Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+            throw new WriteDeferredException();
         }
     }
 
