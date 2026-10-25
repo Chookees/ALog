@@ -238,7 +238,9 @@ public partial class BackgroundLogQueue : IDisposable
     /// <summary>Events dropped because the queue was already at capacity. Counted with an interlocked increment.</summary>
     internal long FullDropCount => Interlocked.Read(ref _fullDrops);
 
-    /// <summary>Events offered after the close point. They were not queued.</summary>
+    /// <summary>
+    /// Events reported as ALOG0072. An offer after the close, and an accept the shutdown snapshot did not include.
+    /// </summary>
     internal long ClosedDropCount => Interlocked.Read(ref _closedDrops);
 
     /// <summary>
@@ -456,8 +458,9 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. Does not take the queue lock while the queue is open and the processor is still in its loop.
     /// That path is the accepted increment plus two volatile reads.
-    /// After the queue has closed, <see cref="CountIfSnapshotMissed"/> reports the event when the processor
-    /// has left and the shutdown snapshot did not include it. The logging thread calls this. The processor does not.
+    /// After the queue has closed, <see cref="CountIfSnapshotMissed"/> reports the event when the
+    /// shutdown snapshot did not include it. That report is ALOG0072, including when a writer call
+    /// is still running and the processor has not left. The logging thread calls this. The processor does not.
     /// </remarks>
     private void AccountQueuedAccept()
     {
@@ -471,36 +474,31 @@ public partial class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Reports <paramref name="ticket"/> when the processor has left and the shutdown snapshot missed it.
+    /// Reports <paramref name="ticket"/> when the shutdown snapshot did not include it.
     /// </summary>
     /// <param name="ticket">The accepted count after this event was added. Greater than zero.</param>
     /// <remarks>
     /// Does not throw. Takes the queue lock to compare the ticket with the snapshot, then reports outside the lock.
-    /// A ticket the snapshot already includes is left in the accepted count and is not reported again.
-    /// A missed ticket is removed from that count. The caller then reports ALOG0071 when the snapshot was empty,
-    /// or ALOG0072 when <see cref="Dispose"/> already owns ALOG0071. Called from the logging thread.
+    /// A ticket the snapshot already includes stays in the accepted count. Dispose owns that ALOG0071 line.
+    /// A ticket accepted after the snapshot is removed from the accepted count and reported as ALOG0072.
+    /// It is not added to ALOG0071, so the deadline line stays one line.
+    /// The processor does not write that event: <see cref="PublishOutcome"/> sets the stop flag before the snapshot,
+    /// and this method runs only after the event is already queued. Called from the logging thread.
+    /// An event that was already inside a writer stays in the snapshot even when that write later finishes.
     /// </remarks>
     private void CountIfSnapshotMissed(long ticket)
     {
-        var reportShutdown = false;
         var reportClosed = false;
         lock (_gate)
         {
-            // Leave the increment in place when Dispose can still see it, or already did.
-            if (!_closed || Volatile.Read(ref _processorLeft) == 0 || !_frozen || ticket <= _frozenAccepted)
+            // The snapshot includes this ticket, or Dispose has not frozen it yet and will.
+            if (!_closed || !_frozen || ticket <= _frozenAccepted)
                 return;
 
             Interlocked.Decrement(ref _accepted);
             Interlocked.Decrement(ref _outstanding);
-            // A positive snapshot already owns ALOG0071. Do not take that flag from Dispose.
-            if (_unwritten > 0 || Interlocked.Exchange(ref _shutdownReported, 1) != 0)
-                NoteClosed(ref reportClosed);
-            else
-                reportShutdown = true;
+            NoteClosed(ref reportClosed);
         }
-
-        if (reportShutdown)
-            SelfLog.ReportLine(FormatShutdown(1));
 
         if (reportClosed)
             SelfLog.ReportLine(ClosedDropLine);
@@ -718,7 +716,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// <returns>The catalog sentence, with no extra prefix.</returns>
     /// <remarks>
     /// Does not throw. Allocates the line.
-    /// <see cref="Dispose"/> calls this for the snapshot. An accept that lands after that snapshot calls it for the one event.
+    /// <see cref="Dispose"/> calls this once for the snapshot. An accept after that snapshot is ALOG0072, not another line.
     /// </remarks>
     private string FormatShutdown(long count)
     {
@@ -1829,10 +1827,14 @@ public partial class BackgroundLogQueue : IDisposable
     /// Does not throw. A processor that is still inside a writer call keeps its wait sources,
     /// because disposing them would race that call. ALOG0071 is not emitted for a clean drain.
     /// ALOG0070 for the open window is written before ALOG0071, even when the 60 s window has not ended.
+    /// The stop flag is set before the snapshot so a processor still inside a writer does not read an event
+    /// accepted after that snapshot. The caller counts that event as ALOG0072.
     /// A rejected flush interval leaves the stopped flag unset. The task has already finished.
     /// </remarks>
     private void PublishOutcome()
     {
+        // Before the snapshot. A writer that returns after this must not start another event.
+        Volatile.Write(ref _stop, 1);
         var ended = _stopped.IsSet;
         var unwritten = FreezeUnwritten();
         PublishReports(unwritten);

@@ -632,7 +632,7 @@ public sealed partial class C4QueueFixTests
 
     /// <summary>
     /// Two accepts held between the slot reservation and the enqueue are counted by the caller
-    /// after dispose has finished. The first is ALOG0071. The second is ALOG0072. Neither is written.
+    /// after dispose has finished. Both are ALOG0072. Neither is written. No deadline line is emitted.
     /// </summary>
     /// <returns>A task that finishes after both accepts return.</returns>
     /// <remarks>
@@ -687,14 +687,15 @@ public sealed partial class C4QueueFixTests
             Assert.True(accepted[0]);
             Assert.True(accepted[1]);
             Assert.Empty(writer.Events);
-            Assert.Equal(1, queue.ClosedDropCount);
+            Assert.Equal(2, queue.ClosedDropCount);
             Assert.Equal(0, queue.UnwrittenCount);
             string joined;
             lock (lines)
                 joined = string.Join('\n', lines);
 
-            Assert.Contains("1 queued events were not written", joined, StringComparison.Ordinal);
+            Assert.DoesNotContain("queued events were not written", joined, StringComparison.Ordinal);
             Assert.Contains(ClosedLine, joined, StringComparison.Ordinal);
+            Assert.Equal(2, writer.Events.Count + queue.ClosedDropCount + queue.FullDropCount);
         }
         finally
         {
@@ -772,6 +773,8 @@ public sealed partial class C4QueueFixTests
             Assert.Equal(0, queue.ClosedDropCount);
             lock (lines)
                 Assert.Empty(lines);
+
+            Assert.Equal(2, writer.Events.Count + queue.ClosedDropCount + queue.FullDropCount);
         }
         finally
         {
