@@ -1,5 +1,6 @@
 namespace ALog.Writers.File;
 
+using System.Text;
 using ALog.Config;
 using ALog.Core;
 
@@ -212,6 +213,9 @@ internal static class LogFileRegistry
 /// </remarks>
 internal sealed class SharedLogFile
 {
+    /// <summary>The newline placed before the next replay line when a partial append could not be truncated.</summary>
+    private static readonly byte[] ReplayBreak = Encoding.UTF8.GetBytes(Environment.NewLine);
+
     private readonly object _fileLock = new();
     private readonly string _path;
     private int _refs;
@@ -239,6 +243,9 @@ internal sealed class SharedLogFile
     private int _droppedFull;
     private DateTimeOffset _fullReported;
     private int _closedDrops;
+
+    /// <summary>1 when a replay append wrote bytes that <see cref="FileStream.SetLength"/> could not remove.</summary>
+    private int _replaySplit;
 
     /// <summary>Stores the first opener's settings. The stream stays closed until the first append.</summary>
     /// <param name="path">Normalized full path. Not null.</param>
@@ -402,6 +409,10 @@ internal sealed class SharedLogFile
     /// The bytes go to the stream before the method returns, including when the flush interval is positive,
     /// so a full device is seen here and the line is not counted written.
     /// A thrown failure does not add <paramref name="line"/> to the buffer and does not change the logical length.
+    /// Bytes already written are removed with <see cref="FileStream.SetLength(long)"/> back to the length from before the append.
+    /// One writer owns the file, so that length is the end of the previous complete line.
+    /// When the reset itself fails, the next successful replay append starts with a newline.
+    /// The fragment then stands on its own line and is not counted as written.
     /// The normal append path does not call this.
     /// </remarks>
     internal void AppendReplay(ReadOnlySpan<byte> line, long? maxBytes)
@@ -436,21 +447,69 @@ internal sealed class SharedLogFile
     /// <summary>Writes <paramref name="line"/> to the stream and flushes it. Does not copy it into the buffer.</summary>
     /// <param name="line">One whole line, including its newline.</param>
     /// <exception cref="WriteDeferredException">The stream is gone after the pending flush.</exception>
-    /// <exception cref="IOException">The stream rejected the pending bytes or this line.</exception>
+    /// <exception cref="IOException">The stream rejected the pending bytes or this line. The file is truncated when that reset works.</exception>
     /// <remarks>
     /// The caller holds the file lock. Pending bytes from an earlier append are written first.
+    /// The file length is remembered before this line. A throw calls <see cref="TryRestoreLength"/> so a partial line is removed.
+    /// One writer owns the file, so no other append races that length.
+    /// When the reset fails, <see cref="_replaySplit"/> is set. The next successful call writes a newline first.
+    /// That fragment is not added to the logical length and is not a written line. The retried line is the same bytes.
     /// If this line's write throws, the logical length does not include it and the buffer does not keep it.
-    /// Only <see cref="AppendReplay"/> calls this.
+    /// Only <see cref="AppendReplay"/> calls this. <see cref="WriteLine"/> does not.
     /// </remarks>
     private void WriteThrough(ReadOnlySpan<byte> line)
     {
         FlushPending();
-        if (_stream is null)
+        var stream = _stream;
+        if (stream is null)
             throw new WriteDeferredException();
 
-        _stream.Write(line);
-        _stream.Flush();
+        var length = stream.Length;
+        try
+        {
+            if (_replaySplit != 0)
+                stream.Write(ReplayBreak);
+
+            stream.Write(line);
+            stream.Flush();
+        }
+        catch (Exception)
+        {
+            if (!TryRestoreLength(stream, length))
+                _replaySplit = 1;
+
+            throw;
+        }
+
+        if (_replaySplit != 0)
+        {
+            _logicalLength += ReplayBreak.Length;
+            _replaySplit = 0;
+        }
+
         _logicalLength += line.Length;
+    }
+
+    /// <summary>Puts <paramref name="stream"/> back to <paramref name="length"/> after a replay append threw.</summary>
+    /// <param name="stream">The open write handle. Not null. The caller holds the file lock.</param>
+    /// <param name="length">The file length from before the append. Not negative.</param>
+    /// <returns>True when <see cref="FileStream.Length"/> is <paramref name="length"/> afterwards.</returns>
+    /// <remarks>
+    /// Does not throw. <see cref="FileStream.SetLength(long)"/> is void, so the length is read again.
+    /// A false return leaves the bytes in the file. The caller starts the next successful append with a newline.
+    /// Only <see cref="WriteThrough"/> calls this. One writer owns the file.
+    /// </remarks>
+    private static bool TryRestoreLength(FileStream stream, long length)
+    {
+        try
+        {
+            stream.SetLength(length);
+            return stream.Length == length;
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     /// <summary>Counts one write that arrived after the file closed. The first one is reported.</summary>
