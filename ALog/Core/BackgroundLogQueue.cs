@@ -90,6 +90,7 @@ public partial class BackgroundLogQueue : IDisposable
     private int _shutdownDeadlineElapsed;
     private int _flushDeadlineElapsed;
     private int _cutoffElapsed;
+    private int _writeDeferred;
     private int _cutoffReached;
     private long _accepted;
     private long _written;
@@ -887,6 +888,8 @@ public partial class BackgroundLogQueue : IDisposable
                 {
                     ParkFront(batch, i, count);
                     ArmRetryDelay();
+                    // Published before the retry wait, so Dispose can see a parked batch and free Block callers.
+                    Volatile.Write(ref _writeDeferred, 1);
                     return;
                 }
 
@@ -900,6 +903,8 @@ public partial class BackgroundLogQueue : IDisposable
         {
             if (committed > 0)
                 CommitBatch(committed);
+            if (_front.Count == 0)
+                Volatile.Write(ref _writeDeferred, 0);
             Interlocked.Decrement(ref _inflight);
         }
     }
@@ -1297,6 +1302,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. A processor that already stopped returns without registering a timer.
     /// Both timers are disposed before this returns so a late callback cannot touch a published outcome.
+    /// A Block caller still waiting when this returns is released here, at the latest when the flush timeout wins.
     /// </remarks>
     private void DrainUntilDeadline()
     {
@@ -1304,26 +1310,45 @@ public partial class BackgroundLogQueue : IDisposable
         {
             OnNewWriteCutoff(this);
             MarkShutdownDeadline();
+            ReleaseBlockedCallersAfterDrain();
             return;
         }
 
-        if (_stopped.IsSet)
-            return;
-
-        if (_newWriteBudget <= TimeSpan.Zero)
+        if (!_stopped.IsSet)
         {
-            OnNewWriteCutoff(this);
-            WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, _shutdownDeadline, ref _disposeWaitsStarted);
-            return;
+            if (_newWriteBudget <= TimeSpan.Zero)
+            {
+                OnNewWriteCutoff(this);
+                WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, _shutdownDeadline, ref _disposeWaitsStarted);
+            }
+            else
+            {
+                // Both timers are registered before the wait is visible, so one clock step can hit either bound.
+                using var cutoff = _clock.CreateTimer(
+                    static state => OnNewWriteCutoff(state),
+                    this,
+                    _newWriteBudget,
+                    Timeout.InfiniteTimeSpan);
+                WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, _shutdownDeadline, ref _disposeWaitsStarted);
+            }
         }
 
-        // Both timers are registered before the wait is visible, so one clock step can hit either bound.
-        using var cutoff = _clock.CreateTimer(
-            static state => OnNewWriteCutoff(state),
-            this,
-            _newWriteBudget,
-            Timeout.InfiniteTimeSpan);
-        WaitUntilSignaledOrDeadline(_clock, _stopped, MarkShutdownDeadline, _shutdownDeadline, ref _disposeWaitsStarted);
+        ReleaseBlockedCallersAfterDrain();
+    }
+
+    /// <summary>
+    /// Releases Block callers when the flush wait ended without the deadline callback.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. The deadline callback already released them when <see cref="_shutdownDeadlineElapsed"/> is set.
+    /// Called once from <see cref="DrainUntilDeadline"/> on the disposing thread, before the unwritten snapshot.
+    /// </remarks>
+    private void ReleaseBlockedCallersAfterDrain()
+    {
+        if (Volatile.Read(ref _shutdownDeadlineElapsed) != 0)
+            return;
+
+        ReleaseBlockedCallers();
     }
 
     /// <summary>
@@ -1364,15 +1389,11 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. Called on the clock callback before the waiter is released.
     /// The count is visible to the thread that advanced the clock before this callback returns.
+    /// Callers blocked on a full queue are released here, including when a file reopen is still failing.
     /// </remarks>
     private void MarkShutdownDeadline()
     {
-        lock (_gate)
-        {
-            _blockRelease = true;
-            SignalWaiters();
-        }
-
+        ReleaseBlockedCallers();
         Interlocked.Increment(ref _shutdownDeadlineElapsed);
     }
 
