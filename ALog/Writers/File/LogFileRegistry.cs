@@ -51,28 +51,58 @@ internal static class LogFileRegistry
 
     private static FileOpen? _openFactory;
 
-    /// <summary>
-    /// The sentence for a write handle that could not be opened again. The line is not dropped.
-    /// </summary>
-    internal const string ReopenBlockedLine =
-        "ALOG0073: could not reopen the log file for writing. The line stays queued and will be tried again on the next flush.";
+    /// <summary>Direct reopen buffer when no background queue is holding the lines. 4 MiB.</summary>
+    internal const int DirectReopenByteBudget = 4 * 1024 * 1024;
+
+    /// <summary>Most lines in the direct reopen buffer. The byte budget can stop it sooner.</summary>
+    internal const int DirectReopenLineBudget = 100_000;
+
+    /// <summary>Prefix of the only ALOG0073 sentence. The line is the reopen failure, not a drop.</summary>
+    internal const string ReopenFailedPrefix = "ALOG0073: reopen failed.";
 
     /// <summary>
-    /// The sentence when the direct retry buffer cannot take another line.
+    /// The first event written after the file has closed. Later events are counted and not reported. ALOG0072.
     /// </summary>
-    internal const string ReopenBufferFullLine =
-        "ALOG0073: could not reopen the log file for writing. The retry buffer is full, so this line was dropped.";
+    internal const string AfterDisposeLine =
+        "Event dropped: ALog is shut down (the log file was closed by Shutdown or Dispose). Later events are counted, not reported. Stop logging before you call Shutdown or Dispose.";
 
     /// <summary>
-    /// Builds the sentence for lines still held when the file closes.
+    /// Builds the ALOG0073 sentence. It only says the reopen failed, plus how many attempts that window saw.
+    /// </summary>
+    /// <param name="attempts">Attempts since the previous line. Greater than zero.</param>
+    /// <returns>The catalog sentence. No stack trace.</returns>
+    /// <remarks>Does not throw. Does not write the line. One attempt uses the singular word.</remarks>
+    internal static string ReopenFailedLine(int attempts)
+    {
+        var label = attempts == 1 ? "attempt" : "attempts";
+        return ReopenFailedPrefix
+            + " "
+            + attempts.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            + " "
+            + label
+            + ".";
+    }
+
+    /// <summary>
+    /// Builds the ALOG0070 sentence for a direct buffer that cannot take another line.
+    /// </summary>
+    /// <param name="count">Lines dropped since the previous line. Greater than zero.</param>
+    /// <returns>The catalog sentence, including the count.</returns>
+    /// <remarks>Does not throw. Does not write the line.</remarks>
+    internal static string BufferFullLine(int count)
+        => "ALOG0070: "
+            + count.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            + " events dropped: the reopen buffer is full.";
+
+    /// <summary>
+    /// Builds the ALOG0071 sentence for lines still held when the file closes.
     /// </summary>
     /// <param name="count">How many lines were still waiting. Greater than zero.</param>
     /// <returns>The catalog sentence, including the count in invariant digits.</returns>
     /// <remarks>Does not throw. Does not write the line.</remarks>
     internal static string ReopenDisposeLine(int count)
-        => "ALOG0073: could not reopen the log file for writing. "
-            + count.ToString(System.Globalization.CultureInfo.InvariantCulture)
-            + " lines were still waiting when the file closed.";
+        => count.ToString(System.Globalization.CultureInfo.InvariantCulture)
+            + " queued events were not written. The log file could not be reopened before dispose.";
 
     /// <summary>
     /// Opens one file the way <see cref="SharedLogFile"/> does. Tests replace it and restore null.
@@ -197,11 +227,16 @@ internal sealed class SharedLogFile
     private ITimer? _timer;
     private ITimer? _retryTimer;
     private readonly Queue<byte[]> _held = new();
+    private int _heldBytes;
     private int _reopenBlocked;
     private DateTimeOffset _lastIdentityCheck;
-
-    /// <summary>Most lines kept when a direct write cannot reopen the file. The queue path does not use this cap.</summary>
-    private const int MaxHeldLines = 100_000;
+    private DateTimeOffset _lastReopenAttempt;
+    private int _reopenAttempts;
+    private DateTimeOffset _reopenReported;
+    private int _reopenStackReported;
+    private int _droppedFull;
+    private DateTimeOffset _fullReported;
+    private int _closedDrops;
 
     /// <summary>Stores the first opener's settings. The stream stays closed until the first append.</summary>
     /// <param name="path">Normalized full path. Not null.</param>
@@ -302,12 +337,14 @@ internal sealed class SharedLogFile
     internal void Append(ReadOnlySpan<byte> line, long? maxBytes)
     {
         EnsureOpen();
+        var reportClosed = false;
         lock (_fileLock)
         {
             if (_closed != 0)
-                return;
-
-            if (EnsureWritable() == WriteOpen.Blocked)
+            {
+                reportClosed = NoteAfterDispose();
+            }
+            else if (EnsureWritable() == WriteOpen.Blocked)
             {
                 // The queue keeps the event and retries on its flush tick.
                 // A direct caller has no queue, so the line stays in this file's bounded buffer.
@@ -315,33 +352,42 @@ internal sealed class SharedLogFile
                     throw new WriteDeferredException();
 
                 HoldDirect(line);
-                return;
             }
-
-            if (_held.Count > 0 && !TryWriteHeld())
+            else if (_held.Count > 0 && !TryWriteHeld())
             {
                 if (BackgroundLogQueue.IsOnProcessor)
                     throw new WriteDeferredException();
 
                 HoldDirect(line);
-                return;
             }
-
-            if (_stream is null)
-                TryReopen();
-            if (_stream is null)
-                return;
-
-            Reconcile(force: false);
-            if (_stream is null)
-                return;
-
-            RotateIfNeeded(maxBytes);
-            if (_stream is null)
-                return;
-
-            WriteLine(line);
+            else
+            {
+                if (_stream is null)
+                    TryReopen();
+                if (_stream is not null)
+                {
+                    Reconcile(force: false);
+                    if (_stream is not null)
+                    {
+                        RotateIfNeeded(maxBytes);
+                        if (_stream is not null)
+                            WriteLine(line);
+                    }
+                }
+            }
         }
+
+        if (reportClosed)
+            ALog.SelfLog.ReportLine(LogFileRegistry.AfterDisposeLine);
+    }
+
+    /// <summary>Counts one write that arrived after the file closed. The first one is reported.</summary>
+    /// <returns>True when this call is the first closed drop and the caller should report ALOG0072.</returns>
+    /// <remarks>The caller holds the file lock. Does not throw. Does not call SelfLog.</remarks>
+    private bool NoteAfterDispose()
+    {
+        _closedDrops++;
+        return _closedDrops == 1;
     }
 
     /// <summary>Writes any buffered bytes and asks the stream to hand them to the operating system. There is no fsync.</summary>
@@ -383,6 +429,7 @@ internal sealed class SharedLogFile
         ITimer? retry = null;
         FileStream? stream = null;
         var stranded = 0;
+        var fullDrops = 0;
         lock (_fileLock)
         {
             if (_closed != 0)
@@ -395,12 +442,15 @@ internal sealed class SharedLogFile
                 FlushPending();
                 stranded = _held.Count;
                 _held.Clear();
+                _heldBytes = 0;
             }
             catch (Exception ex)
             {
                 System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
             }
 
+            fullDrops = _droppedFull;
+            _droppedFull = 0;
             _closed = 1;
 
             timer = _timer;
@@ -410,6 +460,9 @@ internal sealed class SharedLogFile
             stream = _stream;
             _stream = null;
         }
+
+        if (fullDrops > 0)
+            ALog.SelfLog.ReportLine(LogFileRegistry.BufferFullLine(fullDrops));
 
         if (stranded > 0)
             ALog.SelfLog.ReportLine(LogFileRegistry.ReopenDisposeLine(stranded));
@@ -683,16 +736,24 @@ internal sealed class SharedLogFile
     /// <remarks>
     /// The caller holds the file lock. Does not throw. The read handle is closed before the append opens,
     /// because <see cref="FileShare.Read"/> does not allow a second write. A failed open leaves the stream unset
-    /// and reports <see cref="LogFileRegistry.ReopenBlockedLine"/> plus the write-failed line.
-    /// A successful open increments <see cref="LogFileRegistry.OpenCount"/>. One attempt per call.
+    /// and reports ALOG0073. A successful open increments <see cref="LogFileRegistry.OpenCount"/>.
+    /// At most one open is attempted per second on the file clock, including a direct caller with no queue.
     /// </remarks>
     private WriteOpen EnsureWritable()
     {
         if (_reopenBlocked != 0)
+        {
+            if (!ReopenAttemptDue())
+                return WriteOpen.Blocked;
+
             return OpenWriteAgain();
+        }
 
         if (_stream is null || _stream.CanWrite)
             return WriteOpen.Ready;
+
+        if (!ReopenAttemptDue())
+            return WriteOpen.Blocked;
 
         var parked = _stream;
         _stream = null;
@@ -703,11 +764,54 @@ internal sealed class SharedLogFile
         return opened;
     }
 
+    /// <summary>True when a second has passed since the last write-open attempt on the file clock.</summary>
+    /// <returns>True when this call may open. False when the last attempt is less than one second old.</returns>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. A true result records the attempt before the open,
+    /// so a failure still consumes the second. The clock is the file clock.
+    /// </remarks>
+    private bool ReopenAttemptDue()
+    {
+        var now = _clock.GetUtcNow();
+        if (_lastReopenAttempt != default && now - _lastReopenAttempt < TimeSpan.FromSeconds(1))
+            return false;
+
+        _lastReopenAttempt = now;
+        return true;
+    }
+
+    /// <summary>
+    /// Counts one failed write open and reports ALOG0073 at most once per minute.
+    /// </summary>
+    /// <param name="ex">The open failure. Not null. The stack trace is written only the first time.</param>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. Later failures in the same minute only add to the next count.
+    /// The SelfLog line does not include the stack trace.
+    /// </remarks>
+    private void NoteReopenFailed(Exception ex)
+    {
+        _reopenAttempts++;
+        var now = _clock.GetUtcNow();
+        if (_reopenReported != default && now - _reopenReported < TimeSpan.FromSeconds(60))
+            return;
+
+        var attempts = _reopenAttempts;
+        _reopenAttempts = 0;
+        _reopenReported = now;
+        if (_reopenStackReported == 0)
+        {
+            _reopenStackReported = 1;
+            System.Console.Error.WriteLine("[FileLogWriter] Write failed: " + ex);
+        }
+
+        ALog.SelfLog.ReportLine(LogFileRegistry.ReopenFailedLine(attempts));
+    }
+
     /// <summary>Opens the append stream once. A failure leaves the stream unset and keeps the line.</summary>
     /// <returns><see cref="WriteOpen.Ready"/> when the stream can accept a line. <see cref="WriteOpen.Blocked"/> when this attempt failed.</returns>
     /// <remarks>
     /// The caller holds the file lock. Does not throw. One attempt per call, so a blocked reader cannot spin.
-    /// The error stream keeps the write-failed line. <see cref="LogFileRegistry.ReopenBlockedLine"/> is the catalog line.
+    /// <see cref="NoteReopenFailed"/> writes the stack trace once and the ALOG0073 line at most once per minute.
     /// </remarks>
     private WriteOpen OpenWriteAgain()
     {
@@ -719,8 +823,7 @@ internal sealed class SharedLogFile
         }
         catch (Exception ex)
         {
-            System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
-            ALog.SelfLog.ReportLine(LogFileRegistry.ReopenBlockedLine);
+            NoteReopenFailed(ex);
             return WriteOpen.Blocked;
         }
     }
@@ -729,27 +832,49 @@ internal sealed class SharedLogFile
     /// <param name="line">The encoded line, including its newline. Not empty is not required.</param>
     /// <remarks>
     /// The caller holds the file lock. Does not throw. The copy is bounded by the line length.
-    /// The buffer stops at <see cref="MaxHeldLines"/>. A full buffer reports <see cref="LogFileRegistry.ReopenBufferFullLine"/> and drops that line.
-    /// The queue path does not call this. The timer is the file clock and is at least one second.
+    /// The buffer stops at <see cref="LogFileRegistry.DirectReopenLineBudget"/> lines and
+    /// <see cref="LogFileRegistry.DirectReopenByteBudget"/> bytes. A line that does not fit is ALOG0070 and is not copied.
+    /// The queue path does not call this: those events stay in the queue, bounded by its capacity.
+    /// The timer is the file clock and is at least one second.
     /// </remarks>
     private void HoldDirect(ReadOnlySpan<byte> line)
     {
-        if (_held.Count >= MaxHeldLines)
+        if (_held.Count >= LogFileRegistry.DirectReopenLineBudget
+            || (long)_heldBytes + line.Length > LogFileRegistry.DirectReopenByteBudget)
         {
-            ALog.SelfLog.ReportLine(LogFileRegistry.ReopenBufferFullLine);
+            NoteBufferFull();
             return;
         }
 
         var copy = new byte[line.Length];
         line.CopyTo(copy);
         _held.Enqueue(copy);
+        _heldBytes += copy.Length;
         ArmRetry();
+    }
+
+    /// <summary>Counts one direct line that did not fit and reports ALOG0070 at most once per minute.</summary>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. The line includes the count since the previous report.
+    /// A quiet minute reports on the next drop. <see cref="Close"/> reports a count that is still open.
+    /// </remarks>
+    private void NoteBufferFull()
+    {
+        _droppedFull++;
+        var now = _clock.GetUtcNow();
+        if (_fullReported != default && now - _fullReported < TimeSpan.FromSeconds(60))
+            return;
+
+        var count = _droppedFull;
+        _droppedFull = 0;
+        _fullReported = now;
+        ALog.SelfLog.ReportLine(LogFileRegistry.BufferFullLine(count));
     }
 
     /// <summary>Writes held lines when the write handle can be opened. Stops at the first line that does not land.</summary>
     /// <returns>True when no held line remains. False when the handle is still blocked or a write failed.</returns>
     /// <remarks>
-    /// The caller holds the file lock. Does not throw. The loop is bounded by <see cref="MaxHeldLines"/>.
+    /// The caller holds the file lock. Does not throw. The loop is bounded by <see cref="LogFileRegistry.DirectReopenLineBudget"/>.
     /// A blocked open reports once inside <see cref="EnsureWritable"/> and does not retry in this call.
     /// </remarks>
     private bool TryWriteHeld()
@@ -764,7 +889,7 @@ internal sealed class SharedLogFile
             TryReopen();
 
         var guard = 0;
-        while (_held.Count > 0 && _stream is not null && guard < MaxHeldLines)
+        while (_held.Count > 0 && _stream is not null && guard < LogFileRegistry.DirectReopenLineBudget)
         {
             guard++;
             var line = _held.Peek();
@@ -782,6 +907,9 @@ internal sealed class SharedLogFile
                 return false;
 
             _held.Dequeue();
+            _heldBytes -= line.Length;
+            if (_heldBytes < 0)
+                _heldBytes = 0;
         }
 
         return _held.Count == 0;
