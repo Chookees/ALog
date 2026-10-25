@@ -36,14 +36,14 @@ public sealed class BkpCoverageTests
             writer.ApplyStartup(4096, TimeSpan.FromSeconds(60), clock);
             var wide = new string('W', 5000);
             writer.Write(Event(wide));
-            Assert.Contains(wide, ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains(wide, TestFiles.ReadShared(path), StringComparison.Ordinal);
 
             writer.ApplyStartup(4096, TimeSpan.Zero, clock);
-            var beforeShort = ReadShared(path).Length;
+            var beforeShort = TestFiles.ReadShared(path).Length;
             writer.Write(Event("short-line"));
-            Assert.Equal(beforeShort, ReadShared(path).Length);
+            Assert.Equal(beforeShort, TestFiles.ReadShared(path).Length);
             writer.Flush();
-            Assert.Contains("short-line", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("short-line", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -180,7 +180,7 @@ public sealed class BkpCoverageTests
             }
 
             Assert.Equal(before + 2, LogFileRegistry.OpenCount);
-            var text = ReadShared(path);
+            var text = TestFiles.ReadShared(path);
             Assert.Contains("first-line", text, StringComparison.Ordinal);
             Assert.Contains("second-line", text, StringComparison.Ordinal);
             Assert.Contains("Rolling failed", buffer.ToString(), StringComparison.Ordinal);
@@ -454,13 +454,6 @@ public sealed class BkpCoverageTests
         _ = await Task.WhenAny(dispose, Task.Delay(TimeSpan.FromSeconds(30)));
     }
 
-    /// <summary>Reads the file while a writer may still hold it.</summary>
-    private static string ReadShared(string path)
-    {
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
-    }
 
     /// <summary>The file length while a writer may still hold it.</summary>
     private static long LengthShared(string path)

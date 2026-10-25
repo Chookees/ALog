@@ -204,10 +204,10 @@ public sealed class BkpBackpressureTests : IDisposable
             using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(1), clock: clock);
             writer.Write(Event("held"));
             Assert.Equal(before + 1, LogFileRegistry.OpenCount);
-            Assert.DoesNotContain("held", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("held", TestFiles.ReadShared(path), StringComparison.Ordinal);
             clock.Advance(TimeSpan.FromSeconds(1));
             Assert.Equal(before + 2, LogFileRegistry.OpenCount);
-            Assert.Contains("held", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("held", TestFiles.ReadShared(path), StringComparison.Ordinal);
             writer.Write(Event("again"));
             Assert.Equal(before + 3, LogFileRegistry.OpenCount);
         }
@@ -356,13 +356,13 @@ public sealed class BkpBackpressureTests : IDisposable
                 clock: clock);
             var payload = new string('B', 3000);
             writer.Write(Event(payload));
-            Assert.DoesNotContain(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
             writer.Write(Event(payload));
-            Assert.Contains(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
 
             var wide = new string('W', 5000);
             writer.Write(Event(wide));
-            Assert.Contains(wide, ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains(wide, TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -384,11 +384,11 @@ public sealed class BkpBackpressureTests : IDisposable
             var interval = TimeSpan.FromSeconds(1);
             using var writer = new FileLogWriter(path, fileFlushInterval: interval, clock: clock);
             writer.Write(Event("later"));
-            Assert.DoesNotContain("later", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("later", TestFiles.ReadShared(path), StringComparison.Ordinal);
             clock.Advance(interval - DeadlineClock.Tick);
-            Assert.DoesNotContain("later", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("later", TestFiles.ReadShared(path), StringComparison.Ordinal);
             clock.Advance(DeadlineClock.Tick);
-            Assert.Contains("later", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("later", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -409,9 +409,9 @@ public sealed class BkpBackpressureTests : IDisposable
             using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60), clock: clock);
             writer.Flush();
             writer.Write(Event("held"));
-            Assert.DoesNotContain("held", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("held", TestFiles.ReadShared(path), StringComparison.Ordinal);
             writer.Flush();
-            Assert.Contains("held", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("held", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -431,7 +431,7 @@ public sealed class BkpBackpressureTests : IDisposable
             var clock = NewClock();
             var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60), clock: clock);
             writer.Write(Event("held"));
-            Assert.DoesNotContain("held", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("held", TestFiles.ReadShared(path), StringComparison.Ordinal);
             writer.Dispose();
             Assert.Contains("held", File.ReadAllText(path), StringComparison.Ordinal);
         }
@@ -805,7 +805,7 @@ public sealed class BkpBackpressureTests : IDisposable
                 clock);
             directEngine.Log("direct-line");
             await directEngine.FlushAsync();
-            Assert.Contains("direct-line", ReadShared(direct), StringComparison.Ordinal);
+            Assert.Contains("direct-line", TestFiles.ReadShared(direct), StringComparison.Ordinal);
             directEngine.Dispose();
 
             var queued = Path.Combine(directory, "queued.log");
@@ -817,7 +817,7 @@ public sealed class BkpBackpressureTests : IDisposable
                 clock);
             queuedEngine.Log("queued-line");
             await queuedEngine.FlushAsync();
-            Assert.Contains("queued-line", ReadShared(queued), StringComparison.Ordinal);
+            Assert.Contains("queued-line", TestFiles.ReadShared(queued), StringComparison.Ordinal);
             queuedEngine.Dispose();
         }
         finally
@@ -893,15 +893,6 @@ public sealed class BkpBackpressureTests : IDisposable
         return error is null ? "(no exception)" : error.Message;
     }
 
-    private static string ReadShared(string path)
-    {
-        if (!File.Exists(path))
-            return string.Empty;
-
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
-    }
 
     private static FakeTimeProvider NewClock()
         => new(new DateTimeOffset(2026, 6, 1, 0, 0, 0, TimeSpan.Zero));

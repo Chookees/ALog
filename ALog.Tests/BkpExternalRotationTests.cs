@@ -75,9 +75,9 @@ public sealed class BkpExternalRotationTests
             }
 
             await DeadlineClock.WaitFor(
-                () => File.ReadAllText(path).Contains("third-line", StringComparison.Ordinal),
+                () => TestFiles.ReadShared(path).Contains("third-line", StringComparison.Ordinal),
                 "lines did not appear after the reader closed");
-            var text = File.ReadAllText(path);
+            var text = TestFiles.ReadShared(path);
             var first = text.IndexOf("first-line", StringComparison.Ordinal);
             var second = text.IndexOf("second-line", StringComparison.Ordinal);
             var third = text.IndexOf("third-line", StringComparison.Ordinal);
@@ -185,14 +185,14 @@ public sealed class BkpExternalRotationTests
             var interval = TimeSpan.FromSeconds(60);
             using var writer = new FileLogWriter(path, fileFlushInterval: interval, clock: clock);
             writer.Write(Event("buffered-line"));
-            Assert.DoesNotContain("buffered-line", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("buffered-line", TestFiles.ReadShared(path), StringComparison.Ordinal);
             File.Move(path, rotated);
             clock.Advance(interval);
             AssertOneHandle(path);
 
             AssertNoNul(rotated);
             Assert.Contains("buffered-line", File.ReadAllText(rotated), StringComparison.Ordinal);
-            Assert.DoesNotContain("buffered-line", ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain("buffered-line", TestFiles.ReadShared(path), StringComparison.Ordinal);
             Assert.True(File.Exists(path));
         }
         finally
@@ -365,7 +365,7 @@ public sealed class BkpExternalRotationTests
                 new LoggerConfig().AddWriter(new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero, clock: clock)),
                 clock);
             engine.Log("on-disk");
-            Assert.Contains("on-disk", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("on-disk", TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Dispose();
         }
         finally
@@ -394,9 +394,9 @@ public sealed class BkpExternalRotationTests
                 clock);
             var payload = new string('B', 3000);
             engine.Log(payload);
-            Assert.DoesNotContain(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Log(payload);
-            Assert.Contains(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Dispose();
         }
         finally
@@ -422,7 +422,7 @@ public sealed class BkpExternalRotationTests
                     .SetFileFlushInterval(TimeSpan.Zero),
                 clock);
             engine.Log("from-config");
-            Assert.Contains("from-config", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("from-config", TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Dispose();
         }
         finally
@@ -449,9 +449,9 @@ public sealed class BkpExternalRotationTests
                 clock);
             var payload = new string('C', 3000);
             engine.Log(payload);
-            Assert.DoesNotContain(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.DoesNotContain(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Log(payload);
-            Assert.Contains(payload, ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains(payload, TestFiles.ReadShared(path), StringComparison.Ordinal);
             engine.Dispose();
         }
         finally
@@ -611,7 +611,7 @@ public sealed class BkpExternalRotationTests
             Assert.Contains("Write failed", buffer.ToString(), StringComparison.Ordinal);
             writer.Write(Event("after-failure"));
             clock.Advance(TimeSpan.FromSeconds(60));
-            Assert.Contains("after-failure", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("after-failure", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -647,7 +647,7 @@ public sealed class BkpExternalRotationTests
             writer.Write(Event("second"));
             Assert.Equal(1, LogFileRegistry.IdentityCheckCount - before);
             writer.Flush();
-            Assert.Contains("second", ReadShared(path), StringComparison.Ordinal);
+            Assert.Contains("second", TestFiles.ReadShared(path), StringComparison.Ordinal);
         }
         finally
         {
@@ -970,15 +970,6 @@ public sealed class BkpExternalRotationTests
     private static void RestoreDirectory(string directory, UnixFileMode mode)
         => File.SetUnixFileMode(directory, mode);
 
-    private static string ReadShared(string path)
-    {
-        if (!File.Exists(path))
-            return string.Empty;
-
-        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
-        using var reader = new StreamReader(stream);
-        return reader.ReadToEnd();
-    }
 
     /// <summary>Writes <paramref name="count"/> plain lines before ALog opens the file.</summary>
     /// <param name="path">File to create. Not null.</param>

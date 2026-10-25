@@ -133,7 +133,7 @@ public sealed class Round5CoverageTests
             formatter.Text = new string('b', 4000 - newline);
             writer.Write(Line());
             Assert.Equal(4096, FileLogWriter.RetainedUtf8Bytes);
-            var text = File.ReadAllText(path);
+            var text = TestFiles.ReadShared(path);
             Assert.Contains(formatter.Text, text, StringComparison.Ordinal);
         }
         finally
