@@ -13,6 +13,7 @@ namespace ALog.Core;
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading.Channels;
 using ALog.Config;
 using ALog.Public.Interfaces;
@@ -47,6 +48,12 @@ public partial class BackgroundLogQueue : IDisposable
 
     /// <summary>Most events read in one pass. The channel never holds more than its capacity.</summary>
     private const int MaxRead = 100_000;
+
+    /// <summary>
+    /// Bytes before the message in a plain line, plus the newline: <c>[stamp] [level] </c>.
+    /// The longest built-in level name is five letters. Info is one byte shorter, so the hold stays under 4 MiB.
+    /// </summary>
+    private const int PlainLineOverhead = 36;
 
     /// <summary>Shortest wait before a file that could not reopen is tried again. A longer flush interval waits that long instead.</summary>
     private static readonly TimeSpan MinimumReopenRetry = TimeSpan.FromSeconds(1);
@@ -93,6 +100,9 @@ public partial class BackgroundLogQueue : IDisposable
     private int _flushDeadlineElapsed;
     private int _cutoffElapsed;
     private int _writeDeferred;
+    private int _frontBytes;
+    private int _holdDrops;
+    private long _holdReportedTicks;
     private int _cutoffReached;
     private long _accepted;
     private long _written;
@@ -263,6 +273,16 @@ public partial class BackgroundLogQueue : IDisposable
         get => Volatile.Read(ref _beforeEnqueue);
         set => Volatile.Write(ref _beforeEnqueue, value);
     }
+
+    /// <summary>
+    /// Encoded bytes parked outside the channel because the log file could not be reopened.
+    /// </summary>
+    /// <remarks>
+    /// Does not throw. The processor updates the count. A reader may observe a stale value.
+    /// The count stays at or below <see cref="LogFileRegistry.DirectReopenByteBudget"/>.
+    /// Events still inside the channel are not included. Those are bounded by the queue capacity.
+    /// </remarks>
+    internal int DeferredHoldBytes => Volatile.Read(ref _frontBytes);
 
     /// <summary>How many times a deferred file write has armed its retry wait. Zero until the first blocked reopen.</summary>
     /// <remarks>Does not throw. The count moves before the processor blocks, so a test can advance the clock after it changes.</remarks>
@@ -849,6 +869,16 @@ public partial class BackgroundLogQueue : IDisposable
                     continue;
                 }
 
+                // The hold is full and the channel still has events. Wait out the retry instead of spinning.
+                // Those events stay in the channel, bounded by its capacity, until the file can be written again.
+                if (Volatile.Read(ref _writeDeferred) != 0 && !_queue.IsEmpty)
+                {
+                    if (_clock.GetUtcNow().UtcTicks >= Volatile.Read(ref _retryNotBeforeTicks))
+                        ArmRetryDelay();
+                    WaitForRetry();
+                    continue;
+                }
+
                 TryCompleteFlushIfIdle();
                 if (IsClosedAndIdle())
                     break;
@@ -927,22 +957,63 @@ public partial class BackgroundLogQueue : IDisposable
     /// <remarks>
     /// Does not throw. Does not write. The loop stops at the batch size or at <see cref="MaxRead"/>.
     /// Parked events are taken first so a deferred line stays ahead of a line that arrived later.
+    /// While a reopen is failing, events still in the channel are taken only until the parked batch
+    /// would pass <see cref="LogFileRegistry.DirectReopenByteBudget"/>. The rest stay in the channel.
     /// Only the processor calls this.
     /// </remarks>
     private int ReadBatch(List<LogEvent> batch)
     {
         var limit = ReadLimit();
         var count = 0;
+        var deferred = Volatile.Read(ref _writeDeferred) != 0;
+        var bytes = 0;
         while (count < limit && _front.Count > 0)
         {
-            batch.Add(_front.Dequeue());
+            var parked = _front.Dequeue();
+            var size = HoldBytes(parked);
+            _frontBytes -= size;
+            if (deferred)
+                bytes += size;
+            batch.Add(parked);
             count++;
         }
 
-        while (count < limit && _queue.TryDequeue(out var logEvent))
+        if (_frontBytes < 0)
+            _frontBytes = 0;
+        Volatile.Write(ref _frontBytes, _frontBytes);
+
+        if (!deferred)
         {
-            batch.Add(logEvent);
+            while (count < limit && _queue.TryDequeue(out var logEvent))
+            {
+                batch.Add(logEvent);
+                count++;
+            }
+
+            return count;
+        }
+
+        if (bytes >= LogFileRegistry.DirectReopenByteBudget)
+            return count;
+
+        while (count < limit)
+        {
+            if (!_queue.TryPeek(out var peeked))
+                break;
+
+            var size = HoldBytes(peeked);
+            // One event that is itself over the budget is still attempted. Parking drops it if the write fails.
+            if (count > 0 && (long)bytes + size > LogFileRegistry.DirectReopenByteBudget)
+                break;
+
+            if (!_queue.TryDequeue(out var taken))
+                break;
+
+            batch.Add(taken);
+            bytes += size;
             count++;
+            if (bytes >= LogFileRegistry.DirectReopenByteBudget)
+                break;
         }
 
         return count;
@@ -963,6 +1034,7 @@ public partial class BackgroundLogQueue : IDisposable
     {
         Interlocked.Increment(ref _inflight);
         var committed = 0;
+        var deferredNow = false;
         // Captured before a shutdown stop can empty the front. The finally must not clear it in that window.
         var retrying = Volatile.Read(ref _writeDeferred) != 0;
         try
@@ -982,6 +1054,7 @@ public partial class BackgroundLogQueue : IDisposable
                     ParkFront(batch, i, count);
                     ArmRetryDelay();
                     // Published before the retry wait, so Dispose can see a parked batch and free Block callers.
+                    deferredNow = true;
                     Volatile.Write(ref _writeDeferred, 1);
                     return;
                 }
@@ -1000,7 +1073,9 @@ public partial class BackgroundLogQueue : IDisposable
         {
             if (committed > 0)
                 CommitBatch(committed);
-            if (_front.Count == 0 && !retrying)
+            // A failed reopen that dropped every parked line still has to retry. Clearing the flag here
+            // would pull the rest of the channel immediately and drop it.
+            if (_front.Count == 0 && !retrying && !deferredNow)
                 Volatile.Write(ref _writeDeferred, 0);
             Interlocked.Decrement(ref _inflight);
         }
@@ -1119,26 +1194,119 @@ public partial class BackgroundLogQueue : IDisposable
     /// <param name="count">How many entries in the batch are live. Greater than <paramref name="start"/>.</param>
     /// <remarks>
     /// Does not throw. Only the processor calls this. The copy is bounded by <see cref="MaxRead"/>.
-    /// Events already accepted stay in the outstanding count, so a full queue still rejects a new event.
+    /// Lines that do not fit in <see cref="LogFileRegistry.DirectReopenByteBudget"/> are not parked.
+    /// They are counted with ALOG0070 and are no longer accepted, so dispose does not report them again.
+    /// Events that were not read stay in the channel and are bounded only by the queue capacity.
     /// </remarks>
     private void ParkFront(List<LogEvent> batch, int start, int count)
     {
-        if (_front.Count == 0)
+        var dropped = 0;
+        var bytes = _frontBytes;
+        var room = LogFileRegistry.DirectReopenLineBudget - _front.Count;
+        if (room < 0)
+            room = 0;
+
+        var kept = new Queue<LogEvent>(count > start ? count - start : 0);
+        for (var i = start; i < count; i++)
         {
-            for (var i = start; i < count; i++)
-                _front.Enqueue(batch[i]);
-            return;
+            var size = HoldBytes(batch[i]);
+            if (room <= 0 || (long)bytes + size > LogFileRegistry.DirectReopenByteBudget)
+            {
+                dropped++;
+                continue;
+            }
+
+            kept.Enqueue(batch[i]);
+            bytes += size;
+            room--;
         }
 
-        var pending = new Queue<LogEvent>(_front.Count + (count - start));
-        for (var i = start; i < count; i++)
-            pending.Enqueue(batch[i]);
+        if (_front.Count == 0)
+        {
+            while (kept.Count > 0)
+                _front.Enqueue(kept.Dequeue());
+        }
+        else
+        {
+            while (_front.Count > 0)
+                kept.Enqueue(_front.Dequeue());
 
-        while (_front.Count > 0)
-            pending.Enqueue(_front.Dequeue());
+            while (kept.Count > 0)
+                _front.Enqueue(kept.Dequeue());
+        }
 
-        while (pending.Count > 0)
-            _front.Enqueue(pending.Dequeue());
+        Volatile.Write(ref _frontBytes, bytes);
+        if (dropped > 0)
+            NoteReopenHoldDropped(dropped);
+    }
+
+    /// <summary>
+    /// Bytes this event would add to the parked batch. Plain text, the fixed prefix, and the newline.
+    /// </summary>
+    /// <param name="logEvent">The event. The message may be empty.</param>
+    /// <returns>At least <see cref="PlainLineOverhead"/>. At most <see cref="int.MaxValue"/>.</returns>
+    /// <remarks>
+    /// Does not throw. Does not allocate. Only the processor calls this, and only while a reopen has failed
+    /// or a parked batch is being put back. A healthy queue does not call it.
+    /// </remarks>
+    private static int HoldBytes(LogEvent logEvent)
+    {
+        var message = logEvent.Message;
+        var body = string.IsNullOrEmpty(message) ? 0 : Encoding.UTF8.GetByteCount(message);
+        var total = (long)body + PlainLineOverhead;
+        if (total > int.MaxValue)
+            return int.MaxValue;
+
+        return (int)total;
+    }
+
+    /// <summary>
+    /// Counts lines that did not fit in the parked batch and reports them at most once a minute.
+    /// </summary>
+    /// <param name="count">Lines dropped by this park. Greater than zero.</param>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this. The first drop in a quiet period reports immediately.
+    /// Later drops in the same minute stay in the count. The sentence is the file-buffer ALOG0070 line.
+    /// The accepted count loses these lines so a later ALOG0071 does not include them.
+    /// </remarks>
+    private void NoteReopenHoldDropped(int count)
+    {
+        if (!ForgetDropped(count))
+            return;
+
+        _holdDrops += count;
+        var now = _clock.GetUtcNow();
+        if (_holdReportedTicks != 0 && now.UtcTicks - _holdReportedTicks < TimeSpan.TicksPerMinute)
+            return;
+
+        var reported = _holdDrops;
+        _holdDrops = 0;
+        _holdReportedTicks = now.UtcTicks;
+        if (reported > 0)
+            SelfLog.ReportLine(LogFileRegistry.BufferFullLine(reported));
+    }
+
+    /// <summary>
+    /// Removes <paramref name="count"/> events from the accepted and outstanding counts.
+    /// </summary>
+    /// <param name="count">How many parked lines were dropped. Greater than zero.</param>
+    /// <returns>False when the shutdown snapshot already includes the events. True when they were removed.</returns>
+    /// <remarks>
+    /// Does not throw. Takes the queue lock so a shutdown snapshot cannot miss the removal halfway.
+    /// A snapshot that already ran keeps the events in that remainder instead. Only the processor calls this.
+    /// </remarks>
+    private bool ForgetDropped(int count)
+    {
+        lock (_gate)
+        {
+            if (_frozen)
+                return false;
+
+            Interlocked.Add(ref _accepted, -count);
+        }
+
+        Interlocked.Add(ref _outstanding, -count);
+        return true;
     }
 
     /// <summary>Records the earliest time a parked file event may be tried again.</summary>
@@ -1153,12 +1321,16 @@ public partial class BackgroundLogQueue : IDisposable
         Volatile.Write(ref _retryNotBeforeTicks, due);
     }
 
-    /// <summary>True when parked events must wait for the retry time.</summary>
-    /// <returns>True when the front has events and the clock has not reached the retry time.</returns>
-    /// <remarks>Does not throw. Only the processor calls this. An empty front is never blocked.</remarks>
+    /// <summary>True when a failed reopen must wait for the retry time.</summary>
+    /// <returns>True when the clock has not reached the retry time and a batch is parked or a drop left the retry active.</returns>
+    /// <remarks>
+    /// Does not throw. Only the processor calls this.
+    /// An empty front with no failed reopen is not blocked. A failed reopen waits even when every parked line was dropped,
+    /// so the processor does not pull the rest of the channel in a loop.
+    /// </remarks>
     private bool FrontBlocked()
     {
-        if (_front.Count == 0)
+        if (_front.Count == 0 && Volatile.Read(ref _writeDeferred) == 0)
             return false;
 
         return _clock.GetUtcNow().UtcTicks < Volatile.Read(ref _retryNotBeforeTicks);

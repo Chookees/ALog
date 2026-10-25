@@ -877,7 +877,8 @@ internal sealed class SharedLogFile
     /// The caller holds the file lock. Does not throw. The copy is bounded by the line length.
     /// The buffer stops at <see cref="LogFileRegistry.DirectReopenLineBudget"/> lines and
     /// <see cref="LogFileRegistry.DirectReopenByteBudget"/> bytes. A line that does not fit is ALOG0070 and is not copied.
-    /// The queue path does not call this: those events stay in the queue, bounded by its capacity.
+    /// The queue path does not call this. The processor parks at most the same byte budget outside the channel
+    /// and leaves every event it has not read inside the channel, bounded by the queue capacity.
     /// The timer is the file clock and is at least one second.
     /// </remarks>
     private void HoldDirect(ReadOnlySpan<byte> line)
