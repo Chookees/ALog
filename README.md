@@ -181,7 +181,7 @@ Log.Shutdown();
 
 When the queue is full, ALog drops the new event by default and counts it (SelfLog ALOG0070). To make the caller wait instead, set `QueueFullMode = Block` (in JSON: `"ALog": { "QueueFullMode": "Block" }`). Even with `Block`, a call from the queue's own writer thread or after shutdown has started is dropped and counted, so logging can never deadlock.
 
-If the log file can't be reopened, ALog retries at most once per second and reports it once a minute (SelfLog ALOG0073). It keeps up to 4 MiB of lines for the file, with or without a background queue, and drops and counts the rest (SelfLog ALOG0070).
+If the log file can't be reopened, ALog retries at most once per second and reports it once a minute (SelfLog ALOG0073). It keeps up to 4 MiB of lines for the file, with or without a background queue, and drops and counts the rest (SelfLog ALOG0070). Events still in the background queue are limited by the queue capacity, not by this limit.
 
 #### Queue, file buffer, and shutdown options
 
