@@ -202,8 +202,9 @@ internal static class LogFileRegistry
 /// Omitting <see cref="FileShare.Write"/> stops a second writer on Windows only. Linux and macOS still allow one, and the lines can mix.
 /// A write handle cannot be opened together with <c>File.ReadAllText</c> on Windows: that call uses <see cref="FileShare.Read"/>,
 /// which rejects an existing write. Appends keep that write handle, including when <see cref="FileFlushInterval"/> is zero.
-/// The handle is replaced with a read handle only from <see cref="SharedLogFile.Flush"/>, from the idle timer when the interval
-/// is greater than zero, and it is closed by <see cref="SharedLogFile.Close"/>. A zero interval creates no timer, so it does not swap on idle.
+/// The handle is replaced with a read handle only from <see cref="SharedLogFile.Flush"/>, from the idle timer after a full interval
+/// with no new line, and it is closed by <see cref="SharedLogFile.Close"/>. A tick while lines are still arriving flushes and does not swap.
+/// A zero interval creates no timer, so it does not swap on idle.
 /// The next append closes the read handle and opens a write handle again.
 /// The timer is disposed outside the file lock. The callback also takes that lock.
 /// An external rename, delete, or truncate is noticed on the flush tick, on <see cref="Flush"/>, before this process rotates the file, and on close.
@@ -230,6 +231,8 @@ internal sealed class SharedLogFile
     private int _heldBytes;
     private int _reopenBlocked;
     private DateTimeOffset _lastIdentityCheck;
+    private DateTimeOffset _lastAppend;
+    private int _idleSwapped;
     private DateTimeOffset _lastReopenAttempt;
     private int _reopenAttempts;
     private DateTimeOffset _reopenReported;
@@ -333,6 +336,7 @@ internal sealed class SharedLogFile
     /// and retried on the file clock, at least one second later. Any other failure is reported and does not throw.
     /// The copy is bounded by <paramref name="line"/>'s length. The caller may reuse the span after this returns.
     /// The file lock is not held across the caller's stack once this returns or throws.
+    /// Each accepted line restarts the idle interval. The interval timer does not swap while lines keep arriving.
     /// </remarks>
     internal void Append(ReadOnlySpan<byte> line, long? maxBytes)
     {
@@ -344,34 +348,39 @@ internal sealed class SharedLogFile
             {
                 reportClosed = NoteAfterDispose();
             }
-            else if (EnsureWritable() == WriteOpen.Blocked)
-            {
-                // The queue keeps the event and retries on its flush tick.
-                // A direct caller has no queue, so the line stays in this file's bounded buffer.
-                if (BackgroundLogQueue.IsOnProcessor)
-                    throw new WriteDeferredException();
-
-                HoldDirect(line);
-            }
-            else if (_held.Count > 0 && !TryWriteHeld())
-            {
-                if (BackgroundLogQueue.IsOnProcessor)
-                    throw new WriteDeferredException();
-
-                HoldDirect(line);
-            }
             else
             {
-                if (_stream is null)
-                    TryReopen();
-                if (_stream is not null)
+                // A new line starts the idle interval again. The tick alone does not swap.
+                NoteAppend();
+                if (EnsureWritable() == WriteOpen.Blocked)
                 {
-                    Reconcile(force: false);
+                    // The queue keeps the event and retries on its flush tick.
+                    // A direct caller has no queue, so the line stays in this file's bounded buffer.
+                    if (BackgroundLogQueue.IsOnProcessor)
+                        throw new WriteDeferredException();
+
+                    HoldDirect(line);
+                }
+                else if (_held.Count > 0 && !TryWriteHeld())
+                {
+                    if (BackgroundLogQueue.IsOnProcessor)
+                        throw new WriteDeferredException();
+
+                    HoldDirect(line);
+                }
+                else
+                {
+                    if (_stream is null)
+                        TryReopen();
                     if (_stream is not null)
                     {
-                        RotateIfNeeded(maxBytes);
+                        Reconcile(force: false);
                         if (_stream is not null)
-                            WriteLine(line);
+                        {
+                            RotateIfNeeded(maxBytes);
+                            if (_stream is not null)
+                                WriteLine(line);
+                        }
                     }
                 }
             }
@@ -528,12 +537,13 @@ internal sealed class SharedLogFile
         }
     }
 
-    /// <summary>Flushes when the interval elapses. A closed file returns before taking the lock for long.</summary>
+    /// <summary>Flushes when the interval elapses. Swaps to the read handle only after a quiet interval.</summary>
     /// <remarks>
     /// Does not throw. Does not dispose the timer. The callback and <see cref="Close"/> share the file lock.
     /// Created only when <see cref="FileFlushInterval"/> is greater than zero, so a zero interval never runs this callback.
-    /// After the bytes are written the handle becomes read-only. <c>File.ReadAllText</c> on Windows can then open the path.
-    /// The next append opens a write handle again.
+    /// The buffer is written on every tick. The read-handle swap waits until <see cref="IdleSwapDue"/>,
+    /// which is one full interval after the last append. A tick during a burst does not swap.
+    /// The next append opens a write handle again and starts a new idle interval.
     /// </remarks>
     private void OnInterval()
     {
@@ -550,13 +560,44 @@ internal sealed class SharedLogFile
                 Reconcile(force: true);
                 TryWriteHeld();
                 FlushPending();
-                HoldForReaders();
+                if (IdleSwapDue())
+                    HoldForReaders();
             }
             catch (Exception ex)
             {
                 System.Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
             }
         }
+    }
+
+    /// <summary>Records that a line arrived, so the idle swap waits a full interval from now.</summary>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. Does not read the wall clock. The file clock is the only clock.
+    /// A later tick before that interval elapses flushes and leaves the write handle in place.
+    /// </remarks>
+    private void NoteAppend()
+    {
+        _lastAppend = _clock.GetUtcNow();
+        _idleSwapped = 0;
+    }
+
+    /// <summary>True when the read-handle swap is due and this quiet period has not swapped yet.</summary>
+    /// <returns>True once per quiet period, when the last append is at least one interval old.</returns>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw. A zero interval never swaps here.
+    /// A true result records the swap so the next ticks of this quiet period do not open again.
+    /// The next append clears that record.
+    /// </remarks>
+    private bool IdleSwapDue()
+    {
+        if (_interval <= TimeSpan.Zero || _idleSwapped != 0 || _lastAppend == default)
+            return false;
+
+        if (_clock.GetUtcNow() - _lastAppend < _interval)
+            return false;
+
+        _idleSwapped = 1;
+        return true;
     }
 
     /// <summary>
@@ -737,7 +778,8 @@ internal sealed class SharedLogFile
     /// The caller holds the file lock. Does not throw. The read handle is closed before the append opens,
     /// because <see cref="FileShare.Read"/> does not allow a second write. A failed open leaves the stream unset
     /// and reports ALOG0073. A successful open increments <see cref="LogFileRegistry.OpenCount"/>.
-    /// At most one open is attempted per second on the file clock, including a direct caller with no queue.
+    /// Switching a live read handle back to write is one attempt and is not delayed.
+    /// After that attempt fails, at most one further open is tried per second on the file clock, including a direct caller with no queue.
     /// </remarks>
     private WriteOpen EnsureWritable()
     {
@@ -752,15 +794,16 @@ internal sealed class SharedLogFile
         if (_stream is null || _stream.CanWrite)
             return WriteOpen.Ready;
 
-        if (!ReopenAttemptDue())
-            return WriteOpen.Blocked;
-
         var parked = _stream;
         _stream = null;
         DisposeDetached(parked);
         var opened = OpenWriteAgain();
         if (opened == WriteOpen.Blocked)
+        {
             _reopenBlocked = 1;
+            _lastReopenAttempt = _clock.GetUtcNow();
+        }
+
         return opened;
     }
 

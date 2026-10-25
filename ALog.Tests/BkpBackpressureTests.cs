@@ -217,6 +217,46 @@ public sealed class BkpBackpressureTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The idle swap waits for a full interval with no new line. A tick during writing does not swap.
+    /// </summary>
+    /// <remarks>
+    /// The interval is 200 ms. A line every 5 ms for 2 s is 400 writes. Each step checks the open count,
+    /// so a swap on a tick fails at that step. The count stays at the first write.
+    /// 200 ms after the burst the next tick swaps once. The tick after that does not swap again.
+    /// Not thread-safe. The wait bound is 30 seconds. The clock is a <see cref="FakeTimeProvider"/>.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task Idle_SwapOnlyWhenNoNewLines_DuringContinuousWriting()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "burst.log");
+            var clock = NewClock();
+            var interval = TimeSpan.FromMilliseconds(200);
+            var before = LogFileRegistry.OpenCount;
+            using var writer = new FileLogWriter(path, fileFlushInterval: interval, clock: clock);
+            const int steps = 400;
+            for (var i = 0; i < steps; i++)
+            {
+                writer.Write(Event("b" + i.ToString(CultureInfo.InvariantCulture)));
+                clock.Advance(TimeSpan.FromMilliseconds(5));
+                Assert.Equal(before + 1, LogFileRegistry.OpenCount);
+            }
+
+            clock.Advance(interval);
+            Assert.Equal(before + 2, LogFileRegistry.OpenCount);
+            clock.Advance(interval);
+            Assert.Equal(before + 2, LogFileRegistry.OpenCount);
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
     /// <summary>Two writers for one path share one stream and never tear a line.</summary>
     /// <remarks>
     /// Not thread-safe beyond the two writer tasks. The 120 s wait is a hang guard.
