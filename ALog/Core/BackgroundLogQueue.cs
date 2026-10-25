@@ -50,13 +50,10 @@ public partial class BackgroundLogQueue : IDisposable
     private const int MaxRead = 100_000;
 
     /// <summary>
-    /// Bytes before the message in a plain line, plus the newline: <c>[stamp] [level] </c>.
-    /// The longest built-in level name is five letters. Info is one byte shorter, so the hold stays under 4 MiB.
+    /// Bytes charged when a parked event has no file writer: a short plain prefix plus the newline.
+    /// A file writer charges the formatter's UTF-8 instead. This is not a multiplier.
     /// </summary>
     private const int PlainLineOverhead = 36;
-
-    /// <summary>Most property or context entries counted toward the parked batch. A larger bag is treated as the whole byte budget.</summary>
-    private const int MaxHoldBagEntries = 128;
 
     /// <summary>Shortest wait before a file that could not reopen is tried again. A longer flush interval waits that long instead.</summary>
     private static readonly TimeSpan MinimumReopenRetry = TimeSpan.FromSeconds(1);
@@ -66,6 +63,8 @@ public partial class BackgroundLogQueue : IDisposable
     private readonly ManualResetEventSlim _releaseRetry = new(false);
     private readonly ManualResetEventSlim _wake = new(false);
     private int _wakeSignals;
+    private readonly List<ILogWriter> _writers;
+    private readonly ConditionalWeakTable<LogEvent, HeldLines> _held = new();
     private readonly LogDispatcher _dispatcher;
     private readonly CancellationTokenSource _shutdownSignal = new();
     private readonly Task _backgroundTask;
@@ -200,6 +199,7 @@ public partial class BackgroundLogQueue : IDisposable
         _newWriteBudget = LogOptionRules.DeriveCutoff(_shutdownDeadline);
 
         var writerList = CopyWriters(writers);
+        _writers = writerList;
         // File and console writers return inside Write, so the processor calls Write and skips the async state machine.
         // Async off is not enough: a writer that waits must stay on the processor or the log call never returns.
         _directDispatch = WritersCompleteOnCaller(writerList);
@@ -297,6 +297,7 @@ public partial class BackgroundLogQueue : IDisposable
 
     /// <summary>
     /// Encoded bytes parked outside the channel because the log file could not be reopened.
+    /// Each parked file line is the UTF-8 the configured formatter produced, including the newline.
     /// </summary>
     /// <remarks>
     /// Does not throw. The processor updates the count. A reader may observe a stale value.
@@ -1048,6 +1049,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// Does not throw. A writer exception is handled inside the dispatcher.
     /// The in-flight flag keeps <see cref="FlushAsync"/> from completing during the call.
     /// A failed reopen stays deferred when shutdown stops the retry, so the Block caller is part of the ALOG0071 remainder.
+    /// A batch that started as a retry writes the bytes captured at hold time and does not format those lines again.
     /// </remarks>
     private void WriteAccepted(List<LogEvent> batch, int count)
     {
@@ -1055,7 +1057,9 @@ public partial class BackgroundLogQueue : IDisposable
         var committed = 0;
         var deferredNow = false;
         // Captured before a shutdown stop can empty the front. The finally must not clear it in that window.
-        var retrying = Volatile.Read(ref _writeDeferred) != 0;
+        // replaying stays true for the whole batch so every line formatted at hold time is written as those bytes.
+        var replaying = Volatile.Read(ref _writeDeferred) != 0;
+        var retrying = replaying;
         try
         {
             var limit = count;
@@ -1067,7 +1071,7 @@ public partial class BackgroundLogQueue : IDisposable
                     return;
                 }
 
-                var result = DispatchOne(batch[i]);
+                var result = DispatchOne(batch[i], replaying);
                 if (result == DispatchResult.Deferred)
                 {
                     ParkFront(batch, i, count);
@@ -1152,9 +1156,13 @@ public partial class BackgroundLogQueue : IDisposable
     /// Hands one event to every writer. A writer failure stays on the dispatcher error path.
     /// </summary>
     /// <param name="logEvent">The event. May be the default record value.</param>
+    /// <param name="replaying">True when this batch started as a failed-reopen retry. The cached formatter bytes are written, and the line is not formatted again.</param>
     /// <returns><see cref="DispatchResult.Skipped"/> when the deadline skipped a writer. That event stays unwritten and is part of ALOG0071. <see cref="DispatchResult.Deferred"/> when the file could not reopen and the event must stay queued.</returns>
-    /// <remarks>Does not throw. Allocates nothing beyond what the dispatcher allocates. One event, so the deadline can be checked between events.</remarks>
-    private DispatchResult DispatchOne(LogEvent logEvent)
+    /// <remarks>
+    /// Does not throw. A healthy batch passes false and does not look up a cached line.
+    /// One event, so the deadline can be checked between events. Only the processor calls this.
+    /// </remarks>
+    private DispatchResult DispatchOne(LogEvent logEvent, bool replaying)
     {
         var previousQueue = ConsumerQueue.Value;
         var previousThread = Volatile.Read(ref _consumerThread);
@@ -1165,13 +1173,17 @@ public partial class BackgroundLogQueue : IDisposable
             _writerGate.PrepareEvent();
             try
             {
-                if (_directDispatch)
-                    _dispatcher.Dispatch(logEvent);
-                else
+                var wroteHeld = replaying && TryReplayHeld(logEvent);
+                if (!wroteHeld)
                 {
-                    var task = _dispatcher.DispatchAsync(logEvent);
-                    if (!task.IsCompleted)
-                        task.GetAwaiter().GetResult();
+                    if (_directDispatch)
+                        _dispatcher.Dispatch(logEvent);
+                    else
+                    {
+                        var task = _dispatcher.DispatchAsync(logEvent);
+                        if (!task.IsCompleted)
+                            task.GetAwaiter().GetResult();
+                    }
                 }
             }
             catch (WriteDeferredException)
@@ -1183,6 +1195,9 @@ public partial class BackgroundLogQueue : IDisposable
                 Console.Error.WriteLine("[BackgroundLogQueue] Batch processing error: " + ex.GetType().Name);
             }
 
+            if (replaying && !_writerGate.EventSkipped)
+                _held.Remove(logEvent);
+
             return _writerGate.EventSkipped ? DispatchResult.Skipped : DispatchResult.Written;
         }
         finally
@@ -1190,6 +1205,80 @@ public partial class BackgroundLogQueue : IDisposable
             ConsumerQueue.Value = previousQueue;
             Volatile.Write(ref _consumerThread, previousThread);
         }
+    }
+
+    /// <summary>
+    /// Writes the UTF-8 captured when this event was parked. A miss lets the caller format it.
+    /// </summary>
+    /// <param name="logEvent">The event being retried. Not null.</param>
+    /// <returns>True when the cached lines were handed to the writers. False when there is no cached file line.</returns>
+    /// <remarks>
+    /// Does not throw for a writer failure other than <see cref="WriteDeferredException"/>, which escapes.
+    /// Only the processor calls this, and only when the batch started as a failed-reopen retry.
+    /// A healthy batch does not call it, so the lookup stays off the success path.
+    /// </remarks>
+    private bool TryReplayHeld(LogEvent logEvent)
+    {
+        if (!_held.TryGetValue(logEvent, out var held) || held.Lines is null || held.Lines.Length != _writers.Count)
+            return false;
+
+        WriteHeld(logEvent, held);
+        return true;
+    }
+
+    /// <summary>
+    /// Appends each cached file line and sends the event to every writer that has no cached line.
+    /// </summary>
+    /// <param name="logEvent">The event. Passed to a writer that is not a file writer.</param>
+    /// <param name="held">The lines captured for this event. <see cref="HeldLines.Lines"/> matches the writer list.</param>
+    /// <remarks>
+    /// Does not format. <see cref="WriteDeferredException"/> escapes after the writer is marked idle, so the queue can park the event again.
+    /// The loop is bounded by the writer list. Only the processor calls this, on a failed-reopen retry.
+    /// </remarks>
+    private void WriteHeld(LogEvent logEvent, HeldLines held)
+    {
+        var lines = held.Lines!;
+        var count = _writers.Count;
+        for (var i = 0; i < count; i++)
+        {
+            if (!_writerGate.BeginWriterCall(i))
+                continue;
+
+            try
+            {
+                var prepared = lines[i];
+                if (prepared is not null && _writers[i] is FileLogWriter file)
+                    file.WritePrepared(prepared);
+                else
+                    WriteReplayOther(_writers[i], logEvent);
+            }
+            finally
+            {
+                _writerGate.EndWriterCall(i);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Writes one non-file writer during a replay. A file writer uses its cached bytes instead.
+    /// </summary>
+    /// <param name="writer">The destination. Not null. Not a file writer with a cached line.</param>
+    /// <param name="logEvent">The event. Passed through.</param>
+    /// <remarks>
+    /// Does not throw except <see cref="WriteDeferredException"/>. The file and console path calls <see cref="ILogWriter.Write"/>.
+    /// Any other writer uses the async method and waits on this processor thread. Only a failed-reopen retry calls this.
+    /// </remarks>
+    private void WriteReplayOther(ILogWriter writer, LogEvent logEvent)
+    {
+        if (_directDispatch)
+        {
+            writer.Write(logEvent);
+            return;
+        }
+
+        var task = writer.WriteAsync(logEvent);
+        if (!task.IsCompleted)
+            task.GetAwaiter().GetResult();
     }
 
     /// <summary>What one processor write did with an event.</summary>
@@ -1231,6 +1320,7 @@ public partial class BackgroundLogQueue : IDisposable
             var size = HoldBytes(batch[i]);
             if (room <= 0 || (long)bytes + size > LogFileRegistry.DirectReopenByteBudget)
             {
+                _held.Remove(batch[i]);
                 dropped++;
                 continue;
             }
@@ -1260,24 +1350,114 @@ public partial class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Bytes this event would add to the parked batch. Plain text, the fixed prefix, the newline,
-    /// and, when present, the exception, properties, context, and category.
+    /// Bytes this event adds to the parked batch. A file writer contributes the UTF-8 of its formatted line, including the newline.
     /// </summary>
     /// <param name="logEvent">The event. The message may be empty.</param>
-    /// <returns>At least <see cref="PlainLineOverhead"/>. At most <see cref="int.MaxValue"/>.</returns>
+    /// <returns>The cached size when this event was already measured. Otherwise the formatter size. At most <see cref="int.MaxValue"/>.</returns>
     /// <remarks>
     /// Does not throw. Only the processor calls this, and only while a reopen has failed
     /// or a parked batch is being put back. A healthy queue does not call it.
-    /// The exception contribution is <see cref="Exception.ToString"/>, which includes inner exceptions and the stack.
-    /// A throwing <c>ToString</c> counts as the whole byte budget so the line is dropped instead of under-counted.
-    /// A message with no exception, properties, context, or category keeps the plain estimate.
+    /// The formatted bytes are kept so the retry writes those exact bytes and does not format again.
+    /// A formatter that throws counts as one byte past the budget, so the line is dropped instead of under-counted.
+    /// There is no multiplier. A queue with no file writer charges the message UTF-8 plus <see cref="PlainLineOverhead"/>.
     /// </remarks>
-    private static int HoldBytes(LogEvent logEvent)
+    private int HoldBytes(LogEvent logEvent)
+    {
+        if (_held.TryGetValue(logEvent, out var cached))
+            return cached.Bytes;
+
+        return CaptureHold(logEvent);
+    }
+
+    /// <summary>
+    /// Formats <paramref name="logEvent"/> for each file writer and remembers the total.
+    /// </summary>
+    /// <param name="logEvent">The event. Not null. Not already in the cache.</param>
+    /// <returns>The byte count stored for this event. One past the budget when a formatter throws.</returns>
+    /// <remarks>
+    /// Does not throw. The loop is bounded by the writer list. Only <see cref="HoldBytes"/> calls this, on the reopen-failure path.
+    /// A line larger than the budget remembers the size and not the bytes, so a dropped line does not keep the array.
+    /// </remarks>
+    private int CaptureHold(LogEvent logEvent)
+    {
+        var count = _writers.Count;
+        var lines = new byte[]?[count];
+        long total = 0;
+        var anyFile = false;
+        for (var i = 0; i < count; i++)
+        {
+            if (_writers[i] is not FileLogWriter file)
+                continue;
+
+            anyFile = true;
+            if (!TryCapture(file, logEvent, out var captured))
+                return RememberSize(logEvent, null, OverBudgetHold());
+
+            lines[i] = captured;
+            total += captured.Length;
+            if (total > LogFileRegistry.DirectReopenByteBudget)
+                return RememberSize(logEvent, null, SaturatingHold(total));
+        }
+
+        if (!anyFile)
+            return RememberSize(logEvent, null, SaturatingHold(PlainHold(logEvent)));
+
+        return RememberSize(logEvent, lines, SaturatingHold(total));
+    }
+
+    /// <summary>
+    /// Stores <paramref name="size"/> for <paramref name="logEvent"/> and returns it.
+    /// </summary>
+    /// <param name="logEvent">The event. Not null.</param>
+    /// <param name="lines">Cached file lines, or null when the line will not be replayed from those bytes.</param>
+    /// <param name="size">The count the budget uses. Not negative.</param>
+    /// <returns><paramref name="size"/>, or the size already stored for this event.</returns>
+    /// <remarks>Does not throw. Only the processor calls this, on the reopen-failure path. A second store keeps the first size.</remarks>
+    private int RememberSize(LogEvent logEvent, byte[]?[]? lines, int size)
+    {
+        if (!_held.TryAdd(logEvent, new HeldLines(lines, size)) && _held.TryGetValue(logEvent, out var existing))
+            return existing.Bytes;
+
+        return size;
+    }
+
+    /// <summary>One byte past the reopen budget, so a line of that size is not parked.</summary>
+    /// <returns>The budget plus one, or <see cref="int.MaxValue"/> if that sum does not fit.</returns>
+    /// <remarks>Does not throw. No lock. Only the reopen-failure path calls this.</remarks>
+    private static int OverBudgetHold()
+        => SaturatingHold((long)LogFileRegistry.DirectReopenByteBudget + 1);
+
+    /// <summary>
+    /// UTF-8 size of the message plus <see cref="PlainLineOverhead"/>. Used when no writer is a file writer.
+    /// </summary>
+    /// <param name="logEvent">The event. The message may be empty.</param>
+    /// <returns>At least <see cref="PlainLineOverhead"/>.</returns>
+    /// <remarks>Does not throw. Does not allocate. Only the reopen-failure path calls this. Not a multiplier.</remarks>
+    private static long PlainHold(LogEvent logEvent)
     {
         var message = logEvent.Message;
         var body = string.IsNullOrEmpty(message) ? 0 : Encoding.UTF8.GetByteCount(message);
-        var total = (long)body + PlainLineOverhead + ExtraHold(logEvent);
-        return SaturatingHold(total);
+        return body + PlainLineOverhead;
+    }
+
+    /// <summary>Reads one file writer's formatted line. A throw is a failed capture.</summary>
+    /// <param name="file">The writer. Not null.</param>
+    /// <param name="logEvent">The event. Not null.</param>
+    /// <param name="captured">The UTF-8 line, including the newline, when the result is true. Empty when false.</param>
+    /// <returns>False when the formatter throws. The caller then drops the line.</returns>
+    /// <remarks>Does not throw. Only the processor calls this, on the reopen-failure path.</remarks>
+    private static bool TryCapture(FileLogWriter file, LogEvent logEvent, out byte[] captured)
+    {
+        try
+        {
+            captured = file.CaptureLine(logEvent);
+            return true;
+        }
+        catch (Exception)
+        {
+            captured = Array.Empty<byte>();
+            return false;
+        }
     }
 
     /// <summary>
@@ -1299,147 +1479,25 @@ public partial class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Bytes beyond the plain message: exception, properties, context, and category.
+    /// One parked event's formatted file lines and the byte count the reopen budget charges.
     /// </summary>
-    /// <param name="logEvent">The event being parked. Not null.</param>
-    /// <returns>Zero when none of those are set. At most <see cref="LogFileRegistry.DirectReopenByteBudget"/>.</returns>
-    /// <remarks>
-    /// Does not throw. Only <see cref="HoldBytes"/> calls this, and only on the reopen-failure path.
-    /// The sum stops at the byte budget so a huge attachment cannot overflow the parked total.
-    /// </remarks>
-    private static int ExtraHold(LogEvent logEvent)
+    private sealed class HeldLines
     {
-        long total = ExceptionHold(logEvent.Exception);
-        if (total >= LogFileRegistry.DirectReopenByteBudget)
-            return LogFileRegistry.DirectReopenByteBudget;
-
-        total += BagHold(logEvent.Properties);
-        if (total >= LogFileRegistry.DirectReopenByteBudget)
-            return LogFileRegistry.DirectReopenByteBudget;
-
-        total += BagHold(logEvent.Context);
-        if (total >= LogFileRegistry.DirectReopenByteBudget)
-            return LogFileRegistry.DirectReopenByteBudget;
-
-        total += Utf8Length(logEvent.Category);
-        if (total >= LogFileRegistry.DirectReopenByteBudget)
-            return LogFileRegistry.DirectReopenByteBudget;
-
-        return (int)total;
-    }
-
-    /// <summary>
-    /// UTF-8 size of <paramref name="exception"/>'s <see cref="Exception.ToString"/>, including inner exceptions and the stack.
-    /// </summary>
-    /// <param name="exception">The event's exception. Null is zero.</param>
-    /// <returns>Zero when <paramref name="exception"/> is null. The byte budget when <c>ToString</c> throws or the text is at least that large.</returns>
-    /// <remarks>
-    /// Does not throw. Allocates the exception text. Only the reopen-failure path calls this.
-    /// A throw is counted as the whole budget so the parked batch cannot ignore the attachment.
-    /// </remarks>
-    private static int ExceptionHold(Exception? exception)
-    {
-        if (exception is null)
-            return 0;
-
-        string? text;
-        try
+        /// <summary>Stores the lines and the count.</summary>
+        /// <param name="lines">One slot per writer, or null when the bytes are not kept. A null slot is not a file line.</param>
+        /// <param name="bytes">The count. Not negative.</param>
+        /// <remarks>Does not throw. The processor creates this on the reopen-failure path. The array is not copied.</remarks>
+        internal HeldLines(byte[]?[]? lines, int bytes)
         {
-            text = exception.ToString();
-        }
-        catch (Exception)
-        {
-            return LogFileRegistry.DirectReopenByteBudget;
+            Lines = lines;
+            Bytes = bytes;
         }
 
-        var bytes = Utf8Length(text);
-        if (bytes >= LogFileRegistry.DirectReopenByteBudget)
-            return LogFileRegistry.DirectReopenByteBudget;
+        /// <summary>Cached UTF-8 lines, including newlines. Null when only the count is kept.</summary>
+        internal byte[]?[]? Lines { get; }
 
-        return bytes;
-    }
-
-    /// <summary>
-    /// UTF-8 size of one property or context bag, including a few separator bytes per pair.
-    /// </summary>
-    /// <param name="bag">The bag. Null or empty is zero.</param>
-    /// <returns>The byte count, or the byte budget when the bag is larger than <see cref="MaxHoldBagEntries"/> or a value's text throws.</returns>
-    /// <remarks>
-    /// Does not throw. The loop stops at <see cref="MaxHoldBagEntries"/>. Only the reopen-failure path calls this.
-    /// A throwing enumerator or <c>ToString</c> counts as the whole budget.
-    /// </remarks>
-    private static int BagHold(IReadOnlyDictionary<string, object>? bag)
-    {
-        if (bag is null || bag.Count == 0)
-            return 0;
-
-        try
-        {
-            long total = 0;
-            var seen = 0;
-            foreach (var pair in bag)
-            {
-                if (seen >= MaxHoldBagEntries)
-                    return LogFileRegistry.DirectReopenByteBudget;
-
-                seen++;
-                total += Utf8Length(pair.Key);
-                total += ValueHold(pair.Value);
-                total += 4;
-                if (total >= LogFileRegistry.DirectReopenByteBudget)
-                    return LogFileRegistry.DirectReopenByteBudget;
-            }
-
-            return (int)total;
-        }
-        catch (Exception)
-        {
-            return LogFileRegistry.DirectReopenByteBudget;
-        }
-    }
-
-    /// <summary>UTF-8 size of one property or context value.</summary>
-    /// <param name="value">The value. Null is zero. A string is measured directly.</param>
-    /// <returns>The byte count, or the byte budget when <c>ToString</c> throws or the text is at least that large.</returns>
-    /// <remarks>Does not throw. Only <see cref="BagHold"/> calls this, on the reopen-failure path.</remarks>
-    private static int ValueHold(object? value)
-    {
-        if (value is null)
-            return 0;
-
-        if (value is string text)
-        {
-            var textBytes = Utf8Length(text);
-            if (textBytes >= LogFileRegistry.DirectReopenByteBudget)
-                return LogFileRegistry.DirectReopenByteBudget;
-
-            return textBytes;
-        }
-
-        try
-        {
-            var bytes = Utf8Length(value.ToString());
-            if (bytes >= LogFileRegistry.DirectReopenByteBudget)
-                return LogFileRegistry.DirectReopenByteBudget;
-
-            return bytes;
-        }
-        catch (Exception)
-        {
-            return LogFileRegistry.DirectReopenByteBudget;
-        }
-    }
-
-    /// <summary>UTF-8 size of <paramref name="text"/>.</summary>
-    /// <param name="text">Text to measure. Null or empty is zero.</param>
-    /// <returns>The byte count. Zero when there is no text.</returns>
-    /// <remarks>Does not throw. Does not allocate. Only the reopen-failure path calls this.</remarks>
-    private static int Utf8Length(string? text)
-    {
-        if (string.IsNullOrEmpty(text))
-            return 0;
-
-        return Encoding.UTF8.GetByteCount(text);
+        /// <summary>Bytes charged against the reopen budget.</summary>
+        internal int Bytes { get; }
     }
 
     /// <summary>

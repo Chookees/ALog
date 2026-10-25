@@ -179,6 +179,10 @@ public sealed partial class C4QueueFixTests
     /// A token that is already cancelled is neither accepted nor dropped and writes no line.
     /// </summary>
     /// <returns>A task that finishes after the second window is advanced.</returns>
+    /// <remarks>
+    /// The processor is inside the writer before the clock moves, so the report timer is not armed during startup.
+    /// Each advance also wakes an overdue timer that lost that race. The counts are not relaxed.
+    /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task Throttle_SumsReportedCounts_AndCancelledEntryIsNeither()
     {
@@ -208,6 +212,7 @@ public sealed partial class C4QueueFixTests
             Assert.Equal(0, queue.ClosedDropCount);
 
             Assert.True(queue.TryEnqueue(Event("prime")));
+            await WaitUntilWriterEntered(writer);
             var acceptedByMistake = 0;
             Parallel.For(0, 32, _ =>
             {
@@ -220,14 +225,14 @@ public sealed partial class C4QueueFixTests
 
             Assert.Equal(0, acceptedByMistake);
             Assert.Equal(320_000, queue.FullDropCount);
-            clock.Advance(TimeSpan.FromMilliseconds(1));
+            AdvanceReports(clock, TimeSpan.FromMilliseconds(1));
             lock (lines)
                 Assert.Equal("320000" + DropMarker + "1). The writers are slower than your log rate. Lower the log level or check the slowest writer.", Assert.Single(lines));
 
             for (var i = 0; i < 50; i++)
                 Assert.False(queue.TryEnqueue(Event("later")));
 
-            clock.Advance(TimeSpan.FromSeconds(60));
+            AdvanceReports(clock, TimeSpan.FromSeconds(60));
             long reported;
             lock (lines)
             {
@@ -587,6 +592,10 @@ public sealed partial class C4QueueFixTests
     /// A drop in the last fraction of a millisecond of that window still arms a report.
     /// </summary>
     /// <returns>A task that finishes after the clock is advanced.</returns>
+    /// <remarks>
+    /// The processor is inside the writer before the first advance. Later advances wake an overdue report
+    /// that lost the race with the processor. The drop total is still required to match the reported sum.
+    /// </remarks>
     private static async Task CoverReportEdges()
     {
         var clock = new FakeTimeProvider(new DateTimeOffset(2026, 2, 1, 0, 0, 0, TimeSpan.Zero));
@@ -609,13 +618,14 @@ public sealed partial class C4QueueFixTests
         {
             queue = new BackgroundLogQueue(new ILogWriter[] { writer }, 1, 1, TimeSpan.FromHours(1), clock);
             Assert.True(queue.TryEnqueue(Event("prime")));
+            await WaitUntilWriterEntered(writer);
             Assert.False(queue.TryEnqueue(Event("drop")));
-            clock.Advance(TimeSpan.FromMilliseconds(1));
-            clock.Advance(TimeSpan.FromSeconds(60));
+            AdvanceReports(clock, TimeSpan.FromMilliseconds(1));
+            AdvanceReports(clock, TimeSpan.FromSeconds(60));
             var near = TimeSpan.FromSeconds(60) - TimeSpan.FromTicks(TimeSpan.TicksPerMillisecond / 2);
-            clock.Advance(near);
+            AdvanceReports(clock, near);
             Assert.False(queue.TryEnqueue(Event("near-window")));
-            clock.Advance(TimeSpan.FromMilliseconds(2));
+            AdvanceReports(clock, TimeSpan.FromMilliseconds(2));
             lock (lines)
                 Assert.Equal(queue.FullDropCount, SumDropCounts(lines));
             Assert.Equal(3, queue.FullDropCount);
@@ -628,6 +638,36 @@ public sealed partial class C4QueueFixTests
         }
 
         await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Waits until <paramref name="writer"/> is inside its first call, so the processor has finished starting.
+    /// </summary>
+    /// <param name="writer">The writer the queue is blocked on. Not null.</param>
+    /// <returns>A task that finishes when that call has been entered.</returns>
+    /// <remarks>
+    /// Does not throw except through the assertion. The 5 s bound is a hang guard, not a product deadline.
+    /// The processor is inside the writer and is not touching the test clock, so a later advance reaches the report timer.
+    /// </remarks>
+    private static async Task WaitUntilWriterEntered(BlockingWriter writer)
+    {
+        Assert.True(await WaitUntil(() => writer.EnteredCount > 0, TimeSpan.FromSeconds(5)));
+    }
+
+    /// <summary>
+    /// Moves <paramref name="clock"/> and then wakes timers that are already due.
+    /// </summary>
+    /// <param name="clock">The queue's clock. Not null.</param>
+    /// <param name="by">How far to move it. Zero only wakes timers that are already due.</param>
+    /// <remarks>
+    /// Does not throw. The extra wakes are bounded by 8. A callback that lost the race with another wake still runs
+    /// before the caller asserts. A timer that is not yet due stays unfired. Safe to call from the test thread.
+    /// </remarks>
+    private static void AdvanceReports(FakeTimeProvider clock, TimeSpan by)
+    {
+        clock.Advance(by);
+        for (var i = 0; i < 8; i++)
+            clock.Advance(TimeSpan.Zero);
     }
 
     /// <summary>

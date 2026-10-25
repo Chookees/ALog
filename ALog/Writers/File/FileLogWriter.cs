@@ -356,6 +356,48 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     }
 
     /// <summary>
+    /// Formats one event with the configured formatter and returns the UTF-8 the file would append, including the newline.
+    /// </summary>
+    /// <param name="logEvent">Event to render. Not null.</param>
+    /// <returns>The line plus <see cref="Environment.NewLine"/>, encoded without a BOM.</returns>
+    /// <remarks>
+    /// May throw when the formatter throws. The queue catches that and drops the line.
+    /// Does not append and does not take the writer lock. Only the processor calls this, and only after a reopen has failed.
+    /// A later retry writes these exact bytes and does not format the event again.
+    /// </remarks>
+    internal byte[] CaptureLine(LogEvent logEvent)
+    {
+        var line = Formatter?.Format(logEvent) ?? FormatFallback(logEvent);
+        return Utf8.GetBytes(line + Environment.NewLine);
+    }
+
+    /// <summary>
+    /// Appends bytes already formatted for this file. Does not format the event again.
+    /// </summary>
+    /// <param name="line">The line plus its newline, in UTF-8 without a BOM.</param>
+    /// <remarks>
+    /// <see cref="WriteDeferredException"/> escapes so the queue can keep the event.
+    /// Any other failure is reported and does not throw. Takes the writer lock for the append, the same lock <see cref="WriteCore"/> uses.
+    /// Only the processor calls this, when it retries a line captured after a failed reopen. The success path does not.
+    /// </remarks>
+    internal void WritePrepared(ReadOnlySpan<byte> line)
+    {
+        try
+        {
+            lock (_writeLock)
+                _shared.Append(line, _maxFileSizeInBytes);
+        }
+        catch (WriteDeferredException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"[FileLogWriter] Write failed: {ex}");
+        }
+    }
+
+    /// <summary>
     /// The stamp in a rotated file name. Not a shutdown or flush deadline.
     /// </summary>
     /// <returns>UTC time as <c>yyyyMMdd_HHmmss</c>.</returns>
