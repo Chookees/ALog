@@ -88,7 +88,7 @@ public sealed class CoverageGapTests
     }
 
     /// <summary>
-    /// The plain fast path writes levels and properties, and refuses a short buffer, an escape, or a value it cannot render.
+    /// The plain UTF-8 path writes levels and properties, and refuses a short buffer, an escape, or a value it cannot render.
     /// </summary>
     /// <returns>A task that finishes after the buffers are checked.</returns>
     /// <remarks>
@@ -96,7 +96,7 @@ public sealed class CoverageGapTests
     /// Not thread-safe. The formatter reads the culture of this thread.
     /// </remarks>
     [Fact(Timeout = 30000)]
-    public async Task Plain_FastPath_CoversOverflowEscapesAndValues()
+    public async Task Plain_Utf8Path_CoversOverflowEscapesAndValues()
     {
         await Task.CompletedTask;
         var previous = CultureInfo.CurrentCulture;
