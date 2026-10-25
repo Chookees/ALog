@@ -179,6 +179,7 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
     /// <param name="logEvent">Event to append. Null is reported and dropped.</param>
     /// <remarks>
     /// The lock covers rotation and append so two callers cannot split a line.
+    /// Compact JSON is written as UTF-8 into the file buffer when it matches <see cref="JsonFormatter.Format"/>.
     /// A formatting or I/O failure is reported and does not leave the lock held.
     /// <see cref="WriteDeferredException"/> is rethrown so the background queue can keep the event.
     /// A direct caller does not see that exception: the file holds the line and retries on its clock.
@@ -190,7 +191,7 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
             if (logEvent is null)
                 throw new ArgumentNullException(nameof(logEvent));
 
-            if (TryWriteFast(logEvent))
+            if (TryWriteFast(logEvent) || TryWriteJsonFast(logEvent))
                 return;
 
             var line = Formatter?.Format(logEvent) ?? FormatFallback(logEvent);
@@ -240,6 +241,46 @@ public class FileLogWriter : ILogWriter, IFormattableLogWriter
             if (next <= MaxRetainedUtf8)
                 _utf8Scratch = buffer;
             if (!plain.TryWriteUtf8(logEvent, buffer, out written))
+                return false;
+        }
+
+        var newline = NewLineBytes;
+        if (written + newline.Length > buffer.Length)
+            return false;
+        newline.CopyTo(buffer.AsSpan(written));
+        lock (_writeLock)
+            _shared.Append(buffer.AsSpan(0, written + newline.Length), _maxFileSizeInBytes);
+        return true;
+    }
+
+    /// <summary>
+    /// Writes one compact JSON line straight into the file buffer when the formatter is exactly <see cref="JsonFormatter"/>.
+    /// </summary>
+    /// <param name="logEvent">Event to append. Not null.</param>
+    /// <returns>True when the line is in the file buffer. False when the caller uses the string path.</returns>
+    /// <remarks>
+    /// Does not throw. The bytes match <see cref="JsonFormatter.Format"/> plus the newline.
+    /// A pretty formatter, an exception, or a character the hand-built document cannot encode returns false.
+    /// <see cref="object.GetType"/> must be <see cref="JsonFormatter"/> itself, so a subclass that replaces
+    /// <see cref="ILogFormatter.Format"/> is not hidden. Safe to call from several threads.
+    /// </remarks>
+    private bool TryWriteJsonFast(LogEvent logEvent)
+    {
+        if (Formatter is not JsonFormatter json || json.GetType() != typeof(JsonFormatter))
+            return false;
+
+        var buffer = _utf8Scratch ??= new byte[1024];
+        if (!json.TryWriteUtf8(logEvent, buffer, out var written))
+        {
+            if (buffer.Length >= 64 * 1024)
+                return false;
+            var next = buffer.Length * 2;
+            if (next > 64 * 1024)
+                next = 64 * 1024;
+            buffer = new byte[next];
+            if (next <= MaxRetainedUtf8)
+                _utf8Scratch = buffer;
+            if (!json.TryWriteUtf8(logEvent, buffer, out written))
                 return false;
         }
 

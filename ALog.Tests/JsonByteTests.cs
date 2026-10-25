@@ -1,7 +1,9 @@
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using ALog.Core;
 using ALog.Formatters;
+using ALog.Writers.File;
 
 namespace ALog.Tests;
 
@@ -48,6 +50,74 @@ public sealed class JsonByteTests
         Assert.Equal(Serialized(plain), text);
         Assert.Contains("plain-line", text, StringComparison.Ordinal);
         Assert.DoesNotContain("\\u", text, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The UTF-8 buffer and the file both match <see cref="JsonFormatter.Format"/>.
+    /// A short buffer, a pretty formatter, an apostrophe, and an exception stay on the string path.
+    /// A line longer than 1024 characters still matches.
+    /// </summary>
+    /// <returns>A task that finishes after the file is compared and deleted.</returns>
+    /// <remarks>
+    /// Does not throw for a missing file after the delete. The file writer is disposed before the read.
+    /// Not thread-safe. Only the test thread calls the formatter.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task Utf8Bytes_MatchFormat_AndTheFileUsesThem()
+    {
+        var when = new DateTime(2026, 10, 23, 20, 17, 35, 268, DateTimeKind.Utc);
+        var evt = new LogEvent(
+            when,
+            LogLevel.Info,
+            "User 7 logged in from 192.168.1.10",
+            null,
+            null,
+            new Dictionary<string, object> { ["UserId"] = 7, ["Ip"] = "192.168.1.10" },
+            "User {UserId} logged in from {Ip}",
+            "Bench");
+        var formatter = new JsonFormatter();
+        var text = formatter.Format(evt);
+        var expected = Encoding.UTF8.GetBytes(text);
+        var buffer = new byte[expected.Length];
+        Assert.True(formatter.TryWriteUtf8(evt, buffer, out var written));
+        Assert.Equal(expected.Length, written);
+        Assert.Equal(expected, buffer);
+
+        Assert.False(formatter.TryWriteUtf8(evt, buffer.AsSpan(0, 8), out _));
+        Assert.False(new JsonFormatter(pretty: true).TryWriteUtf8(evt, buffer, out _));
+        var broken = new LogEvent(when, LogLevel.Info, "don't", null);
+        Assert.False(formatter.TryWriteUtf8(broken, buffer, out _));
+        var thrown = new LogEvent(when, LogLevel.Error, "plain-line", new InvalidOperationException("x"));
+        Assert.False(formatter.TryWriteUtf8(thrown, buffer, out _));
+
+        var longMessage = new string('a', 1100);
+        var longEvent = new LogEvent(when, LogLevel.Info, longMessage, null, null, null, longMessage, "app");
+        var longText = formatter.Format(longEvent);
+        var longExpected = Encoding.UTF8.GetBytes(longText);
+        var longBuffer = new byte[longExpected.Length];
+        Assert.True(formatter.TryWriteUtf8(longEvent, longBuffer, out var longWritten));
+        Assert.Equal(longExpected.Length, longWritten);
+        Assert.Equal(longExpected, longBuffer);
+
+        var path = Path.Combine(Path.GetTempPath(), "alog-json-" + Guid.NewGuid().ToString("N") + ".log");
+        try
+        {
+            using (var writer = new FileLogWriter(path, formatter, fileFlushInterval: TimeSpan.Zero))
+            {
+                writer.Write(evt);
+                writer.Write(broken);
+            }
+
+            var file = await File.ReadAllBytesAsync(path);
+            var brokenText = formatter.Format(broken);
+            var expectedFile = Encoding.UTF8.GetBytes(text + Environment.NewLine + brokenText + Environment.NewLine);
+            Assert.Equal(expectedFile, file);
+        }
+        finally
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
     }
 
     /// <summary>The document <see cref="JsonFormatter"/> builds for the serializer path.</summary>
