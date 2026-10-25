@@ -55,6 +55,9 @@ public partial class BackgroundLogQueue : IDisposable
     /// </summary>
     private const int PlainLineOverhead = 36;
 
+    /// <summary>Most property or context entries counted toward the parked batch. A larger bag is treated as the whole byte budget.</summary>
+    private const int MaxHoldBagEntries = 128;
+
     /// <summary>Shortest wait before a file that could not reopen is tried again. A longer flush interval waits that long instead.</summary>
     private static readonly TimeSpan MinimumReopenRetry = TimeSpan.FromSeconds(1);
 
@@ -91,6 +94,7 @@ public partial class BackgroundLogQueue : IDisposable
     private int _processorLeft;
     private int _idleWaitEntered;
     private Action? _beforeEnqueue;
+    private Action? _beforeRead;
     private int _reopenWaitsStarted;
     private long _retryNotBeforeTicks;
     private int _disposeWaitsStarted;
@@ -274,6 +278,21 @@ public partial class BackgroundLogQueue : IDisposable
     {
         get => Volatile.Read(ref _beforeEnqueue);
         set => Volatile.Write(ref _beforeEnqueue, value);
+    }
+
+    /// <summary>
+    /// Runs on the processor immediately before the next batch is taken from the channel.
+    /// </summary>
+    /// <remarks>
+    /// Production leaves this null, so a batch is one volatile read. A test holds the processor here
+    /// until the channel contains the events that batch must see together.
+    /// The hook must not throw, take the queue lock, or call <see cref="Dispose"/>.
+    /// It runs on the processor thread. The logging thread does not.
+    /// </remarks>
+    internal Action? BeforeRead
+    {
+        get => Volatile.Read(ref _beforeRead);
+        set => Volatile.Write(ref _beforeRead, value);
     }
 
     /// <summary>
@@ -954,6 +973,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// <returns>How many events were added. Zero when the channel and the parked front have nothing ready.</returns>
     /// <remarks>
     /// Does not throw. Does not write. The loop stops at the batch size or at <see cref="MaxRead"/>.
+    /// <see cref="BeforeRead"/> runs first when a test set it. Production does not.
     /// Parked events are taken first so a deferred line stays ahead of a line that arrived later.
     /// While a reopen is failing, events still in the channel are taken only until the parked batch
     /// would pass <see cref="LogFileRegistry.DirectReopenByteBudget"/>. The rest stay in the channel.
@@ -961,6 +981,7 @@ public partial class BackgroundLogQueue : IDisposable
     /// </remarks>
     private int ReadBatch(List<LogEvent> batch)
     {
+        Volatile.Read(ref _beforeRead)?.Invoke();
         var limit = ReadLimit();
         var count = 0;
         var deferred = Volatile.Read(ref _writeDeferred) != 0;
@@ -1239,23 +1260,186 @@ public partial class BackgroundLogQueue : IDisposable
     }
 
     /// <summary>
-    /// Bytes this event would add to the parked batch. Plain text, the fixed prefix, and the newline.
+    /// Bytes this event would add to the parked batch. Plain text, the fixed prefix, the newline,
+    /// and, when present, the exception, properties, context, and category.
     /// </summary>
     /// <param name="logEvent">The event. The message may be empty.</param>
     /// <returns>At least <see cref="PlainLineOverhead"/>. At most <see cref="int.MaxValue"/>.</returns>
     /// <remarks>
-    /// Does not throw. Does not allocate. Only the processor calls this, and only while a reopen has failed
+    /// Does not throw. Only the processor calls this, and only while a reopen has failed
     /// or a parked batch is being put back. A healthy queue does not call it.
+    /// The exception contribution is <see cref="Exception.ToString"/>, which includes inner exceptions and the stack.
+    /// A throwing <c>ToString</c> counts as the whole byte budget so the line is dropped instead of under-counted.
+    /// A message with no exception, properties, context, or category keeps the plain estimate.
     /// </remarks>
     private static int HoldBytes(LogEvent logEvent)
     {
         var message = logEvent.Message;
         var body = string.IsNullOrEmpty(message) ? 0 : Encoding.UTF8.GetByteCount(message);
-        var total = (long)body + PlainLineOverhead;
+        var total = (long)body + PlainLineOverhead + ExtraHold(logEvent);
+        return SaturatingHold(total);
+    }
+
+    /// <summary>
+    /// Clamps a parked-byte total into an int. A sum past <see cref="int.MaxValue"/> becomes that maximum.
+    /// </summary>
+    /// <param name="total">Message bytes, the plain prefix, and any attachment. Not negative for a real event.</param>
+    /// <returns><paramref name="total"/> when it fits in an int. <see cref="int.MaxValue"/> when it does not.</returns>
+    /// <remarks>
+    /// Does not throw. No lock. <see cref="HoldBytes"/> calls this on the processor, and only on the reopen-failure path.
+    /// A message whose UTF-8 size is near <see cref="int.MaxValue"/> plus the attachment can pass that maximum.
+    /// The caller then treats the line as too large to park.
+    /// </remarks>
+    internal static int SaturatingHold(long total)
+    {
         if (total > int.MaxValue)
             return int.MaxValue;
 
         return (int)total;
+    }
+
+    /// <summary>
+    /// Bytes beyond the plain message: exception, properties, context, and category.
+    /// </summary>
+    /// <param name="logEvent">The event being parked. Not null.</param>
+    /// <returns>Zero when none of those are set. At most <see cref="LogFileRegistry.DirectReopenByteBudget"/>.</returns>
+    /// <remarks>
+    /// Does not throw. Only <see cref="HoldBytes"/> calls this, and only on the reopen-failure path.
+    /// The sum stops at the byte budget so a huge attachment cannot overflow the parked total.
+    /// </remarks>
+    private static int ExtraHold(LogEvent logEvent)
+    {
+        long total = ExceptionHold(logEvent.Exception);
+        if (total >= LogFileRegistry.DirectReopenByteBudget)
+            return LogFileRegistry.DirectReopenByteBudget;
+
+        total += BagHold(logEvent.Properties);
+        if (total >= LogFileRegistry.DirectReopenByteBudget)
+            return LogFileRegistry.DirectReopenByteBudget;
+
+        total += BagHold(logEvent.Context);
+        if (total >= LogFileRegistry.DirectReopenByteBudget)
+            return LogFileRegistry.DirectReopenByteBudget;
+
+        total += Utf8Length(logEvent.Category);
+        if (total >= LogFileRegistry.DirectReopenByteBudget)
+            return LogFileRegistry.DirectReopenByteBudget;
+
+        return (int)total;
+    }
+
+    /// <summary>
+    /// UTF-8 size of <paramref name="exception"/>'s <see cref="Exception.ToString"/>, including inner exceptions and the stack.
+    /// </summary>
+    /// <param name="exception">The event's exception. Null is zero.</param>
+    /// <returns>Zero when <paramref name="exception"/> is null. The byte budget when <c>ToString</c> throws or the text is at least that large.</returns>
+    /// <remarks>
+    /// Does not throw. Allocates the exception text. Only the reopen-failure path calls this.
+    /// A throw is counted as the whole budget so the parked batch cannot ignore the attachment.
+    /// </remarks>
+    private static int ExceptionHold(Exception? exception)
+    {
+        if (exception is null)
+            return 0;
+
+        string? text;
+        try
+        {
+            text = exception.ToString();
+        }
+        catch (Exception)
+        {
+            return LogFileRegistry.DirectReopenByteBudget;
+        }
+
+        var bytes = Utf8Length(text);
+        if (bytes >= LogFileRegistry.DirectReopenByteBudget)
+            return LogFileRegistry.DirectReopenByteBudget;
+
+        return bytes;
+    }
+
+    /// <summary>
+    /// UTF-8 size of one property or context bag, including a few separator bytes per pair.
+    /// </summary>
+    /// <param name="bag">The bag. Null or empty is zero.</param>
+    /// <returns>The byte count, or the byte budget when the bag is larger than <see cref="MaxHoldBagEntries"/> or a value's text throws.</returns>
+    /// <remarks>
+    /// Does not throw. The loop stops at <see cref="MaxHoldBagEntries"/>. Only the reopen-failure path calls this.
+    /// A throwing enumerator or <c>ToString</c> counts as the whole budget.
+    /// </remarks>
+    private static int BagHold(IReadOnlyDictionary<string, object>? bag)
+    {
+        if (bag is null || bag.Count == 0)
+            return 0;
+
+        try
+        {
+            long total = 0;
+            var seen = 0;
+            foreach (var pair in bag)
+            {
+                if (seen >= MaxHoldBagEntries)
+                    return LogFileRegistry.DirectReopenByteBudget;
+
+                seen++;
+                total += Utf8Length(pair.Key);
+                total += ValueHold(pair.Value);
+                total += 4;
+                if (total >= LogFileRegistry.DirectReopenByteBudget)
+                    return LogFileRegistry.DirectReopenByteBudget;
+            }
+
+            return (int)total;
+        }
+        catch (Exception)
+        {
+            return LogFileRegistry.DirectReopenByteBudget;
+        }
+    }
+
+    /// <summary>UTF-8 size of one property or context value.</summary>
+    /// <param name="value">The value. Null is zero. A string is measured directly.</param>
+    /// <returns>The byte count, or the byte budget when <c>ToString</c> throws or the text is at least that large.</returns>
+    /// <remarks>Does not throw. Only <see cref="BagHold"/> calls this, on the reopen-failure path.</remarks>
+    private static int ValueHold(object? value)
+    {
+        if (value is null)
+            return 0;
+
+        if (value is string text)
+        {
+            var textBytes = Utf8Length(text);
+            if (textBytes >= LogFileRegistry.DirectReopenByteBudget)
+                return LogFileRegistry.DirectReopenByteBudget;
+
+            return textBytes;
+        }
+
+        try
+        {
+            var bytes = Utf8Length(value.ToString());
+            if (bytes >= LogFileRegistry.DirectReopenByteBudget)
+                return LogFileRegistry.DirectReopenByteBudget;
+
+            return bytes;
+        }
+        catch (Exception)
+        {
+            return LogFileRegistry.DirectReopenByteBudget;
+        }
+    }
+
+    /// <summary>UTF-8 size of <paramref name="text"/>.</summary>
+    /// <param name="text">Text to measure. Null or empty is zero.</param>
+    /// <returns>The byte count. Zero when there is no text.</returns>
+    /// <remarks>Does not throw. Does not allocate. Only the reopen-failure path calls this.</remarks>
+    private static int Utf8Length(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+            return 0;
+
+        return Encoding.UTF8.GetByteCount(text);
     }
 
     /// <summary>
