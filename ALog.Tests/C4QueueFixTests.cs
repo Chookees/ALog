@@ -704,6 +704,87 @@ public sealed partial class C4QueueFixTests
         }
     }
 
+    /// <summary>
+    /// An accept that lands while dispose is still waiting stays in the shutdown snapshot.
+    /// The caller does not report it. Dispose writes it once the blocked writer returns.
+    /// </summary>
+    /// <returns>A task that finishes after dispose returns.</returns>
+    /// <remarks>
+    /// The hook holds the second accept until the shutdown wait is armed, then lets it enqueue.
+    /// The processor is inside the first write, so it has not left and the snapshot has not run.
+    /// The clock does not advance, so the new-write cutoff does not fire. The 20 second waits are hang guards.
+    /// Not thread-safe. The finally block releases the hook, the writer, and SelfLog.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task FastAccept_WhileDisposeWaits_StaysInTheSnapshot()
+    {
+        var lines = new List<string>();
+        var previous = SelfLog.Target;
+        SelfLog.Enable(line =>
+        {
+            lock (lines)
+                lines.Add(line);
+        });
+        var clock = new FakeTimeProvider(new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero));
+        var writer = new BlockingWriter();
+        var queue = new BackgroundLogQueue(
+            new ILogWriter[] { writer },
+            new BackgroundLogQueue.QueueSettings(8, 1, TimeSpan.FromHours(1), false, clock));
+        using var release = new ManualResetEventSlim(false);
+        var inHook = 0;
+        Task? disposing = null;
+        try
+        {
+            Assert.True(queue.TryEnqueue(Event("owned-a")));
+            Assert.True(
+                await WaitUntil(() => writer.EnteredCount > 0, TimeSpan.FromSeconds(20)),
+                "processor never entered the blocked writer");
+            queue.BeforeEnqueue = () =>
+            {
+                Interlocked.Increment(ref inHook);
+                release.Wait(TimeSpan.FromSeconds(20));
+            };
+            Assert.NotNull(queue.BeforeEnqueue);
+
+            var second = Task.Run(() => queue.TryEnqueue(Event("owned-b")));
+            Assert.True(
+                await WaitUntil(() => Volatile.Read(ref inHook) >= 1, TimeSpan.FromSeconds(20)),
+                "second accept did not reach the hook");
+            disposing = Task.Run(() => queue.Dispose());
+            Assert.True(
+                await WaitUntil(() => queue.DisposeWaitsStarted >= 1, TimeSpan.FromSeconds(20)),
+                "dispose did not arm the shutdown wait");
+            Assert.False(queue.ProcessorHasLeft);
+            release.Set();
+            var finished = await Task.WhenAny(second, Task.Delay(TimeSpan.FromSeconds(20))) == second;
+            Assert.True(finished, "second accept did not return");
+            Assert.True(await second);
+            Assert.False(queue.ProcessorHasLeft);
+            Assert.Equal(2, queue.AcceptedCount);
+            writer.Release();
+            var disposed = await Task.WhenAny(disposing, Task.Delay(TimeSpan.FromSeconds(20))) == disposing;
+            Assert.True(disposed, "dispose did not return after the writer was released");
+            await disposing;
+            Assert.Equal(2, writer.Events.Count);
+            Assert.Contains(writer.Events, item => item.Message == "owned-a");
+            Assert.Contains(writer.Events, item => item.Message == "owned-b");
+            Assert.Equal(0, queue.UnwrittenCount);
+            Assert.Equal(0, queue.ClosedDropCount);
+            lock (lines)
+                Assert.Empty(lines);
+        }
+        finally
+        {
+            release.Set();
+            writer.Release();
+            if (disposing is not null)
+                await Task.WhenAny(disposing, Task.Delay(TimeSpan.FromSeconds(20)));
+
+            queue.Dispose();
+            SelfLog.Target = previous;
+        }
+    }
+
     /// <summary>Builds an info event. The timestamp is fixed so tests do not depend on the clock.</summary>
     /// <param name="message">Rendered message. Not null.</param>
     /// <returns>An event with no exception.</returns>
