@@ -220,13 +220,25 @@ class SyncWaitCheckTests(unittest.TestCase):
         self.assertTrue(any("not allowlisted" in item for item in problems))
 
     def test_waitone_named_milliseconds_timeout_infinite_is_flagged(self) -> None:
-        """WaitOne(millisecondsTimeout: -1) is an unbounded sync wait."""
+        """_evt.WaitOne(millisecondsTimeout: -1) is an unbounded sync wait."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_tree(
                 root,
                 "",
-                "WaitHandle.WaitOne(millisecondsTimeout: -1);\n",
+                "_evt.WaitOne(millisecondsTimeout: -1);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitone_named_timeout_with_spaces_around_minus_is_flagged(self) -> None:
+        """_evt.WaitOne(timeout: - 1) is still an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne(timeout: - 1);\n",
             )
             problems = CHECK.evaluate(root)
         self.assertTrue(any("not allowlisted" in item for item in problems))
@@ -280,13 +292,25 @@ class SyncWaitCheckTests(unittest.TestCase):
         self.assertTrue(any("not allowlisted" in item for item in problems))
 
     def test_waitone_minus_one_with_exit_context_is_flagged(self) -> None:
-        """WaitOne(-1, false) is an unbounded sync wait."""
+        """_evt.WaitOne(-1, false) is an unbounded sync wait."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_tree(
                 root,
                 "",
-                "WaitHandle.WaitOne(-1, false);\n",
+                "_evt.WaitOne(-1, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitone_parameterless_instance_is_flagged(self) -> None:
+        """_evt.WaitOne() is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne();\n",
             )
             problems = CHECK.evaluate(root)
         self.assertTrue(any("not allowlisted" in item for item in problems))
@@ -304,25 +328,37 @@ class SyncWaitCheckTests(unittest.TestCase):
         self.assertTrue(any("not allowlisted" in item for item in problems))
 
     def test_waitone_finite_with_exit_context_is_not_a_hit(self) -> None:
-        """WaitOne(100, false) is a bounded wait and must not be flagged."""
+        """_evt.WaitOne(100, false) is a bounded wait and must not be flagged."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_tree(
                 root,
                 "",
-                "WaitHandle.WaitOne(100, false);\n",
+                "_evt.WaitOne(100, false);\n",
             )
             problems = CHECK.evaluate(root)
         self.assertEqual(problems, [])
 
     def test_waitone_named_finite_milliseconds_is_not_a_hit(self) -> None:
-        """WaitOne(millisecondsTimeout: 100) is a bounded wait and must not be flagged."""
+        """_evt.WaitOne(millisecondsTimeout: 100) is a bounded wait and must not be flagged."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_tree(
                 root,
                 "",
-                "WaitHandle.WaitOne(millisecondsTimeout: 100);\n",
+                "_evt.WaitOne(millisecondsTimeout: 100);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitone_instance_finite_milliseconds_is_not_a_hit(self) -> None:
+        """_evt.WaitOne(1000) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne(1000);\n",
             )
             problems = CHECK.evaluate(root)
         self.assertEqual(problems, [])

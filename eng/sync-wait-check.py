@@ -2,8 +2,8 @@
 """Fail when a library sync-wait is not on the allowlist.
 
 Scans ``ALog`` and ``ALog.Extensions.Logging`` for ``.Result``, ``.Wait(``,
-``GetResult(``, ``WaitHandle.WaitAny`` / ``WaitAll`` / ``WaitOne`` calls
-that pass no finite timeout, and ``WaitHandle.SignalAndWait`` without a
+``GetResult(``, ``WaitHandle.WaitAny`` / ``WaitAll``, instance ``.WaitOne(``
+calls that pass no finite timeout, and ``WaitHandle.SignalAndWait`` without a
 timeout. Every hit must match one line in ``eng/sync-wait-allowlist.txt``.
 Every allowlist line must match exactly one hit and must name a timeout.
 ``FileLogWriter.cs`` must not call ``Task.Run``.
@@ -21,7 +21,11 @@ ALLOWLIST_NAME = "eng/sync-wait-allowlist.txt"
 FILE_WRITER = "ALog/Writers/File/FileLogWriter.cs"
 HIT_RE = re.compile(r"\.Result\b|\.Wait\(|GetResult\(")
 WAIT_HANDLE_RE = re.compile(
-    r"\bWaitHandle\s*\.\s*Wait(Any|All|One)\s*\(",
+    r"\bWaitHandle\s*\.\s*Wait(Any|All)\s*\(",
+    re.MULTILINE,
+)
+WAIT_ONE_RE = re.compile(
+    r"\.\s*WaitOne\s*\(",
     re.MULTILINE,
 )
 SIGNAL_AND_WAIT_RE = re.compile(
@@ -32,17 +36,17 @@ SIGNAL_AND_WAIT_RE = re.compile(
 INFINITE_TIMEOUT_RE = re.compile(
     r"(?:"
     r"(?:(?:System\s*\.\s*Threading\s*\.\s*)?Timeout\s*\.\s*Infinite(?:TimeSpan)?)"
-    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-1\s*\))"
-    r"|(?:-1)"
+    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-?\s*1\s*\))"
+    r"|(?:-\s*1)"
     r")",
 )
 NAMED_INFINITE_RE = re.compile(
     r"\b(?:millisecondsTimeout|timeout)\s*:\s*"
     r"(?:"
     r"(?:(?:System\s*\.\s*Threading\s*\.\s*)?Timeout\s*\.\s*Infinite(?:TimeSpan)?)"
-    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-1\s*\))"
-    r"|(?:-1)"
-    r")\b",
+    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-?\s*1\s*\))"
+    r"|(?:-\s*1)"
+    r")(?=\s*[,)])",
     re.IGNORECASE,
 )
 TASK_RUN_RE = re.compile(r"\bTask\.Run\b")
@@ -150,12 +154,13 @@ def wait_handle_lacks_timeout(text: str) -> bool:
 
     Args:
         text: One source line, or a short span that may contain a newline between
-            ``WaitHandle`` and ``.WaitAny`` / ``WaitAll`` / ``WaitOne``.
+            ``WaitHandle`` and ``.WaitAny`` / ``WaitAll``, or an instance
+            ``.WaitOne`` call.
 
     Returns:
         True when ``WaitAny`` or ``WaitAll`` has only the handles, or passes
         ``Timeout.Infinite``, ``Timeout.InfiniteTimeSpan``, or ``-1`` as the
-        timeout; or when ``WaitOne`` has an empty argument list or those same
+        timeout; or when ``.WaitOne`` has an empty argument list or those same
         infinite values. A call that passes a finite timeout is false.
 
     Raises:
@@ -165,17 +170,18 @@ def wait_handle_lacks_timeout(text: str) -> bool:
         None.
     """
     for match in WAIT_HANDLE_RE.finditer(text):
-        # Group 1 is Any / All / One from Wait(Any|All|One).
+        # Group 1 is Any / All from Wait(Any|All).
         kind = match.group(1)
         open_paren = match.end() - 1
-        if kind == "One":
-            if not _call_has_argument(text, open_paren):
-                return True
-            if _timeout_argument_is_infinite(text, open_paren, "WaitOne"):
-                return True
-        elif not _call_has_timeout_argument(text, open_paren):
+        if not _call_has_timeout_argument(text, open_paren):
             return True
-        elif _timeout_argument_is_infinite(text, open_paren, "Wait" + kind):
+        if _timeout_argument_is_infinite(text, open_paren, "Wait" + kind):
+            return True
+    for match in WAIT_ONE_RE.finditer(text):
+        open_paren = match.end() - 1
+        if not _call_has_argument(text, open_paren):
+            return True
+        if _timeout_argument_is_infinite(text, open_paren, "WaitOne"):
             return True
     return False
 
@@ -489,13 +495,25 @@ def scan_hits(root: Path) -> tuple[list[tuple[str, str]], list[str]]:
             span = text[start:span_end]
             if not wait_handle_lacks_timeout(span):
                 continue
-            line_no = _line_number_at(text, match.start())
             # Prefer the line that holds ".Wait..." when WaitHandle sat alone above.
             method_line = _line_number_at(text, match.end() - 1)
             report_no = method_line
             report = _line_text(lines, report_no)
             if report_no - 1 in marked:
                 continue
+            hits.append((relative, report if report else span.splitlines()[0]))
+            marked.add(report_no - 1)
+
+        for match in WAIT_ONE_RE.finditer(text):
+            start = match.start()
+            span_end = min(len(text), match.end() + 400)
+            span = text[start:span_end]
+            if not wait_handle_lacks_timeout(span):
+                continue
+            report_no = _line_number_at(text, match.end() - 1)
+            if report_no - 1 in marked:
+                continue
+            report = _line_text(lines, report_no)
             hits.append((relative, report if report else span.splitlines()[0]))
             marked.add(report_no - 1)
 
