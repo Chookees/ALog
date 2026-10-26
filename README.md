@@ -245,9 +245,9 @@ Log.Init(config);
 ## Observations during testing
 
 - After the log file has opened successfully, a later flush that fails (for example disk full or an I/O error) is reported only on stderr. The buffered lines of that failed flush are lost, not just one line, and stderr gets one message per failed flush. Those events still count as written. Watch free disk space and stderr, and keep logs on a volume with headroom.
-- If the log file is renamed or moved while the writer still holds its write handle, and every later reopen fails (for example something else now occupies the path), further lines are lost with only stderr output and no SelfLog event. Before external rotation, `await Log.FlushAsync()` and wait one more `FileFlushInterval` (it can rarely return early, see below), or rotate with tools that leave the path writable. `FileLogWriter.Flush()` alone does not drain the background queue. Watch stderr.
+- If the log file is renamed or moved while the writer still holds its write handle, and every later reopen fails (for example something else now occupies the path), further lines are lost with only stderr output and no SelfLog event. Before external rotation, `await Log.FlushAsync()` and wait one more `FileFlushInterval` (it can return early, see below), or rotate with tools that leave the path writable. `FileLogWriter.Flush()` alone does not drain the background queue. Watch stderr.
 - If the very first open fails (for example a read-only directory), each event tries one open and writes `Write failed` to stderr, with no SelfLog event, and the queue counts the event as written. Make sure the directory is writable at startup (see [Platform-Specific Paths](#platform-specific-paths-optional)) and watch stderr.
-- `await Log.FlushAsync()` can rarely return before the last event is in the file (about 1 in 2000 calls, and up to about 1 in 3 on the first call in a fresh process). Use `Log.Shutdown()` when you must read the file right afterwards.
+- `await Log.FlushAsync()` can return before the last event is in the file (about 1 in 2000 calls, and up to about 1 in 3 on the first call in a fresh process). Use `Log.Shutdown()` when you must read the file right afterwards.
 
 ---
 
