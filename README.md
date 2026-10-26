@@ -30,7 +30,7 @@ dotnet add package ALog
 dotnet add package ALog.Extensions.Logging
 ```
 
-Release zips are on the [Releases](https://github.com/Chookees/ALog/releases) page: Lite (`ALog-v0.2.1-Lite.zip`) covers Console, File, and HTTP on any platform; Full is per RID (`ALog-v0.2.1-Full-win-x64.zip`, `ALog-v0.2.1-Full-linux-x64.zip`). For other platforms, or for SQL/AWS outside those RIDs, use NuGet.
+Release zips are on the [Releases](https://github.com/Chookees/ALog/releases) page: Lite (`ALog-v0.2.1-Lite.zip`) covers Console, File, HTTP and Azure Application Insights on any platform (HTTP and Azure Application Insights only when configured in code; JSON config still supports only Console and File); Full is per RID (`ALog-v0.2.1-Full-win-x64.zip`, `ALog-v0.2.1-Full-linux-x64.zip`). For other platforms, or for SQL/AWS outside those RIDs, use NuGet.
 
 Source: https://github.com/Chookees/ALog · Optional future sink split: [`docs/PACKAGE_SPLIT.md`](https://github.com/Chookees/ALog/blob/master/docs/PACKAGE_SPLIT.md)
 

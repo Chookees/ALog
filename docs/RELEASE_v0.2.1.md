@@ -19,11 +19,11 @@ Exactly three zip assets:
 
 | Asset | Platform | Writers | Dependencies | Size |
 |---|---|---|---|---|
-| `ALog-v0.2.1-Lite.zip` | portable (any RID with a compatible .NET runtime) | Console, File, HTTP, background queue, enrichers, templates, JSON | `ALog.dll` + LICENSE + NOTICE + README.txt (no SQL, no AWS, no `ALog.Extensions.Logging`) | ~78 KB |
-| `ALog-v0.2.1-Full-win-x64.zip` | win-x64 | Lite writers plus SQL Server, AWS CloudWatch, and the ILogger provider (`ALog.Extensions.Logging`) | Full publish output for win-x64 (includes SqlClient/AWS/MEL provider assets) | see release page |
-| `ALog-v0.2.1-Full-linux-x64.zip` | linux-x64 | same as Full win-x64 | Full publish output for linux-x64 | see release page |
+| `ALog-v0.2.1-Lite.zip` | portable (any RID with a compatible .NET runtime) | Console, File, HTTP and Azure Application Insights | `ALog.dll` + LICENSE + NOTICE + README.txt (no SQL, no AWS, no `ALog.Extensions.Logging`) | ~78 KB |
+| `ALog-v0.2.1-Full-win-x64.zip` | win-x64 | All Lite writers plus SQL Server, AWS CloudWatch and the ILogger provider | Full publish output for win-x64 (includes SqlClient/AWS/MEL provider assets) | see release page |
+| `ALog-v0.2.1-Full-linux-x64.zip` | linux-x64 | All Lite writers plus SQL Server, AWS CloudWatch and the ILogger provider | Full publish output for linux-x64 | see release page |
 
-Lite is enough for Console, File, and HTTP on every platform. Use a Full RID zip when you need SQL, AWS CloudWatch, or the MEL provider on that RID. For other platforms, or for SQL/AWS outside win-x64 and linux-x64, use NuGet.
+Lite is enough for Console, File, HTTP and Azure Application Insights on every platform. HTTP and Azure Application Insights work in Lite only when configured in code; JSON config still supports only Console and File. Use a Full RID zip when you need SQL, AWS CloudWatch, or the MEL provider on that RID. For other platforms, or for SQL/AWS outside win-x64 and linux-x64, use NuGet.
 
 ## Related
 

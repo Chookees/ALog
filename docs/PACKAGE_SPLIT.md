@@ -15,14 +15,14 @@ Do **not** split in 0.2.1 — publish the current monolith (and Full/Lite zip la
 
 ## Lite today (0.2.1)
 
-`ALog.dll` runs without the AWS or SQL DLLs as long as those writers are not used. Console, File (including rotation), background queue, enrichers, templates, `JsonFormatter`, `SelfLog`, and `Log.Init(ALogOptions)` / `LoggerConfigFactory` work with only `ALog.dll`.
+`ALog.dll` runs without the AWS or SQL DLLs as long as those writers are not used. Console, File (including rotation), HTTP and Azure Application Insights, background queue, enrichers, templates, `JsonFormatter`, `SelfLog`, and `Log.Init(ALogOptions)` / `LoggerConfigFactory` work with only `ALog.dll`. HTTP and Azure Application Insights work in Lite only when configured in code; JSON / `ALogOptions` config can create only Console and File writers.
 
 Edge cases when the optional DLLs are missing:
 
 - `SqlLogWriter` with `autoCreateTable: true` (the default) and the AWS region constructor throw `FileNotFoundException` at construction.
 - With `autoCreateTable: false`, the first write reports `FileNotFoundException` on stderr (not through SelfLog).
 - `Assembly.GetTypes()` throws `ReflectionTypeLoadException` (three AWS types fail to load); `GetExportedTypes()` succeeds.
-- JSON / `ALogOptions` config can create only Console and File writers, so config init does not pull SQL or AWS.
+- JSON / `ALogOptions` config still creates only Console and File, so config init does not pull SQL, AWS, HTTP, or Azure.
 
 ## Migration steps
 

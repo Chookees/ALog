@@ -11,7 +11,6 @@
 - Changed: FileLogWriter writes simple events from PlainTextFormatter and JsonFormatter through a faster path. The written text stays the same.
 - Added: on Windows, `File.ReadAllText` can read the log file while the logger is running: after `Flush`, when the flush interval passes with no new lines (not with `FileFlushInterval` 0), and after dispose. While lines are being written, the write handle stays open, also with `FileFlushInterval` 0. To read the file at any time, open it with `FileShare.ReadWrite`.
 - Changed: message templates are cached, up to 1024 entries.
-
 - Breaking (dependency): `Microsoft.Data.SqlClient` moves from 6.0.2 to 7.1.1. If your app references `Microsoft.Data.SqlClient` directly, upgrade it to 7.x as well.
 - Changed: ALog is now licensed under the Apache License 2.0 instead of MIT. Versions up to and including 0.2.0 stay under the MIT License.
 - Fixed: inner scope wins on duplicate keys; scopes are isolated across parallel tasks; dispose restores the correct parent
