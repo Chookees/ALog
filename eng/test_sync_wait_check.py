@@ -351,6 +351,66 @@ class SyncWaitCheckTests(unittest.TestCase):
             problems = CHECK.evaluate(root)
         self.assertEqual(problems, [])
 
+    def test_waitall_minus_one_with_exit_context_is_flagged(self) -> None:
+        """WaitAll(hs, -1, true) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAll(hs, -1, true);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitall_finite_with_exit_context_is_not_a_hit(self) -> None:
+        """WaitAll(hs, 100, true) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAll(hs, 100, true);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_signal_and_wait_minus_one_with_exit_context_is_flagged(self) -> None:
+        """SignalAndWait(a, b, -1, false) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.SignalAndWait(a, b, -1, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_signal_and_wait_timeout_infinite_is_flagged(self) -> None:
+        """SignalAndWait(a, b, Timeout.Infinite) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.SignalAndWait(a, b, Timeout.Infinite);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_signal_and_wait_finite_with_exit_context_is_not_a_hit(self) -> None:
+        """SignalAndWait(a, b, 100, false) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.SignalAndWait(a, b, 100, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
     def test_task_run_in_file_writer_fails(self) -> None:
         """Task.Run in the file writer is a failure even when no sync wait exists."""
         with tempfile.TemporaryDirectory() as tmp:

@@ -244,10 +244,10 @@ Log.Init(config);
 
 ## Observations during testing
 
-- After the log file has opened successfully, a later write that fails (for example disk full or an I/O error) is reported only on stderr. That line is lost and is still counted as written. Watch free disk space and stderr, and keep logs on a volume with headroom.
-- If the log file is renamed or moved while the writer still holds its write handle, and every later reopen fails (for example something else now occupies the path), further lines are lost with only stderr output and no SelfLog event. Rotate with tools that leave the path writable, or call `Flush` / let the flush interval pass before external rotation, and watch stderr.
+- After the log file has opened successfully, a later flush that fails (for example disk full or an I/O error) is reported only on stderr. The buffered lines of that failed flush are lost (not only one line): with `FileFlushInterval` of 1000 ms, measurement lost 20/20 lines across 2 stderr messages—one report per failed flush attempt, not per line. Those events are still counted as written. Watch free disk space and stderr, and keep logs on a volume with headroom.
+- If the log file is renamed or moved while the writer still holds its write handle, and every later reopen fails (for example something else now occupies the path), further lines are lost with only stderr output and no SelfLog event. Rotate with tools that leave the path writable, or `await Log.FlushAsync()` (drains the queue and flushes writers) / let the file flush interval pass before external rotation, and watch stderr. `FileLogWriter.Flush()` alone does not drain the background queue.
 - If the very first open fails (for example a read-only directory), each event tries one open and writes `Write failed` to stderr, with no SelfLog event, and the queue counts the event as written. Make sure the directory is writable at startup (see [Platform-Specific Paths](#platform-specific-paths-optional)) and watch stderr.
-- `FlushAsync` can rarely return before the event logged just before it is in the file (about 1 in 2000 calls in measurement, and more often on the first `FlushAsync` in a fresh process). Use `Flush()` or `Shutdown()` when you must read the file right afterwards.
+- `await Log.FlushAsync()` can return before the event logged just before it is in the file (about 1 in 2000 calls in measurement on Linux; the first `FlushAsync` in a cold process returned early in 6/20 runs on this branch and 5/20 on master). `Log.Flush()` and `LoggerEngine.Flush()` do not exist; `FileLogWriter.Flush()` does not drain the queue. Use `Log.Shutdown()` when you must read the file right afterwards.
 
 ---
 

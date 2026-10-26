@@ -343,6 +343,67 @@ public sealed class EofFragmentMergeTests
     }
 
     /// <summary>
+    /// A failed replay length reset, then a Flush read-handle swap, still inserts exactly one <c>\n</c>
+    /// before the retried line (no <c>replayed-lin\n\nreplayed-line</c> blank line).
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ReplaySplit_FlushSwap_InsertExactlyOneLf()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var previous = LogFileRegistry.OpenFactory;
+        var previousError = Console.Error;
+        var errors = new StringWriter();
+        Console.SetError(errors);
+        var fault = new PartialReplay();
+        try
+        {
+            var path = Path.Combine(directory, "replay-swap.log");
+            File.WriteAllBytes(path, Encoding.UTF8.GetBytes("seed\n"));
+            LogFileRegistry.OpenFactory = (p, mode, access, share) =>
+                new PartialReplayStream(p, mode, access, share, fault);
+
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
+            var shared = SharedOf(writer);
+            // 14 bytes; TakeBytes 12 yields the stuck prefix "replayed-lin".
+            var line = Encoding.UTF8.GetBytes("replayed-line\n");
+            fault.TakeBytes = 12;
+            fault.Arm(failReset: true);
+            var threw = false;
+            try
+            {
+                shared.AppendReplay(line, maxBytes: null);
+            }
+            catch (IOException)
+            {
+                threw = true;
+            }
+
+            Assert.True(threw);
+            Assert.Equal("replayed-lin", Volatile.Read(ref fault.Fragment));
+            Assert.Equal(1, NeedsLineSeparator(shared));
+
+            var opensBeforeFlush = LogFileRegistry.OpenCount;
+            writer.Flush();
+            Assert.True(LogFileRegistry.OpenCount > opensBeforeFlush);
+
+            shared.AppendReplay(line, maxBytes: null);
+            var after = ReadSharedBytes(path);
+            var text = Encoding.UTF8.GetString(after);
+            Assert.DoesNotContain("replayed-lin\n\nreplayed-line", text, StringComparison.Ordinal);
+            Assert.Contains("replayed-lin\nreplayed-line\n", text, StringComparison.Ordinal);
+            Assert.False(HasDoubleLf(after));
+            Assert.Equal(0, NeedsLineSeparator(shared));
+        }
+        finally
+        {
+            Console.SetError(previousError);
+            LogFileRegistry.OpenFactory = previous;
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
     /// When the trailing-byte probe cannot open the path, the append open still writes the next line.
     /// </summary>
     [Fact(Timeout = 30000)]
@@ -538,9 +599,11 @@ public sealed class EofFragmentMergeTests
         internal int Active;
         internal int ThrowsLeft;
         internal int FailReset;
+        /// <summary>When greater than zero, write this many bytes before the throw instead of half.</summary>
+        internal int TakeBytes;
         internal string Fragment = string.Empty;
 
-        /// <summary>Throws on the next multi-byte write, after half of that write has been stored.</summary>
+        /// <summary>Throws on the next multi-byte write, after a prefix of that write has been stored.</summary>
         /// <param name="failReset">True when <see cref="FileStream.SetLength(long)"/> must throw.</param>
         /// <remarks>Does not throw. The reset flag and the budget are stored before the armed flag.</remarks>
         internal void Arm(bool failReset)
@@ -617,7 +680,9 @@ public sealed class EofFragmentMergeTests
                 && Volatile.Read(ref _fault.Active) != 0
                 && Interlocked.Decrement(ref _fault.ThrowsLeft) >= 0)
             {
-                var take = count / 2;
+                var take = _fault.TakeBytes > 0 ? _fault.TakeBytes : count / 2;
+                if (take > count)
+                    take = count;
                 if (take > 0)
                 {
                     base.Write(buffer, offset, take);
