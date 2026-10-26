@@ -397,6 +397,135 @@ public sealed class EofFragmentMergeTests
     }
 
     /// <summary>
+    /// A buffered line after a fragment open, then an external truncate to empty, must not start with <c>\n</c>.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ReopenKeepingPending_TruncateToEmpty_NoLeadingLf()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "trunc-empty.log");
+            File.WriteAllBytes(path, Encoding.UTF8.GetBytes(new string('f', 200)));
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60));
+            var evt = Event("only-line");
+            writer.Write(evt);
+            Assert.Equal(1, NeedsLineSeparator(SharedOf(writer)));
+            using (var trunc = new FileStream(
+                       path,
+                       FileMode.Open,
+                       FileAccess.Write,
+                       FileShare.ReadWrite | FileShare.Delete,
+                       bufferSize: 1,
+                       FileOptions.None))
+            {
+                trunc.SetLength(0);
+            }
+
+            writer.Flush();
+            var expected = new PlainTextFormatter().Format(evt) + "\n";
+            var text = File.ReadAllText(path);
+            Assert.Equal(expected, text);
+            Assert.False(text.StartsWith('\n'));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// A buffered line after a fragment open, then an external replace that ends with <c>\n</c>,
+    /// must not insert a blank line before the buffered line.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ReopenKeepingPending_ReplaceEndingWithLf_NoBlankLine()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        try
+        {
+            var path = Path.Combine(directory, "replace-lf.log");
+            var rotated = path + ".1";
+            File.WriteAllBytes(path, Encoding.UTF8.GetBytes(new string('f', 200)));
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60));
+            writer.Write(Event("buffered-line"));
+            Assert.Equal(1, NeedsLineSeparator(SharedOf(writer)));
+            File.Move(path, rotated);
+            File.WriteAllBytes(path, Encoding.UTF8.GetBytes("kept\n"));
+            writer.Flush();
+            var text = File.ReadAllText(path);
+            Assert.StartsWith("kept\n[", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("kept\n\n", text, StringComparison.Ordinal);
+            Assert.Contains("buffered-line", text, StringComparison.Ordinal);
+            Assert.False(HasDoubleLf(File.ReadAllBytes(path)));
+        }
+        finally
+        {
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// When a later open's trailing-byte probe cannot read the path, a flag already set stays set and
+    /// the next append writes exactly one <c>\n</c> after the fragment.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ProbeFailure_KeepsSetFlag_NextAppendWritesExactlyOneLf()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var previous = LogFileRegistry.OpenFactory;
+        var previousError = Console.Error;
+        var errors = new StringWriter();
+        Console.SetError(errors);
+        try
+        {
+            var path = Path.Combine(directory, "probe-keep.log");
+            var fragment = Encoding.UTF8.GetBytes(new string('f', 200));
+            File.WriteAllBytes(path, fragment);
+            using var writer = new FileLogWriter(
+                path,
+                fileBufferSize: 4096,
+                fileFlushInterval: TimeSpan.FromSeconds(60));
+            writer.Write(Event("after-probe-keep"));
+            var shared = SharedOf(writer);
+            Assert.Equal(1, NeedsLineSeparator(shared));
+            Assert.True(shared.EofProbes >= 1);
+
+            LogFileRegistry.OpenFactory = (p, mode, access, share) =>
+            {
+                var stream = new FileStream(p, mode, access, share, bufferSize: 1, FileOptions.None);
+                if (mode == FileMode.Append && File.Exists(p))
+                    File.Move(p, p + ".moved", overwrite: true);
+                return stream;
+            };
+
+            File.WriteAllBytes(path, Encoding.UTF8.GetBytes("frag"));
+            var probesBeforeReopen = shared.EofProbes;
+            writer.Flush();
+            Assert.Equal(probesBeforeReopen, shared.EofProbes);
+            Assert.Equal(0, NeedsLineSeparator(shared));
+
+            var bytes = File.ReadAllBytes(path + ".moved");
+            var frag = Encoding.UTF8.GetBytes("frag");
+            Assert.True(bytes.AsSpan(0, frag.Length).SequenceEqual(frag));
+            Assert.Equal((byte)'\n', bytes[frag.Length]);
+            Assert.Equal((byte)'[', bytes[frag.Length + 1]);
+            Assert.False(HasDoubleLf(bytes));
+            Assert.Contains("after-probe-keep", Encoding.UTF8.GetString(bytes), StringComparison.Ordinal);
+            Assert.DoesNotContain("Write failed", errors.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(previousError);
+            LogFileRegistry.OpenFactory = previous;
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
     /// A failed replay length reset, then a Flush read-handle swap, still inserts exactly one <c>\n</c>
     /// before the retried line (no <c>replayed-lin\n\nreplayed-line</c> blank line).
     /// </summary>

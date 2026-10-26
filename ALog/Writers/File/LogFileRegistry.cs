@@ -267,8 +267,11 @@ internal sealed class SharedLogFile
     private int _closedDrops;
 
     /// <summary>
-    /// 1 when the next append must write a single <c>\n</c> first: either the open probe saw a non-<c>\n</c>
-    /// last byte, or a replay append left bytes that <see cref="FileStream.SetLength"/> could not remove.
+    /// 1 when the next append must write a single <c>\n</c> first. Set when the open probe sees a non-empty
+    /// file whose last byte is not <c>\n</c>, or when a replay append left bytes that
+    /// <see cref="FileStream.SetLength"/> could not remove. Cleared by <see cref="WriteSeparatorIfNeeded"/>
+    /// after writing, and by a successful probe of an empty file or a file that already ends with <c>\n</c>.
+    /// A failed probe leaves this value unchanged.
     /// </summary>
     private int _needsLineSeparator;
 
@@ -699,21 +702,28 @@ internal sealed class SharedLogFile
     }
 
     /// <summary>
-    /// When the newly opened append stream points at a non-empty file whose last byte is not <c>\n</c>,
-    /// sets <see cref="_needsLineSeparator"/> so exactly one <c>\n</c> is written before the next append.
+    /// Updates <see cref="_needsLineSeparator"/> from the bytes currently at the path after an open.
     /// </summary>
     /// <remarks>
     /// The caller holds the file lock and <see cref="_stream"/> is the write handle just opened.
-    /// Empty files and files that already end with <c>\n</c> leave the flag unchanged.
-    /// A lone <c>\r</c> is not a line ending, so the flag is set. The check reads only the last byte through
-    /// a short-lived shared read handle; the append stream itself is write-only. A failed probe is swallowed:
-    /// this method never throws, so the open path keeps its existing error handling for real open failures.
+    /// An empty file (length 0) or a last byte of <c>\n</c> sets the flag to 0 so a prior fragment flag
+    /// does not insert a blank line after copytruncate or an external replace that ends with <c>\n</c>.
+    /// Any other last byte, including a lone <c>\r</c>, sets the flag to 1. The check reads only the last
+    /// byte through a short-lived shared read handle; the append stream itself is write-only.
+    /// When the probe open or read throws, the flag is left unchanged so a replay fragment that still
+    /// needs a separator is not cleared by a broken check. This method never throws.
     /// The inserted <c>\n</c> is not a logged line and does not change queue written counters.
     /// </remarks>
     private void ProbeTrailingByte()
     {
-        if (_stream is null || _logicalLength <= 0)
+        if (_stream is null)
             return;
+
+        if (_logicalLength <= 0)
+        {
+            _needsLineSeparator = 0;
+            return;
+        }
 
         try
         {
@@ -728,7 +738,12 @@ internal sealed class SharedLogFile
                        FileOptions.None))
             {
                 if (probe.Length <= 0)
+                {
+                    _eofProbes++;
+                    LogFileRegistry.NoteEofProbe();
+                    _needsLineSeparator = 0;
                     return;
+                }
 
                 probe.Seek(-1, SeekOrigin.End);
                 read = probe.Read(tail);
@@ -739,14 +754,11 @@ internal sealed class SharedLogFile
             if (read <= 0)
                 return;
 
-            if (tail[0] == (byte)'\n')
-                return;
-
-            _needsLineSeparator = 1;
+            _needsLineSeparator = tail[0] == (byte)'\n' ? 0 : 1;
         }
         catch (Exception)
         {
-            // Open already succeeded; a broken trailing-byte check must not fail the open.
+            // Open already succeeded; a broken trailing-byte check must not fail the open or clear the flag.
         }
     }
 
