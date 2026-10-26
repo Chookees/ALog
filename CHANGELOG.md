@@ -40,7 +40,6 @@
 - Breaking (dependency): `AWSSDK.CloudWatchLogs` moves from 3.7.509.3 (AWS SDK for .NET V3, end of support since 2026-06-01) to 4.0.106 (V4). If your app references other `AWSSDK.*` packages, upgrade all of them to V4 together; otherwise restore fails with NU1107 (version conflict on `AWSSDK.Core`), or it succeeds with warning NU1608 and the app throws `MissingMethodException` at runtime.
 - Fixed: `AwsCloudWatchWriter` now sends the message-template properties and the context with each event, not only the rendered message.
 
-
 ### Security
 
 - SDK pin raised to 10.0.403 (runtime 10.0.14) for CVE-2026-111497.
