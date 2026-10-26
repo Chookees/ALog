@@ -238,8 +238,17 @@ internal sealed class SharedLogFile
     private byte[] _buffer;
     private int _pending;
     private long _logicalLength;
+
+    /// <summary>
+    /// 1 after the first successful <see cref="OpenStream"/> for this instance.
+    /// Never reset to 0: once the file has been opened, later opens are reopen/swap paths that
+    /// compare length against <see cref="_logicalLength"/> to decide whether to probe again.
+    /// </summary>
     private int _opened;
     private int _closed;
+
+    /// <summary>How many trailing-byte probes this instance has run.</summary>
+    private int _eofProbes;
     private FileStream? _stream;
     private ITimer? _timer;
     private ITimer? _retryTimer;
@@ -262,6 +271,9 @@ internal sealed class SharedLogFile
     /// last byte, or a replay append left bytes that <see cref="FileStream.SetLength"/> could not remove.
     /// </summary>
     private int _needsLineSeparator;
+
+    /// <summary>How many times this instance read the last byte to decide on a line separator.</summary>
+    internal int EofProbes => _eofProbes;
 
     /// <summary>Stores the first opener's settings. The stream stays closed until the first append.</summary>
     /// <param name="path">Normalized full path. Not null.</param>
@@ -466,9 +478,11 @@ internal sealed class SharedLogFile
     /// <exception cref="IOException">The stream rejected the pending bytes or this line. The file is truncated when that reset works.</exception>
     /// <remarks>
     /// The caller holds the file lock. Pending bytes from an earlier append are written first.
-    /// The file length is remembered before this line. A throw calls <see cref="TryRestoreLength"/> so a partial line is removed.
-    /// One writer owns the file, so no other append races that length.
-    /// When the reset fails, <see cref="_needsLineSeparator"/> is set. The next successful call writes one <c>\n</c> first.
+    /// The file length and the separator flag are remembered before this line. A throw calls
+    /// <see cref="TryRestoreLength"/> so a partial line is removed. When that reset succeeds, the
+    /// flag and <see cref="_logicalLength"/> are put back so a separator written in this call does
+    /// not stay cleared while the <c>\n</c> itself was truncated away. When the reset fails,
+    /// <see cref="_needsLineSeparator"/> is set. The next successful call writes one <c>\n</c> first.
     /// That fragment is not added to the logical length and is not a written line. The retried line is the same bytes.
     /// If this line's write throws, the logical length does not include it and the buffer does not keep it.
     /// Only <see cref="AppendReplay"/> calls this. <see cref="WriteLine"/> does not.
@@ -481,6 +495,8 @@ internal sealed class SharedLogFile
             throw new WriteDeferredException();
 
         var length = stream.Length;
+        var separatorNeeded = _needsLineSeparator;
+        var logicalBefore = _logicalLength;
         try
         {
             WriteSeparatorIfNeeded(stream);
@@ -489,7 +505,12 @@ internal sealed class SharedLogFile
         }
         catch (Exception)
         {
-            if (!TryRestoreLength(stream, length))
+            if (TryRestoreLength(stream, length))
+            {
+                _needsLineSeparator = separatorNeeded;
+                _logicalLength = logicalBefore;
+            }
+            else
                 _needsLineSeparator = 1;
 
             throw;
@@ -713,6 +734,7 @@ internal sealed class SharedLogFile
                 read = probe.Read(tail);
             }
 
+            _eofProbes++;
             LogFileRegistry.NoteEofProbe();
             if (read <= 0)
                 return;
@@ -1274,14 +1296,14 @@ internal sealed class SharedLogFile
         if (_stream is null)
             return;
 
-        WriteSeparatorIfNeeded(_stream);
-
         if (line.Length > _buffer.Length && _buffer.Length < _bufferSize && line.Length <= _bufferSize)
             GrowToConfiguredBuffer();
 
         if (_interval <= TimeSpan.Zero || line.Length > _buffer.Length)
         {
+            // FlushPending writes a deferred separator when it has pending bytes; a direct line still needs one.
             FlushPending();
+            WriteSeparatorIfNeeded(_stream);
             _stream.Write(line);
             _stream.Flush();
             _logicalLength += line.Length;
@@ -1319,7 +1341,12 @@ internal sealed class SharedLogFile
     }
 
     /// <summary>Writes the pending bytes and flushes the stream. An empty buffer still flushes an open stream.</summary>
-    /// <remarks>The caller holds the file lock. Does not catch failures.</remarks>
+    /// <remarks>
+    /// The caller holds the file lock. Does not catch failures. When there are pending bytes, one
+    /// <see cref="WriteSeparatorIfNeeded"/> runs first so a reopen that kept the buffer still inserts
+    /// at most one <c>\n</c> before those bytes (the separator is not written in <see cref="WriteLine"/>
+    /// before buffering).
+    /// </remarks>
     private void FlushPending()
     {
         if (_stream is null)
@@ -1327,6 +1354,7 @@ internal sealed class SharedLogFile
 
         if (_pending > 0)
         {
+            WriteSeparatorIfNeeded(_stream);
             _stream.Write(_buffer, 0, _pending);
             _pending = 0;
         }
