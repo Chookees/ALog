@@ -9,6 +9,10 @@
 - Added: on Windows, `File.ReadAllText` can read the log file while the logger is running: after `Flush`, when the flush interval passes with no new lines (not with `FileFlushInterval` 0), and after dispose. While lines are being written, the write handle stays open, also with `FileFlushInterval` 0. To read the file at any time, open it with `FileShare.ReadWrite`.
 - Changed: message templates are cached, up to 1024 entries.
 
+### Security
+
+- SDK pin raised to 10.0.403 (runtime 10.0.14) for CVE-2026-111497.
+
 ## 0.2.1
 
 - Breaking (dependency): `Microsoft.Data.SqlClient` moves from 6.0.2 to 7.1.1. If your app references `Microsoft.Data.SqlClient` directly, upgrade it to 7.x as well.
