@@ -36,12 +36,17 @@ public sealed class PlainTextFastStampParityTests
         }
     }
 
-    /// <summary>Extra cultures: assert fast when allowed, Format-only when not.</summary>
-    public static TheoryData<string> ConditionalCultures
+    /// <summary>Extra cultures with the expected <see cref="PlainTextFormatter.AllowsFastStamp"/> result.</summary>
+    public static TheoryData<string, bool> ConditionalCultures
     {
         get
         {
-            var data = new TheoryData<string> { "fr-FR", "fi-FI", "sv-SE" };
+            var data = new TheoryData<string, bool>
+            {
+                { "fr-FR", true },
+                { "fi-FI", false },
+                { "sv-SE", false },
+            };
             return data;
         }
     }
@@ -49,6 +54,7 @@ public sealed class PlainTextFastStampParityTests
     /// <summary>
     /// Under each required fast culture the default pattern takes the fast path and matches Format.
     /// </summary>
+    /// <param name="cultureName">Culture name, or empty for invariant.</param>
     [Theory(Timeout = 60000)]
     [MemberData(nameof(FastCultures))]
     public async Task DefaultPattern_TryWriteUtf8_MatchesFormat(string cultureName)
@@ -64,6 +70,7 @@ public sealed class PlainTextFastStampParityTests
     /// <summary>
     /// Under each required fast culture the UTC-millis pattern takes the fast path and matches Format.
     /// </summary>
+    /// <param name="cultureName">Culture name, or empty for invariant.</param>
     [Theory(Timeout = 60000)]
     [MemberData(nameof(FastCultures))]
     public async Task UtcMillisPattern_TryWriteUtf8_MatchesFormat(string cultureName)
@@ -75,31 +82,33 @@ public sealed class PlainTextFastStampParityTests
     }
 
     /// <summary>
-    /// fr-FR, fi-FI, and sv-SE: take the fast path only when the probe allows it; otherwise Format only.
+    /// fr-FR, fi-FI, and sv-SE: take the fast path only when the expected probe result allows it.
     /// </summary>
+    /// <param name="cultureName">Culture under test.</param>
+    /// <param name="expectedAllowed">Expected <see cref="PlainTextFormatter.AllowsFastStamp"/> result.</param>
     [Theory(Timeout = 60000)]
     [MemberData(nameof(ConditionalCultures))]
-    public async Task DefaultPattern_ConditionalCulture_MatchesFormat(string cultureName)
+    public async Task DefaultPattern_ConditionalCulture_MatchesFormat(string cultureName, bool expectedAllowed)
     {
         await Task.CompletedTask;
         using var scope = new CultureScope(cultureName);
-        var allowed = PlainTextFormatter.AllowsFastStamp(scope.Culture);
-        System.Console.WriteLine("PROBE " + ProbeReport(scope.Culture) + " allowed=" + allowed);
-        AssertConditional(new PlainTextFormatter(), SampleEvents(), allowed);
+        Assert.Equal(expectedAllowed, PlainTextFormatter.AllowsFastStamp(scope.Culture));
+        AssertConditional(new PlainTextFormatter(), SampleEvents(), expectedAllowed);
     }
 
     /// <summary>
     /// fr-FR, fi-FI, and sv-SE for the UTC-millis pattern.
     /// </summary>
+    /// <param name="cultureName">Culture under test.</param>
+    /// <param name="expectedAllowed">Expected <see cref="PlainTextFormatter.AllowsFastStamp"/> result.</param>
     [Theory(Timeout = 60000)]
     [MemberData(nameof(ConditionalCultures))]
-    public async Task UtcMillisPattern_ConditionalCulture_MatchesFormat(string cultureName)
+    public async Task UtcMillisPattern_ConditionalCulture_MatchesFormat(string cultureName, bool expectedAllowed)
     {
         await Task.CompletedTask;
         using var scope = new CultureScope(cultureName);
-        var allowed = PlainTextFormatter.AllowsFastStamp(scope.Culture);
-        System.Console.WriteLine("PROBE " + ProbeReport(scope.Culture) + " allowed=" + allowed);
-        AssertConditional(new PlainTextFormatter(UtcMillisPattern), SampleEvents(), allowed);
+        Assert.Equal(expectedAllowed, PlainTextFormatter.AllowsFastStamp(scope.Culture));
+        AssertConditional(new PlainTextFormatter(UtcMillisPattern), SampleEvents(), expectedAllowed);
     }
 
     /// <summary>
@@ -126,6 +135,9 @@ public sealed class PlainTextFastStampParityTests
     {
         await Task.CompletedTask;
         var culture = (CultureInfo)CultureInfo.GetCultureInfo("ar-SA").Clone();
+        // Pin sign and separator so only the non-Gregorian DTFI calendar can reject the fast path.
+        culture.NumberFormat.NegativeSign = "-";
+        culture.DateTimeFormat.TimeSeparator = ":";
         culture.DateTimeFormat.Calendar = new HijriCalendar();
         using var scope = new CultureScope(culture);
         Assert.False(PlainTextFormatter.AllowsFastStamp(culture), ProbeReport(culture));
@@ -142,6 +154,8 @@ public sealed class PlainTextFastStampParityTests
     {
         await Task.CompletedTask;
         var culture = (CultureInfo)CultureInfo.GetCultureInfo("ar-SA").Clone();
+        culture.NumberFormat.NegativeSign = "-";
+        culture.DateTimeFormat.TimeSeparator = ":";
         culture.DateTimeFormat.Calendar = new UmAlQuraCalendar();
         using var scope = new CultureScope(culture);
         Assert.False(PlainTextFormatter.AllowsFastStamp(culture), ProbeReport(culture));
