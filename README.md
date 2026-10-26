@@ -472,7 +472,7 @@ Contributions welcome! Fork the repository and submit a PR.
 ```bash
 dotnet build ALog.sln -c Release
 dotnet test ALog.sln -c Release --no-build
-dotnet format ALog.sln --verify-no-changes
+dotnet format whitespace ALog.sln --verify-no-changes
 ```
 
 To see why a test was skipped, run `dotnet test --logger "console;verbosity=normal"`.
