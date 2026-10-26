@@ -106,7 +106,7 @@ public sealed class PlainTextFastStampParityTests
     /// A ja-JP clone whose <see cref="DateTimeFormatInfo.Calendar"/> is Japanese stays off the fast path.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task JapaneseCalendarOnDateTimeFormat_DisablesFastPath()
+    public async Task JapaneseDtfiCalendar_AllowsStampIsFalse()
     {
         await Task.CompletedTask;
         var culture = (CultureInfo)CultureInfo.GetCultureInfo("ja-JP").Clone();
@@ -122,7 +122,7 @@ public sealed class PlainTextFastStampParityTests
     /// A culture whose <see cref="DateTimeFormatInfo.Calendar"/> is Hijri stays off the fast path.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task HijriCalendarOnDateTimeFormat_DisablesFastPath()
+    public async Task HijriDtfiCalendar_AllowsStampIsFalse()
     {
         await Task.CompletedTask;
         var culture = (CultureInfo)CultureInfo.GetCultureInfo("ar-SA").Clone();
@@ -138,7 +138,7 @@ public sealed class PlainTextFastStampParityTests
     /// A culture whose <see cref="DateTimeFormatInfo.Calendar"/> is UmAlQura stays off the fast path.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task UmAlQuraCalendarOnDateTimeFormat_DisablesFastPath()
+    public async Task UmAlQuraDtfiCalendar_AllowsStampIsFalse()
     {
         await Task.CompletedTask;
         var culture = (CultureInfo)CultureInfo.GetCultureInfo("ar-SA").Clone();
