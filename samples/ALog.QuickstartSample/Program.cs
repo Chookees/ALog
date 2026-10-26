@@ -7,7 +7,7 @@ using ALog.Formatters;
 
 var config = new LoggerConfig()
     .AddWriter(new ConsoleLogWriter(useColors: true, formatter: new PlainTextFormatter("HH:mm:ss")))
-    .AddWriter(new FileLogWriter("logs/app.log", new JsonFormatter(pretty: true), maxFileSizeInBytes: 1_048_576)) // 1 MB
+    .AddWriter(new FileLogWriter("logs/app.log", new JsonFormatter(pretty: false), maxFileSizeInBytes: 1_048_576)) // 1 MB
     .SetMinimumLevel(LogLevel.Debug);
 
 Log.Init(config);
@@ -20,7 +20,7 @@ using (Log.BeginScope("userId", 42))
 {
     using (Log.BeginScope("feature", "Login"))
     {
-        Log.Write("User successfully authenticated");
+        Log.Write(LogLevel.Info, "User {UserId} logged in", 42);
     }
 }
 
