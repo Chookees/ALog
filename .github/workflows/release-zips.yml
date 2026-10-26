@@ -43,7 +43,8 @@ jobs:
 
       - name: Non-tag guard skip
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        run: echo "guard: not a version tag; build and smoke only"
+        run: |
+          echo "guard: not a version tag; build and smoke only"
 
   build-zips:
     needs: [guard]
