@@ -188,7 +188,7 @@ If the log file can't be reopened, ALog retries at most once per second and repo
 - `QueueFullMode`: `Drop` (default) drops and counts new events while the queue is full. `Block` makes the caller wait until there is room.
 - `FileBufferSize`: how much `FileLogWriter` collects before it writes to the file. Default 64 KiB, 4 KiB to 16 MiB.
 - `FileFlushInterval`: how often buffered lines are written even if the buffer is not full. Default 1 s, 0 to 60 s. `0` writes every event right away.
-- `FlushTimeout`: how long `Flush`, `Dispose`, and `Shutdown` wait for queued events. Default 5 s, 0 to 60 s. Events still unwritten after that are counted (ALOG0071). On Windows, `Flush` also closes and reopens the log file so readers can open it, which makes each call slower. Don't call `Flush` after every line.
+- `FlushTimeout`: how long `Flush`, `Dispose`, and `Shutdown` wait for queued events. Default 5 s, 0 to 60 s. Events still unwritten after that are counted (ALOG0071). On every OS, `Flush` closes the write handle and reopens the file for reading so readers can open it, which makes each call slower. That matters most on Windows, where `File.ReadAllText` needs that reopen. Don't call `Flush` after every line.
 - Each log file has one writer process: give each process its own file. Other programs can read, tail, and rotate it. On Windows, `File.ReadAllText` asks for `FileShare.Read`, so it can open the file only after `Flush`, when the flush interval passes with no new lines (not with `FileFlushInterval` 0), or after dispose. To read while lines are being written, open the file with `new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete)`.
 
 If the process crashes, the file can miss up to one `FileFlushInterval` or one `FileBufferSize` of lines, whichever comes first. Set `FileFlushInterval` to `0` if every line must reach the operating system immediately.
@@ -241,6 +241,13 @@ Log.Init(config);
 - **Writer lifetime:** `AddWriter` transfers ownership to the engine; call `Log.Shutdown()` (or `Log.Reset()`) to dispose writers. Prefer `Shutdown` before a second `Init`.
 - Injected `HttpClient` instances are **not** disposed by `HttpLogWriter` / `AzureLogWriter`. Injected `IAwsCloudWatchLogsTransport` is **not** disposed by `AwsCloudWatchWriter`.
 - Cloud writers fail closed (errors to stderr) when credentials/endpoints reject the request.
+
+## Observations during testing
+
+- After the log file has opened successfully, a later flush that fails (for example disk full or an I/O error) is reported only on stderr. The buffered lines of that failed flush are lost, not just one line, and stderr gets one message per failed flush. Those events still count as written. Watch free disk space and stderr, and keep logs on a volume with headroom.
+- If the log file is renamed or moved while the writer still holds its write handle, and every later reopen fails (for example something else now occupies the path), further lines are lost with only stderr output and no SelfLog event. Before external rotation, first `await Log.FlushAsync()` (it can return early, see below), then wait one more `FileFlushInterval` (not with `FileFlushInterval` 0, see next sentence). With `FileFlushInterval` 0 the write handle stays open, so waiting does not help: keep the `FileLogWriter` instance you pass to `AddWriter` and call its `Flush()` after `await Log.FlushAsync()`, before rotating. `FileLogWriter.Flush()` alone does not drain the background queue. Or rotate with tools that leave the path writable. Watch stderr.
+- If the very first open fails (for example a read-only directory), each event tries one open and writes `Write failed` to stderr, with no SelfLog event, and the queue counts the event as written. Make sure the directory is writable at startup (see [Platform-Specific Paths](#platform-specific-paths-optional)) and watch stderr.
+- `await Log.FlushAsync()` can return before the last event is in the file (about 1 in 2000 calls, and up to about 1 in 3 on the first call in a fresh process). Use `Log.Shutdown()` when you must read the file right afterwards.
 
 ---
 

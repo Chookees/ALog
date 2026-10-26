@@ -1,6 +1,5 @@
 namespace ALog.Writers.File;
 
-using System.Text;
 using ALog.Config;
 using ALog.Core;
 
@@ -210,12 +209,12 @@ internal static class LogFileRegistry
 /// An external rename, delete, or truncate is noticed on the flush tick, on <see cref="Flush"/>, before this process rotates the file, and on close.
 /// A zero <see cref="FileFlushInterval"/> compares the path before every write to the operating system. A positive interval compares at most once per that interval.
 /// Close, flush, and rotation do not wait for the gap.
+/// <see cref="ProbeTrailingByte"/> updates the shared <see cref="_needsLineSeparator"/> flag from the file's
+/// last byte (0 for empty or trailing <c>\n</c>, 1 otherwise; unchanged when the probe fails). A partial
+/// replay that could not be truncated also sets the flag. At most one <c>\n</c> is written before the next append.
 /// </remarks>
 internal sealed class SharedLogFile
 {
-    /// <summary>The newline placed before the next replay line when a partial append could not be truncated.</summary>
-    private static readonly byte[] ReplayBreak = Encoding.UTF8.GetBytes(Environment.NewLine);
-
     private readonly object _fileLock = new();
     private readonly string _path;
     private int _refs;
@@ -225,8 +224,17 @@ internal sealed class SharedLogFile
     private byte[] _buffer;
     private int _pending;
     private long _logicalLength;
+
+    /// <summary>
+    /// 1 after the first successful <see cref="OpenStream"/> for this instance.
+    /// Never reset to 0: once the file has been opened, later opens are reopen/swap paths that
+    /// compare length against <see cref="_logicalLength"/> to decide whether to probe again.
+    /// </summary>
     private int _opened;
     private int _closed;
+
+    /// <summary>How many trailing-byte probes this instance has run.</summary>
+    private int _eofProbes;
     private FileStream? _stream;
     private ITimer? _timer;
     private ITimer? _retryTimer;
@@ -244,8 +252,17 @@ internal sealed class SharedLogFile
     private DateTimeOffset _fullReported;
     private int _closedDrops;
 
-    /// <summary>1 when a replay append wrote bytes that <see cref="FileStream.SetLength"/> could not remove.</summary>
-    private int _replaySplit;
+    /// <summary>
+    /// 1 when the next append must write a single <c>\n</c> first. Set when the open probe sees a non-empty
+    /// file whose last byte is not <c>\n</c>, or when a replay append left bytes that
+    /// <see cref="FileStream.SetLength"/> could not remove. Cleared by <see cref="WriteSeparatorIfNeeded"/>
+    /// after writing, and by a successful probe of an empty file or a file that already ends with <c>\n</c>.
+    /// A failed probe leaves this value unchanged.
+    /// </summary>
+    private int _needsLineSeparator;
+
+    /// <summary>How many times this instance read the last byte to decide on a line separator.</summary>
+    internal int EofProbes => _eofProbes;
 
     /// <summary>Stores the first opener's settings. The stream stays closed until the first append.</summary>
     /// <param name="path">Normalized full path. Not null.</param>
@@ -450,9 +467,11 @@ internal sealed class SharedLogFile
     /// <exception cref="IOException">The stream rejected the pending bytes or this line. The file is truncated when that reset works.</exception>
     /// <remarks>
     /// The caller holds the file lock. Pending bytes from an earlier append are written first.
-    /// The file length is remembered before this line. A throw calls <see cref="TryRestoreLength"/> so a partial line is removed.
-    /// One writer owns the file, so no other append races that length.
-    /// When the reset fails, <see cref="_replaySplit"/> is set. The next successful call writes a newline first.
+    /// The file length and the separator flag are remembered before this line. A throw calls
+    /// <see cref="TryRestoreLength"/> so a partial line is removed. When that reset succeeds, the
+    /// flag and <see cref="_logicalLength"/> are put back so a separator written in this call does
+    /// not stay cleared while the <c>\n</c> itself was truncated away. When the reset fails,
+    /// <see cref="_needsLineSeparator"/> is set. The next successful call writes one <c>\n</c> first.
     /// That fragment is not added to the logical length and is not a written line. The retried line is the same bytes.
     /// If this line's write throws, the logical length does not include it and the buffer does not keep it.
     /// Only <see cref="AppendReplay"/> calls this. <see cref="WriteLine"/> does not.
@@ -465,26 +484,25 @@ internal sealed class SharedLogFile
             throw new WriteDeferredException();
 
         var length = stream.Length;
+        var separatorNeeded = _needsLineSeparator;
+        var logicalBefore = _logicalLength;
         try
         {
-            if (_replaySplit != 0)
-                stream.Write(ReplayBreak);
-
+            WriteSeparatorIfNeeded(stream);
             stream.Write(line);
             stream.Flush();
         }
         catch (Exception)
         {
-            if (!TryRestoreLength(stream, length))
-                _replaySplit = 1;
+            if (TryRestoreLength(stream, length))
+            {
+                _needsLineSeparator = separatorNeeded;
+                _logicalLength = logicalBefore;
+            }
+            else
+                _needsLineSeparator = 1;
 
             throw;
-        }
-
-        if (_replaySplit != 0)
-        {
-            _logicalLength += ReplayBreak.Length;
-            _replaySplit = 0;
         }
 
         _logicalLength += line.Length;
@@ -635,18 +653,27 @@ internal sealed class SharedLogFile
     /// Every successful open, including a switch from the read handle back to write, increments <see cref="LogFileRegistry.OpenCount"/>.
     /// bufferSize 1 means the FileStream keeps no internal buffer, so Dispose has nothing left to write.
     /// .NET 10 accepts bufferSize 0, and 0 and 1 are both unbuffered. ALog buffers itself.
+    /// After a successful open, <see cref="ProbeTrailingByte"/> updates <see cref="_needsLineSeparator"/> from the file's last byte (0 for empty or trailing <c>\n</c>, 1 otherwise; unchanged when the probe fails). The probe is skipped when this open is ALog's own flush/idle handle swap
+    /// and the file length still equals the last length ALog recorded.
     /// </remarks>
     private void OpenStream()
     {
+        var knownLength = _logicalLength;
+        var wasOpen = _opened != 0;
         _stream = LogFileRegistry.OpenNew(
             _path,
             FileMode.Append,
             FileAccess.Write,
             FileShare.Read | FileShare.Delete);
-        _logicalLength = _stream.Length;
+        var length = _stream.Length;
+        _logicalLength = length;
         _pending = 0;
         Volatile.Write(ref _opened, 1);
         LogFileRegistry.NoteOpen();
+
+        // ALog's own Flush/idle swap reopens the same bytes it wrote; do not re-read the last byte.
+        if (!(wasOpen && length == knownLength))
+            ProbeTrailingByte();
 
         _lastIdentityCheck = _clock.GetUtcNow();
         if (_timer is null && _interval > TimeSpan.Zero)
@@ -657,6 +684,84 @@ internal sealed class SharedLogFile
                 _interval,
                 _interval);
         }
+    }
+
+    /// <summary>
+    /// Updates <see cref="_needsLineSeparator"/> from the bytes currently at the path after an open.
+    /// </summary>
+    /// <remarks>
+    /// The caller holds the file lock and <see cref="_stream"/> is the write handle just opened.
+    /// An empty file (length 0) or a last byte of <c>\n</c> sets the flag to 0 so a prior fragment flag
+    /// does not insert a blank line after copytruncate or an external replace that ends with <c>\n</c>.
+    /// Any other last byte, including a lone <c>\r</c>, sets the flag to 1. The check reads only the last
+    /// byte through a short-lived shared read handle; the append stream itself is write-only.
+    /// When the probe open or read throws, the flag is left unchanged so a replay fragment that still
+    /// needs a separator is not cleared by a broken check. This method never throws.
+    /// The inserted <c>\n</c> is not a logged line and does not change queue written counters.
+    /// </remarks>
+    private void ProbeTrailingByte()
+    {
+        if (_stream is null)
+            return;
+
+        if (_logicalLength <= 0)
+        {
+            _needsLineSeparator = 0;
+            return;
+        }
+
+        try
+        {
+            Span<byte> tail = stackalloc byte[1];
+            int read;
+            using (var probe = new FileStream(
+                       _path,
+                       FileMode.Open,
+                       FileAccess.Read,
+                       FileShare.ReadWrite | FileShare.Delete,
+                       bufferSize: 1,
+                       FileOptions.None))
+            {
+                if (probe.Length <= 0)
+                {
+                    _eofProbes++;
+                    _needsLineSeparator = 0;
+                    return;
+                }
+
+                probe.Seek(-1, SeekOrigin.End);
+                read = probe.Read(tail);
+            }
+
+            _eofProbes++;
+            if (read <= 0)
+                return;
+
+            _needsLineSeparator = tail[0] == (byte)'\n' ? 0 : 1;
+        }
+        catch (Exception)
+        {
+            // Open already succeeded; a broken trailing-byte check must not fail the open or clear the flag.
+        }
+    }
+
+    /// <summary>
+    /// Writes one <c>\n</c> when <see cref="_needsLineSeparator"/> is set, then clears the flag.
+    /// </summary>
+    /// <param name="stream">The open write handle. Not null.</param>
+    /// <remarks>
+    /// The caller holds the file lock. Does not throw for a normal write. Shared by the open probe and
+    /// replay recovery so both paths insert at most one separator before the next append.
+    /// Advances <see cref="_logicalLength"/> by one. Does not count as a written log line.
+    /// </remarks>
+    private void WriteSeparatorIfNeeded(FileStream stream)
+    {
+        if (_needsLineSeparator == 0)
+            return;
+
+        stream.WriteByte((byte)'\n');
+        _logicalLength += 1;
+        _needsLineSeparator = 0;
     }
 
     /// <summary>Flushes when the interval elapses. Swaps to the read handle only after a quiet interval.</summary>
@@ -1191,7 +1296,9 @@ internal sealed class SharedLogFile
 
         if (_interval <= TimeSpan.Zero || line.Length > _buffer.Length)
         {
+            // FlushPending writes a deferred separator when it has pending bytes; a direct line still needs one.
             FlushPending();
+            WriteSeparatorIfNeeded(_stream);
             _stream.Write(line);
             _stream.Flush();
             _logicalLength += line.Length;
@@ -1229,7 +1336,12 @@ internal sealed class SharedLogFile
     }
 
     /// <summary>Writes the pending bytes and flushes the stream. An empty buffer still flushes an open stream.</summary>
-    /// <remarks>The caller holds the file lock. Does not catch failures.</remarks>
+    /// <remarks>
+    /// The caller holds the file lock. Does not catch failures. When there are pending bytes, one
+    /// <see cref="WriteSeparatorIfNeeded"/> runs first so a reopen that kept the buffer still inserts
+    /// at most one <c>\n</c> before those bytes (the separator is not written in <see cref="WriteLine"/>
+    /// before buffering).
+    /// </remarks>
     private void FlushPending()
     {
         if (_stream is null)
@@ -1237,6 +1349,7 @@ internal sealed class SharedLogFile
 
         if (_pending > 0)
         {
+            WriteSeparatorIfNeeded(_stream);
             _stream.Write(_buffer, 0, _pending);
             _pending = 0;
         }

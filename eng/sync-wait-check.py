@@ -2,10 +2,11 @@
 """Fail when a library sync-wait is not on the allowlist.
 
 Scans ``ALog`` and ``ALog.Extensions.Logging`` for ``.Result``, ``.Wait(``,
-``GetResult(``, and ``WaitHandle.WaitAny`` / ``WaitAll`` / ``WaitOne`` calls
-that pass no timeout. Every hit must match one line in
-``eng/sync-wait-allowlist.txt``. Every allowlist line must match a hit and
-must name a timeout. ``FileLogWriter.cs`` must not call ``Task.Run``.
+``GetResult(``, ``WaitHandle.WaitAny`` / ``WaitAll``, instance ``.WaitOne(``
+calls that pass no finite timeout, and ``WaitHandle.SignalAndWait`` without a
+timeout. Every hit must match one line in ``eng/sync-wait-allowlist.txt``.
+Every allowlist line must match exactly one hit and must name a timeout.
+``FileLogWriter.cs`` must not call ``Task.Run``.
 Next file: ``eng/sync-wait-allowlist.txt``.
 """
 
@@ -19,7 +20,35 @@ LIBRARIES = ("ALog", "ALog.Extensions.Logging")
 ALLOWLIST_NAME = "eng/sync-wait-allowlist.txt"
 FILE_WRITER = "ALog/Writers/File/FileLogWriter.cs"
 HIT_RE = re.compile(r"\.Result\b|\.Wait\(|GetResult\(")
-WAIT_HANDLE_RE = re.compile(r"\bWaitHandle\s*\.\s*Wait(Any|All|One)\s*\(")
+WAIT_HANDLE_RE = re.compile(
+    r"\bWaitHandle\s*\.\s*Wait(Any|All)\s*\(",
+    re.MULTILINE,
+)
+WAIT_ONE_RE = re.compile(
+    r"\.\s*WaitOne\s*\(",
+    re.MULTILINE,
+)
+SIGNAL_AND_WAIT_RE = re.compile(
+    r"\bWaitHandle\s*\.\s*SignalAndWait\s*\(",
+    re.MULTILINE,
+)
+# One timeout argument that means "wait forever".
+INFINITE_TIMEOUT_RE = re.compile(
+    r"(?:"
+    r"(?:(?:System\s*\.\s*Threading\s*\.\s*)?Timeout\s*\.\s*Infinite(?:TimeSpan)?)"
+    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-\s*1\s*\))"
+    r"|(?:-\s*1)"
+    r")",
+)
+NAMED_INFINITE_RE = re.compile(
+    r"\b(?:millisecondsTimeout|timeout)\s*:\s*"
+    r"(?:"
+    r"(?:(?:System\s*\.\s*Threading\s*\.\s*)?Timeout\s*\.\s*Infinite(?:TimeSpan)?)"
+    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-\s*1\s*\))"
+    r"|(?:-\s*1)"
+    r")(?=\s*[,)])",
+    re.IGNORECASE,
+)
 TASK_RUN_RE = re.compile(r"\bTask\.Run\b")
 MAX_ALLOWLIST_LINES = 50
 MAX_FILES = 500
@@ -120,15 +149,19 @@ def iter_source_files(root: Path) -> list[Path]:
     return found
 
 
-def wait_handle_lacks_timeout(line: str) -> bool:
-    """True when a WaitHandle wait on this line has no timeout argument.
+def wait_handle_lacks_timeout(text: str) -> bool:
+    """True when a WaitHandle wait in ``text`` has no finite timeout argument.
 
     Args:
-        line: One source line.
+        text: One source line, or a short span that may contain a newline between
+            ``WaitHandle`` and ``.WaitAny`` / ``WaitAll``, or an instance
+            ``.WaitOne`` call.
 
     Returns:
-        True when ``WaitAny`` or ``WaitAll`` has only the handles, or ``WaitOne``
-        has an empty argument list. A call that passes a timeout is false.
+        True when ``WaitAny`` or ``WaitAll`` has only the handles, or passes
+        ``Timeout.Infinite``, ``Timeout.InfiniteTimeSpan``, or ``-1`` as the
+        timeout; or when ``.WaitOne`` has an empty argument list or those same
+        infinite values. A call that passes a finite timeout is false.
 
     Raises:
         None.
@@ -136,22 +169,54 @@ def wait_handle_lacks_timeout(line: str) -> bool:
     Side effects:
         None.
     """
-    for match in WAIT_HANDLE_RE.finditer(line):
+    for match in WAIT_HANDLE_RE.finditer(text):
+        # Group 1 is Any / All from Wait(Any|All).
         kind = match.group(1)
         open_paren = match.end() - 1
-        if kind == "WaitOne":
-            if not _call_has_argument(line, open_paren):
-                return True
-        elif not _call_has_timeout_argument(line, open_paren):
+        if not _call_has_timeout_argument(text, open_paren):
+            return True
+        if _timeout_argument_is_infinite(text, open_paren, "Wait" + kind):
+            return True
+    for match in WAIT_ONE_RE.finditer(text):
+        open_paren = match.end() - 1
+        if not _call_has_argument(text, open_paren):
+            return True
+        if _timeout_argument_is_infinite(text, open_paren, "WaitOne"):
             return True
     return False
 
 
-def _call_has_argument(line: str, open_paren: int) -> bool:
+def signal_and_wait_lacks_timeout(text: str) -> bool:
+    """True when ``WaitHandle.SignalAndWait`` is called without a timeout.
+
+    Args:
+        text: One source line, or a short span that may contain a newline between
+            ``WaitHandle`` and ``.SignalAndWait``.
+
+    Returns:
+        True when the call has fewer than three top-level arguments (the
+        two-handle form). A call that passes a timeout after the handles is false.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    for match in SIGNAL_AND_WAIT_RE.finditer(text):
+        open_paren = match.end() - 1
+        if not _call_has_timeout_argument(text, open_paren):
+            return True
+        if _timeout_argument_is_infinite(text, open_paren, "SignalAndWait"):
+            return True
+    return False
+
+
+def _call_has_argument(text: str, open_paren: int) -> bool:
     """True when the call at ``open_paren`` has any argument.
 
     Args:
-        line: One source line.
+        text: Source text that contains the call.
         open_paren: Index of the opening parenthesis.
 
     Returns:
@@ -164,8 +229,8 @@ def _call_has_argument(line: str, open_paren: int) -> bool:
         None.
     """
     paren = 0
-    for index in range(open_paren, len(line)):
-        char = line[index]
+    for index in range(open_paren, len(text)):
+        char = text[index]
         if char == "(":
             paren += 1
         elif char == ")":
@@ -177,16 +242,17 @@ def _call_has_argument(line: str, open_paren: int) -> bool:
     return False
 
 
-def _call_has_timeout_argument(line: str, open_paren: int) -> bool:
-    """True when a WaitAny or WaitAll call passes an argument after the handles.
+def _call_has_timeout_argument(text: str, open_paren: int) -> bool:
+    """True when a multi-argument wait call passes an argument after the handles.
 
     Args:
-        line: One source line.
+        text: Source text that contains the call.
         open_paren: Index of the opening parenthesis.
 
     Returns:
         True when a comma sits at the call's own argument depth. Commas inside
-        the handles array do not count.
+        the handles array do not count. For ``SignalAndWait``, the first comma
+        separates the two handles; a second top-level comma is the timeout.
 
     Raises:
         None.
@@ -197,8 +263,15 @@ def _call_has_timeout_argument(line: str, open_paren: int) -> bool:
     paren = 0
     bracket = 0
     brace = 0
-    for index in range(open_paren, len(line)):
-        char = line[index]
+    top_commas = 0
+    is_signal = False
+    # Look back a short distance for SignalAndWait so the first comma is not
+    # treated as the timeout separator.
+    prefix = text[max(0, open_paren - 40) : open_paren + 1]
+    if "SignalAndWait" in prefix:
+        is_signal = True
+    for index in range(open_paren, len(text)):
+        char = text[index]
         if char == "(":
             paren += 1
         elif char == ")":
@@ -214,8 +287,168 @@ def _call_has_timeout_argument(line: str, open_paren: int) -> bool:
         elif char == "}":
             brace -= 1
         elif char == "," and paren == 1 and bracket == 0 and brace == 0:
-            return True
+            top_commas += 1
+            if is_signal:
+                if top_commas >= 2:
+                    return True
+            else:
+                return True
     return False
+
+
+def _timeout_argument_is_infinite(text: str, open_paren: int, kind: str) -> bool:
+    """True when the call's timeout argument is an infinite wait.
+
+    Args:
+        text: Source text that contains the call.
+        open_paren: Index of the opening parenthesis.
+        kind: ``WaitOne``, ``WaitAny``, ``WaitAll``, or ``SignalAndWait``.
+
+    Returns:
+        True when the timeout argument is ``Timeout.Infinite``,
+        ``Timeout.InfiniteTimeSpan``, ``System.Threading.Timeout.Infinite``,
+        ``TimeSpan.FromMilliseconds(-1)``, or ``-1``, including named forms
+        such as ``millisecondsTimeout: -1`` and the ``(timeout, exitContext)``
+        overloads. False when there is no timeout argument or the timeout is finite.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    close = _matching_close_paren(text, open_paren)
+    if close < 0:
+        return False
+    inside = text[open_paren + 1 : close]
+    if NAMED_INFINITE_RE.search(inside):
+        return True
+    args = _top_level_arguments(inside)
+    if kind == "WaitOne":
+        # WaitOne(timeout) or WaitOne(timeout, exitContext)
+        timeout_index = 0
+    elif kind == "SignalAndWait":
+        # SignalAndWait(toSignal, toWaitOn, timeout[, exitContext])
+        timeout_index = 2
+    else:
+        # WaitAny/WaitAll(handles, timeout[, exitContext])
+        timeout_index = 1
+    if timeout_index >= len(args):
+        return False
+    argument = args[timeout_index].strip()
+    # Strip a named-argument prefix when present.
+    if ":" in argument and not argument.startswith("TimeSpan"):
+        _name, _sep, value = argument.partition(":")
+        argument = value.strip()
+    return INFINITE_TIMEOUT_RE.fullmatch(argument) is not None
+
+
+def _matching_close_paren(text: str, open_paren: int) -> int:
+    """Index of the close parenthesis that matches ``open_paren``, or -1.
+
+    Args:
+        text: Source text.
+        open_paren: Index of ``(``.
+
+    Returns:
+        The matching ``)`` index, or -1 when not found.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    paren = 0
+    for index in range(open_paren, len(text)):
+        char = text[index]
+        if char == "(":
+            paren += 1
+        elif char == ")":
+            paren -= 1
+            if paren == 0:
+                return index
+    return -1
+
+
+def _top_level_arguments(inside: str) -> list[str]:
+    """Split a call's argument list on top-level commas.
+
+    Args:
+        inside: Text between the call's parentheses.
+
+    Returns:
+        Argument strings in order. Nested ``()``, ``[]``, and ``{}`` are kept whole.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    args: list[str] = []
+    start = 0
+    paren = 0
+    bracket = 0
+    brace = 0
+    for index, char in enumerate(inside):
+        if char == "(":
+            paren += 1
+        elif char == ")":
+            paren -= 1
+        elif char == "[":
+            bracket += 1
+        elif char == "]":
+            bracket -= 1
+        elif char == "{":
+            brace += 1
+        elif char == "}":
+            brace -= 1
+        elif char == "," and paren == 0 and bracket == 0 and brace == 0:
+            args.append(inside[start:index])
+            start = index + 1
+    args.append(inside[start:])
+    return args
+
+
+def _line_number_at(text: str, index: int) -> int:
+    """1-based line number of ``index`` in ``text``.
+
+    Args:
+        text: Full file text.
+        index: Character offset. Not negative.
+
+    Returns:
+        The line number that contains ``index``.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    return text.count("\n", 0, index) + 1
+
+
+def _line_text(lines: list[str], line_no: int) -> str:
+    """Return the source line at a 1-based number.
+
+    Args:
+        lines: File lines without separators.
+        line_no: 1-based line number.
+
+    Returns:
+        The line text, or empty when out of range.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    if line_no < 1 or line_no > len(lines):
+        return ""
+    return lines[line_no - 1]
 
 
 def scan_hits(root: Path) -> tuple[list[tuple[str, str]], list[str]]:
@@ -226,7 +459,8 @@ def scan_hits(root: Path) -> tuple[list[tuple[str, str]], list[str]]:
 
     Returns:
         ``(relative path, line text)`` hits, and problems for files that are
-        too large to trust.
+        too large to trust. A ``WaitHandle`` call split across lines is reported
+        on the line that contains the method name.
 
     Raises:
         OSError: A source file cannot be read.
@@ -243,12 +477,58 @@ def scan_hits(root: Path) -> tuple[list[tuple[str, str]], list[str]]:
             problems.append(f"{path} has more than {MAX_LINES} lines.")
             continue
         relative = path.relative_to(root).as_posix()
-        for line in lines:
+        marked: set[int] = set()
+        for line_index, line in enumerate(lines):
             if len(line) > MAX_LINE_CHARS:
                 problems.append(f"{relative} has a line longer than {MAX_LINE_CHARS} characters.")
+                marked.clear()
                 break
-            if HIT_RE.search(line) or wait_handle_lacks_timeout(line):
+            if HIT_RE.search(line):
                 hits.append((relative, line))
+                marked.add(line_index)
+
+        # WaitHandle / SignalAndWait may span lines: "WaitHandle\n    .WaitAny(...)".
+        for match in WAIT_HANDLE_RE.finditer(text):
+            start = match.start()
+            # Extend far enough to cover a typical argument list on following lines.
+            span_end = min(len(text), match.end() + 400)
+            span = text[start:span_end]
+            if not wait_handle_lacks_timeout(span):
+                continue
+            # Prefer the line that holds ".Wait..." when WaitHandle sat alone above.
+            method_line = _line_number_at(text, match.end() - 1)
+            report_no = method_line
+            report = _line_text(lines, report_no)
+            if report_no - 1 in marked:
+                continue
+            hits.append((relative, report if report else span.splitlines()[0]))
+            marked.add(report_no - 1)
+
+        for match in WAIT_ONE_RE.finditer(text):
+            start = match.start()
+            span_end = min(len(text), match.end() + 400)
+            span = text[start:span_end]
+            if not wait_handle_lacks_timeout(span):
+                continue
+            report_no = _line_number_at(text, match.end() - 1)
+            if report_no - 1 in marked:
+                continue
+            report = _line_text(lines, report_no)
+            hits.append((relative, report if report else span.splitlines()[0]))
+            marked.add(report_no - 1)
+
+        for match in SIGNAL_AND_WAIT_RE.finditer(text):
+            start = match.start()
+            span_end = min(len(text), match.end() + 400)
+            span = text[start:span_end]
+            if not signal_and_wait_lacks_timeout(span):
+                continue
+            report_no = _line_number_at(text, match.end() - 1)
+            if report_no - 1 in marked:
+                continue
+            report = _line_text(lines, report_no)
+            hits.append((relative, report if report else span.splitlines()[0]))
+            marked.add(report_no - 1)
     return hits, problems
 
 
@@ -286,14 +566,15 @@ def unused_entries(
     hits: list[tuple[str, str]],
     entries: list[tuple[str, re.Pattern[str], str]],
 ) -> list[str]:
-    """Return allowlist entries that match no current hit.
+    """Return allowlist entries that do not match exactly one current hit.
 
     Args:
         hits: Path and line pairs from ``scan_hits``.
         entries: Parsed allowlist.
 
     Returns:
-        One problem per stale entry.
+        One problem per entry whose hit count is not exactly one. The message
+        names the path, pattern, and hit count.
 
     Raises:
         None.
@@ -303,13 +584,15 @@ def unused_entries(
     """
     problems: list[str] = []
     for path, pattern, _reason in entries:
-        matched = False
+        count = 0
         for hit_path, line in hits:
             if hit_path == path and pattern.search(line):
-                matched = True
-                break
-        if not matched:
-            problems.append(f"allowlist entry matches nothing: {path}")
+                count += 1
+        if count != 1:
+            problems.append(
+                f"allowlist entry must match exactly one hit (found {count}): "
+                f"{path}: {pattern.pattern}"
+            )
     return problems
 
 

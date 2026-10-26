@@ -2,8 +2,11 @@
 """Tests for the sync-wait allowlist gate.
 
 A hit that is not listed fails. A listed line with no timeout fails.
-A listed line that matches nothing fails. ``Task.Run`` in the file writer fails.
-``WaitHandle.WaitAny``, ``WaitAll``, and ``WaitOne`` without a timeout fail the same way.
+A listed line that matches nothing, or matches more than one hit, fails.
+``Task.Run`` in the file writer fails. ``WaitHandle.WaitAny``, ``WaitAll``,
+and ``WaitOne`` without a finite timeout fail the same way, including
+``Timeout.Infinite``, a call split across lines, and ``SignalAndWait`` without
+a timeout.
 """
 
 from __future__ import annotations
@@ -126,7 +129,21 @@ class SyncWaitCheckTests(unittest.TestCase):
                 "var ok = 1;\n",
             )
             problems = CHECK.evaluate(root)
-        self.assertTrue(any("matches nothing" in item for item in problems))
+        self.assertTrue(any("exactly one hit (found 0)" in item for item in problems))
+
+    def test_allowlist_entry_with_two_hits_fails(self) -> None:
+        """An allowlist pattern that matches two call sites is a failure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "ALog/Core/Sample.cs:GetResult\\(\\); // WaitWriterOnConsumerThread # Only one site. Timeout: the writer task itself.\n",
+                "x.GetResult(); // WaitWriterOnConsumerThread\n"
+                "y.GetResult(); // WaitWriterOnConsumerThread\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("exactly one hit (found 2)" in item for item in problems))
+        self.assertTrue(any("ALog/Core/Sample.cs" in item for item in problems))
 
     def test_queue_entries_name_the_consumer_thread(self) -> None:
         """The consumer waits name that thread. Block and dispose waits name their own timeout."""
@@ -162,6 +179,294 @@ class SyncWaitCheckTests(unittest.TestCase):
                 root,
                 "",
                 "WaitHandle.WaitAny(new WaitHandle[] { left, right }, 1000);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitany_with_timeout_infinite_is_flagged(self) -> None:
+        """WaitAny with Timeout.Infinite is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(new WaitHandle[] { left, right }, Timeout.Infinite);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_split_across_lines_is_flagged(self) -> None:
+        """WaitHandle on one line and WaitAny on the next is still a sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle\n    .WaitAny(new WaitHandle[] { left, right });\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_signal_and_wait_without_timeout_is_flagged(self) -> None:
+        """WaitHandle.SignalAndWait with only the two handles is a sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.SignalAndWait(toSignal, toWaitOn);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitone_named_milliseconds_timeout_infinite_is_flagged(self) -> None:
+        """_evt.WaitOne(millisecondsTimeout: -1) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne(millisecondsTimeout: -1);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitone_named_timeout_with_spaces_around_minus_is_flagged(self) -> None:
+        """_evt.WaitOne(timeout: - 1) is still an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne(timeout: - 1);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_named_timeout_infinite_is_flagged(self) -> None:
+        """WaitAny with a named Timeout.Infinite timeout is unbounded."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(waitHandles: hs, millisecondsTimeout: Timeout.Infinite);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_fully_qualified_timeout_infinite_is_flagged(self) -> None:
+        """System.Threading.Timeout.Infinite is still an unbounded timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, System.Threading.Timeout.Infinite);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_timespan_from_milliseconds_minus_one_is_flagged(self) -> None:
+        """TimeSpan.FromMilliseconds(-1) is an unbounded timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, TimeSpan.FromMilliseconds(-1));\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_infinite_timespan_is_flagged(self) -> None:
+        """Timeout.InfiniteTimeSpan is an unbounded timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, Timeout.InfiniteTimeSpan);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitone_minus_one_with_exit_context_is_flagged(self) -> None:
+        """_evt.WaitOne(-1, false) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne(-1, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitone_parameterless_instance_is_flagged(self) -> None:
+        """_evt.WaitOne() is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne();\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_infinite_with_exit_context_is_flagged(self) -> None:
+        """WaitAny(hs, Timeout.Infinite, false) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, Timeout.Infinite, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitone_finite_with_exit_context_is_not_a_hit(self) -> None:
+        """_evt.WaitOne(100, false) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne(100, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitone_named_finite_milliseconds_is_not_a_hit(self) -> None:
+        """_evt.WaitOne(millisecondsTimeout: 100) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne(millisecondsTimeout: 100);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitone_instance_finite_milliseconds_is_not_a_hit(self) -> None:
+        """_evt.WaitOne(1000) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne(1000);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitany_timespan_from_milliseconds_finite_is_not_a_hit(self) -> None:
+        """WaitAny(hs, TimeSpan.FromMilliseconds(100)) is bounded and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, TimeSpan.FromMilliseconds(100));\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitone_timespan_from_milliseconds_one_is_not_a_hit(self) -> None:
+        """_evt.WaitOne(TimeSpan.FromMilliseconds(1)) is bounded and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne(TimeSpan.FromMilliseconds(1));\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitany_timespan_from_milliseconds_one_is_not_a_hit(self) -> None:
+        """WaitAny(h, TimeSpan.FromMilliseconds(1)) is bounded and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(h, TimeSpan.FromMilliseconds(1));\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitany_finite_with_exit_context_is_not_a_hit(self) -> None:
+        """WaitAny(hs, 100, false) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, 100, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitall_minus_one_with_exit_context_is_flagged(self) -> None:
+        """WaitAll(hs, -1, true) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAll(hs, -1, true);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitall_finite_with_exit_context_is_not_a_hit(self) -> None:
+        """WaitAll(hs, 100, true) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAll(hs, 100, true);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_signal_and_wait_minus_one_with_exit_context_is_flagged(self) -> None:
+        """SignalAndWait(a, b, -1, false) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.SignalAndWait(a, b, -1, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_signal_and_wait_timeout_infinite_is_flagged(self) -> None:
+        """SignalAndWait(a, b, Timeout.Infinite) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.SignalAndWait(a, b, Timeout.Infinite);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_signal_and_wait_finite_with_exit_context_is_not_a_hit(self) -> None:
+        """SignalAndWait(a, b, 100, false) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.SignalAndWait(a, b, 100, false);\n",
             )
             problems = CHECK.evaluate(root)
         self.assertEqual(problems, [])
