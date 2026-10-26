@@ -42,26 +42,11 @@ internal static class LogFileRegistry
     /// <summary>How many times an open file was compared with its path. A skipped check does not count.</summary>
     internal static int IdentityCheckCount => Volatile.Read(ref _identityChecks);
 
-    private static int _eofProbeCount;
-
-    /// <summary>
-    /// How many times the append-open path read the last byte to decide whether a line separator is needed.
-    /// A skipped probe (ALog's own flush swap with unchanged length) does not count.
-    /// </summary>
-    internal static int EofProbeCount => Volatile.Read(ref _eofProbeCount);
-
     /// <summary>Records one path comparison.</summary>
     /// <remarks>Does not throw. Called under the file lock when the check is due or forced.</remarks>
     internal static void NoteIdentityCheck()
     {
         Interlocked.Increment(ref _identityChecks);
-    }
-
-    /// <summary>Records one trailing-byte probe.</summary>
-    /// <remarks>Does not throw. Called under the file lock when the last byte is actually read.</remarks>
-    internal static void NoteEofProbe()
-    {
-        Interlocked.Increment(ref _eofProbeCount);
     }
 
     private static FileOpen? _openFactory;
@@ -224,8 +209,9 @@ internal static class LogFileRegistry
 /// An external rename, delete, or truncate is noticed on the flush tick, on <see cref="Flush"/>, before this process rotates the file, and on close.
 /// A zero <see cref="FileFlushInterval"/> compares the path before every write to the operating system. A positive interval compares at most once per that interval.
 /// Close, flush, and rotation do not wait for the gap.
-/// A missing trailing <c>\n</c> at open (or a partial replay that could not be truncated) sets one shared
-/// <see cref="_needsLineSeparator"/> flag; at most one <c>\n</c> is written before the next append.
+/// <see cref="ProbeTrailingByte"/> updates the shared <see cref="_needsLineSeparator"/> flag from the file's
+/// last byte (0 for empty or trailing <c>\n</c>, 1 otherwise; unchanged when the probe fails). A partial
+/// replay that could not be truncated also sets the flag. At most one <c>\n</c> is written before the next append.
 /// </remarks>
 internal sealed class SharedLogFile
 {
@@ -739,7 +725,6 @@ internal sealed class SharedLogFile
                 if (probe.Length <= 0)
                 {
                     _eofProbes++;
-                    LogFileRegistry.NoteEofProbe();
                     _needsLineSeparator = 0;
                     return;
                 }
@@ -749,7 +734,6 @@ internal sealed class SharedLogFile
             }
 
             _eofProbes++;
-            LogFileRegistry.NoteEofProbe();
             if (read <= 0)
                 return;
 

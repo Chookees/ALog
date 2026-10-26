@@ -178,6 +178,52 @@ public sealed class PlainTextFastStampParityTests
         AssertFileMatchesFormat(new PlainTextFormatter(), SampleEvents()[0]);
     }
 
+    /// <summary>
+    /// A fi-FI clone with <see cref="NumberFormatInfo.NegativeSign"/> pinned to <c>-</c> stays off the fast path
+    /// because its time separator is not <c>:</c>; Format bytes stay the source of truth.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task FiFiTimeSeparator_AllowsStampIsFalse()
+    {
+        await Task.CompletedTask;
+        const bool expectedAllowed = false;
+        var culture = (CultureInfo)CultureInfo.GetCultureInfo("fi-FI").Clone();
+        // Pin sign so only TimeSeparator can reject the fast path.
+        culture.NumberFormat.NegativeSign = "-";
+        if (culture.DateTimeFormat.TimeSeparator == ":")
+            culture.DateTimeFormat.TimeSeparator = ".";
+        Assert.NotEqual(":", culture.DateTimeFormat.TimeSeparator);
+        using var scope = new CultureScope(culture);
+        Assert.Equal(expectedAllowed, PlainTextFormatter.AllowsFastStamp(culture));
+        Assert.False(PlainTextFormatter.AllowsFastStamp(culture), ProbeReport(culture));
+        AssertParityNotTaken(new PlainTextFormatter(), SampleEvents()[0]);
+        AssertParityNotTaken(new PlainTextFormatter(UtcMillisPattern), SampleEvents()[0]);
+        AssertFileMatchesFormat(new PlainTextFormatter(), SampleEvents()[0]);
+        AssertFileMatchesFormat(new PlainTextFormatter(UtcMillisPattern), SampleEvents()[0]);
+    }
+
+    /// <summary>
+    /// An InvariantCulture clone whose time separator is <c>.</c> stays off the fast path; Format bytes match.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task InvariantTimeSeparatorDot_AllowsStampIsFalse()
+    {
+        await Task.CompletedTask;
+        const bool expectedAllowed = false;
+        var culture = (CultureInfo)CultureInfo.InvariantCulture.Clone();
+        // Pin sign so only TimeSeparator can reject the fast path.
+        culture.NumberFormat.NegativeSign = "-";
+        culture.DateTimeFormat.TimeSeparator = ".";
+        Assert.NotEqual(":", culture.DateTimeFormat.TimeSeparator);
+        using var scope = new CultureScope(culture);
+        Assert.Equal(expectedAllowed, PlainTextFormatter.AllowsFastStamp(culture));
+        Assert.False(PlainTextFormatter.AllowsFastStamp(culture), ProbeReport(culture));
+        AssertParityNotTaken(new PlainTextFormatter(), SampleEvents()[0]);
+        AssertParityNotTaken(new PlainTextFormatter(UtcMillisPattern), SampleEvents()[0]);
+        AssertFileMatchesFormat(new PlainTextFormatter(), SampleEvents()[0]);
+        AssertFileMatchesFormat(new PlainTextFormatter(UtcMillisPattern), SampleEvents()[0]);
+    }
+
     /// <summary>A pattern that is neither default nor UTC-millis never takes the UTF-8 fast path.</summary>
     [Fact(Timeout = 30000)]
     public async Task OtherPattern_TryWriteUtf8_ReturnsFalse()
