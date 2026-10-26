@@ -153,7 +153,7 @@ public sealed class PlainTextFastStampParityTests
     /// th-TH defaults to ThaiBuddhistCalendar, so the fast stamp stays off and file bytes match Format.
     /// </summary>
     [Fact(Timeout = 30000)]
-    public async Task ThThThaiBuddhistCalendar_AllowsStampIsFalse()
+    public async Task ThaiBuddhistCalendar_AllowsStampIsFalse()
     {
         await Task.CompletedTask;
         using var scope = new CultureScope("th-TH");
