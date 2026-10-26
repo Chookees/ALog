@@ -32,7 +32,7 @@ jobs:
       run: |
         version=$(dotnet --version)
         echo "dotnet --version ${version}"
-        test "$version" = "10.0.402"
+        test "$version" = "10.0.403"
 
     - name: Five sequential runs
       working-directory: eng/comparison-bench

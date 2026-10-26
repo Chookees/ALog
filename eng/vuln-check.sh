@@ -2,7 +2,7 @@
 # Fails the CI job when `dotnet list` reports a vulnerable package.
 #
 # arc_spec 4.1 point 2: the command exits 0 even when it finds vulnerabilities
-# (checked on SDK 10.0.402). This script fails on the sentence
+# (checked on SDK 10.0.403). This script fails on the sentence
 # "has the following vulnerable packages" and also on an empty report or a
 # non-zero exit. Run it from the repository root. Next: .github/workflows/dotnet.yml.
 
