@@ -219,6 +219,89 @@ class SyncWaitCheckTests(unittest.TestCase):
             problems = CHECK.evaluate(root)
         self.assertTrue(any("not allowlisted" in item for item in problems))
 
+    def test_waitone_named_milliseconds_timeout_infinite_is_flagged(self) -> None:
+        """WaitOne(millisecondsTimeout: -1) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitOne(millisecondsTimeout: -1);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_named_timeout_infinite_is_flagged(self) -> None:
+        """WaitAny with a named Timeout.Infinite timeout is unbounded."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(waitHandles: hs, millisecondsTimeout: Timeout.Infinite);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_fully_qualified_timeout_infinite_is_flagged(self) -> None:
+        """System.Threading.Timeout.Infinite is still an unbounded timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, System.Threading.Timeout.Infinite);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_timespan_from_milliseconds_minus_one_is_flagged(self) -> None:
+        """TimeSpan.FromMilliseconds(-1) is an unbounded timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, TimeSpan.FromMilliseconds(-1));\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_infinite_timespan_is_flagged(self) -> None:
+        """Timeout.InfiniteTimeSpan is an unbounded timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, Timeout.InfiniteTimeSpan);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitone_minus_one_with_exit_context_is_flagged(self) -> None:
+        """WaitOne(-1, false) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitOne(-1, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_infinite_with_exit_context_is_flagged(self) -> None:
+        """WaitAny(hs, Timeout.Infinite, false) is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, Timeout.Infinite, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
     def test_task_run_in_file_writer_fails(self) -> None:
         """Task.Run in the file writer is a failure even when no sync wait exists."""
         with tempfile.TemporaryDirectory() as tmp:

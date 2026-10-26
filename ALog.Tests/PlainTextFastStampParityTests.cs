@@ -2,12 +2,13 @@ using System.Globalization;
 using System.Text;
 using ALog.Core;
 using ALog.Formatters;
+using ALog.Writers.File;
 
 namespace ALog.Tests;
 
 /// <summary>
 /// The UTF-8 fast path for both stamp patterns must match <see cref="PlainTextFormatter.Format"/>
-/// under the listed cultures, and <see cref="PlainTextFormatter.TryWriteUtf8"/> must actually succeed.
+/// under the listed cultures, or stay off when the culture cannot use the hand-written stamp.
 /// </summary>
 [Collection("Culture")]
 public sealed class PlainTextFastStampParityTests
@@ -15,8 +16,8 @@ public sealed class PlainTextFastStampParityTests
     private const string UtcMillisPattern = "yyyy-MM-dd'T'HH:mm:ss.fff'Z'";
     private const string LocalSecondsPattern = "yyyy-MM-dd HH:mm:ss";
 
-    /// <summary>Cultures Artur required, plus the invariant culture.</summary>
-    public static TheoryData<string> Cultures
+    /// <summary>Cultures that must allow the fast path on Linux/ICU (Artur's list plus invariant).</summary>
+    public static TheoryData<string> FastCultures
     {
         get
         {
@@ -35,40 +36,120 @@ public sealed class PlainTextFastStampParityTests
         }
     }
 
+    /// <summary>Extra cultures: assert fast when allowed, Format-only when not.</summary>
+    public static TheoryData<string> ConditionalCultures
+    {
+        get
+        {
+            var data = new TheoryData<string> { "fr-FR", "fi-FI", "sv-SE" };
+            return data;
+        }
+    }
+
     /// <summary>
-    /// Under each listed culture the default pattern takes the fast path and matches <see cref="PlainTextFormatter.Format"/>.
+    /// Under each required fast culture the default pattern takes the fast path and matches Format.
     /// </summary>
-    /// <param name="cultureName">Culture name, or empty for <see cref="CultureInfo.InvariantCulture"/>.</param>
     [Theory(Timeout = 60000)]
-    [MemberData(nameof(Cultures))]
+    [MemberData(nameof(FastCultures))]
     public async Task DefaultPattern_TryWriteUtf8_MatchesFormat(string cultureName)
     {
         await Task.CompletedTask;
         using var scope = new CultureScope(cultureName);
-        AssertCultureAllowsFastStamp(scope.Culture);
-        AssertParity(new PlainTextFormatter(), SampleEvents());
-        AssertParity(new PlainTextFormatter(false), SampleEvents());
-        AssertParity(new PlainTextFormatter(LocalSecondsPattern), SampleEvents());
+        Assert.True(ProbeAllowsFastStamp(scope.Culture), ProbeReport(scope.Culture));
+        AssertParityTaken(new PlainTextFormatter(), SampleEvents());
+        AssertParityTaken(new PlainTextFormatter(false), SampleEvents());
+        AssertParityTaken(new PlainTextFormatter(LocalSecondsPattern), SampleEvents());
     }
 
     /// <summary>
-    /// Under each listed culture the UTC-millis pattern takes the fast path and matches <see cref="PlainTextFormatter.Format"/>.
+    /// Under each required fast culture the UTC-millis pattern takes the fast path and matches Format.
     /// </summary>
-    /// <param name="cultureName">Culture name, or empty for <see cref="CultureInfo.InvariantCulture"/>.</param>
     [Theory(Timeout = 60000)]
-    [MemberData(nameof(Cultures))]
+    [MemberData(nameof(FastCultures))]
     public async Task UtcMillisPattern_TryWriteUtf8_MatchesFormat(string cultureName)
     {
         await Task.CompletedTask;
         using var scope = new CultureScope(cultureName);
-        AssertCultureAllowsFastStamp(scope.Culture);
-        var formatter = new PlainTextFormatter(UtcMillisPattern);
-        AssertParity(formatter, SampleEvents());
+        Assert.True(ProbeAllowsFastStamp(scope.Culture), ProbeReport(scope.Culture));
+        AssertParityTaken(new PlainTextFormatter(UtcMillisPattern), SampleEvents());
     }
 
     /// <summary>
-    /// A pattern that is neither default nor UTC-millis never takes the UTF-8 fast path.
+    /// fr-FR, fi-FI, and sv-SE: take the fast path only when the probe allows it; otherwise Format only.
     /// </summary>
+    [Theory(Timeout = 60000)]
+    [MemberData(nameof(ConditionalCultures))]
+    public async Task DefaultPattern_ConditionalCulture_MatchesFormat(string cultureName)
+    {
+        await Task.CompletedTask;
+        using var scope = new CultureScope(cultureName);
+        var allowed = ProbeAllowsFastStamp(scope.Culture);
+        System.Console.WriteLine("PROBE " + ProbeReport(scope.Culture) + " allowed=" + allowed);
+        AssertConditional(new PlainTextFormatter(), SampleEvents(), allowed);
+    }
+
+    /// <summary>
+    /// fr-FR, fi-FI, and sv-SE for the UTC-millis pattern.
+    /// </summary>
+    [Theory(Timeout = 60000)]
+    [MemberData(nameof(ConditionalCultures))]
+    public async Task UtcMillisPattern_ConditionalCulture_MatchesFormat(string cultureName)
+    {
+        await Task.CompletedTask;
+        using var scope = new CultureScope(cultureName);
+        var allowed = ProbeAllowsFastStamp(scope.Culture);
+        System.Console.WriteLine("PROBE " + ProbeReport(scope.Culture) + " allowed=" + allowed);
+        AssertConditional(new PlainTextFormatter(UtcMillisPattern), SampleEvents(), allowed);
+    }
+
+    /// <summary>
+    /// A ja-JP clone whose <see cref="DateTimeFormatInfo.Calendar"/> is Japanese stays off the fast path.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task JapaneseCalendarOnDateTimeFormat_DisablesFastPath()
+    {
+        await Task.CompletedTask;
+        var culture = (CultureInfo)CultureInfo.GetCultureInfo("ja-JP").Clone();
+        culture.DateTimeFormat.Calendar = new JapaneseCalendar();
+        using var scope = new CultureScope(culture);
+        Assert.False(ProbeAllowsFastStamp(culture), ProbeReport(culture));
+        AssertParityNotTaken(new PlainTextFormatter(), SampleEvents()[0]);
+        AssertParityNotTaken(new PlainTextFormatter(UtcMillisPattern), SampleEvents()[0]);
+        AssertFileMatchesFormat(new PlainTextFormatter(), SampleEvents()[0]);
+    }
+
+    /// <summary>
+    /// A culture whose <see cref="DateTimeFormatInfo.Calendar"/> is Hijri stays off the fast path.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task HijriCalendarOnDateTimeFormat_DisablesFastPath()
+    {
+        await Task.CompletedTask;
+        var culture = (CultureInfo)CultureInfo.GetCultureInfo("ar-SA").Clone();
+        culture.DateTimeFormat.Calendar = new HijriCalendar();
+        using var scope = new CultureScope(culture);
+        Assert.False(ProbeAllowsFastStamp(culture), ProbeReport(culture));
+        AssertParityNotTaken(new PlainTextFormatter(), SampleEvents()[0]);
+        AssertParityNotTaken(new PlainTextFormatter(UtcMillisPattern), SampleEvents()[0]);
+        AssertFileMatchesFormat(new PlainTextFormatter(), SampleEvents()[0]);
+    }
+
+    /// <summary>
+    /// A culture whose <see cref="DateTimeFormatInfo.Calendar"/> is UmAlQura stays off the fast path.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task UmAlQuraCalendarOnDateTimeFormat_DisablesFastPath()
+    {
+        await Task.CompletedTask;
+        var culture = (CultureInfo)CultureInfo.GetCultureInfo("ar-SA").Clone();
+        culture.DateTimeFormat.Calendar = new UmAlQuraCalendar();
+        using var scope = new CultureScope(culture);
+        Assert.False(ProbeAllowsFastStamp(culture), ProbeReport(culture));
+        AssertParityNotTaken(new PlainTextFormatter(), SampleEvents()[0]);
+        AssertFileMatchesFormat(new PlainTextFormatter(), SampleEvents()[0]);
+    }
+
+    /// <summary>A pattern that is neither default nor UTC-millis never takes the UTF-8 fast path.</summary>
     [Fact(Timeout = 30000)]
     public async Task OtherPattern_TryWriteUtf8_ReturnsFalse()
     {
@@ -80,23 +161,17 @@ public sealed class PlainTextFastStampParityTests
         Assert.Equal(0, written);
     }
 
-    /// <summary>
-    /// A buffer shorter than the 19-byte local stamp makes <see cref="PlainTextFormatter.TryWriteUtf8"/> return false.
-    /// </summary>
+    /// <summary>A buffer shorter than the 19-byte local stamp makes TryWriteUtf8 return false.</summary>
     [Fact(Timeout = 30000)]
     public async Task DefaultPattern_BufferTooSmallForStamp_ReturnsFalse()
     {
         await Task.CompletedTask;
         using var scope = new CultureScope("en-US");
         var formatter = new PlainTextFormatter();
-        // '[' plus 18 bytes cannot hold the 19-byte stamp.
         Assert.False(formatter.TryWriteUtf8(SampleEvents()[0], new byte[1 + 18], out _));
     }
 
-    /// <summary>
-    /// Builds events that exercise category, message, int (including negative), string props, and edge timestamps.
-    /// </summary>
-    /// <returns>A fixed list of events. Not null.</returns>
+    /// <summary>Builds events that exercise category, message, props, and edge timestamps.</summary>
     private static LogEvent[] SampleEvents()
     {
         return
@@ -115,49 +190,85 @@ public sealed class PlainTextFastStampParityTests
         ];
     }
 
-    /// <summary>
-    /// Asserts every event's fast path returns true and equals UTF-8 of <see cref="PlainTextFormatter.Format"/>.
-    /// </summary>
-    /// <param name="formatter">Formatter under the current culture. Not null.</param>
-    /// <param name="events">Events to compare. Not null.</param>
-    private static void AssertParity(PlainTextFormatter formatter, IEnumerable<LogEvent> events)
+    /// <summary>True when the same rules as <c>AllowsFastStamp</c> pass for <paramref name="culture"/>.</summary>
+    private static bool ProbeAllowsFastStamp(CultureInfo culture)
+        => culture.DateTimeFormat.Calendar is GregorianCalendar
+            && culture.DateTimeFormat.TimeSeparator == ":"
+            && culture.NumberFormat.NegativeSign == "-";
+
+    /// <summary>One-line probe report for diagnostics.</summary>
+    private static string ProbeReport(CultureInfo culture)
+        => culture.Name
+            + " DTFI.Calendar="
+            + culture.DateTimeFormat.Calendar.GetType().Name
+            + " TimeSeparator='"
+            + culture.DateTimeFormat.TimeSeparator
+            + "' NegativeSign='"
+            + culture.NumberFormat.NegativeSign
+            + "'";
+
+    /// <summary>Asserts fast path taken and byte-identical to Format.</summary>
+    private static void AssertParityTaken(PlainTextFormatter formatter, IEnumerable<LogEvent> events)
     {
         var buffer = new byte[1024];
         foreach (var evt in events)
         {
-            Assert.True(
-                formatter.TryWriteUtf8(evt, buffer, out var written),
-                "TryWriteUtf8 must take the fast path for " + Describe(evt));
+            Assert.True(formatter.TryWriteUtf8(evt, buffer, out var written), Describe(evt));
             var expected = Encoding.UTF8.GetBytes(formatter.Format(evt));
             Assert.Equal(expected.Length, written);
-            Assert.True(
-                expected.AsSpan().SequenceEqual(buffer.AsSpan(0, written)),
-                "fast bytes must equal Encoding.UTF8.GetBytes(Format(e)) for " + Describe(evt));
+            Assert.True(expected.AsSpan().SequenceEqual(buffer.AsSpan(0, written)), Describe(evt));
         }
     }
 
-    /// <summary>
-    /// Fails with the calendar, time separator, and negative sign when the culture cannot use the hand-written stamp.
-    /// </summary>
-    /// <param name="culture">Current culture. Not null.</param>
-    private static void AssertCultureAllowsFastStamp(CultureInfo culture)
+    /// <summary>Asserts fast path not taken.</summary>
+    private static void AssertParityNotTaken(PlainTextFormatter formatter, LogEvent evt)
     {
-        var calendarOk = culture.Calendar is GregorianCalendar;
-        var separatorOk = culture.DateTimeFormat.TimeSeparator == ":";
-        var signOk = culture.NumberFormat.NegativeSign == "-";
-        if (calendarOk && separatorOk && signOk)
-            return;
+        var buffer = new byte[1024];
+        Assert.False(formatter.TryWriteUtf8(evt, buffer, out var written));
+        Assert.Equal(0, written);
+    }
 
-        Assert.Fail(
-            "AllowsFastStamp failed for "
-            + culture.Name
-            + ": calendar="
-            + culture.Calendar.GetType().Name
-            + ", TimeSeparator='"
-            + culture.DateTimeFormat.TimeSeparator
-            + "', NegativeSign='"
-            + culture.NumberFormat.NegativeSign
-            + "'");
+    /// <summary>When allowed, fast path; otherwise TryWriteUtf8 false and Format bytes are the source of truth.</summary>
+    private static void AssertConditional(PlainTextFormatter formatter, IEnumerable<LogEvent> events, bool allowed)
+    {
+        if (allowed)
+            AssertParityTaken(formatter, events);
+        else
+        {
+            foreach (var evt in events)
+            {
+                AssertParityNotTaken(formatter, evt);
+                AssertFileMatchesFormat(formatter, evt);
+            }
+        }
+    }
+
+    /// <summary>File bytes for one event equal Format plus the platform newline.</summary>
+    private static void AssertFileMatchesFormat(PlainTextFormatter formatter, LogEvent evt)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "alog-parity-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var path = Path.Combine(directory, "line.log");
+            using (var writer = new FileLogWriter(path, formatter, fileFlushInterval: TimeSpan.Zero))
+            {
+                writer.Write(evt);
+                writer.Flush();
+            }
+
+            Assert.Equal(formatter.Format(evt) + Environment.NewLine, File.ReadAllText(path));
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(directory, recursive: true);
+            }
+            catch (IOException)
+            {
+            }
+        }
     }
 
     /// <summary>One info event with optional category, message, and properties.</summary>
@@ -172,13 +283,12 @@ public sealed class PlainTextFastStampParityTests
     private static string Describe(LogEvent evt)
         => evt.Timestamp.ToString("o", CultureInfo.InvariantCulture) + "/" + (evt.Message ?? "");
 
-    /// <summary>Sets <see cref="CultureInfo.CurrentCulture"/> and restores it on dispose.</summary>
+    /// <summary>Sets CurrentCulture and restores it on dispose.</summary>
     private sealed class CultureScope : IDisposable
     {
         private readonly CultureInfo _previous;
 
-        /// <summary>Activates <paramref name="cultureName"/>, or the invariant culture when the name is empty.</summary>
-        /// <param name="cultureName">Culture name, or empty for invariant.</param>
+        /// <summary>Activates a named culture, or invariant when the name is empty.</summary>
         public CultureScope(string cultureName)
         {
             _previous = CultureInfo.CurrentCulture;
@@ -188,10 +298,18 @@ public sealed class PlainTextFastStampParityTests
             CultureInfo.CurrentCulture = Culture;
         }
 
-        /// <summary>The culture that was installed for this scope.</summary>
+        /// <summary>Activates an already-built culture instance.</summary>
+        public CultureScope(CultureInfo culture)
+        {
+            _previous = CultureInfo.CurrentCulture;
+            Culture = culture;
+            CultureInfo.CurrentCulture = culture;
+        }
+
+        /// <summary>The culture installed for this scope.</summary>
         public CultureInfo Culture { get; }
 
-        /// <summary>Restores the previous <see cref="CultureInfo.CurrentCulture"/>.</summary>
+        /// <summary>Restores the previous culture.</summary>
         public void Dispose() => CultureInfo.CurrentCulture = _previous;
     }
 }

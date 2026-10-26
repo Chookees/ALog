@@ -28,8 +28,22 @@ SIGNAL_AND_WAIT_RE = re.compile(
     r"\bWaitHandle\s*\.\s*SignalAndWait\s*\(",
     re.MULTILINE,
 )
+# One timeout argument that means "wait forever".
 INFINITE_TIMEOUT_RE = re.compile(
-    r"\bTimeout\.Infinite(?:TimeSpan)?\b|(?<![\w.])-1\b",
+    r"(?:"
+    r"(?:(?:System\s*\.\s*Threading\s*\.\s*)?Timeout\s*\.\s*Infinite(?:TimeSpan)?)"
+    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-1\s*\))"
+    r"|(?:-1)"
+    r")",
+)
+NAMED_INFINITE_RE = re.compile(
+    r"\b(?:millisecondsTimeout|timeout)\s*:\s*"
+    r"(?:"
+    r"(?:(?:System\s*\.\s*Threading\s*\.\s*)?Timeout\s*\.\s*Infinite(?:TimeSpan)?)"
+    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-1\s*\))"
+    r"|(?:-1)"
+    r")\b",
+    re.IGNORECASE,
 )
 TASK_RUN_RE = re.compile(r"\bTask\.Run\b")
 MAX_ALLOWLIST_LINES = 50
@@ -151,16 +165,17 @@ def wait_handle_lacks_timeout(text: str) -> bool:
         None.
     """
     for match in WAIT_HANDLE_RE.finditer(text):
+        # Group 1 is Any / All / One from Wait(Any|All|One).
         kind = match.group(1)
         open_paren = match.end() - 1
-        if kind == "WaitOne":
+        if kind == "One":
             if not _call_has_argument(text, open_paren):
                 return True
-            if _timeout_argument_is_infinite(text, open_paren):
+            if _timeout_argument_is_infinite(text, open_paren, "WaitOne"):
                 return True
         elif not _call_has_timeout_argument(text, open_paren):
             return True
-        elif _timeout_argument_is_infinite(text, open_paren):
+        elif _timeout_argument_is_infinite(text, open_paren, "Wait" + kind):
             return True
     return False
 
@@ -186,7 +201,7 @@ def signal_and_wait_lacks_timeout(text: str) -> bool:
         open_paren = match.end() - 1
         if not _call_has_timeout_argument(text, open_paren):
             return True
-        if _timeout_argument_is_infinite(text, open_paren):
+        if _timeout_argument_is_infinite(text, open_paren, "SignalAndWait"):
             return True
     return False
 
@@ -275,18 +290,62 @@ def _call_has_timeout_argument(text: str, open_paren: int) -> bool:
     return False
 
 
-def _timeout_argument_is_infinite(text: str, open_paren: int) -> bool:
+def _timeout_argument_is_infinite(text: str, open_paren: int, kind: str) -> bool:
     """True when the call's timeout argument is an infinite wait.
 
     Args:
         text: Source text that contains the call.
         open_paren: Index of the opening parenthesis.
+        kind: ``WaitOne``, ``WaitAny``, ``WaitAll``, or ``SignalAndWait``.
 
     Returns:
-        True when the text after the last top-level comma and before the matching
-        close paren is only ``Timeout.Infinite``, ``Timeout.InfiniteTimeSpan``,
-        or ``-1`` (with optional whitespace). False when there is no timeout
-        argument or the timeout is finite.
+        True when the timeout argument is ``Timeout.Infinite``,
+        ``Timeout.InfiniteTimeSpan``, ``System.Threading.Timeout.Infinite``,
+        ``TimeSpan.FromMilliseconds(-1)``, or ``-1``, including named forms
+        such as ``millisecondsTimeout: -1`` and the ``(timeout, exitContext)``
+        overloads. False when there is no timeout argument or the timeout is finite.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    close = _matching_close_paren(text, open_paren)
+    if close < 0:
+        return False
+    inside = text[open_paren + 1 : close]
+    if NAMED_INFINITE_RE.search(inside):
+        return True
+    args = _top_level_arguments(inside)
+    if kind == "WaitOne":
+        # WaitOne(timeout) or WaitOne(timeout, exitContext)
+        timeout_index = 0
+    elif kind == "SignalAndWait":
+        # SignalAndWait(toSignal, toWaitOn, timeout[, exitContext])
+        timeout_index = 2
+    else:
+        # WaitAny/WaitAll(handles, timeout[, exitContext])
+        timeout_index = 1
+    if timeout_index >= len(args):
+        return False
+    argument = args[timeout_index].strip()
+    # Strip a named-argument prefix when present.
+    if ":" in argument and not argument.startswith("TimeSpan"):
+        _name, _sep, value = argument.partition(":")
+        argument = value.strip()
+    return INFINITE_TIMEOUT_RE.fullmatch(argument) is not None
+
+
+def _matching_close_paren(text: str, open_paren: int) -> int:
+    """Index of the close parenthesis that matches ``open_paren``, or -1.
+
+    Args:
+        text: Source text.
+        open_paren: Index of ``(``.
+
+    Returns:
+        The matching ``)`` index, or -1 when not found.
 
     Raises:
         None.
@@ -295,10 +354,6 @@ def _timeout_argument_is_infinite(text: str, open_paren: int) -> bool:
         None.
     """
     paren = 0
-    bracket = 0
-    brace = 0
-    last_comma = -1
-    close = -1
     for index in range(open_paren, len(text)):
         char = text[index]
         if char == "(":
@@ -306,8 +361,35 @@ def _timeout_argument_is_infinite(text: str, open_paren: int) -> bool:
         elif char == ")":
             paren -= 1
             if paren == 0:
-                close = index
-                break
+                return index
+    return -1
+
+
+def _top_level_arguments(inside: str) -> list[str]:
+    """Split a call's argument list on top-level commas.
+
+    Args:
+        inside: Text between the call's parentheses.
+
+    Returns:
+        Argument strings in order. Nested ``()``, ``[]``, and ``{}`` are kept whole.
+
+    Raises:
+        None.
+
+    Side effects:
+        None.
+    """
+    args: list[str] = []
+    start = 0
+    paren = 0
+    bracket = 0
+    brace = 0
+    for index, char in enumerate(inside):
+        if char == "(":
+            paren += 1
+        elif char == ")":
+            paren -= 1
         elif char == "[":
             bracket += 1
         elif char == "]":
@@ -316,14 +398,11 @@ def _timeout_argument_is_infinite(text: str, open_paren: int) -> bool:
             brace += 1
         elif char == "}":
             brace -= 1
-        elif char == "," and paren == 1 and bracket == 0 and brace == 0:
-            last_comma = index
-    if last_comma < 0 or close < 0:
-        return False
-    argument = text[last_comma + 1 : close].strip()
-    if argument == "":
-        return False
-    return INFINITE_TIMEOUT_RE.fullmatch(argument) is not None
+        elif char == "," and paren == 0 and bracket == 0 and brace == 0:
+            args.append(inside[start:index])
+            start = index + 1
+    args.append(inside[start:])
+    return args
 
 
 def _line_number_at(text: str, index: int) -> int:

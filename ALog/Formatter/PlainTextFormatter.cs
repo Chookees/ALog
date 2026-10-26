@@ -117,19 +117,23 @@ public class PlainTextFormatter : ILogFormatter
     /// </summary>
     /// <param name="culture">The culture of the thread that is about to write. Not null.</param>
     /// <returns>
-    /// True only for a Gregorian calendar whose time separator is <c>:</c> and whose negative sign is <c>-</c>.
+    /// True only when <see cref="DateTimeFormatInfo.Calendar"/> is Gregorian, the time separator is <c>:</c>,
+    /// and the negative sign is <c>-</c>.
     /// </returns>
     /// <remarks>
     /// Does not throw. The stamp always uses <c>:</c> and a dot before the milliseconds, which is what
     /// <see cref="DateTime.ToString(string)"/> writes for this pattern when the time separator is <c>:</c>.
     /// The dot is a literal in that pattern, not <see cref="System.Globalization.NumberFormatInfo.NumberDecimalSeparator"/>.
-    /// A different time separator, a non-Gregorian calendar, or a negative sign other than <c>-</c> would make an integer
-    /// property or the clock differ, so the whole fast path stays off and <see cref="Format"/> is used.
+    /// <see cref="DateTime.ToString(string)"/> uses <see cref="DateTimeFormatInfo.Calendar"/>, not
+    /// <see cref="CultureInfo.Calendar"/>, so a culture whose DTFI calendar is Japanese or Hijri must stay off
+    /// the fast path even when <see cref="CultureInfo.Calendar"/> is still Gregorian.
+    /// A different time separator or a negative sign other than <c>-</c> would make an integer property or the
+    /// clock differ, so the whole fast path stays off and <see cref="Format"/> is used.
     /// Does not allocate. Safe to call from any thread. The culture object is not stored.
     /// </remarks>
     private static bool AllowsFastStamp(CultureInfo culture)
     {
-        if (culture.Calendar is not GregorianCalendar)
+        if (culture.DateTimeFormat.Calendar is not GregorianCalendar)
             return false;
         if (culture.DateTimeFormat.TimeSeparator != ":")
             return false;
