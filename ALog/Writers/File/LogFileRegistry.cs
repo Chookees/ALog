@@ -667,8 +667,7 @@ internal sealed class SharedLogFile
     /// Every successful open, including a switch from the read handle back to write, increments <see cref="LogFileRegistry.OpenCount"/>.
     /// bufferSize 1 means the FileStream keeps no internal buffer, so Dispose has nothing left to write.
     /// .NET 10 accepts bufferSize 0, and 0 and 1 are both unbuffered. ALog buffers itself.
-    /// After a successful open, <see cref="ProbeTrailingByte"/> may set <see cref="_needsLineSeparator"/> when the
-    /// file does not end with <c>\n</c>. The probe is skipped when this open is ALog's own flush/idle handle swap
+    /// After a successful open, <see cref="ProbeTrailingByte"/> updates <see cref="_needsLineSeparator"/> from the file's last byte (0 for empty or trailing <c>\n</c>, 1 otherwise; unchanged when the probe fails). The probe is skipped when this open is ALog's own flush/idle handle swap
     /// and the file length still equals the last length ALog recorded.
     /// </remarks>
     private void OpenStream()
