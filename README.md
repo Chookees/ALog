@@ -198,6 +198,8 @@ Step 1 and Step 2 together are a complete program: [`samples/ALog.QuickstartSamp
 {"timestamp":"2026-10-26T21:38:52.0278365Z","level":"Info","message":"Async log message","properties":{},"context":{}}
 ```
 
+The console output and these log lines come from a real run of the sample, unedited.
+
 Pretty form of the template line (display only — do not write a file this way):
 
 ```json
@@ -215,8 +217,6 @@ Pretty form of the template line (display only — do not write a file this way)
   }
 }
 ```
-
-Both come from a real run of the sample, unedited.
 
 ### Step 3: Background Queue (Optional)
 
