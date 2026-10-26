@@ -2,8 +2,11 @@
 """Tests for the sync-wait allowlist gate.
 
 A hit that is not listed fails. A listed line with no timeout fails.
-A listed line that matches nothing fails. ``Task.Run`` in the file writer fails.
-``WaitHandle.WaitAny``, ``WaitAll``, and ``WaitOne`` without a timeout fail the same way.
+A listed line that matches nothing, or matches more than one hit, fails.
+``Task.Run`` in the file writer fails. ``WaitHandle.WaitAny``, ``WaitAll``,
+and ``WaitOne`` without a finite timeout fail the same way, including
+``Timeout.Infinite``, a call split across lines, and ``SignalAndWait`` without
+a timeout.
 """
 
 from __future__ import annotations
@@ -126,7 +129,21 @@ class SyncWaitCheckTests(unittest.TestCase):
                 "var ok = 1;\n",
             )
             problems = CHECK.evaluate(root)
-        self.assertTrue(any("matches nothing" in item for item in problems))
+        self.assertTrue(any("exactly one hit (found 0)" in item for item in problems))
+
+    def test_allowlist_entry_with_two_hits_fails(self) -> None:
+        """An allowlist pattern that matches two call sites is a failure."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "ALog/Core/Sample.cs:GetResult\\(\\); // WaitWriterOnConsumerThread # Only one site. Timeout: the writer task itself.\n",
+                "x.GetResult(); // WaitWriterOnConsumerThread\n"
+                "y.GetResult(); // WaitWriterOnConsumerThread\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("exactly one hit (found 2)" in item for item in problems))
+        self.assertTrue(any("ALog/Core/Sample.cs" in item for item in problems))
 
     def test_queue_entries_name_the_consumer_thread(self) -> None:
         """The consumer waits name that thread. Block and dispose waits name their own timeout."""
@@ -165,6 +182,42 @@ class SyncWaitCheckTests(unittest.TestCase):
             )
             problems = CHECK.evaluate(root)
         self.assertEqual(problems, [])
+
+    def test_waitany_with_timeout_infinite_is_flagged(self) -> None:
+        """WaitAny with Timeout.Infinite is an unbounded sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(new WaitHandle[] { left, right }, Timeout.Infinite);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitany_split_across_lines_is_flagged(self) -> None:
+        """WaitHandle on one line and WaitAny on the next is still a sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle\n    .WaitAny(new WaitHandle[] { left, right });\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_signal_and_wait_without_timeout_is_flagged(self) -> None:
+        """WaitHandle.SignalAndWait with only the two handles is a sync wait."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.SignalAndWait(toSignal, toWaitOn);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertTrue(any("not allowlisted" in item for item in problems))
 
     def test_task_run_in_file_writer_fails(self) -> None:
         """Task.Run in the file writer is a failure even when no sync wait exists."""
