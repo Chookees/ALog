@@ -635,6 +635,9 @@ internal sealed class SharedLogFile
     /// Every successful open, including a switch from the read handle back to write, increments <see cref="LogFileRegistry.OpenCount"/>.
     /// bufferSize 1 means the FileStream keeps no internal buffer, so Dispose has nothing left to write.
     /// .NET 10 accepts bufferSize 0, and 0 and 1 are both unbuffered. ALog buffers itself.
+    /// After a successful open of a non-empty file, <see cref="EnsureTrailingLineEnding"/> may write one
+    /// <see cref="Environment.NewLine"/> when the existing bytes do not already end that way, so the next
+    /// line never merges with a leftover fragment from a previous process.
     /// </remarks>
     private void OpenStream()
     {
@@ -647,6 +650,7 @@ internal sealed class SharedLogFile
         _pending = 0;
         Volatile.Write(ref _opened, 1);
         LogFileRegistry.NoteOpen();
+        EnsureTrailingLineEnding();
 
         _lastIdentityCheck = _clock.GetUtcNow();
         if (_timer is null && _interval > TimeSpan.Zero)
@@ -656,6 +660,66 @@ internal sealed class SharedLogFile
                 this,
                 _interval,
                 _interval);
+        }
+    }
+
+    /// <summary>
+    /// When the newly opened append stream points at a non-empty file that does not end with a line
+    /// terminator, writes one <see cref="Environment.NewLine"/> so the next append starts on its own line.
+    /// </summary>
+    /// <remarks>
+    /// The caller holds the file lock and <see cref="_stream"/> is the write handle just opened.
+    /// Empty files and files that already end with <c>\n</c> (or the full platform <see cref="Environment.NewLine"/>)
+    /// are left unchanged. The check reads only the last byte(s) through a short-lived shared read handle;
+    /// the append stream itself is write-only. A failed probe or a failed repair write is swallowed: this
+    /// method never throws, so the open path keeps its existing error handling for real open failures.
+    /// </remarks>
+    private void EnsureTrailingLineEnding()
+    {
+        var stream = _stream;
+        if (stream is null || _logicalLength <= 0)
+            return;
+
+        try
+        {
+            var ending = ReplayBreak;
+            var take = ending.Length;
+            if (_logicalLength < take)
+                take = (int)_logicalLength;
+
+            Span<byte> tail = stackalloc byte[take];
+            int read;
+            using (var probe = new FileStream(
+                       _path,
+                       FileMode.Open,
+                       FileAccess.Read,
+                       FileShare.ReadWrite | FileShare.Delete,
+                       bufferSize: 1,
+                       FileOptions.None))
+            {
+                if (probe.Length <= 0)
+                    return;
+
+                take = (int)Math.Min(probe.Length, ending.Length);
+                probe.Seek(-take, SeekOrigin.End);
+                read = probe.Read(tail.Slice(0, take));
+            }
+
+            if (read <= 0)
+                return;
+
+            if (tail[read - 1] == (byte)'\n')
+                return;
+
+            if (read == ending.Length && tail.Slice(0, read).SequenceEqual(ending))
+                return;
+
+            stream.Write(ending);
+            _logicalLength += ending.Length;
+        }
+        catch (Exception)
+        {
+            // Open already succeeded; a broken trailing-byte check must not fail the open.
         }
     }
 
