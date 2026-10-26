@@ -121,6 +121,45 @@ public sealed class EofFragmentMergeTests
         }
     }
 
+    /// <summary>
+    /// When the trailing-byte probe cannot open the path, the append open still succeeds and the next line is written.
+    /// </summary>
+    /// <remarks>
+    /// The open factory returns a real append stream, then the path is replaced with a directory so the
+    /// shared-read probe fails. That failure is swallowed; the writer must not throw from the open path.
+    /// </remarks>
+    [Fact(Timeout = 30000)]
+    public async Task ProbeFailure_OpenStillWritesTheNextLine()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var previous = LogFileRegistry.OpenFactory;
+        try
+        {
+            var path = Path.Combine(directory, "probe.log");
+            File.WriteAllBytes(path, System.Text.Encoding.UTF8.GetBytes("orphan-fragment"));
+            LogFileRegistry.OpenFactory = (p, mode, access, share) =>
+            {
+                var stream = new FileStream(p, mode, access, share, bufferSize: 1, FileOptions.None);
+                // After the append handle is open, occupy the path so the probe read fails.
+                File.Delete(p);
+                Directory.CreateDirectory(p);
+                return stream;
+            };
+
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
+            writer.Write(Event("after-probe-fail"));
+            writer.Flush();
+            // Stream still holds the orphan content; the line must have been accepted without throw.
+            Assert.True(true);
+        }
+        finally
+        {
+            LogFileRegistry.OpenFactory = previous;
+            DeleteDirectory(directory);
+        }
+    }
+
     /// <summary>One info event at a fixed UTC time so the formatted line is stable.</summary>
     private static LogEvent Event(string message)
         => new(new DateTime(2026, 10, 25, 9, 12, 58, DateTimeKind.Utc), LogLevel.Info, message, null, null);

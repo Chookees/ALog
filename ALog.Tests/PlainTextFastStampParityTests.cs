@@ -67,6 +67,33 @@ public sealed class PlainTextFastStampParityTests
     }
 
     /// <summary>
+    /// A pattern that is neither default nor UTC-millis never takes the UTF-8 fast path.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task OtherPattern_TryWriteUtf8_ReturnsFalse()
+    {
+        await Task.CompletedTask;
+        using var scope = new CultureScope("en-US");
+        var formatter = new PlainTextFormatter("yyyy/MM/dd HH:mm:ss");
+        var buffer = new byte[256];
+        Assert.False(formatter.TryWriteUtf8(SampleEvents()[0], buffer, out var written));
+        Assert.Equal(0, written);
+    }
+
+    /// <summary>
+    /// A buffer shorter than the 19-byte local stamp makes <see cref="PlainTextFormatter.TryWriteUtf8"/> return false.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task DefaultPattern_BufferTooSmallForStamp_ReturnsFalse()
+    {
+        await Task.CompletedTask;
+        using var scope = new CultureScope("en-US");
+        var formatter = new PlainTextFormatter();
+        // '[' plus 18 bytes cannot hold the 19-byte stamp.
+        Assert.False(formatter.TryWriteUtf8(SampleEvents()[0], new byte[1 + 18], out _));
+    }
+
+    /// <summary>
     /// Builds events that exercise category, message, int (including negative), string props, and edge timestamps.
     /// </summary>
     /// <returns>A fixed list of events. Not null.</returns>
