@@ -131,7 +131,7 @@ public class PlainTextFormatter : ILogFormatter
     /// clock differ, so the whole fast path stays off and <see cref="Format"/> is used.
     /// Does not allocate. Safe to call from any thread. The culture object is not stored.
     /// </remarks>
-    private static bool AllowsFastStamp(CultureInfo culture)
+    internal static bool AllowsFastStamp(CultureInfo culture)
     {
         if (culture.DateTimeFormat.Calendar is not GregorianCalendar)
             return false;

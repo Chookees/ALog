@@ -302,6 +302,55 @@ class SyncWaitCheckTests(unittest.TestCase):
             )
             problems = CHECK.evaluate(root)
         self.assertTrue(any("not allowlisted" in item for item in problems))
+
+    def test_waitone_finite_with_exit_context_is_not_a_hit(self) -> None:
+        """WaitOne(100, false) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitOne(100, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitone_named_finite_milliseconds_is_not_a_hit(self) -> None:
+        """WaitOne(millisecondsTimeout: 100) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitOne(millisecondsTimeout: 100);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitany_timespan_from_milliseconds_finite_is_not_a_hit(self) -> None:
+        """WaitAny(hs, TimeSpan.FromMilliseconds(100)) is bounded and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, TimeSpan.FromMilliseconds(100));\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitany_finite_with_exit_context_is_not_a_hit(self) -> None:
+        """WaitAny(hs, 100, false) is a bounded wait and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(hs, 100, false);\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
     def test_task_run_in_file_writer_fails(self) -> None:
         """Task.Run in the file writer is a failure even when no sync wait exists."""
         with tempfile.TemporaryDirectory() as tmp:

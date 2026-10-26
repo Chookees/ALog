@@ -1,6 +1,7 @@
 using System.Reflection;
 using System.Text;
 using ALog.Core;
+using ALog.Formatters;
 using ALog.Public.Interfaces;
 using ALog.Writers.File;
 namespace ALog.Tests;
@@ -117,6 +118,10 @@ public sealed class EofFragmentMergeTests
 
             var after = File.ReadAllBytes(path);
             Assert.True(after.AsSpan(0, before.Length).SequenceEqual(before));
+            Assert.True(after.Length > before.Length);
+            Assert.Equal((byte)'[', after[before.Length]);
+            Assert.False(HasDoubleLf(after));
+            Assert.Equal(2, CountChar(Encoding.UTF8.GetString(after), '\n'));
         }
         finally
         {
@@ -201,13 +206,23 @@ public sealed class EofFragmentMergeTests
             File.WriteAllBytes(path, Encoding.UTF8.GetBytes("seed\n"));
             using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
             writer.Write(Event("one"));
-            var afterFirst = LogFileRegistry.EofProbeCount;
+            var afterFirstProbe = LogFileRegistry.EofProbeCount;
+            var opensAfterFirstWrite = LogFileRegistry.OpenCount;
             writer.Flush();
+            Assert.True(
+                LogFileRegistry.OpenCount > opensAfterFirstWrite,
+                "Flush must swap the handle so OpenCount rises.");
+            var opensAfterFlush1 = LogFileRegistry.OpenCount;
             writer.Write(Event("two"));
             writer.Flush();
+            Assert.True(
+                LogFileRegistry.OpenCount > opensAfterFlush1,
+                "Each flush cycle must open again.");
+            var opensAfterFlush2 = LogFileRegistry.OpenCount;
             writer.Write(Event("three"));
             writer.Flush();
-            Assert.Equal(afterFirst, LogFileRegistry.EofProbeCount);
+            Assert.True(LogFileRegistry.OpenCount > opensAfterFlush2);
+            Assert.Equal(afterFirstProbe, LogFileRegistry.EofProbeCount);
         }
         finally
         {
@@ -256,30 +271,73 @@ public sealed class EofFragmentMergeTests
     }
 
     /// <summary>
-    /// Probe and replay recovery share one flag: at most one <c>\n</c> is inserted before the next append.
+    /// An EOF fragment plus a failed replay length reset share one flag: the next successful append
+    /// inserts exactly one <c>\n</c> (no blank line).
     /// </summary>
     [Fact(Timeout = 30000)]
     public async Task ProbeAndReplayFlag_InsertExactlyOneLf()
     {
         await Task.CompletedTask;
         var directory = NewDirectory();
+        var previous = LogFileRegistry.OpenFactory;
+        var previousError = Console.Error;
+        var errors = new StringWriter();
+        Console.SetError(errors);
+        var fault = new PartialReplay();
         try
         {
             var path = Path.Combine(directory, "both.log");
-            File.WriteAllBytes(path, Encoding.UTF8.GetBytes("frag-from-disk"));
+            var fragment = Encoding.UTF8.GetBytes("frag-from-disk");
+            File.WriteAllBytes(path, fragment);
+            LogFileRegistry.OpenFactory = (p, mode, access, share) =>
+                new PartialReplayStream(p, mode, access, share, fault);
+
             using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
             var shared = SharedOf(writer);
-            // Probe already set the shared flag; setting it again must not double the separator.
-            SetNeedsLineSeparator(shared, 1);
-            writer.Write(Event("only-once"));
-            writer.Flush();
-            var text = File.ReadAllText(path);
-            Assert.Contains("frag-from-disk\n", text, StringComparison.Ordinal);
-            Assert.DoesNotContain("frag-from-disk\n\n", text, StringComparison.Ordinal);
-            Assert.Equal(1, CountBetween(text, "frag-from-disk", "only-once", '\n'));
+            var line = Encoding.UTF8.GetBytes(new PlainTextFormatter().Format(Event("only-once")) + "\n");
+            fault.Arm(failReset: true);
+            var threw = false;
+            try
+            {
+                shared.AppendReplay(line, maxBytes: null);
+            }
+            catch (IOException)
+            {
+                threw = true;
+            }
+
+            Assert.True(threw);
+            var half = Volatile.Read(ref fault.Fragment);
+            Assert.True(half.Length > 0);
+            Assert.DoesNotContain("\n", half, StringComparison.Ordinal);
+            Assert.Equal(1, NeedsLineSeparator(shared));
+
+            var afterPartial = ReadSharedBytes(path);
+            // Probe separator was written inside the failed WriteThrough and could not be rolled back.
+            Assert.True(afterPartial.AsSpan(0, fragment.Length).SequenceEqual(fragment));
+            Assert.Equal((byte)'\n', afterPartial[fragment.Length]);
+            var halfBytes = Encoding.UTF8.GetBytes(half);
+            Assert.True(
+                afterPartial.AsSpan(fragment.Length + 1, halfBytes.Length).SequenceEqual(halfBytes));
+            Assert.False(HasDoubleLf(afterPartial));
+
+            shared.AppendReplay(line, maxBytes: null);
+            var after = ReadSharedBytes(path);
+            Assert.False(HasDoubleLf(after));
+            Assert.Equal(0, NeedsLineSeparator(shared));
+
+            // Exactly one \n between the stuck half-line and the successful line start.
+            var halfAt = IndexOfSequence(after, halfBytes);
+            Assert.True(halfAt >= 0);
+            var afterHalf = halfAt + halfBytes.Length;
+            Assert.Equal((byte)'\n', after[afterHalf]);
+            Assert.Equal((byte)'[', after[afterHalf + 1]);
+            Assert.Contains("only-once", Encoding.UTF8.GetString(after), StringComparison.Ordinal);
         }
         finally
         {
+            Console.SetError(previousError);
+            LogFileRegistry.OpenFactory = previous;
             DeleteDirectory(directory);
         }
     }
@@ -301,6 +359,7 @@ public sealed class EofFragmentMergeTests
             var path = Path.Combine(directory, "probe.log");
             var orphan = Encoding.UTF8.GetBytes("orphan-fragment");
             File.WriteAllBytes(path, orphan);
+            var probesBefore = LogFileRegistry.EofProbeCount;
             // Probe uses a direct FileStream on _path. Move the path after append opens so that read fails
             // while the write handle (unlinked inode) stays usable. A positive flush interval avoids
             // Reconcile treating the missing path as a reopen on this first write.
@@ -314,19 +373,30 @@ public sealed class EofFragmentMergeTests
 
             // Message longer than the configured buffer so the line is written despite a positive flush interval.
             var message = "after-probe-fail-" + new string('x', 5000);
+            byte[] bytes;
             using (var writer = new FileLogWriter(
                        path,
                        fileBufferSize: 4096,
                        fileFlushInterval: TimeSpan.FromSeconds(60)))
             {
                 writer.Write(Event(message));
+                Assert.Equal(probesBefore, LogFileRegistry.EofProbeCount);
+                Assert.Equal(0, NeedsLineSeparator(SharedOf(writer)));
                 var stream = GetStream(SharedOf(writer));
                 Assert.NotNull(stream);
                 Assert.True(stream!.Length > orphan.Length);
                 Assert.True(stream.Length >= orphan.Length + message.Length);
+
+                // Read via the moved path while the write handle still owns the inode.
+                bytes = ReadSharedBytes(path + ".moved");
             }
 
+            // Probe open failed (path moved), so the flag stayed clear and the next line is glued.
+            Assert.True(bytes.Length > orphan.Length);
+            Assert.True(bytes.AsSpan(0, orphan.Length).SequenceEqual(orphan));
+            Assert.Equal((byte)'[', bytes[orphan.Length]);
             Assert.DoesNotContain("Write failed", errors.ToString(), StringComparison.Ordinal);
+            Assert.Equal(probesBefore, LogFileRegistry.EofProbeCount);
         }
         finally
         {
@@ -393,12 +463,12 @@ public sealed class EofFragmentMergeTests
         return Assert.IsType<SharedLogFile>(field!.GetValue(writer));
     }
 
-    /// <summary>Sets the shared needs-separator flag used by the open probe and replay recovery.</summary>
-    private static void SetNeedsLineSeparator(SharedLogFile shared, int value)
+    /// <summary>Reads the shared <c>_needsLineSeparator</c> flag.</summary>
+    private static int NeedsLineSeparator(SharedLogFile shared)
     {
         var field = typeof(SharedLogFile).GetField("_needsLineSeparator", BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.NotNull(field);
-        field!.SetValue(shared, value);
+        return Assert.IsType<int>(field!.GetValue(shared));
     }
 
     /// <summary>The live stream field, when present.</summary>
@@ -407,6 +477,38 @@ public sealed class EofFragmentMergeTests
         var field = typeof(SharedLogFile).GetField("_stream", BindingFlags.Instance | BindingFlags.NonPublic);
         Assert.NotNull(field);
         return field!.GetValue(shared) as FileStream;
+    }
+
+    /// <summary>Reads the file while another handle may still hold it.</summary>
+    private static byte[] ReadSharedBytes(string path)
+    {
+        using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete,
+            bufferSize: 1,
+            FileOptions.None);
+        var bytes = new byte[stream.Length];
+        var read = stream.Read(bytes);
+        Assert.Equal(bytes.Length, read);
+        return bytes;
+    }
+
+    /// <summary>Index of <paramref name="needle"/> in <paramref name="haystack"/>, or -1.</summary>
+    private static int IndexOfSequence(byte[] haystack, byte[] needle)
+    {
+        if (needle.Length == 0 || haystack.Length < needle.Length)
+            return -1;
+
+        var last = haystack.Length - needle.Length;
+        for (var i = 0; i <= last; i++)
+        {
+            if (haystack.AsSpan(i, needle.Length).SequenceEqual(needle))
+                return i;
+        }
+
+        return -1;
     }
 
     /// <summary>Creates an empty directory that belongs to this test.</summary>
@@ -427,6 +529,118 @@ public sealed class EofFragmentMergeTests
         }
         catch (IOException)
         {
+        }
+    }
+
+    /// <summary>One partial replay write, and whether the following length reset throws.</summary>
+    private sealed class PartialReplay
+    {
+        internal int Active;
+        internal int ThrowsLeft;
+        internal int FailReset;
+        internal string Fragment = string.Empty;
+
+        /// <summary>Throws on the next multi-byte write, after half of that write has been stored.</summary>
+        /// <param name="failReset">True when <see cref="FileStream.SetLength(long)"/> must throw.</param>
+        /// <remarks>Does not throw. The reset flag and the budget are stored before the armed flag.</remarks>
+        internal void Arm(bool failReset)
+        {
+            Volatile.Write(ref FailReset, failReset ? 1 : 0);
+            Volatile.Write(ref ThrowsLeft, 1);
+            Volatile.Write(ref Active, 1);
+        }
+
+        /// <summary>Stores the bytes that were written before the throw.</summary>
+        /// <param name="buffer">The write buffer. Not null.</param>
+        /// <param name="offset">Start of the written half.</param>
+        /// <param name="count">How many bytes were written.</param>
+        /// <remarks>Does not throw. The copy is bounded by <paramref name="count"/>.</remarks>
+        internal void Remember(byte[] buffer, int offset, int count)
+        {
+            var copy = new byte[count];
+            Buffer.BlockCopy(buffer, offset, copy, 0, count);
+            Volatile.Write(ref Fragment, Encoding.UTF8.GetString(copy));
+        }
+    }
+
+    /// <summary>A file stream that writes half of one armed replay line and then throws.</summary>
+    private sealed class PartialReplayStream : FileStream
+    {
+        private readonly PartialReplay _fault;
+
+        /// <summary>Opens <paramref name="path"/> with no internal buffer.</summary>
+        /// <param name="path">The real file. Not null.</param>
+        /// <param name="mode">Passed to <see cref="FileStream"/>.</param>
+        /// <param name="access">Passed to <see cref="FileStream"/>.</param>
+        /// <param name="share">Passed to <see cref="FileStream"/>.</param>
+        /// <param name="fault">The shared fault. Not null.</param>
+        /// <remarks>May throw the base constructor's I/O exception. Does not throw the replay fault.</remarks>
+        internal PartialReplayStream(string path, FileMode mode, FileAccess access, FileShare share, PartialReplay fault)
+            : base(path, mode, access, share, 1, FileOptions.None)
+        {
+            _fault = fault;
+        }
+
+        /// <summary>Writes half of an armed multi-byte buffer and throws. Single-byte writes always succeed.</summary>
+        /// <param name="buffer">The bytes. Not null.</param>
+        /// <param name="offset">Start in <paramref name="buffer"/>.</param>
+        /// <param name="count">How many bytes.</param>
+        /// <exception cref="IOException">This is the armed partial write.</exception>
+        /// <remarks>
+        /// Count 1 is the separator <c>\n</c> from <c>WriteByte</c>; it must not consume the throw budget.
+        /// Half is <paramref name="count"/> divided by two. The base write is the array method.
+        /// </remarks>
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+            WriteFaultable(buffer, offset, count);
+        }
+
+        /// <summary>Span writes use the same partial-fault path as the array overload.</summary>
+        /// <param name="buffer">The bytes to write.</param>
+        /// <exception cref="IOException">This is the armed partial write.</exception>
+        /// <remarks>Copies to an array so the fault logic stays in one place.</remarks>
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            var copy = buffer.ToArray();
+            WriteFaultable(copy, 0, copy.Length);
+        }
+
+        /// <summary>Shared write body for array and span overloads.</summary>
+        /// <param name="buffer">The bytes. Not null.</param>
+        /// <param name="offset">Start in <paramref name="buffer"/>.</param>
+        /// <param name="count">How many bytes.</param>
+        /// <exception cref="IOException">This is the armed partial write.</exception>
+        /// <remarks>Does not recurse into the span overload. Count 1 always succeeds.</remarks>
+        private void WriteFaultable(byte[] buffer, int offset, int count)
+        {
+            if (count > 1
+                && Volatile.Read(ref _fault.Active) != 0
+                && Interlocked.Decrement(ref _fault.ThrowsLeft) >= 0)
+            {
+                var take = count / 2;
+                if (take > 0)
+                {
+                    base.Write(buffer, offset, take);
+                    base.Flush();
+                }
+
+                _fault.Remember(buffer, offset, take);
+                throw new IOException("partial replay");
+            }
+
+            base.Write(buffer, offset, count);
+        }
+
+        /// <summary>Throws when the fault wants the reset to fail. Otherwise truncates.</summary>
+        /// <param name="value">The length to keep.</param>
+        /// <exception cref="IOException">The fault was armed with a failing reset.</exception>
+        /// <remarks>The replay path calls this after a partial write. A throw leaves the half line in the file.</remarks>
+        public override void SetLength(long value)
+        {
+            if (Volatile.Read(ref _fault.FailReset) != 0)
+                throw new IOException("reset failed");
+
+            base.SetLength(value);
         }
     }
 }

@@ -55,7 +55,7 @@ public sealed class PlainTextFastStampParityTests
     {
         await Task.CompletedTask;
         using var scope = new CultureScope(cultureName);
-        Assert.True(ProbeAllowsFastStamp(scope.Culture), ProbeReport(scope.Culture));
+        Assert.True(PlainTextFormatter.AllowsFastStamp(scope.Culture), ProbeReport(scope.Culture));
         AssertParityTaken(new PlainTextFormatter(), SampleEvents());
         AssertParityTaken(new PlainTextFormatter(false), SampleEvents());
         AssertParityTaken(new PlainTextFormatter(LocalSecondsPattern), SampleEvents());
@@ -70,7 +70,7 @@ public sealed class PlainTextFastStampParityTests
     {
         await Task.CompletedTask;
         using var scope = new CultureScope(cultureName);
-        Assert.True(ProbeAllowsFastStamp(scope.Culture), ProbeReport(scope.Culture));
+        Assert.True(PlainTextFormatter.AllowsFastStamp(scope.Culture), ProbeReport(scope.Culture));
         AssertParityTaken(new PlainTextFormatter(UtcMillisPattern), SampleEvents());
     }
 
@@ -83,7 +83,7 @@ public sealed class PlainTextFastStampParityTests
     {
         await Task.CompletedTask;
         using var scope = new CultureScope(cultureName);
-        var allowed = ProbeAllowsFastStamp(scope.Culture);
+        var allowed = PlainTextFormatter.AllowsFastStamp(scope.Culture);
         System.Console.WriteLine("PROBE " + ProbeReport(scope.Culture) + " allowed=" + allowed);
         AssertConditional(new PlainTextFormatter(), SampleEvents(), allowed);
     }
@@ -97,7 +97,7 @@ public sealed class PlainTextFastStampParityTests
     {
         await Task.CompletedTask;
         using var scope = new CultureScope(cultureName);
-        var allowed = ProbeAllowsFastStamp(scope.Culture);
+        var allowed = PlainTextFormatter.AllowsFastStamp(scope.Culture);
         System.Console.WriteLine("PROBE " + ProbeReport(scope.Culture) + " allowed=" + allowed);
         AssertConditional(new PlainTextFormatter(UtcMillisPattern), SampleEvents(), allowed);
     }
@@ -112,7 +112,7 @@ public sealed class PlainTextFastStampParityTests
         var culture = (CultureInfo)CultureInfo.GetCultureInfo("ja-JP").Clone();
         culture.DateTimeFormat.Calendar = new JapaneseCalendar();
         using var scope = new CultureScope(culture);
-        Assert.False(ProbeAllowsFastStamp(culture), ProbeReport(culture));
+        Assert.False(PlainTextFormatter.AllowsFastStamp(culture), ProbeReport(culture));
         AssertParityNotTaken(new PlainTextFormatter(), SampleEvents()[0]);
         AssertParityNotTaken(new PlainTextFormatter(UtcMillisPattern), SampleEvents()[0]);
         AssertFileMatchesFormat(new PlainTextFormatter(), SampleEvents()[0]);
@@ -128,7 +128,7 @@ public sealed class PlainTextFastStampParityTests
         var culture = (CultureInfo)CultureInfo.GetCultureInfo("ar-SA").Clone();
         culture.DateTimeFormat.Calendar = new HijriCalendar();
         using var scope = new CultureScope(culture);
-        Assert.False(ProbeAllowsFastStamp(culture), ProbeReport(culture));
+        Assert.False(PlainTextFormatter.AllowsFastStamp(culture), ProbeReport(culture));
         AssertParityNotTaken(new PlainTextFormatter(), SampleEvents()[0]);
         AssertParityNotTaken(new PlainTextFormatter(UtcMillisPattern), SampleEvents()[0]);
         AssertFileMatchesFormat(new PlainTextFormatter(), SampleEvents()[0]);
@@ -144,8 +144,23 @@ public sealed class PlainTextFastStampParityTests
         var culture = (CultureInfo)CultureInfo.GetCultureInfo("ar-SA").Clone();
         culture.DateTimeFormat.Calendar = new UmAlQuraCalendar();
         using var scope = new CultureScope(culture);
-        Assert.False(ProbeAllowsFastStamp(culture), ProbeReport(culture));
+        Assert.False(PlainTextFormatter.AllowsFastStamp(culture), ProbeReport(culture));
         AssertParityNotTaken(new PlainTextFormatter(), SampleEvents()[0]);
+        AssertFileMatchesFormat(new PlainTextFormatter(), SampleEvents()[0]);
+    }
+
+    /// <summary>
+    /// th-TH defaults to ThaiBuddhistCalendar, so the fast stamp stays off and file bytes match Format.
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ThThThaiBuddhistCalendar_AllowsStampIsFalse()
+    {
+        await Task.CompletedTask;
+        using var scope = new CultureScope("th-TH");
+        Assert.IsType<ThaiBuddhistCalendar>(scope.Culture.DateTimeFormat.Calendar);
+        Assert.False(PlainTextFormatter.AllowsFastStamp(scope.Culture), ProbeReport(scope.Culture));
+        AssertParityNotTaken(new PlainTextFormatter(), SampleEvents()[0]);
+        AssertParityNotTaken(new PlainTextFormatter(UtcMillisPattern), SampleEvents()[0]);
         AssertFileMatchesFormat(new PlainTextFormatter(), SampleEvents()[0]);
     }
 
@@ -189,12 +204,6 @@ public sealed class PlainTextFastStampParityTests
             Event(new DateTime(2026, 9, 8, 7, 6, 5, DateTimeKind.Utc), null, "single-digits", null),
         ];
     }
-
-    /// <summary>True when the same rules as <c>AllowsFastStamp</c> pass for <paramref name="culture"/>.</summary>
-    private static bool ProbeAllowsFastStamp(CultureInfo culture)
-        => culture.DateTimeFormat.Calendar is GregorianCalendar
-            && culture.DateTimeFormat.TimeSeparator == ":"
-            && culture.NumberFormat.NegativeSign == "-";
 
     /// <summary>One-line probe report for diagnostics.</summary>
     private static string ProbeReport(CultureInfo culture)
@@ -289,6 +298,7 @@ public sealed class PlainTextFastStampParityTests
         private readonly CultureInfo _previous;
 
         /// <summary>Activates a named culture, or invariant when the name is empty.</summary>
+        /// <param name="cultureName">Culture name, or empty for invariant.</param>
         public CultureScope(string cultureName)
         {
             _previous = CultureInfo.CurrentCulture;
@@ -299,6 +309,7 @@ public sealed class PlainTextFastStampParityTests
         }
 
         /// <summary>Activates an already-built culture instance.</summary>
+        /// <param name="culture">Culture to install. Not null.</param>
         public CultureScope(CultureInfo culture)
         {
             _previous = CultureInfo.CurrentCulture;
