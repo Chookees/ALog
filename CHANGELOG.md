@@ -2,16 +2,16 @@
 
 ## Unreleased
 
-### Security
-
-- SDK pin raised to 10.0.403 (runtime 10.0.14) for CVE-2026-111497.
-
 - Fixed: when a log file ends without a line ending (for example after a crash), the next writer starts a new line instead of appending to the leftover fragment.
 - Changed: logging through the background queue is faster. Adding an event usually no longer takes a lock.
 - Changed: each logger with a background queue now uses one dedicated thread.
 - Changed: FileLogWriter writes simple events from PlainTextFormatter and JsonFormatter through a faster path. The written text stays the same.
 - Added: on Windows, `File.ReadAllText` can read the log file while the logger is running: after `Flush`, when the flush interval passes with no new lines (not with `FileFlushInterval` 0), and after dispose. While lines are being written, the write handle stays open, also with `FileFlushInterval` 0. To read the file at any time, open it with `FileShare.ReadWrite`.
 - Changed: message templates are cached, up to 1024 entries.
+
+### Security
+
+- SDK pin raised to 10.0.403 (runtime 10.0.14) for CVE-2026-111497.
 
 ## 0.2.1
 
