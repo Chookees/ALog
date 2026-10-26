@@ -182,10 +182,10 @@ Log.Shutdown();
 Step 1 and Step 2 together are a complete program: the `ALog.QuickstartSample` project in [`DemoApp/Quickstart`](https://github.com/Chookees/ALog/tree/master/DemoApp/Quickstart). Running it prints this to the console:
 
 ```
-[22:34:24] [Info] Application started
-[22:34:24] [Info] User 42 logged in | props: UserId=42 | ctx: feature=Login, userId=42
-[22:34:24] [Error] Payment failed | InvalidOperationException: Card declined | at Program.Main in Program.cs:33 | ctx: feature=Checkout, orderId=17
-[22:34:24] [Info] Async log message
+[22:48:09] [Info] Application started
+[22:48:09] [Info] User 42 logged in | props: UserId=42 | ctx: feature=Login, userId=42
+[22:48:09] [Error] Payment failed | InvalidOperationException: Card declined | at Program.Main in Program.cs:33 | ctx: feature=Checkout, orderId=17
+[22:48:09] [Info] Async log message
 ```
 
 ![Console output of the Quick Start sample from Step 1 and Step 2](https://raw.githubusercontent.com/Chookees/ALog/master/docs/images/quickstart-console.png)
@@ -193,10 +193,10 @@ Step 1 and Step 2 together are a complete program: the `ALog.QuickstartSample` p
 `logs/app.log` of the same run (`JsonFormatter(pretty: false)`, NDJSON):
 
 ```
-{"timestamp":"2026-10-26T22:34:24.0952420Z","level":"Info","message":"Application started","properties":{},"context":{}}
-{"timestamp":"2026-10-26T22:34:24.1344050Z","level":"Info","message":"User 42 logged in","messageTemplate":"User {UserId} logged in","properties":{"UserId":42},"context":{"feature":"Login","userId":42}}
-{"timestamp":"2026-10-26T22:34:24.1357663Z","level":"Error","message":"Payment failed","exception":{"type":"System.InvalidOperationException","message":"Card declined","stackTrace":"   at Program.\u003CMain\u003E$(String[] args) in /_/Program.cs:line 33","source":{"method":"Program.Main","file":"Program.cs","line":33}},"properties":{},"context":{"feature":"Checkout","orderId":17}}
-{"timestamp":"2026-10-26T22:34:24.1822718Z","level":"Info","message":"Async log message","properties":{},"context":{}}
+{"timestamp":"2026-10-26T22:48:09.3570731Z","level":"Info","message":"Application started","properties":{},"context":{}}
+{"timestamp":"2026-10-26T22:48:09.3928381Z","level":"Info","message":"User 42 logged in","messageTemplate":"User {UserId} logged in","properties":{"UserId":42},"context":{"feature":"Login","userId":42}}
+{"timestamp":"2026-10-26T22:48:09.3940362Z","level":"Error","message":"Payment failed","exception":{"type":"System.InvalidOperationException","message":"Card declined","stackTrace":"   at Program.\u003CMain\u003E$(String[] args) in /_/Program.cs:line 33","source":{"method":"Program.Main","file":"Program.cs","line":33}},"properties":{},"context":{"feature":"Checkout","orderId":17}}
+{"timestamp":"2026-10-26T22:48:09.4468376Z","level":"Info","message":"Async log message","properties":{},"context":{}}
 ```
 
 The console output and these log lines come from a real run of the sample, unedited.

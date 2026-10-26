@@ -6,7 +6,7 @@ Do **not** split in 0.2.1 — publish the current monolith (and Full/Lite zip la
 
 | Package | Contents | Dependencies |
 |---|---|---|
-| `ALog` | Core engine, queue, formatters, enrichers, console + file writers, `ALogOptions` / `LoggerConfigFactory` | Today `ALog.dll` also references `Microsoft.Data.SqlClient` 7.0 and `AWSSDK.CloudWatchLogs` / `AWSSDK.Core` 4.0 because SQL and AWS writers ship in the same assembly. After a real split: none (or only BCL). |
+| `ALog` | Core engine, queue, formatters, enrichers, console + file writers, `ALogOptions` / `LoggerConfigFactory` | Today `ALog.dll` also references `Microsoft.Data.SqlClient` (assembly version 7.0, package 7.1.1) and `AWSSDK.CloudWatchLogs` / `AWSSDK.Core` (assembly version 4.0, package `AWSSDK.CloudWatchLogs` 4.0.106) because SQL and AWS writers ship in the same assembly. After a real split: none (or only BCL). |
 | `ALog.Extensions.Logging` | MEL provider + `IConfiguration` bind (already separate) | `ALog`, `Microsoft.Extensions.*` |
 | `ALog.Sinks.Http` | `HttpLogWriter` | `ALog` |
 | `ALog.Sinks.Sql` | `SqlLogWriter` | `ALog`, `Microsoft.Data.SqlClient` |
