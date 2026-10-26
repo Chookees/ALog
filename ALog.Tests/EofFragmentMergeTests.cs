@@ -206,7 +206,8 @@ public sealed class EofFragmentMergeTests
             File.WriteAllBytes(path, Encoding.UTF8.GetBytes("seed\n"));
             using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
             writer.Write(Event("one"));
-            var afterFirstProbe = LogFileRegistry.EofProbeCount;
+            var shared = SharedOf(writer);
+            var afterFirstProbe = shared.EofProbes;
             var opensAfterFirstWrite = LogFileRegistry.OpenCount;
             writer.Flush();
             Assert.True(
@@ -222,7 +223,7 @@ public sealed class EofFragmentMergeTests
             writer.Write(Event("three"));
             writer.Flush();
             Assert.True(LogFileRegistry.OpenCount > opensAfterFlush2);
-            Assert.Equal(afterFirstProbe, LogFileRegistry.EofProbeCount);
+            Assert.Equal(afterFirstProbe, shared.EofProbes);
         }
         finally
         {
@@ -244,7 +245,8 @@ public sealed class EofFragmentMergeTests
             using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
             writer.Write(Event("seed"));
             writer.Flush();
-            var probesAfterFlush = LogFileRegistry.EofProbeCount;
+            var shared = SharedOf(writer);
+            var probesAfterFlush = shared.EofProbes;
             var lengthAfterFlush = new FileInfo(path).Length;
 
             // Extend the file while the writer holds only the read handle.
@@ -258,7 +260,7 @@ public sealed class EofFragmentMergeTests
             Assert.True(new FileInfo(path).Length > lengthAfterFlush);
             writer.Write(Event("after-external"));
             writer.Flush();
-            Assert.True(LogFileRegistry.EofProbeCount > probesAfterFlush);
+            Assert.True(shared.EofProbes > probesAfterFlush);
             var text = File.ReadAllText(path);
             Assert.Contains("external-frag\n", text, StringComparison.Ordinal);
             Assert.Contains("after-external", text, StringComparison.Ordinal);
@@ -271,11 +273,14 @@ public sealed class EofFragmentMergeTests
     }
 
     /// <summary>
-    /// An EOF fragment plus a failed replay length reset share one flag: the next successful append
-    /// inserts exactly one <c>\n</c> (no blank line).
+    /// An EOF fragment plus a replay write failure share one flag: the next successful append
+    /// inserts exactly one <c>\n</c> whether the length reset succeeds or fails.
     /// </summary>
-    [Fact(Timeout = 30000)]
-    public async Task ProbeAndReplayFlag_InsertExactlyOneLf()
+    /// <param name="failReset">True when <see cref="FileStream.SetLength(long)"/> throws after the partial write.</param>
+    [Theory(Timeout = 30000)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ProbeAndReplayFlag_InsertExactlyOneLf(bool failReset)
     {
         await Task.CompletedTask;
         var directory = NewDirectory();
@@ -295,7 +300,7 @@ public sealed class EofFragmentMergeTests
             using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.Zero);
             var shared = SharedOf(writer);
             var line = Encoding.UTF8.GetBytes(new PlainTextFormatter().Format(Event("only-once")) + "\n");
-            fault.Arm(failReset: true);
+            fault.Arm(failReset);
             var threw = false;
             try
             {
@@ -313,31 +318,80 @@ public sealed class EofFragmentMergeTests
             Assert.Equal(1, NeedsLineSeparator(shared));
 
             var afterPartial = ReadSharedBytes(path);
-            // Probe separator was written inside the failed WriteThrough and could not be rolled back.
             Assert.True(afterPartial.AsSpan(0, fragment.Length).SequenceEqual(fragment));
-            Assert.Equal((byte)'\n', afterPartial[fragment.Length]);
             var halfBytes = Encoding.UTF8.GetBytes(half);
-            Assert.True(
-                afterPartial.AsSpan(fragment.Length + 1, halfBytes.Length).SequenceEqual(halfBytes));
+            if (failReset)
+            {
+                // Separator written in the failed call could not be rolled back; half stays after it.
+                Assert.Equal((byte)'\n', afterPartial[fragment.Length]);
+                Assert.True(
+                    afterPartial.AsSpan(fragment.Length + 1, halfBytes.Length).SequenceEqual(halfBytes));
+            }
+            else
+            {
+                // Successful reset removed the separator and the half; flag was restored for the retry.
+                Assert.Equal(fragment.Length, afterPartial.Length);
+            }
+
             Assert.False(HasDoubleLf(afterPartial));
 
             shared.AppendReplay(line, maxBytes: null);
             var after = ReadSharedBytes(path);
             Assert.False(HasDoubleLf(after));
             Assert.Equal(0, NeedsLineSeparator(shared));
-
-            // Exactly one \n between the stuck half-line and the successful line start.
-            var halfAt = IndexOfSequence(after, halfBytes);
-            Assert.True(halfAt >= 0);
-            var afterHalf = halfAt + halfBytes.Length;
-            Assert.Equal((byte)'\n', after[afterHalf]);
-            Assert.Equal((byte)'[', after[afterHalf + 1]);
+            Assert.Equal((byte)'\n', after[fragment.Length]);
+            Assert.Equal((byte)'[', after[fragment.Length + 1]);
             Assert.Contains("only-once", Encoding.UTF8.GetString(after), StringComparison.Ordinal);
+            if (failReset)
+            {
+                var halfAt = IndexOfSequence(after, halfBytes);
+                Assert.True(halfAt >= 0);
+                Assert.Equal((byte)'\n', after[halfAt + halfBytes.Length]);
+                Assert.Equal((byte)'[', after[halfAt + halfBytes.Length + 1]);
+            }
         }
         finally
         {
             Console.SetError(previousError);
             LogFileRegistry.OpenFactory = previous;
+            DeleteDirectory(directory);
+        }
+    }
+
+    /// <summary>
+    /// After a shorter external recreate, buffered pending bytes are written with exactly one <c>\n</c>
+    /// after the new fragment (separator runs in <c>FlushPending</c>, not before buffering).
+    /// </summary>
+    [Fact(Timeout = 30000)]
+    public async Task ReopenKeepingPending_OntoFragment_InsertExactlyOneLf()
+    {
+        await Task.CompletedTask;
+        var directory = NewDirectory();
+        var previousError = Console.Error;
+        var errors = new StringWriter();
+        Console.SetError(errors);
+        try
+        {
+            var path = Path.Combine(directory, "pending.log");
+            var rotated = path + ".1";
+            // Long enough that the recreated fragment is shorter than the write position.
+            File.WriteAllBytes(path, Encoding.UTF8.GetBytes(new string('s', 200) + "\n"));
+            using var writer = new FileLogWriter(path, fileFlushInterval: TimeSpan.FromSeconds(60));
+            writer.Write(Event("buffered-line"));
+            File.Move(path, rotated);
+            File.WriteAllBytes(path, Encoding.UTF8.GetBytes("frag"));
+            writer.Flush();
+            var text = File.ReadAllText(path);
+            Assert.Contains("frag\n", text, StringComparison.Ordinal);
+            Assert.Contains("buffered-line", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("frag[", text, StringComparison.Ordinal);
+            Assert.False(HasDoubleLf(File.ReadAllBytes(path)));
+            Assert.Equal(1, CountBetween(text, "frag", "[", '\n'));
+            Assert.DoesNotContain("Write failed", errors.ToString(), StringComparison.Ordinal);
+        }
+        finally
+        {
+            Console.SetError(previousError);
             DeleteDirectory(directory);
         }
     }
@@ -420,7 +474,6 @@ public sealed class EofFragmentMergeTests
             var path = Path.Combine(directory, "probe.log");
             var orphan = Encoding.UTF8.GetBytes("orphan-fragment");
             File.WriteAllBytes(path, orphan);
-            var probesBefore = LogFileRegistry.EofProbeCount;
             // Probe uses a direct FileStream on _path. Move the path after append opens so that read fails
             // while the write handle (unlinked inode) stays usable. A positive flush interval avoids
             // Reconcile treating the missing path as a reopen on this first write.
@@ -441,9 +494,10 @@ public sealed class EofFragmentMergeTests
                        fileFlushInterval: TimeSpan.FromSeconds(60)))
             {
                 writer.Write(Event(message));
-                Assert.Equal(probesBefore, LogFileRegistry.EofProbeCount);
-                Assert.Equal(0, NeedsLineSeparator(SharedOf(writer)));
-                var stream = GetStream(SharedOf(writer));
+                var shared = SharedOf(writer);
+                Assert.Equal(0, shared.EofProbes);
+                Assert.Equal(0, NeedsLineSeparator(shared));
+                var stream = GetStream(shared);
                 Assert.NotNull(stream);
                 Assert.True(stream!.Length > orphan.Length);
                 Assert.True(stream.Length >= orphan.Length + message.Length);
@@ -457,7 +511,6 @@ public sealed class EofFragmentMergeTests
             Assert.True(bytes.AsSpan(0, orphan.Length).SequenceEqual(orphan));
             Assert.Equal((byte)'[', bytes[orphan.Length]);
             Assert.DoesNotContain("Write failed", errors.ToString(), StringComparison.Ordinal);
-            Assert.Equal(probesBefore, LogFileRegistry.EofProbeCount);
         }
         finally
         {
