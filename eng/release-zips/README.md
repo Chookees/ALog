@@ -1,0 +1,73 @@
+# Release zips (v0.2.1 contract)
+
+Builds the three portable/RID zip assets Artur Bobb ships for a library tag:
+`ALog-v<version>-Lite.zip`, `ALog-v<version>-Full-win-x64.zip`, and
+`ALog-v<version>-Full-linux-x64.zip`.
+
+This tree is **not** in `ALog.sln`. The throwaway publish host only exists so
+`dotnet publish -r` flattens the real SqlClient graph.
+
+## Local build
+
+From the repository root:
+
+```bash
+bash eng/build-release-zips.sh lite
+bash eng/build-release-zips.sh full linux-x64
+bash eng/build-release-zips.sh full win-x64
+# or
+bash eng/build-release-zips.sh all
+```
+
+Output defaults to `artifacts/release-zips/` (`RELEASE_ZIPS_OUT` overrides).
+`SOURCE_DATE_EPOCH` defaults to `git log -1 --format=%ct`. Two runs on the
+same commit must produce identical SHA-256 digests (`SHA256SUMS`).
+
+Smoke against an unpacked zip (or the zip itself):
+
+```bash
+bash eng/release-smoke/run-smoke.sh lite artifacts/release-zips/ALog-v0.2.1-Lite.zip
+# Full linux needs ALOG_SQL_TEST_CONNECTION (CI uses eng/start-sql.sh)
+bash eng/release-smoke/run-smoke.sh full artifacts/release-zips/ALog-v0.2.1-Full-linux-x64.zip linux-x64
+```
+
+Helper tests (no tag, no GitHub publish):
+
+```bash
+python3 eng/test_release_zips.py
+```
+
+## Allowlists
+
+Exact file lists live in `allowlists/`. The packer fails when the stage is
+missing a listed file or contains anything else. After a dependency bump that
+changes the Full publish graph, update the matching `Full-*.txt` and re-run
+`bash eng/build-release-zips.sh full <rid>`.
+
+## Checks in the builder
+
+- Package `<Version>` from both library csproj files must match.
+- `ALog.dll` / `ALog.Extensions.Logging.dll` FileVersion and InformationalVersion
+  must match that package version (InformationalVersion may carry `+git` metadata).
+- `System.Security.Cryptography.Pkcs` FileVersion must be ≥ 10.0.13.
+- Top-level `Microsoft.Data.SqlClient.dll` must be the real RID implementation
+  (size gate rejects the ~93 KiB reference stub).
+- No host exe/DLL, no `*.pdb`, no `*.deps.json` / `*.runtimeconfig.json`, no `runtimes/`.
+- Deterministic zip: sorted members, fixed timestamps, mode `0644`, deflate level 9.
+
+## Tag flow (CI)
+
+Workflow: `.github/workflows/release-zips.yml`.
+
+1. **Guard** (tag pushes only): tagged commit must be an ancestor of
+   `origin/master`, and the tag version (without `v`) must equal both package
+   `<Version>` values.
+2. **build-zips**: matrix builds Lite+linux-x64 on Ubuntu and win-x64 on Windows.
+3. **release-smoke**: matrix unpacks those artifacts, builds consumers only against
+   zip DLLs, runs Lite (incl. HTTP listener) and Full SQL checks.
+4. **publish** (tag only, after both RIDs are green): creates the GitHub release
+   with exactly the three zips. `SHA256SUMS` is inlined in the notes, not uploaded
+   as a fourth asset. If the release already exists, publish aborts (no clobber).
+
+A red run creates neither a release nor a draft. Do not push a real tag from this
+folder to test publish; use `python3 eng/test_release_zips.py` for guard/notes logic.

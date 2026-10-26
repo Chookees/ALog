@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    Lite zip smoke consumer. Not in ALog.sln.
+    References only ALog.dll from an unpacked Lite zip via HintPath (Private=true).
+    Set ZipDir to the unpacked folder that contains ALog.dll.
+  -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>LiteSmoke</AssemblyName>
+    <RootNamespace>LiteSmoke</RootNamespace>
+    <ZipDir Condition="'$(ZipDir)' == ''">..</ZipDir>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="ALog">
+      <HintPath>$(ZipDir)/ALog.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

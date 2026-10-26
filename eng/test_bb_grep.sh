@@ -235,10 +235,22 @@ else
   pass "metadata tool is outside the solution"
 fi
 
+if grep -F -q 'ReleaseZipHost' ALog.sln || grep -F -q 'LiteSmoke' ALog.sln || grep -F -q 'FullSmoke' ALog.sln || grep -F -q 'AssemblyVersions' ALog.sln; then
+  fail "release-zip host or smoke projects are in the solution"
+else
+  pass "release-zip host and smoke projects stay outside the solution"
+fi
+
 if ! grep -F -q '<IsPackable>false</IsPackable>' eng/coverage-metadata/CoverageMetadata.csproj; then
   fail "metadata tool is packable"
 else
   pass "metadata tool is not packed"
+fi
+
+if ! grep -F -q '<IsPackable>false</IsPackable>' eng/release-zips/host/ReleaseZipHost.csproj; then
+  fail "release zip host is packable"
+else
+  pass "release zip host is not packed"
 fi
 
 if ! grep -F -q '# analyzer-ratchet (BB): bestehende Befunde, nur schrumpfen' .editorconfig; then
