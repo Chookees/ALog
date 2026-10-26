@@ -30,6 +30,8 @@ dotnet add package ALog
 dotnet add package ALog.Extensions.Logging
 ```
 
+Release zips are on the [Releases](https://github.com/Chookees/ALog/releases) page: Lite (`ALog-v0.2.1-Lite.zip`) covers Console, File, and HTTP on any platform; Full is per RID (`ALog-v0.2.1-Full-win-x64.zip`, `ALog-v0.2.1-Full-linux-x64.zip`). For other platforms, or for SQL/AWS outside those RIDs, use NuGet.
+
 Source: https://github.com/Chookees/ALog · Optional future sink split: [`docs/PACKAGE_SPLIT.md`](https://github.com/Chookees/ALog/blob/master/docs/PACKAGE_SPLIT.md)
 
 ### Hello World
@@ -57,7 +59,7 @@ Turn on ALog's console in `appsettings.json`:
 { "ALog": { "Console": { "Enabled": true } } }
 ```
 
-With `AddALog`, choose one console: keep the Microsoft console provider and leave ALog's console off, or call `builder.Logging.ClearProviders()` and set `ALog:Console:Enabled` to `true` (as in `samples/ALog.AspNetSample`). With both, every line appears twice.
+With `AddALog`, choose one console: keep the Microsoft console provider and leave ALog's console off, or call `builder.Logging.ClearProviders()` and set `ALog:Console:Enabled` to `true` (as in the `ALog.AspNetSample` project in [`DemoApp/AspNet`](https://github.com/Chookees/ALog/tree/master/DemoApp/AspNet)). With both, every line appears twice.
 
 ALog reads its settings, including MinimumLevel, once at startup. Changes while the app runs have no effect; restart the app.
 
@@ -79,7 +81,7 @@ With `"Formatter": "json"` (and `JsonPretty` false), that event is one NDJSON li
 {"timestamp":"2026-10-26T21:15:55.0000000Z","level":"Info","message":"Order 17","messageTemplate":"Order {OrderId}","category":"OrdersController","properties":{"OrderId":17},"context":{}}
 ```
 
-See `samples/ALog.AspNetSample`.
+See the `ALog.AspNetSample` project in [`DemoApp/AspNet`](https://github.com/Chookees/ALog/tree/master/DemoApp/AspNet).
 
 ### Configuration
 
@@ -177,13 +179,13 @@ Log.Shutdown();
 
 ### Example output
 
-Step 1 and Step 2 together are a complete program: [`samples/ALog.QuickstartSample`](https://github.com/Chookees/ALog/tree/master/samples/ALog.QuickstartSample). Running it prints this to the console:
+Step 1 and Step 2 together are a complete program: the `ALog.QuickstartSample` project in [`DemoApp/Quickstart`](https://github.com/Chookees/ALog/tree/master/DemoApp/Quickstart). Running it prints this to the console:
 
 ```
-[21:38:51] [Info] Application started
-[21:38:51] [Info] User 42 logged in | props: UserId=42 | ctx: feature=Login, userId=42
-[21:38:51] [Error] Payment failed | InvalidOperationException: Card declined | at Program.Main in Program.cs:33 | ctx: feature=Checkout, orderId=17
-[21:38:52] [Info] Async log message
+[22:34:24] [Info] Application started
+[22:34:24] [Info] User 42 logged in | props: UserId=42 | ctx: feature=Login, userId=42
+[22:34:24] [Error] Payment failed | InvalidOperationException: Card declined | at Program.Main in Program.cs:33 | ctx: feature=Checkout, orderId=17
+[22:34:24] [Info] Async log message
 ```
 
 ![Console output of the Quick Start sample from Step 1 and Step 2](https://raw.githubusercontent.com/Chookees/ALog/master/docs/images/quickstart-console.png)
@@ -191,10 +193,10 @@ Step 1 and Step 2 together are a complete program: [`samples/ALog.QuickstartSamp
 `logs/app.log` of the same run (`JsonFormatter(pretty: false)`, NDJSON):
 
 ```
-{"timestamp":"2026-10-26T21:38:51.9431979Z","level":"Info","message":"Application started","properties":{},"context":{}}
-{"timestamp":"2026-10-26T21:38:51.9798504Z","level":"Info","message":"User 42 logged in","messageTemplate":"User {UserId} logged in","properties":{"UserId":42},"context":{"feature":"Login","userId":42}}
-{"timestamp":"2026-10-26T21:38:51.9811263Z","level":"Error","message":"Payment failed","exception":{"type":"System.InvalidOperationException","message":"Card declined","stackTrace":"   at Program.\u003CMain\u003E$(String[] args) in /_/Program.cs:line 33","source":{"method":"Program.Main","file":"Program.cs","line":33}},"properties":{},"context":{"feature":"Checkout","orderId":17}}
-{"timestamp":"2026-10-26T21:38:52.0278365Z","level":"Info","message":"Async log message","properties":{},"context":{}}
+{"timestamp":"2026-10-26T22:34:24.0952420Z","level":"Info","message":"Application started","properties":{},"context":{}}
+{"timestamp":"2026-10-26T22:34:24.1344050Z","level":"Info","message":"User 42 logged in","messageTemplate":"User {UserId} logged in","properties":{"UserId":42},"context":{"feature":"Login","userId":42}}
+{"timestamp":"2026-10-26T22:34:24.1357663Z","level":"Error","message":"Payment failed","exception":{"type":"System.InvalidOperationException","message":"Card declined","stackTrace":"   at Program.\u003CMain\u003E$(String[] args) in /_/Program.cs:line 33","source":{"method":"Program.Main","file":"Program.cs","line":33}},"properties":{},"context":{"feature":"Checkout","orderId":17}}
+{"timestamp":"2026-10-26T22:34:24.1822718Z","level":"Info","message":"Async log message","properties":{},"context":{}}
 ```
 
 The console output and these log lines come from a real run of the sample, unedited.

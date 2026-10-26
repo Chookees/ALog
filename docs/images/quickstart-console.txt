@@ -1,5 +1,5 @@
-$ dotnet run --project samples/ALog.QuickstartSample
-[21:38:51] [Info] Application started
-[21:38:51] [Info] User 42 logged in | props: UserId=42 | ctx: feature=Login, userId=42
-[21:38:51] [Error] Payment failed | InvalidOperationException: Card declined | at Program.Main in Program.cs:33 | ctx: feature=Checkout, orderId=17
-[21:38:52] [Info] Async log message
+$ dotnet run --project DemoApp/Quickstart
+[22:34:24] [Info] Application started
+[22:34:24] [Info] User 42 logged in | props: UserId=42 | ctx: feature=Login, userId=42
+[22:34:24] [Error] Payment failed | InvalidOperationException: Card declined | at Program.Main in Program.cs:33 | ctx: feature=Checkout, orderId=17
+[22:34:24] [Info] Async log message
