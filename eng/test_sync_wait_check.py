@@ -375,6 +375,30 @@ class SyncWaitCheckTests(unittest.TestCase):
             problems = CHECK.evaluate(root)
         self.assertEqual(problems, [])
 
+    def test_waitone_timespan_from_milliseconds_one_is_not_a_hit(self) -> None:
+        """_evt.WaitOne(TimeSpan.FromMilliseconds(1)) is bounded and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "_evt.WaitOne(TimeSpan.FromMilliseconds(1));\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
+    def test_waitany_timespan_from_milliseconds_one_is_not_a_hit(self) -> None:
+        """WaitAny(h, TimeSpan.FromMilliseconds(1)) is bounded and must not be flagged."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_tree(
+                root,
+                "",
+                "WaitHandle.WaitAny(h, TimeSpan.FromMilliseconds(1));\n",
+            )
+            problems = CHECK.evaluate(root)
+        self.assertEqual(problems, [])
+
     def test_waitany_finite_with_exit_context_is_not_a_hit(self) -> None:
         """WaitAny(hs, 100, false) is a bounded wait and must not be flagged."""
         with tempfile.TemporaryDirectory() as tmp:

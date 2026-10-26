@@ -36,7 +36,7 @@ SIGNAL_AND_WAIT_RE = re.compile(
 INFINITE_TIMEOUT_RE = re.compile(
     r"(?:"
     r"(?:(?:System\s*\.\s*Threading\s*\.\s*)?Timeout\s*\.\s*Infinite(?:TimeSpan)?)"
-    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-?\s*1\s*\))"
+    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-\s*1\s*\))"
     r"|(?:-\s*1)"
     r")",
 )
@@ -44,7 +44,7 @@ NAMED_INFINITE_RE = re.compile(
     r"\b(?:millisecondsTimeout|timeout)\s*:\s*"
     r"(?:"
     r"(?:(?:System\s*\.\s*Threading\s*\.\s*)?Timeout\s*\.\s*Infinite(?:TimeSpan)?)"
-    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-?\s*1\s*\))"
+    r"|(?:TimeSpan\s*\.\s*FromMilliseconds\s*\(\s*-\s*1\s*\))"
     r"|(?:-\s*1)"
     r")(?=\s*[,)])",
     re.IGNORECASE,
