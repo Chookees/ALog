@@ -132,7 +132,7 @@ using ALog.Formatters;
 
 var config = new LoggerConfig()
     .AddWriter(new ConsoleLogWriter(useColors: true, formatter: new PlainTextFormatter("HH:mm:ss")))
-    .AddWriter(new FileLogWriter("logs/app.log", new JsonFormatter(pretty: false), maxFileSizeInBytes: 1_048_576)) // 1 MB; NDJSON
+    .AddWriter(new FileLogWriter("logs/app.log", new JsonFormatter(pretty: false), maxFileSizeInBytes: 1_048_576)) // 1 MB
     .SetMinimumLevel(LogLevel.Debug);
 
 Log.Init(config);
@@ -178,30 +178,31 @@ Log.Shutdown();
 
 ### Example output
 
-A runnable program for these steps is also at [`samples/ALog.QuickstartSample`](https://github.com/Chookees/ALog/tree/master/samples/ALog.QuickstartSample). Console from Step 1 and Step 2:
+Step 1 and Step 2 together are a complete program: [`samples/ALog.QuickstartSample`](https://github.com/Chookees/ALog/tree/master/samples/ALog.QuickstartSample). Running it prints this to the console:
 
 ```
-[21:15:55] [Info] Application started
-[21:15:55] [Info] User 42 logged in | props: UserId=42 | ctx: feature=Login, userId=42
-[21:15:55] [Error] Payment failed | InvalidOperationException: Card declined | at Program.Main in Program.cs:34 | ctx: feature=Checkout, orderId=17
-[21:15:55] [Info] Async log message
+[21:38:51] [Info] Application started
+[21:38:51] [Info] User 42 logged in | props: UserId=42 | ctx: feature=Login, userId=42
+[21:38:51] [Error] Payment failed | InvalidOperationException: Card declined | at Program.Main in Program.cs:33 | ctx: feature=Checkout, orderId=17
+[21:38:52] [Info] Async log message
 ```
 
-![Console output of the Quick Start sample](https://raw.githubusercontent.com/Chookees/ALog/master/docs/images/quickstart-console.png)
+![Console output of the Quick Start sample from Step 1 and Step 2](https://raw.githubusercontent.com/Chookees/ALog/master/docs/images/quickstart-console.png)
 
-Matching `logs/app.log` lines with `JsonFormatter(pretty: false)` (NDJSON):
+`logs/app.log` of the same run (`JsonFormatter(pretty: false)`, NDJSON):
 
 ```
-{"timestamp":"2026-10-26T21:15:55.2745533Z","level":"Info","message":"Application started","properties":{},"context":{}}
-{"timestamp":"2026-10-26T21:15:55.3134055Z","level":"Info","message":"User 42 logged in","messageTemplate":"User {UserId} logged in","properties":{"UserId":42},"context":{"feature":"Login","userId":42}}
-{"timestamp":"2026-10-26T21:15:55.3147885Z","level":"Error","message":"Payment failed","exception":{"type":"System.InvalidOperationException","message":"Card declined","stackTrace":"   at Program.\u003CMain\u003E$(String[] args) in Program.cs:line 34","source":{"method":"Program.Main","file":"Program.cs","line":34}},"properties":{},"context":{"feature":"Checkout","orderId":17}}
+{"timestamp":"2026-10-26T21:38:51.9431979Z","level":"Info","message":"Application started","properties":{},"context":{}}
+{"timestamp":"2026-10-26T21:38:51.9798504Z","level":"Info","message":"User 42 logged in","messageTemplate":"User {UserId} logged in","properties":{"UserId":42},"context":{"feature":"Login","userId":42}}
+{"timestamp":"2026-10-26T21:38:51.9811263Z","level":"Error","message":"Payment failed","exception":{"type":"System.InvalidOperationException","message":"Card declined","stackTrace":"   at Program.\u003CMain\u003E$(String[] args) in /_/Program.cs:line 33","source":{"method":"Program.Main","file":"Program.cs","line":33}},"properties":{},"context":{"feature":"Checkout","orderId":17}}
+{"timestamp":"2026-10-26T21:38:52.0278365Z","level":"Info","message":"Async log message","properties":{},"context":{}}
 ```
 
 Pretty form of the template line (display only — do not write a file this way):
 
 ```json
 {
-  "timestamp": "2026-10-26T21:15:55.3134055Z",
+  "timestamp": "2026-10-26T21:38:51.9798504Z",
   "level": "Info",
   "message": "User 42 logged in",
   "messageTemplate": "User {UserId} logged in",
@@ -214,6 +215,8 @@ Pretty form of the template line (display only — do not write a file this way)
   }
 }
 ```
+
+Both come from a real run of the sample, unedited.
 
 ### Step 3: Background Queue (Optional)
 
@@ -323,6 +326,7 @@ Catalog codes (some lines include the code text; others are identified only in s
 
 ---
 
+<a id="limitations"></a>
 ## Known issues and limitations
 
 ### SQL `tableName`
@@ -349,6 +353,7 @@ Catalog codes (some lines include the code text; others are identified only in s
 - **When it happens:** Credentials or endpoints reject the request.
 - **Workaround:** Fix credentials/endpoints; watch stderr / SelfLog.
 
+<a id="observations-during-testing"></a>
 ### Silent loss: flush I/O failure (ENOSPC / EIO)
 
 - **Symptom:** Buffered lines of a failed flush are gone; stderr gets one message per failed flush; those events still count as written.
@@ -426,6 +431,7 @@ If you pass your own `HttpClient` to `HttpLogWriter` or `AzureLogWriter`, its ha
 
 Namespace: `ALog.Formatters`. Config-level `SetFormatter` applies only to writers that do not already have a formatter (single format pass).
 
+<a id="console-output"></a>
 ### Console and plain-text line shape
 
 ALog writes to the console only when `ALog:Console:Enabled` is `true` (or you add `ConsoleLogWriter` in code). An exception shares that line. The form is `Type: Message`, then inner exceptions, then the source frame. Types in `System.*` use the short name; every other type keeps its namespace. A thrown exception names the application frame:
