@@ -89,8 +89,8 @@ PY
 }
 
 # Build release notes from CHANGELOG + asset table + SHA256SUMS text.
-# Args: repo, version, paths to the three zips, optional SHA256SUMS path.
-# Writes notes to the path printed on stdout.
+# Args: repo, version, three zip paths, optional SHA256SUMS path, notes out path.
+# Writes the notes file in place (caller owns mktemp / NOTES_FILE / cleanup).
 write_notes() {
   local repo="$1"
   local version="$2"
@@ -98,8 +98,7 @@ write_notes() {
   local win="$4"
   local linux="$5"
   local sums="${6:-}"
-  local notes
-  notes=$(mktemp)
+  local notes="$7"
   python3 - "$repo" "$version" "$lite" "$win" "$linux" "$sums" "$notes" <<'PY'
 import hashlib
 import sys
@@ -139,7 +138,6 @@ notes_path.write_text(
     encoding="utf-8",
     newline="\n",
 )
-print(notes_path)
 PY
 }
 
@@ -182,20 +180,40 @@ delete_owned_draft() {
   gh release delete "$tag" --yes
 }
 
+# Trim CR and leading/trailing whitespace from one isDraft token.
+# Args: raw stdout text. Prints the trimmed token with no trailing newline logic
+# beyond printf %s.
+trim_is_draft_token() {
+  local out="$1"
+  out="${out//$'\r'/}"
+  out="${out#"${out%%[![:space:]]*}"}"
+  out="${out%"${out##*[![:space:]]}"}"
+  printf '%s' "$out"
+}
+
 # Read isDraft for a tag via gh. Prints exactly true or false on success.
 # Args: bare tag name.
-# Returns: 0 when stdout is true or false; non-zero on gh failure or unexpected output.
-# Keeps errexit off across non-zero returns so callers with ``set +e`` can read $?.
+# Returns: 0 when trimmed stdout is exactly true or false; non-zero on gh
+# failure or unexpected stdout. stderr is logged separately and never mixed
+# into the parsed value. Keeps errexit off across non-zero returns.
 query_release_is_draft() {
   local tag="$1"
   local out
   local rc
+  local err_file
+  err_file="${TMPDIR:-/tmp}/publish-isdraft-err.$$"
   set +e
-  out=$(gh release view "$tag" --json isDraft -q .isDraft 2>&1)
+  # stdout only into out; stderr to a side file then the script log.
+  out=$(gh release view "$tag" --json isDraft -q .isDraft 2>"$err_file")
   rc=$?
+  if [ -s "$err_file" ]; then
+    cat "$err_file" >&2
+  fi
+  rm -f "$err_file"
   if [ "$rc" -ne 0 ]; then
     return 1
   fi
+  out=$(trim_is_draft_token "$out")
   case "$out" in
     true|false)
       printf '%s\n' "$out"
@@ -213,6 +231,7 @@ query_release_is_draft() {
 #   2 — view failed or unexpected (could not read draft state)
 #   3 — delete failed after isDraft=true
 # Errexit stays off so a non-zero return does not abort the caller mid-case.
+# Only an exact trimmed ``true`` triggers delete; never garbage/empty/null.
 try_rollback_delete() {
   local tag="$1"
   local draft
@@ -224,16 +243,19 @@ try_rollback_delete() {
   if [ "$q_rc" -ne 0 ]; then
     return 2
   fi
+  if [ "$draft" = "true" ]; then
+    delete_owned_draft "$tag"
+    del_rc=$?
+    if [ "$del_rc" -ne 0 ]; then
+      return 3
+    fi
+    return 0
+  fi
   if [ "$draft" = "false" ]; then
     echo "publish_release: $tag is already published, rollback skipped" >&2
     return 1
   fi
-  delete_owned_draft "$tag"
-  del_rc=$?
-  if [ "$del_rc" -ne 0 ]; then
-    return 3
-  fi
-  return 0
+  return 2
 }
 
 # Roll back an owned draft after upload/edit failure.
@@ -269,6 +291,7 @@ rollback_owned_draft() {
 # TERM/INT/EXIT handler: roll back owned draft only when still a draft.
 # Args: signal name (TERM, INT, or EXIT). Uses OWNED_DRAFT / OWNED_TAG.
 # Always removes NOTES_FILE. EXIT preserves a prior non-zero exit status.
+# TERM/INT callers must ignore nested TERM/INT before invoking this function.
 on_owned_draft_trap() {
   # Capture before any other command; `local` would reset $?.
   local prev_rc=$?
@@ -320,12 +343,26 @@ on_owned_draft_trap() {
   esac
 }
 
+# TERM trap entry: ignore further TERM/INT, then roll back if needed.
+# No args.
+on_term_trap() {
+  trap '' TERM INT
+  on_owned_draft_trap TERM
+}
+
+# INT trap entry: ignore further TERM/INT, then roll back if needed.
+# No args.
+on_int_trap() {
+  trap '' TERM INT
+  on_owned_draft_trap INT
+}
+
 # Install TERM/INT/EXIT traps that roll back an owned draft (isDraft-gated).
 # No args. Exports PUBLISH_RELEASE_PID so helpers can signal this process.
 install_owned_draft_traps() {
   export PUBLISH_RELEASE_PID=$$
-  trap 'on_owned_draft_trap TERM' TERM
-  trap 'on_owned_draft_trap INT' INT
+  trap 'on_term_trap' TERM
+  trap 'on_int_trap' INT
   trap 'on_owned_draft_trap EXIT' EXIT
 }
 
@@ -444,12 +481,12 @@ main() {
     sums=$(printf '%s\n' "$sums_hits" | sed '/^$/d' | head -n 1)
   fi
 
-  local notes
-  notes=$(write_notes "$repo" "$version" "$lite" "$win" "$linux" "$sums")
-  NOTES_FILE="$notes"
-  # Notes cleanup until create_release installs draft traps (those also clean notes).
+  # Install notes cleanup BEFORE mktemp so SIGTERM during write_notes still
+  # removes the file. NOTES_FILE is set in this shell (not a $(…) subshell).
   trap 'rc=$?; cleanup_notes_file; exit "$rc"' EXIT
-  create_release "$tag_ref" "$version" "$notes" "$lite" "$win" "$linux"
+  NOTES_FILE=$(mktemp)
+  write_notes "$repo" "$version" "$lite" "$win" "$linux" "$sums" "$NOTES_FILE"
+  create_release "$tag_ref" "$version" "$NOTES_FILE" "$lite" "$win" "$linux"
 }
 
 main "$@"

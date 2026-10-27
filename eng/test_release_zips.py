@@ -10,6 +10,7 @@ Run from repo root: ``python3 eng/test_release_zips.py``.
 
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -615,22 +616,66 @@ class ReleaseZipHelperTests(unittest.TestCase):
         return artifacts
 
     @staticmethod
-    def _fake_gh_absent_view(*, draft: str | None = "true") -> str:
+    def _fake_gh_absent_view(
+        *,
+        draft: str | None = "true",
+        draft_stdout: str | None = None,
+        draft_stderr: str = "",
+        draft_rc: int | None = None,
+        second_term_during_json: bool = False,
+    ) -> str:
         """Return a bash fragment for ``gh release view`` in fake-gh scripts.
 
         Plain view reports ``release not found``. A ``--json`` isDraft query
-        prints ``draft`` (``true``/``false``) or fails when ``draft`` is None.
+        prints ``draft`` / ``draft_stdout`` (or fails when ``draft`` is None).
 
         Args:
-            draft: isDraft value to print, or None to fail the JSON view.
+            draft: Convenience isDraft token (``true``/``false``), or None to
+                fail the JSON view with stderr ``view failed``.
+            draft_stdout: Exact stdout to emit (overrides ``draft``). May include
+                spaces or CR; use with a Python printf in the fragment.
+            draft_stderr: Optional stderr text printed before stdout.
+            draft_rc: Optional exit code for the JSON view (default 0, or 1 when
+                ``draft`` is None).
+            second_term_during_json: When True, signal TERM to
+                ``PUBLISH_RELEASE_PID`` before printing the isDraft result.
 
         Returns:
             Bash ``if`` block text.
         """
-        if draft is None:
-            json_body = 'echo "view failed" >&2\n            exit 1'
-        else:
-            json_body = f'echo "{draft}"\n            exit 0'
+        if draft_stdout is None and draft is None:
+            draft_stdout = ""
+            if draft_rc is None:
+                draft_rc = 1
+            if not draft_stderr:
+                draft_stderr = "view failed"
+        elif draft_stdout is None:
+            draft_stdout = draft if draft is not None else ""
+            if draft_rc is None:
+                draft_rc = 0
+        elif draft_rc is None:
+            draft_rc = 0
+        # Encode stdout via base64 so CR/spaces survive the script text.
+        b64 = base64.b64encode(draft_stdout.encode("utf-8")).decode("ascii")
+        term_line = ""
+        if second_term_during_json:
+            term_line = (
+                'kill -TERM "${PUBLISH_RELEASE_PID:-$PPID}"\n'
+                "            sleep 0.05\n"
+            )
+        stderr_line = ""
+        if draft_stderr:
+            err_b64 = base64.b64encode(draft_stderr.encode("utf-8")).decode("ascii")
+            stderr_line = (
+                f'printf "%s\\n" "$(printf "%s" "{err_b64}" | base64 -d)" >&2\n'
+                "            "
+            )
+        json_body = (
+            f"{term_line}"
+            f"{stderr_line}"
+            f'printf "%s" "$(printf "%s" "{b64}" | base64 -d)"\n'
+            f"            exit {draft_rc}"
+        )
         return (
             'if [[ "$1" == "release" && "$2" == "view" ]]; then\n'
             '  if [[ "$*" == *"--json"* ]]; then\n'
@@ -1135,6 +1180,252 @@ class ReleaseZipHelperTests(unittest.TestCase):
             ]
             self.assertEqual(len(err_lines), 1, result.stderr)
             self.assertIn("Hello World", err_lines[0])
+
+    def _run_upload_fail_with_isdraft(
+        self,
+        *,
+        draft_stdout: str | None = None,
+        draft: str | None = "true",
+        draft_stderr: str = "",
+        draft_rc: int | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], str]:
+        """Run publish with upload failure and a custom isDraft view response.
+
+        Args:
+            draft_stdout: Exact isDraft stdout bytes as text.
+            draft: Convenience draft token when ``draft_stdout`` is omitted.
+            draft_stderr: stderr emitted by the JSON view.
+            draft_rc: Optional JSON view exit code.
+
+        Returns:
+            ``(result, gh_log_text)``.
+        """
+        view = self._fake_gh_absent_view(
+            draft=draft,
+            draft_stdout=draft_stdout,
+            draft_stderr=draft_stderr,
+            draft_rc=draft_rc,
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            artifacts = self._prepare_publish_artifacts(work)
+            log_path, env = self._install_fake_gh(
+                work,
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then\n'
+                '  echo "upload failed" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then\n'
+                "  echo DELETE_CALLED >> {log}\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n",
+            )
+            result = self._run_publish(artifacts, env)
+            return result, log_path.read_text(encoding="utf-8")
+
+    def test_publish_isdraft_true_crlf_deletes(self) -> None:
+        """Trimmed ``true\\r\\n`` from isDraft stdout still deletes the draft."""
+        result, log = self._run_upload_fail_with_isdraft(draft_stdout="true\r\n")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DELETE_CALLED", log)
+        self.assertIn("release delete v0.2.1 --yes", log)
+
+    def test_publish_isdraft_true_padded_deletes(self) -> None:
+        """Trimmed `` true `` from isDraft stdout still deletes the draft."""
+        result, log = self._run_upload_fail_with_isdraft(draft_stdout=" true ")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DELETE_CALLED", log)
+
+    def test_publish_isdraft_true_with_stderr_warning_deletes(self) -> None:
+        """stderr warnings on isDraft view do not enter the value; delete proceeds."""
+        result, log = self._run_upload_fail_with_isdraft(
+            draft="true", draft_stderr="warning: rate limit almost exceeded"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DELETE_CALLED", log)
+        self.assertIn("rate limit", result.stderr)
+
+    def test_publish_isdraft_garbage_empty_null_truex_no_delete(self) -> None:
+        """garbage/empty/null/TRUE/truex → 0 deletes and could-not-read FAILED."""
+        cases = ("garbage", "", "null", "TRUE", "truex")
+        for token in cases:
+            with self.subTest(token=repr(token)):
+                result, log = self._run_upload_fail_with_isdraft(draft_stdout=token)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn("DELETE_CALLED", log)
+                self.assertNotIn("release delete", log)
+                self.assertNotIn("rolled back", result.stderr)
+                self.assertIn(
+                    "error: rollback FAILED for v0.2.1, manual cleanup needed "
+                    "(could not read draft state)",
+                    result.stderr,
+                )
+
+    def test_publish_isdraft_view_uses_tag_and_jq_query(self) -> None:
+        """Rollback isDraft view uses the release tag and ``-q .isDraft``."""
+        result, log = self._run_upload_fail_with_isdraft(draft="true")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("release view v0.2.1 --json isDraft -q .isDraft", log)
+
+    def test_publish_edit_view_error_never_prints_rolled_back(self) -> None:
+        """Edit-failure rollback with a view error never prints ``rolled back``."""
+        view = self._fake_gh_absent_view(draft=None)
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            artifacts = self._prepare_publish_artifacts(work)
+            log_path, env = self._install_fake_gh(
+                work,
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "edit" ]]; then\n'
+                '  echo "edit failed" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then\n'
+                "  echo DELETE_CALLED >> {log}\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n",
+            )
+            result = self._run_publish(artifacts, env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("rolled back", result.stderr)
+            self.assertNotIn("DELETE_CALLED", log_path.read_text(encoding="utf-8"))
+            self.assertIn(
+                "error: rollback FAILED for v0.2.1, manual cleanup needed "
+                "(could not read draft state)",
+                result.stderr,
+            )
+
+    def test_publish_second_term_during_isdraft_still_one_delete(self) -> None:
+        """Second TERM during trap isDraft view still yields exactly one delete."""
+        view = self._fake_gh_absent_view(draft="true", second_term_during_json=True)
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            artifacts = self._prepare_publish_artifacts(work)
+            log_path, env = self._install_fake_gh(
+                work,
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then\n'
+                '  kill -TERM "${PUBLISH_RELEASE_PID:-$PPID}"\n'
+                "  sleep 30\n"
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then\n'
+                "  echo DELETE_CALLED >> {log}\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n",
+            )
+            result = self._run_publish(artifacts, env)
+            self.assertNotEqual(result.returncode, 0)
+            log = log_path.read_text(encoding="utf-8")
+            self.assertEqual(log.count("DELETE_CALLED"), 1, log)
+            self.assertEqual(log.count("release delete v0.2.1 --yes"), 1, log)
+
+    def test_publish_second_term_during_isdraft_view_error_failed(self) -> None:
+        """Second TERM during a failing isDraft view still reports rollback FAILED."""
+        view = self._fake_gh_absent_view(draft=None, second_term_during_json=True)
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            artifacts = self._prepare_publish_artifacts(work)
+            log_path, env = self._install_fake_gh(
+                work,
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then\n'
+                '  kill -TERM "${PUBLISH_RELEASE_PID:-$PPID}"\n'
+                "  sleep 30\n"
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then\n'
+                "  echo DELETE_CALLED >> {log}\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n",
+            )
+            result = self._run_publish(artifacts, env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "publish_release: error: rollback FAILED for v0.2.1, manual cleanup "
+                "needed (could not read draft state)",
+                result.stderr,
+            )
+            self.assertNotIn("DELETE_CALLED", log_path.read_text(encoding="utf-8"))
+
+    def test_publish_notes_cleanup_trap_before_write_notes(self) -> None:
+        """Source contract: notes EXIT trap is installed before mktemp/write_notes."""
+        text = PUBLISH_SCRIPT.read_text(encoding="utf-8")
+        main_idx = text.index("\nmain() {")
+        main_body = text[main_idx:]
+        trap_idx = main_body.index("trap 'rc=$?; cleanup_notes_file; exit \"$rc\"' EXIT")
+        mktemp_idx = main_body.index("NOTES_FILE=$(mktemp)")
+        write_idx = main_body.index('write_notes "$repo"')
+        self.assertLess(trap_idx, mktemp_idx, "notes cleanup trap must precede mktemp")
+        self.assertLess(mktemp_idx, write_idx, "mktemp must precede write_notes")
+        # write_notes must not create its own mktemp (caller owns NOTES_FILE).
+        wn = text[text.index("\nwrite_notes() {") : text.index("\nbare_tag()")]
+        self.assertNotIn("mktemp", wn)
+
+    def test_publish_sigterm_during_write_notes_cleans_tmpdir(self) -> None:
+        """SIGTERM during write_notes leaves TMPDIR empty (trap armed before mktemp)."""
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            tmp = work / "tmpdir"
+            tmp.mkdir()
+            artifacts = self._prepare_publish_artifacts(work)
+            bin_dir = work / "bin"
+            bin_dir.mkdir()
+            real_python = Path(sys.executable).resolve()
+            fake_py = bin_dir / "python3"
+            fake_py.write_text(
+                "#!/bin/bash\n"
+                f"REAL={str(real_python)!r}\n"
+                'last="${@: -1}"\n'
+                'if [[ -n "${TMPDIR:-}" && "$last" == "$TMPDIR"* && -f "$last" '
+                '&& ! -s "$last" ]]; then\n'
+                '  kill -TERM "$PPID"\n'
+                "  sleep 30\n"
+                "  exit 1\n"
+                "fi\n"
+                'exec "$REAL" "$@"\n',
+                encoding="utf-8",
+            )
+            fake_py.chmod(fake_py.stat().st_mode | stat.S_IXUSR)
+            log_path = work / "gh.log"
+            fake_gh = bin_dir / "gh"
+            fake_gh.write_text(
+                "#!/bin/bash\necho \"$@\" >> "
+                + str(log_path)
+                + "\nexit 99\n",
+                encoding="utf-8",
+            )
+            fake_gh.chmod(fake_gh.stat().st_mode | stat.S_IXUSR)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+            env["GITHUB_TOKEN"] = "fake-token"
+            env["TMPDIR"] = str(tmp)
+            result = self._run_publish(artifacts, env)
+            self.assertNotEqual(result.returncode, 0)
+            leftovers = [
+                p.name
+                for p in tmp.iterdir()
+                if not p.name.startswith("publish-isdraft-err.")
+            ]
+            self.assertEqual(leftovers, [], leftovers)
 
 
 def main() -> int:

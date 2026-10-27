@@ -78,9 +78,14 @@ Workflow: `.github/workflows/release-zips.yml`.
 4. **publish** (tag only, after both RIDs are green): creates a **draft** with
    `gh release create --draft --verify-tag` (no assets), uploads the three zips,
    then `gh release edit --draft=false`. `SHA256SUMS` is inlined in the notes, not
-   uploaded as a fourth asset. Upload/edit failure or TERM/INT deletes the owned
-   draft (`gh release delete --yes`, never `--cleanup-tag`). If the release already
-   exists, or the tag is missing on the remote, publish aborts (no clobber).
+   uploaded as a fourth asset. On upload/edit failure or TERM/INT, publish may
+   roll back with `gh release delete --yes` (never `--cleanup-tag`), but only
+   after confirming the release is still a draft. If the release already exists,
+   or the tag is missing on the remote, publish aborts (no clobber).
+   Before any delete, publish checks `gh release view --json isDraft` and deletes
+   only a draft. `already published, rollback skipped` means the release is live
+   and the run is red only for the log; `(could not read draft state)` means
+   nothing was deleted, check the release page by hand.
 
 A normal red run leaves no draft. A draft can remain only after SIGKILL, runner
 loss, or a signal right after create (Repo Manager checks for leftover drafts
