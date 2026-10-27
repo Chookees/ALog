@@ -1,0 +1,209 @@
+# Release zip build, smoke, and tag publish for ALog.
+# PR/push: build-zips + release-smoke only (contents: read).
+# Tag v*: guard → build-zips → release-smoke → publish (write only on publish).
+# Publish creates a draft, uploads assets, then publishes (edit --draft=false).
+# Rollback/TERM/INT delete only when gh reports isDraft=true; OWNED_DRAFT is
+# cleared immediately after a successful edit. A draft can remain only after
+# SIGKILL, runner loss, or a signal right after create. Values used inside
+# run: arrive via env:.
+
+name: Release zips
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+    branches: [ "master" ]
+    paths:
+      - "eng/release-zips/**"
+      - "eng/release-smoke/**"
+      - "eng/build-release-zips.sh"
+      - "eng/test_release_zips.py"
+      - "eng/start-sql.sh"
+      - "ALog/**"
+      - "ALog.Extensions.Logging/**"
+      - "CHANGELOG.md"
+      - "README.md"
+      - "global.json"
+      - "Directory.Build.props"
+      - ".github/workflows/release-zips.yml"
+  push:
+    branches: [ "master" ]
+    tags: [ "v*" ]
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Tag release guard
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TAG_REF: ${{ github.ref }}
+          TAG_SHA: ${{ github.sha }}
+        run: bash eng/release-zips/guard_tag.sh "$TAG_REF" "$TAG_SHA"
+
+      - name: Non-tag guard skip
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          echo "guard: not a version tag; build and smoke only"
+
+  build-zips:
+    needs: [guard]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+          - os: windows-latest
+            target: win
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Assert SDK version
+        shell: bash
+        run: |
+          version=$(dotnet --version)
+          echo "dotnet --version ${version}"
+          test "$version" = "10.0.403"
+
+      - name: Helper tests
+        if: matrix.target == 'linux'
+        shell: bash
+        run: python3 eng/test_release_zips.py
+
+      - name: Build Lite and Full-linux-x64
+        if: matrix.target == 'linux'
+        shell: bash
+        env:
+          RELEASE_ZIPS_OUT: ${{ runner.temp }}/release-zips
+        run: |
+          bash eng/build-release-zips.sh lite
+          bash eng/build-release-zips.sh full linux-x64
+
+      - name: Build Full-win-x64
+        if: matrix.target == 'win'
+        shell: bash
+        env:
+          RELEASE_ZIPS_OUT: ${{ runner.temp }}/release-zips
+        run: bash eng/build-release-zips.sh full win-x64
+
+      - name: Upload zip artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-zips-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/release-zips/*.zip
+            ${{ runner.temp }}/release-zips/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  release-smoke:
+    needs: [build-zips]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+            rid: linux-x64
+          - os: windows-latest
+            target: win
+            rid: win-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      ALOG_SQL_IMAGE: mcr.microsoft.com/mssql/server@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: global.json
+
+      - name: Assert SDK version
+        shell: bash
+        run: |
+          version=$(dotnet --version)
+          echo "dotnet --version ${version}"
+          test "$version" = "10.0.403"
+
+      - name: Download zip artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/zip-artifacts
+
+      - name: Start SQL Server
+        if: matrix.target == 'linux'
+        shell: bash
+        run: bash eng/start-sql.sh "$ALOG_SQL_IMAGE"
+
+      - name: Smoke Lite and Full-linux-x64
+        if: matrix.target == 'linux'
+        shell: bash
+        env:
+          ZIP_ARTIFACTS: ${{ runner.temp }}/zip-artifacts
+        run: |
+          set -euo pipefail
+          lite=$(find "$ZIP_ARTIFACTS" -name 'ALog-v*-Lite.zip' -print)
+          full=$(find "$ZIP_ARTIFACTS" -name 'ALog-v*-Full-linux-x64.zip' -print)
+          test -n "$lite"
+          test -n "$full"
+          bash eng/release-smoke/run-smoke.sh lite "$lite"
+          bash eng/release-smoke/run-smoke.sh full "$full" linux-x64
+
+      - name: Smoke Full-win-x64
+        if: matrix.target == 'win'
+        shell: bash
+        env:
+          ZIP_ARTIFACTS: ${{ runner.temp }}/zip-artifacts
+        run: |
+          set -euo pipefail
+          full=$(find "$ZIP_ARTIFACTS" -name 'ALog-v*-Full-win-x64.zip' -print)
+          test -n "$full"
+          bash eng/release-smoke/run-smoke.sh full "$full" win-x64
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [release-smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download zip artifacts from this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: ${{ runner.temp }}/publish-artifacts
+
+      - name: Publish GitHub release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TAG_REF: ${{ github.ref }}
+          PUBLISH_ARTIFACTS: ${{ runner.temp }}/publish-artifacts
+        run: bash eng/release-zips/publish_release.sh "$TAG_REF" "$PUBLISH_ARTIFACTS"

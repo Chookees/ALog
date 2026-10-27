@@ -78,22 +78,27 @@ require_absent "saved SQL password" "$password"
 require_absent "moving SQL tag" "$moving_tag"
 require_absent "SQL password assignment" "$secret_assignment"
 
+release_zips_workflow=".github/workflows/release-zips.yml"
 pin_files=$(matching_files "$marker" | LC_ALL=C sort)
-expected=$(printf '%s\n%s\n' "./${workflow}" "./${sql_test}" | LC_ALL=C sort)
+expected=$(printf '%s\n%s\n%s\n' "./${workflow}" "./${release_zips_workflow}" "./${sql_test}" | LC_ALL=C sort)
 if [ "$pin_files" != "$expected" ]; then
   echo "FAIL digest marker files:" >&2
   printf '%s\n' "$pin_files" >&2
   failures=$((failures + 1))
 else
-  pass "digest marker only in the two pin files"
+  pass "digest marker only in the three pin files"
 fi
 require_once "workflow digest" "$workflow" "$marker"
+require_once "release-zips digest" "$release_zips_workflow" "$marker"
 require_once "test digest" "$sql_test" "$marker"
 
 workflow_digest=$(grep -o -E 'sha256:[0-9a-f]{64}' "$workflow")
+release_zips_digest=$(grep -o -E 'sha256:[0-9a-f]{64}' "$release_zips_workflow")
 test_digest=$(grep -o -E 'sha256:[0-9a-f]{64}' "$sql_test")
 if [ "$workflow_digest" != "$test_digest" ] || [ -z "$workflow_digest" ]; then
   fail "workflow and test digests differ"
+elif [ "$workflow_digest" != "$release_zips_digest" ]; then
+  fail "release-zips workflow digest differs from dotnet.yml"
 else
   pass "workflow and test digests match"
 fi
