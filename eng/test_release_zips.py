@@ -325,8 +325,12 @@ class ReleaseZipHelperTests(unittest.TestCase):
             self.assertIn("Newtonsoft.Json.dll", str(ctx.exception))
             self.assertIn("extra:", str(ctx.exception))
 
-    def test_rid_hash_rejects_wrong_nuget_source(self) -> None:
-        """Published SqlClient matching only the stub lib/ asset fails RID hash check."""
+    def _ensure_sqlclient_nuget_assets(self) -> Path:
+        """Restore the release-zip host so SqlClient NuGet assets exist for hash tests.
+
+        Returns:
+            The NuGet packages root used by ``release_lib``.
+        """
         nuget = self.lib.default_nuget_packages_root()
         stub = (
             nuget
@@ -336,8 +340,45 @@ class ReleaseZipHelperTests(unittest.TestCase):
             / "net9.0"
             / "Microsoft.Data.SqlClient.dll"
         )
-        if not stub.is_file():
-            self.skipTest(f"SqlClient stub missing in NuGet cache: {stub}")
+        unix = (
+            nuget
+            / "microsoft.data.sqlclient"
+            / "7.1.1"
+            / "runtimes"
+            / "unix"
+            / "lib"
+            / "net9.0"
+            / "Microsoft.Data.SqlClient.dll"
+        )
+        if stub.is_file() and unix.is_file():
+            return nuget
+        host = ROOT / "eng" / "release-zips" / "host" / "ReleaseZipHost.csproj"
+        result = subprocess.run(
+            ["dotnet", "restore", str(host), "--nologo", "-v", "q"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            "dotnet restore host failed:\n" + result.stdout + result.stderr,
+        )
+        self.assertTrue(stub.is_file(), f"SqlClient stub still missing after restore: {stub}")
+        self.assertTrue(unix.is_file(), f"unix SqlClient still missing after restore: {unix}")
+        return nuget
+
+    def test_rid_hash_rejects_wrong_nuget_source(self) -> None:
+        """Published SqlClient matching only the stub lib/ asset fails RID hash check."""
+        nuget = self._ensure_sqlclient_nuget_assets()
+        stub = (
+            nuget
+            / "microsoft.data.sqlclient"
+            / "7.1.1"
+            / "lib"
+            / "net9.0"
+            / "Microsoft.Data.SqlClient.dll"
+        )
         with tempfile.TemporaryDirectory() as raw:
             publish = Path(raw)
             shutil.copy2(stub, publish / "Microsoft.Data.SqlClient.dll")
@@ -349,7 +390,7 @@ class ReleaseZipHelperTests(unittest.TestCase):
 
     def test_rid_hash_accepts_real_linux_publish_sqlclient(self) -> None:
         """A real linux-x64 publish SqlClient matches runtimes/unix/lib in the cache."""
-        nuget = self.lib.default_nuget_packages_root()
+        nuget = self._ensure_sqlclient_nuget_assets()
         unix = (
             nuget
             / "microsoft.data.sqlclient"
@@ -360,8 +401,6 @@ class ReleaseZipHelperTests(unittest.TestCase):
             / "net9.0"
             / "Microsoft.Data.SqlClient.dll"
         )
-        if not unix.is_file():
-            self.skipTest(f"unix SqlClient RID asset missing: {unix}")
         with tempfile.TemporaryDirectory() as raw:
             publish = Path(raw)
             shutil.copy2(unix, publish / "Microsoft.Data.SqlClient.dll")
