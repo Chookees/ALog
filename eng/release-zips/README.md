@@ -82,6 +82,7 @@ Workflow: `.github/workflows/release-zips.yml`.
    draft (`gh release delete --yes`, never `--cleanup-tag`). If the release already
    exists, or the tag is missing on the remote, publish aborts (no clobber).
 
-A normal red run leaves no draft. A draft can remain only after SIGKILL or runner
-loss (Repo Manager checks for leftover drafts after each run). Do not push a real
-tag from this folder to test publish; use `python3 eng/test_release_zips.py`.
+A normal red run leaves no draft. A draft can remain only after SIGKILL, runner
+loss, or a signal right after create (Repo Manager checks for leftover drafts
+after each run). Do not push a real tag from this folder to test publish; use
+`python3 eng/test_release_zips.py`.

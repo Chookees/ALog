@@ -124,8 +124,16 @@ repo, zip_dir, work = map(Path, sys.argv[1:4])
 sys.path.insert(0, str(repo / "eng" / "release-zips"))
 from release_lib import extract_hello_world_snippet
 
-readme = (zip_dir / "README.txt").read_text(encoding="utf-8")
-snippet = extract_hello_world_snippet(readme)
+readme_path = zip_dir / "README.txt"
+if not readme_path.is_file():
+    print("release-smoke: error: README.txt missing from zip", file=sys.stderr)
+    sys.exit(1)
+readme = readme_path.read_text(encoding="utf-8")
+try:
+    snippet = extract_hello_world_snippet(readme)
+except ValueError as exc:
+    print(f"release-smoke: error: {exc}", file=sys.stderr)
+    sys.exit(1)
 (work / "Program.cs").write_text(snippet, encoding="utf-8", newline="\n")
 (work / "HelloFromReadme.csproj").write_text(
     """<Project Sdk="Microsoft.NET.Sdk">

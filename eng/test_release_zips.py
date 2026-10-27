@@ -289,12 +289,15 @@ class ReleaseZipHelperTests(unittest.TestCase):
         self.assertNotIn("--cleanup-tag", delete_line[0])
 
     def test_workflow_publish_yaml_contract(self) -> None:
-        """yaml.safe_load: publish concurrency, if, and contents:write only on publish."""
+        """yaml.safe_load: publish needs/concurrency/if/write; PR paths include start-sql."""
         text = WORKFLOW_PATH.read_text(encoding="utf-8")
         data = yaml.safe_load(text)
         self.assertEqual(data["permissions"]["contents"], "read")
-        self.assertIn("eng/start-sql.sh", text)
         publish = data["jobs"]["publish"]
+        needs = publish["needs"]
+        if isinstance(needs, str):
+            needs = [needs]
+        self.assertIn("release-smoke", needs)
         self.assertEqual(
             publish["concurrency"],
             {
@@ -310,6 +313,25 @@ class ReleaseZipHelperTests(unittest.TestCase):
                 self.assertEqual(perms.get("contents"), "write")
             else:
                 self.assertNotEqual(perms.get("contents"), "write", name)
+        # PyYAML 1.1 loads the workflow key ``on`` as boolean True.
+        on_block = data.get("on", data.get(True))
+        self.assertIsInstance(on_block, dict)
+        paths = on_block["pull_request"]["paths"]
+        for required in (
+            "eng/release-zips/**",
+            "eng/release-smoke/**",
+            "eng/build-release-zips.sh",
+            "eng/test_release_zips.py",
+            "eng/start-sql.sh",
+            "ALog/**",
+            "ALog.Extensions.Logging/**",
+            "CHANGELOG.md",
+            "README.md",
+            "global.json",
+            "Directory.Build.props",
+            ".github/workflows/release-zips.yml",
+        ):
+            self.assertIn(required, paths)
         self.assertNotIn("continue-on-error:", text)
         self.assertNotIn("--clobber", text)
 
@@ -592,12 +614,42 @@ class ReleaseZipHelperTests(unittest.TestCase):
             (artifacts / name).write_bytes(b"zip")
         return artifacts
 
+    @staticmethod
+    def _fake_gh_absent_view(*, draft: str | None = "true") -> str:
+        """Return a bash fragment for ``gh release view`` in fake-gh scripts.
+
+        Plain view reports ``release not found``. A ``--json`` isDraft query
+        prints ``draft`` (``true``/``false``) or fails when ``draft`` is None.
+
+        Args:
+            draft: isDraft value to print, or None to fail the JSON view.
+
+        Returns:
+            Bash ``if`` block text.
+        """
+        if draft is None:
+            json_body = 'echo "view failed" >&2\n            exit 1'
+        else:
+            json_body = f'echo "{draft}"\n            exit 0'
+        return (
+            'if [[ "$1" == "release" && "$2" == "view" ]]; then\n'
+            '  if [[ "$*" == *"--json"* ]]; then\n'
+            f"            {json_body}\n"
+            "  fi\n"
+            '  echo "release not found" >&2\n'
+            "  exit 1\n"
+            "fi"
+        )
+
     def _install_fake_gh(self, work: Path, script: str) -> tuple[Path, dict[str, str]]:
         """Write an executable fake gh and return (log_path, env).
 
         Args:
             work: Temporary root.
-            script: Fake gh bash script body (may use ``{log}``).
+            script: Fake gh bash script body (may use the token ``{log}``).
+                Signal the publish script with
+                ``kill -TERM "${PUBLISH_RELEASE_PID:-$PPID}"`` so TERM hits the
+                main process (not the ``$(…)`` subshell).
 
         Returns:
             Path to the gh call log and an env dict with PATH/GITHUB_TOKEN set.
@@ -606,7 +658,7 @@ class ReleaseZipHelperTests(unittest.TestCase):
         bin_dir.mkdir()
         log_path = work / "gh.log"
         fake_gh = bin_dir / "gh"
-        fake_gh.write_text(script.format(log=log_path), encoding="utf-8")
+        fake_gh.write_text(script.replace("{log}", str(log_path)), encoding="utf-8")
         fake_gh.chmod(fake_gh.stat().st_mode | stat.S_IXUSR)
         env = os.environ.copy()
         env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
@@ -661,6 +713,7 @@ class ReleaseZipHelperTests(unittest.TestCase):
 
     def test_publish_fake_gh_create_401_and_500_no_delete(self) -> None:
         """Create HTTP 401 and 500 fail red with zero gh release delete calls."""
+        view = self._fake_gh_absent_view(draft="true")
         for code, label in ((401, "Bad credentials"), (500, "server error")):
             with self.subTest(code=code):
                 with tempfile.TemporaryDirectory() as raw:
@@ -668,25 +721,18 @@ class ReleaseZipHelperTests(unittest.TestCase):
                     artifacts = self._prepare_publish_artifacts(work)
                     log_path, env = self._install_fake_gh(
                         work,
-                        textwrap.dedent(
-                            f"""\
-                            #!/bin/bash
-                            echo "$@" >> {{log}}
-                            if [[ "$1" == "release" && "$2" == "view" ]]; then
-                              echo "release not found" >&2
-                              exit 1
-                            fi
-                            if [[ "$1" == "release" && "$2" == "create" ]]; then
-                              echo "HTTP {code}: {label}" >&2
-                              exit 1
-                            fi
-                            if [[ "$1" == "release" && "$2" == "delete" ]]; then
-                              echo DELETE >&2
-                              exit 0
-                            fi
-                            exit 99
-                            """
-                        ),
+                        "#!/bin/bash\n"
+                        'echo "$@" >> {log}\n'
+                        f"{view}\n"
+                        'if [[ "$1" == "release" && "$2" == "create" ]]; then\n'
+                        f'  echo "HTTP {code}: {label}" >&2\n'
+                        "  exit 1\n"
+                        "fi\n"
+                        'if [[ "$1" == "release" && "$2" == "delete" ]]; then\n'
+                        "  echo DELETE >&2\n"
+                        "  exit 0\n"
+                        "fi\n"
+                        "exit 99\n",
                     )
                     result = self._run_publish(artifacts, env)
                     self.assertNotEqual(result.returncode, 0)
@@ -695,26 +741,20 @@ class ReleaseZipHelperTests(unittest.TestCase):
 
     def test_publish_fake_gh_already_exists_does_not_delete(self) -> None:
         """Concurrent create 'already exists' fails red without calling gh release delete."""
+        view = self._fake_gh_absent_view(draft="true")
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             artifacts = self._prepare_publish_artifacts(work)
             log_path, env = self._install_fake_gh(
                 work,
-                textwrap.dedent(
-                    """\
-                    #!/bin/bash
-                    echo "$@" >> {log}
-                    if [[ "$1" == "release" && "$2" == "view" ]]; then
-                      echo "release not found" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "create" ]]; then
-                      echo "HTTP 422: Release already exists" >&2
-                      exit 1
-                    fi
-                    exit 99
-                    """
-                ),
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then\n'
+                '  echo "HTTP 422: Release already exists" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                "exit 99\n",
             )
             result = self._run_publish(artifacts, env)
             self.assertNotEqual(result.returncode, 0)
@@ -729,31 +769,19 @@ class ReleaseZipHelperTests(unittest.TestCase):
 
     def test_publish_fake_gh_happy_path_draft_upload_edit(self) -> None:
         """Happy path: create --draft --verify-tag, upload, edit --draft=false, 0 deletes."""
+        view = self._fake_gh_absent_view(draft="true")
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             artifacts = self._prepare_publish_artifacts(work)
             log_path, env = self._install_fake_gh(
                 work,
-                textwrap.dedent(
-                    """\
-                    #!/bin/bash
-                    echo "$@" >> {log}
-                    if [[ "$1" == "release" && "$2" == "view" ]]; then
-                      echo "release not found" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "create" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "upload" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "edit" ]]; then
-                      exit 0
-                    fi
-                    exit 99
-                    """
-                ),
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "edit" ]]; then exit 0; fi\n'
+                "exit 99\n",
             )
             result = self._run_publish(artifacts, env)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -766,32 +794,22 @@ class ReleaseZipHelperTests(unittest.TestCase):
 
     def test_publish_fake_gh_upload_failure_deletes_without_cleanup_tag(self) -> None:
         """Upload failure after draft create rolls back with delete --yes (no --cleanup-tag)."""
+        view = self._fake_gh_absent_view(draft="true")
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             artifacts = self._prepare_publish_artifacts(work)
             log_path, env = self._install_fake_gh(
                 work,
-                textwrap.dedent(
-                    """\
-                    #!/bin/bash
-                    echo "$@" >> {log}
-                    if [[ "$1" == "release" && "$2" == "view" ]]; then
-                      echo "release not found" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "create" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "upload" ]]; then
-                      echo "upload failed" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "delete" ]]; then
-                      exit 0
-                    fi
-                    exit 99
-                    """
-                ),
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then\n'
+                '  echo "upload failed" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then exit 0; fi\n'
+                "exit 99\n",
             )
             result = self._run_publish(artifacts, env)
             self.assertNotEqual(result.returncode, 0)
@@ -802,33 +820,25 @@ class ReleaseZipHelperTests(unittest.TestCase):
 
     def test_publish_fake_gh_upload_fail_then_delete_fail(self) -> None:
         """Upload fails and delete fails → exact rollback FAILED message, red."""
+        view = self._fake_gh_absent_view(draft="true")
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             artifacts = self._prepare_publish_artifacts(work)
             log_path, env = self._install_fake_gh(
                 work,
-                textwrap.dedent(
-                    """\
-                    #!/bin/bash
-                    echo "$@" >> {log}
-                    if [[ "$1" == "release" && "$2" == "view" ]]; then
-                      echo "release not found" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "create" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "upload" ]]; then
-                      echo "upload failed" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "delete" ]]; then
-                      echo "delete failed" >&2
-                      exit 1
-                    fi
-                    exit 99
-                    """
-                ),
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then\n'
+                '  echo "upload failed" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then\n'
+                '  echo "delete failed" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                "exit 99\n",
             )
             result = self._run_publish(artifacts, env)
             self.assertNotEqual(result.returncode, 0)
@@ -836,157 +846,295 @@ class ReleaseZipHelperTests(unittest.TestCase):
                 "error: rollback FAILED for v0.2.1, manual cleanup needed",
                 result.stderr,
             )
+            self.assertNotIn("could not read draft state", result.stderr)
             self.assertNotIn("rolled back", result.stderr)
 
     def test_publish_fake_gh_edit_failure_deletes_draft(self) -> None:
-        """Publish edit failure deletes the owned draft and the run is red."""
+        """Publish edit failure with isDraft=true deletes the owned draft; red."""
+        view = self._fake_gh_absent_view(draft="true")
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             artifacts = self._prepare_publish_artifacts(work)
             log_path, env = self._install_fake_gh(
                 work,
-                textwrap.dedent(
-                    """\
-                    #!/bin/bash
-                    echo "$@" >> {log}
-                    if [[ "$1" == "release" && "$2" == "view" ]]; then
-                      echo "release not found" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "create" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "upload" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "edit" ]]; then
-                      echo "edit failed" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "delete" ]]; then
-                      exit 0
-                    fi
-                    exit 99
-                    """
-                ),
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "edit" ]]; then\n'
+                '  echo "edit failed" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then exit 0; fi\n'
+                "exit 99\n",
             )
             result = self._run_publish(artifacts, env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("rolled back draft", result.stderr)
             self.assertIn("release delete v0.2.1 --yes", log_path.read_text(encoding="utf-8"))
 
-    def test_publish_fake_gh_sigterm_during_upload_deletes_draft(self) -> None:
-        """SIGTERM during upload deletes the owned draft."""
+    def test_publish_fake_gh_edit_fail_but_published_skips_delete(self) -> None:
+        """Edit fails but isDraft=false → 0 deletes, already-published message, red."""
+        view = self._fake_gh_absent_view(draft="false")
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             artifacts = self._prepare_publish_artifacts(work)
             log_path, env = self._install_fake_gh(
                 work,
-                textwrap.dedent(
-                    """\
-                    #!/bin/bash
-                    echo "$@" >> {log}
-                    if [[ "$1" == "release" && "$2" == "view" ]]; then
-                      echo "release not found" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "create" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "upload" ]]; then
-                      kill -TERM "$PPID"
-                      sleep 30
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "delete" ]]; then
-                      exit 0
-                    fi
-                    exit 99
-                    """
-                ),
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "edit" ]]; then\n'
+                '  echo "edit failed" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then\n'
+                "  echo DELETE_CALLED >> {log}\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n",
+            )
+            result = self._run_publish(artifacts, env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "publish_release: v0.2.1 is already published, rollback skipped",
+                result.stderr,
+            )
+            self.assertNotIn("rolled back", result.stderr)
+            log = log_path.read_text(encoding="utf-8")
+            self.assertNotIn("DELETE_CALLED", log)
+            self.assertNotIn("release delete", log)
+
+    def test_publish_fake_gh_sigterm_during_upload_deletes_draft(self) -> None:
+        """SIGTERM during upload deletes the owned draft (still isDraft=true)."""
+        view = self._fake_gh_absent_view(draft="true")
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            artifacts = self._prepare_publish_artifacts(work)
+            log_path, env = self._install_fake_gh(
+                work,
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then\n'
+                '  kill -TERM "${PUBLISH_RELEASE_PID:-$PPID}"\n'
+                "  sleep 30\n"
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then exit 0; fi\n'
+                "exit 99\n",
             )
             result = self._run_publish(artifacts, env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("release delete v0.2.1 --yes", log_path.read_text(encoding="utf-8"))
 
     def test_publish_fake_gh_sigterm_before_edit_deletes_draft(self) -> None:
-        """SIGTERM at the start of edit (before publish) deletes the owned draft."""
+        """SIGTERM during edit while still a draft deletes the owned draft."""
+        view = self._fake_gh_absent_view(draft="true")
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             artifacts = self._prepare_publish_artifacts(work)
             log_path, env = self._install_fake_gh(
                 work,
-                textwrap.dedent(
-                    """\
-                    #!/bin/bash
-                    echo "$@" >> {log}
-                    if [[ "$1" == "release" && "$2" == "view" ]]; then
-                      echo "release not found" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "create" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "upload" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "edit" ]]; then
-                      kill -TERM "$PPID"
-                      sleep 30
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "delete" ]]; then
-                      exit 0
-                    fi
-                    exit 99
-                    """
-                ),
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "edit" ]]; then\n'
+                '  kill -TERM "${PUBLISH_RELEASE_PID:-$PPID}"\n'
+                "  sleep 30\n"
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then exit 0; fi\n'
+                "exit 99\n",
             )
             result = self._run_publish(artifacts, env)
             self.assertNotEqual(result.returncode, 0)
             log = log_path.read_text(encoding="utf-8")
             self.assertIn("release delete v0.2.1 --yes", log)
 
-    def test_publish_fake_gh_sigterm_after_edit_deletes_nothing(self) -> None:
-        """SIGTERM after successful edit (OWNED_DRAFT cleared) deletes nothing."""
+    def test_publish_fake_gh_sigterm_during_edit_published_no_delete(self) -> None:
+        """SIGTERM during edit after publish (isDraft=false) → 0 deletes, rc 143."""
+        view = self._fake_gh_absent_view(draft="false")
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             artifacts = self._prepare_publish_artifacts(work)
             log_path, env = self._install_fake_gh(
                 work,
-                textwrap.dedent(
-                    """\
-                    #!/bin/bash
-                    echo "$@" >> {log}
-                    if [[ "$1" == "release" && "$2" == "view" ]]; then
-                      echo "release not found" >&2
-                      exit 1
-                    fi
-                    if [[ "$1" == "release" && "$2" == "create" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "upload" ]]; then
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "edit" ]]; then
-                      ( sleep 0.05; kill -TERM "$PPID" ) &
-                      exit 0
-                    fi
-                    if [[ "$1" == "release" && "$2" == "delete" ]]; then
-                      echo DELETE_CALLED >> {log}
-                      exit 0
-                    fi
-                    exit 99
-                    """
-                ),
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "edit" ]]; then\n'
+                '  kill -TERM "${PUBLISH_RELEASE_PID:-$PPID}"\n'
+                "  sleep 30\n"
+                "  exit 0\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then\n'
+                "  echo DELETE_CALLED >> {log}\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n",
             )
             result = self._run_publish(artifacts, env)
-            # Process may exit 0 (finished) or be terminated after disarm; never delete.
+            self.assertEqual(result.returncode, 143)
+            self.assertIn(
+                "publish_release: v0.2.1 is already published, rollback skipped",
+                result.stderr,
+            )
+            log = log_path.read_text(encoding="utf-8")
+            self.assertNotIn("DELETE_CALLED", log)
+            self.assertNotIn("release delete", log)
+
+    def test_publish_fake_gh_sigterm_trap_view_fail_no_delete(self) -> None:
+        """SIGTERM trap with failed isDraft view → 0 deletes and rollback FAILED."""
+        view = self._fake_gh_absent_view(draft=None)
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            artifacts = self._prepare_publish_artifacts(work)
+            log_path, env = self._install_fake_gh(
+                work,
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then\n'
+                '  kill -TERM "${PUBLISH_RELEASE_PID:-$PPID}"\n'
+                "  sleep 30\n"
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then\n'
+                "  echo DELETE_CALLED >> {log}\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n",
+            )
+            result = self._run_publish(artifacts, env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(
+                "error: rollback FAILED for v0.2.1, manual cleanup needed "
+                "(could not read draft state)",
+                result.stderr,
+            )
+            log = log_path.read_text(encoding="utf-8")
+            self.assertNotIn("DELETE_CALLED", log)
+            self.assertNotIn("release delete", log)
+
+    def test_publish_fake_gh_sigterm_after_edit_deletes_nothing(self) -> None:
+        """SIGTERM after successful edit (OWNED_DRAFT cleared) deletes nothing."""
+        view = self._fake_gh_absent_view(draft="false")
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            artifacts = self._prepare_publish_artifacts(work)
+            log_path, env = self._install_fake_gh(
+                work,
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "edit" ]]; then\n'
+                '  ( sleep 0.05; kill -TERM "${PUBLISH_RELEASE_PID:-$PPID}" ) &\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then\n'
+                "  echo DELETE_CALLED >> {log}\n"
+                "  exit 0\n"
+                "fi\n"
+                "exit 99\n",
+            )
+            result = self._run_publish(artifacts, env)
             time.sleep(0.2)
             log = log_path.read_text(encoding="utf-8")
             self.assertIn("release edit v0.2.1 --draft=false", log)
             self.assertNotIn("DELETE_CALLED", log)
             self.assertNotIn("release delete", log)
+
+    def test_publish_cleans_notes_tmpdir_on_success(self) -> None:
+        """write_notes mktemp under TMPDIR is removed on successful publish."""
+        view = self._fake_gh_absent_view(draft="true")
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            tmp = work / "tmpdir"
+            tmp.mkdir()
+            artifacts = self._prepare_publish_artifacts(work)
+            _log_path, env = self._install_fake_gh(
+                work,
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "edit" ]]; then exit 0; fi\n'
+                "exit 99\n",
+            )
+            env["TMPDIR"] = str(tmp)
+            result = self._run_publish(artifacts, env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            leftovers = sorted(p.name for p in tmp.iterdir())
+            self.assertEqual(leftovers, [], leftovers)
+
+    def test_publish_cleans_notes_tmpdir_on_failure(self) -> None:
+        """write_notes mktemp under TMPDIR is removed when publish fails."""
+        view = self._fake_gh_absent_view(draft="true")
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            tmp = work / "tmpdir"
+            tmp.mkdir()
+            artifacts = self._prepare_publish_artifacts(work)
+            _log_path, env = self._install_fake_gh(
+                work,
+                "#!/bin/bash\n"
+                'echo "$@" >> {log}\n'
+                f"{view}\n"
+                'if [[ "$1" == "release" && "$2" == "create" ]]; then exit 0; fi\n'
+                'if [[ "$1" == "release" && "$2" == "upload" ]]; then\n'
+                '  echo "upload failed" >&2\n'
+                "  exit 1\n"
+                "fi\n"
+                'if [[ "$1" == "release" && "$2" == "delete" ]]; then exit 0; fi\n'
+                "exit 99\n",
+            )
+            env["TMPDIR"] = str(tmp)
+            result = self._run_publish(artifacts, env)
+            self.assertNotEqual(result.returncode, 0)
+            leftovers = sorted(p.name for p in tmp.iterdir())
+            self.assertEqual(leftovers, [], leftovers)
+
+    def test_run_smoke_missing_readme_hello_marker(self) -> None:
+        """Missing Hello World marker prints one release-smoke error line, no traceback."""
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            zip_path = work / "ALog-v0.2.1-Lite.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("ALog-v0.2.1-Lite/ALog.dll", b"not-a-real-dll")
+                zf.writestr(
+                    "ALog-v0.2.1-Lite/README.txt",
+                    "ALog Lite\nNo Hello World section here.\nLicense: Apache-2.0\n",
+                )
+            result = subprocess.run(
+                ["bash", str(RUN_SMOKE), "lite", str(zip_path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=str(ROOT),
+            )
+            self.assertEqual(result.returncode, 1)
+            combined = result.stdout + result.stderr
+            self.assertNotIn("Traceback", combined)
+            err_lines = [
+                line
+                for line in result.stderr.splitlines()
+                if line.startswith("release-smoke: error:")
+            ]
+            self.assertEqual(len(err_lines), 1, result.stderr)
+            self.assertIn("Hello World", err_lines[0])
 
 
 def main() -> int:

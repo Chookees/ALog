@@ -7,9 +7,11 @@
 #
 # Flow: create a --draft release (no assets) → upload zips → gh release edit
 # --draft=false. OWNED_DRAFT is set only after our create succeeds and cleared
-# immediately after publish edit succeeds. A TERM/INT/EXIT trap deletes the
-# draft (gh release delete --yes, never --cleanup-tag) while OWNED_DRAFT is set.
-# Concurrent "already exists" and other create failures never delete.
+# immediately after publish edit succeeds. A TERM/INT/EXIT trap rolls back while
+# OWNED_DRAFT is set, but only after `gh release view --json isDraft` prints
+# true (never delete a published release). A draft can remain only after
+# SIGKILL, runner loss, or a signal right after create. Concurrent "already
+# exists" and other create failures never delete.
 #
 # Usage:
 #   bash eng/release-zips/publish_release.sh <tag-ref> <artifacts-dir>
@@ -21,6 +23,8 @@ set -euo pipefail
 # Set when this run successfully created a draft release; cleared after publish.
 OWNED_DRAFT=0
 OWNED_TAG=""
+# mktemp notes path from write_notes; removed by EXIT / signal traps.
+NOTES_FILE=""
 
 # Resolve repository root from this script.
 # Prints the absolute repo path.
@@ -35,6 +39,15 @@ repo_root() {
 fail() {
   echo "publish_release: $*" >&2
   exit 1
+}
+
+# Remove the write_notes mktemp file when set.
+# No args; uses NOTES_FILE.
+cleanup_notes_file() {
+  if [ -n "${NOTES_FILE:-}" ]; then
+    rm -f "$NOTES_FILE"
+    NOTES_FILE=""
+  fi
 }
 
 # Derive version and required asset names; verify the artifact directory.
@@ -169,55 +182,148 @@ delete_owned_draft() {
   gh release delete "$tag" --yes
 }
 
-# Roll back an owned draft after upload/edit failure or signal.
+# Read isDraft for a tag via gh. Prints exactly true or false on success.
+# Args: bare tag name.
+# Returns: 0 when stdout is true or false; non-zero on gh failure or unexpected output.
+# Keeps errexit off across non-zero returns so callers with ``set +e`` can read $?.
+query_release_is_draft() {
+  local tag="$1"
+  local out
+  local rc
+  set +e
+  out=$(gh release view "$tag" --json isDraft -q .isDraft 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    return 1
+  fi
+  case "$out" in
+    true|false)
+      printf '%s\n' "$out"
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+# Delete an owned draft only when gh reports isDraft=true.
+# Args: bare tag name.
+# Returns:
+#   0 — deleted successfully
+#   1 — isDraft=false (already published; delete skipped)
+#   2 — view failed or unexpected (could not read draft state)
+#   3 — delete failed after isDraft=true
+# Errexit stays off so a non-zero return does not abort the caller mid-case.
+try_rollback_delete() {
+  local tag="$1"
+  local draft
+  local q_rc
+  local del_rc
+  set +e
+  draft=$(query_release_is_draft "$tag")
+  q_rc=$?
+  if [ "$q_rc" -ne 0 ]; then
+    return 2
+  fi
+  if [ "$draft" = "false" ]; then
+    echo "publish_release: $tag is already published, rollback skipped" >&2
+    return 1
+  fi
+  delete_owned_draft "$tag"
+  del_rc=$?
+  if [ "$del_rc" -ne 0 ]; then
+    return 3
+  fi
+  return 0
+}
+
+# Roll back an owned draft after upload/edit failure.
 # Args: bare tag name, reason words for a successful delete path.
-# On delete failure prints the exact FAILED message and exits 1 (never "rolled back").
+# Always checks isDraft before delete. On isDraft=false stays red without delete.
 rollback_owned_draft() {
   local tag="$1"
   shift
   local reason="$*"
+  local rb_rc
   OWNED_DRAFT=0
   OWNED_TAG=""
   set +e
-  delete_owned_draft "$tag"
-  local del_rc=$?
+  try_rollback_delete "$tag"
+  rb_rc=$?
   set -e
-  if [ "$del_rc" -ne 0 ]; then
-    fail "error: rollback FAILED for $tag, manual cleanup needed"
-  fi
-  fail "error: $reason; rolled back draft $tag, tag kept"
+  case "$rb_rc" in
+    0)
+      fail "error: $reason; rolled back draft $tag, tag kept"
+      ;;
+    1)
+      fail "error: $reason"
+      ;;
+    2)
+      fail "error: rollback FAILED for $tag, manual cleanup needed (could not read draft state)"
+      ;;
+    *)
+      fail "error: rollback FAILED for $tag, manual cleanup needed"
+      ;;
+  esac
 }
 
-# TERM/INT/EXIT handler: delete owned draft if still marked, then exit non-zero on signals.
-# No args; uses OWNED_DRAFT / OWNED_TAG.
+# TERM/INT/EXIT handler: roll back owned draft only when still a draft.
+# Args: signal name (TERM, INT, or EXIT). Uses OWNED_DRAFT / OWNED_TAG.
+# Always removes NOTES_FILE. EXIT preserves a prior non-zero exit status.
 on_owned_draft_trap() {
+  # Capture before any other command; `local` would reset $?.
+  local prev_rc=$?
   local signal="${1:-EXIT}"
   if [ "${OWNED_DRAFT}" != "1" ] || [ -z "${OWNED_TAG}" ]; then
+    cleanup_notes_file
     if [ "$signal" = "TERM" ] || [ "$signal" = "INT" ]; then
       exit 143
+    fi
+    if [ "$prev_rc" -ne 0 ]; then
+      exit "$prev_rc"
     fi
     return 0
   fi
   local tag="$OWNED_TAG"
+  local rb_rc
   OWNED_DRAFT=0
   OWNED_TAG=""
   set +e
-  delete_owned_draft "$tag"
-  local del_rc=$?
+  try_rollback_delete "$tag"
+  rb_rc=$?
   set -e
-  if [ "$del_rc" -ne 0 ]; then
-    echo "publish_release: error: rollback FAILED for $tag, manual cleanup needed" >&2
-    exit 1
-  fi
-  if [ "$signal" = "TERM" ] || [ "$signal" = "INT" ]; then
-    echo "publish_release: error: interrupted ($signal); deleted owned draft $tag" >&2
-    exit 143
-  fi
+  cleanup_notes_file
+  case "$rb_rc" in
+    0)
+      if [ "$signal" = "TERM" ] || [ "$signal" = "INT" ]; then
+        echo "publish_release: error: interrupted ($signal); deleted owned draft $tag" >&2
+        exit 143
+      fi
+      return 0
+      ;;
+    1)
+      if [ "$signal" = "TERM" ] || [ "$signal" = "INT" ]; then
+        exit 143
+      fi
+      if [ "$prev_rc" -ne 0 ]; then
+        exit "$prev_rc"
+      fi
+      return 0
+      ;;
+    2)
+      echo "publish_release: error: rollback FAILED for $tag, manual cleanup needed (could not read draft state)" >&2
+      exit 1
+      ;;
+    *)
+      echo "publish_release: error: rollback FAILED for $tag, manual cleanup needed" >&2
+      exit 1
+      ;;
+  esac
 }
 
-# Install TERM/INT/EXIT traps that roll back an owned draft.
-# No args.
+# Install TERM/INT/EXIT traps that roll back an owned draft (isDraft-gated).
+# No args. Exports PUBLISH_RELEASE_PID so helpers can signal this process.
 install_owned_draft_traps() {
+  export PUBLISH_RELEASE_PID=$$
   trap 'on_owned_draft_trap TERM' TERM
   trap 'on_owned_draft_trap INT' INT
   trap 'on_owned_draft_trap EXIT' EXIT
@@ -340,6 +446,9 @@ main() {
 
   local notes
   notes=$(write_notes "$repo" "$version" "$lite" "$win" "$linux" "$sums")
+  NOTES_FILE="$notes"
+  # Notes cleanup until create_release installs draft traps (those also clean notes).
+  trap 'rc=$?; cleanup_notes_file; exit "$rc"' EXIT
   create_release "$tag_ref" "$version" "$notes" "$lite" "$win" "$linux"
 }
 
