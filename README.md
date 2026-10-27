@@ -67,8 +67,8 @@ Time and memory per event when writing to a file, with each library's own async 
 | | ALog | Serilog | NLog | log4net |
 |---|---|---|---|---|
 | Plain message, 1M events (ns per event) | 600 | 1,450 | 1,020 | 1,400 |
-| Message template, 1M events (ns per event) | 1,050 | 1,800 | 1,320 | n/a[^13] |
-| JSON output, 1M events (ns per event) | 1,300 | 5,450 | 1,700 | n/a[^14] |
+| Message template, 1M events (ns per event) | 1,050 | 1,800 | 1,320 | n/a[^12] |
+| JSON output, 1M events (ns per event) | 1,300 | 5,450 | 1,700 | n/a[^13] |
 | Exception with 3-level chain, 100k events (ns per event) | 22,400 | 30,700 | 28,800 | 31,800 |
 | 8 threads, 1M events (ns per event) | 720 | 2,540 | 1,360 | 1,690 |
 | Cold start to first event written (ms) | 26.0 | 128 | 102 | 94.8 |
@@ -79,8 +79,8 @@ ALog is behind NLog in three measurements: memory per event with message templat
 
 Measured on 2026-10-27 with ALog 0.2.1, Serilog 4.4.0 (Serilog.Sinks.File 7.0.0), NLog 6.2.2, and log4net 3.5.0 on .NET 10.0.14, GitHub Actions ubuntu-24.04 (AMD EPYC 7763, 4 cores), mean of 5 runs. Every row shown here also held in 9 further runs on a separate Linux machine, with ALog at least 5% ahead of each library in every environment. Commit b3daa7c. Harness, method, and all results, including where ALog is behind: [the harness at b3daa7c](https://github.com/Chookees/ALog/tree/b3daa7c77a743809fa09854aa760d81896b618b9/eng/comparison-bench) and [RESULTS.md](eng/comparison-bench/RESULTS.md).
 
-[^13]: log4net has no message templates or named properties.
-[^14]: log4net has no built-in JSON layout.
+[^12]: log4net has no message templates or named properties.
+[^13]: log4net has no built-in JSON layout.
 
 ---
 
