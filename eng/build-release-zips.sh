@@ -231,7 +231,27 @@ stage_lite() {
   check_versions "$repo" "$reader" "$version" "$dest/ALog.dll"
 }
 
-# Publish the host for one RID and stage Full zip contents (flat DLLs only).
+# Fail when publish output ≠ allowlist payload or RID DLL hashes ≠ NuGet runtimes/.
+# Args: repo, publish directory, allowlist path, rid.
+check_publish_before_stage() {
+  local repo="$1"
+  local publish="$2"
+  local allowlist="$3"
+  local rid="$4"
+  python3 - "$repo" "$publish" "$allowlist" "$rid" <<'PY'
+import sys
+from pathlib import Path
+
+repo, publish, allowlist, rid = sys.argv[1:5]
+sys.path.insert(0, str(Path(repo) / "eng" / "release-zips"))
+from release_lib import check_full_publish_output
+
+check_full_publish_output(Path(publish), Path(allowlist), rid)
+print(f"publish allowlist + RID NuGet hash ok for {rid}")
+PY
+}
+
+# Publish the host for one RID and stage Full zip contents (DLLs + language folders).
 # Args: repo, version, rid (linux-x64|win-x64), stage parent, version-reader DLL.
 stage_full() {
   local repo="$1"
@@ -243,15 +263,22 @@ stage_full() {
   local folder="ALog-v${version}-${kind}"
   local dest="$stage_root/$folder"
   local publish="$stage_root/publish-${rid}"
+  local host_dir="$repo/eng/release-zips/host"
   rm -rf "$dest" "$publish"
+  rm -rf "$host_dir/bin" "$host_dir/obj"
   mkdir -p "$dest" "$publish"
 
-  dotnet publish "$repo/eng/release-zips/host/ReleaseZipHost.csproj" \
+  dotnet publish "$host_dir/ReleaseZipHost.csproj" \
     -c Release -r "$rid" --self-contained false \
     -o "$publish" --nologo -v q
 
-  # Copy only allowlisted payload: DLLs flat, SqlClient satellite folders, no host bits.
+  # Compare full publish output to the allowlist BEFORE staging (BUG-51-2).
+  # Exclusions: host files, *.pdb, *.deps.json, *.runtimeconfig.json only.
+  # RID DLLs must SHA-256-match NuGet runtimes/<family>/lib|native assets.
   local allowlist="$repo/eng/release-zips/allowlists/${kind}.txt"
+  check_publish_before_stage "$repo" "$publish" "$allowlist" "$rid"
+
+  # Copy only allowlisted payload: top-level DLLs + SqlClient satellite folders.
   while IFS= read -r rel || [ -n "$rel" ]; do
     rel=${rel//$'\r'/}
     [ -z "$rel" ] && continue
@@ -339,6 +366,9 @@ main() {
   echo "SOURCE_DATE_EPOCH: $epoch"
   echo "output: $out_dir"
 
+  # Clean host outputs and the stage tree so local/CI runs start from a known state.
+  rm -rf "$stage_root"
+  rm -rf "$repo/eng/release-zips/host/bin" "$repo/eng/release-zips/host/obj"
   mkdir -p "$out_dir" "$stage_root"
   local reader
   reader=$(ensure_version_reader "$repo")

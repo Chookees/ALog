@@ -2,22 +2,32 @@
 """Local tests for release-zip guard and notes helpers (no real tag/publish).
 
 Covers CHANGELOG extraction (plain and dated headings), package/tag version
-equality, asset names, README wording, and guard changelog failure.
+equality, asset names, README wording, guard changelog failure, publish-output
+allowlist checks, RID NuGet hash checks, workflow ``env:`` hygiene, and fake-gh
+publish rollback.
 Run from repo root: ``python3 eng/test_release_zips.py``.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LIB_PATH = ROOT / "eng" / "release-zips" / "release_lib.py"
 CLEANUP_CHANGELOG = ROOT / "eng" / "testdata" / "release-zips" / "changelog-cleanup-v0.2.1.md"
+PUBLISH_SCRIPT = ROOT / "eng" / "release-zips" / "publish_release.sh"
+WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release-zips.yml"
+RUN_SMOKE = ROOT / "eng" / "release-smoke" / "run-smoke.sh"
 
 
 def load_lib():
@@ -208,7 +218,15 @@ class ReleaseZipHelperTests(unittest.TestCase):
         self.assertIn("For other platforms, use the NuGet packages.", full)
         self.assertNotIn("Other platforms or SQL/AWS:", full)
         self.assertNotIn("allowlist", full)
+        self.assertNotIn("flat", full.lower())
+        self.assertIn(
+            "DLLs in one folder, plus language folders (de/, cs/, …) "
+            "for translated SqlClient messages",
+            full,
+        )
         self.assertIn("Microsoft.Data.SqlClient.dll", full)
+        self.assertIn("language folders:", full)
+        self.assertNotIn("cs/Microsoft.Data.SqlClient.resources.dll", full)
         self.assertNotIn("Known edge cases (Lite):", full)
         self.assertEqual(
             self.lib.extract_hello_world_snippet(full),
@@ -233,20 +251,25 @@ class ReleaseZipHelperTests(unittest.TestCase):
 
     def test_publish_uses_verify_tag(self) -> None:
         """publish_release.sh passes --verify-tag and never passes --clobber to gh."""
-        text = (ROOT / "eng" / "release-zips" / "publish_release.sh").read_text(
-            encoding="utf-8"
-        )
+        text = PUBLISH_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("--verify-tag", text)
-        # Comments may mention --clobber; the gh invocation must not pass it.
+        # Comments may mention --clobber / --cleanup-tag; gh invocations must not pass them.
         create_block = text[text.index("gh release create") :]
-        create_block = create_block[: create_block.index("echo")]
+        create_block = create_block[: create_block.index("create_rc")]
         self.assertNotIn("--clobber", create_block)
+        self.assertIn("gh release delete", text)
+        delete_line = [
+            line.strip()
+            for line in text.splitlines()
+            if "gh release delete" in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(len(delete_line), 1, delete_line)
+        self.assertIn("--yes", delete_line[0])
+        self.assertNotIn("--cleanup-tag", delete_line[0])
 
     def test_workflow_default_read_and_publish_write(self) -> None:
         """release-zips.yml defaults to contents:read; only publish writes."""
-        text = (ROOT / ".github" / "workflows" / "release-zips.yml").read_text(
-            encoding="utf-8"
-        )
+        text = WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn("permissions:\n  contents: read", text)
         self.assertIn("publish:", text)
         publish_at = text.index("publish:")
@@ -254,12 +277,210 @@ class ReleaseZipHelperTests(unittest.TestCase):
         self.assertIn("needs: [release-smoke]", text[publish_at : publish_at + 400])
         self.assertNotIn("continue-on-error:", text)
         self.assertNotIn("--clobber", text)
+        self.assertIn("CHANGELOG.md", text)
+        self.assertIn("README.md", text)
+
+    def test_workflow_run_blocks_have_no_expressions(self) -> None:
+        """No ``run:`` body may embed ``${{``; values must arrive via ``env:``."""
+        text = WORKFLOW_PATH.read_text(encoding="utf-8")
+        offenders = self.lib.workflow_run_blocks_with_expressions(text)
+        self.assertEqual(offenders, [], msg="\n---\n".join(offenders))
+        self.assertIn("TAG_REF: ${{ github.ref }}", text)
+        self.assertIn("TAG_SHA: ${{ github.sha }}", text)
+        self.assertIn('"$TAG_REF"', text)
+        self.assertIn('"$TAG_SHA"', text)
+        self.assertIn("PUBLISH_ARTIFACTS:", text)
+        self.assertIn("ZIP_ARTIFACTS:", text)
 
     def test_license_is_apache_20(self) -> None:
         """Zip README claims Apache-2.0 only when LICENSE is Apache 2.0."""
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
         self.assertIn("Apache License", license_text)
         self.assertIn("Version 2.0", license_text)
+
+    def test_publish_extra_dll_fails_allowlist_compare(self) -> None:
+        """Newtonsoft.Json.dll in publish output fails before staging (BUG-51-2)."""
+        allowlist = self.lib.load_allowlist(
+            ROOT / "eng" / "release-zips" / "allowlists" / "Full-linux-x64.txt"
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            publish = Path(raw)
+            for name in allowlist:
+                if name in self.lib.STAGE_ONLY_NAMES:
+                    continue
+                path = publish / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"payload")
+            # Host / pdb / deps are exclusions and must not trip the check.
+            (publish / "ReleaseZipHost.dll").write_bytes(b"host")
+            (publish / "ALog.pdb").write_bytes(b"pdb")
+            (publish / "ReleaseZipHost.deps.json").write_text("{}", encoding="utf-8")
+            (publish / "ReleaseZipHost.runtimeconfig.json").write_text(
+                "{}", encoding="utf-8"
+            )
+            self.lib.compare_publish_to_allowlist(publish, allowlist)
+            (publish / "Newtonsoft.Json.dll").write_bytes(b"extra")
+            with self.assertRaises(ValueError) as ctx:
+                self.lib.compare_publish_to_allowlist(publish, allowlist)
+            self.assertIn("Newtonsoft.Json.dll", str(ctx.exception))
+            self.assertIn("extra:", str(ctx.exception))
+
+    def test_rid_hash_rejects_wrong_nuget_source(self) -> None:
+        """Published SqlClient matching only the stub lib/ asset fails RID hash check."""
+        nuget = self.lib.default_nuget_packages_root()
+        stub = (
+            nuget
+            / "microsoft.data.sqlclient"
+            / "7.1.1"
+            / "lib"
+            / "net9.0"
+            / "Microsoft.Data.SqlClient.dll"
+        )
+        if not stub.is_file():
+            self.skipTest(f"SqlClient stub missing in NuGet cache: {stub}")
+        with tempfile.TemporaryDirectory() as raw:
+            publish = Path(raw)
+            shutil.copy2(stub, publish / "Microsoft.Data.SqlClient.dll")
+            with self.assertRaises(ValueError) as ctx:
+                self.lib.verify_rid_nuget_hashes(publish, "linux-x64", nuget_root=nuget)
+            msg = str(ctx.exception)
+            self.assertIn("Microsoft.Data.SqlClient.dll", msg)
+            self.assertIn("does not match", msg)
+
+    def test_rid_hash_accepts_real_linux_publish_sqlclient(self) -> None:
+        """A real linux-x64 publish SqlClient matches runtimes/unix/lib in the cache."""
+        nuget = self.lib.default_nuget_packages_root()
+        unix = (
+            nuget
+            / "microsoft.data.sqlclient"
+            / "7.1.1"
+            / "runtimes"
+            / "unix"
+            / "lib"
+            / "net9.0"
+            / "Microsoft.Data.SqlClient.dll"
+        )
+        if not unix.is_file():
+            self.skipTest(f"unix SqlClient RID asset missing: {unix}")
+        with tempfile.TemporaryDirectory() as raw:
+            publish = Path(raw)
+            shutil.copy2(unix, publish / "Microsoft.Data.SqlClient.dll")
+            self.lib.verify_rid_nuget_hashes(publish, "linux-x64", nuget_root=nuget)
+
+    def test_linux_zip_on_win_path_fails(self) -> None:
+        """run-smoke.sh full <linux.zip> win-x64 exits non-zero (BUG-51-4)."""
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            linux_zip = work / "ALog-v0.2.1-Full-linux-x64.zip"
+            # Minimal zip with ALog.dll so prepare_zip_dir succeeds before RID gate.
+            with zipfile.ZipFile(linux_zip, "w") as zf:
+                zf.writestr("ALog-v0.2.1-Full-linux-x64/ALog.dll", b"not-a-real-dll")
+                zf.writestr("ALog-v0.2.1-Full-linux-x64/README.txt", b"x")
+            result = subprocess.run(
+                ["bash", str(RUN_SMOKE), "full", str(linux_zip), "win-x64"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            combined = result.stdout + result.stderr
+            self.assertIn("does not match RID win-x64", combined)
+
+    def test_publish_fake_gh_auth_error_on_view(self) -> None:
+        """Auth/other gh release view errors fail; only 'release not found' continues."""
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            artifacts = work / "artifacts"
+            artifacts.mkdir()
+            for name in self.lib.expected_asset_names("0.2.1"):
+                (artifacts / name).write_bytes(b"zip")
+            bin_dir = work / "bin"
+            bin_dir.mkdir()
+            log_path = work / "gh.log"
+            fake_gh = bin_dir / "gh"
+            fake_gh.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/bash
+                    echo "$@" >> {log_path!s}
+                    if [[ "$1" == "release" && "$2" == "view" ]]; then
+                      echo "HTTP 401: Bad credentials" >&2
+                      exit 1
+                    fi
+                    echo "unexpected gh invocation: $*" >&2
+                    exit 99
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_gh.chmod(fake_gh.stat().st_mode | stat.S_IXUSR)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+            env["GITHUB_TOKEN"] = "fake-token"
+            result = subprocess.run(
+                ["bash", str(PUBLISH_SCRIPT), "v0.2.1", str(artifacts)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(ROOT),
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Bad credentials", result.stderr)
+            self.assertIn("not a clear 'release not found'", result.stderr)
+            self.assertNotIn("release create", log_path.read_text(encoding="utf-8"))
+
+    def test_publish_fake_gh_upload_failure_deletes_without_cleanup_tag(self) -> None:
+        """Create/upload failure rolls back with gh release delete --yes (no --cleanup-tag)."""
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            artifacts = work / "artifacts"
+            artifacts.mkdir()
+            for name in self.lib.expected_asset_names("0.2.1"):
+                (artifacts / name).write_bytes(b"zip")
+            bin_dir = work / "bin"
+            bin_dir.mkdir()
+            log_path = work / "gh.log"
+            fake_gh = bin_dir / "gh"
+            fake_gh.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/bash
+                    echo "$@" >> {log_path!s}
+                    if [[ "$1" == "release" && "$2" == "view" ]]; then
+                      echo "release not found" >&2
+                      exit 1
+                    fi
+                    if [[ "$1" == "release" && "$2" == "create" ]]; then
+                      echo "upload failed" >&2
+                      exit 1
+                    fi
+                    if [[ "$1" == "release" && "$2" == "delete" ]]; then
+                      exit 0
+                    fi
+                    echo "unexpected gh invocation: $*" >&2
+                    exit 99
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_gh.chmod(fake_gh.stat().st_mode | stat.S_IXUSR)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+            env["GITHUB_TOKEN"] = "fake-token"
+            result = subprocess.run(
+                ["bash", str(PUBLISH_SCRIPT), "refs/tags/v0.2.1", str(artifacts)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(ROOT),
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("rolled back release", result.stderr)
+            log = log_path.read_text(encoding="utf-8")
+            self.assertIn("release delete v0.2.1 --yes", log)
+            self.assertNotIn("--cleanup-tag", log)
 
 
 def main() -> int:

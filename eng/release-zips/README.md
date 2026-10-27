@@ -50,9 +50,16 @@ changes the Full publish graph, update the matching `Full-*.txt` and re-run
 - `ALog.dll` / `ALog.Extensions.Logging.dll` FileVersion and InformationalVersion
   must match that package version (InformationalVersion may carry `+git` metadata).
 - `System.Security.Cryptography.Pkcs` FileVersion must be ≥ 10.0.13.
-- Top-level `Microsoft.Data.SqlClient.dll` must be the real RID implementation
-  (size gate rejects the ~93 KiB reference stub).
+- Before staging, the full `dotnet publish -r` tree (minus host files, `*.pdb`,
+  `*.deps.json`, `*.runtimeconfig.json`) must equal the allowlist payload. Extra
+  DLLs (for example Newtonsoft.Json) fail the build.
+- RID-specific DLL SHA-256 must match the NuGet cache asset under
+  `runtimes/<rid-family>/lib/…` (SqlClient; on win also Pkcs, EventLog) or
+  `runtimes/win-x64/native/` (SNI).
+- Top-level `Microsoft.Data.SqlClient.dll` must also clear the size gate that
+  rejects the ~93 KiB reference stub.
 - No host exe/DLL, no `*.pdb`, no `*.deps.json` / `*.runtimeconfig.json`, no `runtimes/`.
+- Host `bin/`/`obj/` and the stage directory are removed before each build.
 - Deterministic zip: sorted members, fixed timestamps, mode `0644`, deflate level 9.
 
 ## Tag flow (CI)

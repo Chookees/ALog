@@ -55,6 +55,50 @@ PY
   dirname "$alog"
 }
 
+# Require a Full zip file name to contain Full-<rid> so a linux zip cannot
+# be smoked on the win path (and vice versa).
+# Args: zip-or-dir source, rid.
+require_zip_name_matches_rid() {
+  local source="$1"
+  local rid="$2"
+  if [ -d "$source" ]; then
+    # Unpacked folder: require the folder name (or a parent) to contain Full-<rid>.
+    local base
+    base=$(basename "$source")
+    case "$base" in
+      *Full-"${rid}"*) return 0 ;;
+    esac
+    fail "unpacked dir name does not match RID ${rid}: ${base}"
+  fi
+  local name
+  name=$(basename "$source")
+  case "$name" in
+    *Full-"${rid}"*.zip) return 0 ;;
+  esac
+  fail "zip name does not match RID ${rid}: ${name}"
+}
+
+# Require SNI presence/absence for the Full RID.
+# Args: unpacked zip dir, rid.
+require_sni_for_rid() {
+  local zip_dir="$1"
+  local rid="$2"
+  local sni="$zip_dir/Microsoft.Data.SqlClient.SNI.dll"
+  if [ "$rid" = "win-x64" ]; then
+    if [ ! -f "$sni" ]; then
+      fail "win-x64 Full zip missing Microsoft.Data.SqlClient.SNI.dll"
+    fi
+    echo "release-smoke: SNI present for win-x64"
+  elif [ "$rid" = "linux-x64" ]; then
+    if [ -f "$sni" ]; then
+      fail "linux-x64 Full zip must not contain Microsoft.Data.SqlClient.SNI.dll"
+    fi
+    echo "release-smoke: SNI absent for linux-x64"
+  else
+    fail "unsupported RID: $rid"
+  fi
+}
+
 # Compile the Hello World snippet from the zip README.txt against ALog.dll in ZipDir.
 # Args: repo, unpacked folder containing ALog.dll and README.txt.
 compile_readme_hello() {
@@ -115,11 +159,14 @@ run_lite() {
 }
 
 # Build and run the Full smoke project; copy zip payload beside the output.
-# Args: repo, unpacked folder, rid.
+# Args: repo, unpacked folder, rid, original zip-or-dir source.
 run_full() {
   local repo="$1"
   local zip_dir="$2"
   local rid="$3"
+  local source="$4"
+  require_zip_name_matches_rid "$source" "$rid"
+  require_sni_for_rid "$zip_dir" "$rid"
   local project="$repo/eng/release-smoke/Full/FullSmoke.csproj"
   dotnet build "$project" -c Release -p:ZipDir="$zip_dir" --nologo
   local out
@@ -142,6 +189,8 @@ main() {
   local mode="$1"
   local source="$2"
   local work="${RUNNER_TEMP:-/tmp}/alog-release-smoke-$$"
+  # shellcheck disable=SC2064
+  trap 'rm -rf "$work"' EXIT
   local zip_dir
   zip_dir=$(prepare_zip_dir "$source" "$work")
   echo "zip dir: $zip_dir"
@@ -154,7 +203,7 @@ main() {
       if [ "$#" -ne 3 ]; then
         fail "full smoke requires a RID argument"
       fi
-      run_full "$repo" "$zip_dir" "$3"
+      run_full "$repo" "$zip_dir" "$3" "$source"
       ;;
     *)
       fail "unknown mode: $mode"

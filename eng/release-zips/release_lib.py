@@ -7,12 +7,62 @@ without building zips or talking to GitHub. Next: ``make_zips.py``, ``guard_tag.
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 from pathlib import Path
 
 # Stub SqlClient reference assemblies are ~93 KiB. Real RID implementations are ~1.67 MiB.
 SQLCLIENT_MIN_BYTES = 500_000
 PKCS_MIN_VERSION = (10, 0, 13)
+
+# Files in ``dotnet publish -r`` output that are not part of the Full zip payload.
+# Anything else under the publish directory must match the allowlist (minus LICENSE /
+# NOTICE / README.txt, which the builder adds after staging).
+PUBLISH_EXCLUSION_HOST_PREFIX = "ReleaseZipHost"
+PUBLISH_EXCLUSION_SUFFIXES = (".pdb", ".deps.json", ".runtimeconfig.json")
+
+# Added by the builder after publish staging; not present in publish output.
+STAGE_ONLY_NAMES = frozenset({"LICENSE", "NOTICE", "README.txt"})
+
+# RID-specific DLLs whose SHA-256 must match a NuGet ``runtimes/<family>/…`` asset.
+# Kind ``lib`` → ``runtimes/<family>/lib/net*/<file>``; ``native`` → ``…/native/<file>``.
+RID_NUGET_HASH_CHECKS: dict[str, list[tuple[str, str, str, str]]] = {
+    "linux-x64": [
+        (
+            "Microsoft.Data.SqlClient.dll",
+            "microsoft.data.sqlclient",
+            "unix",
+            "lib",
+        ),
+    ],
+    "win-x64": [
+        (
+            "Microsoft.Data.SqlClient.dll",
+            "microsoft.data.sqlclient",
+            "win",
+            "lib",
+        ),
+        (
+            "System.Security.Cryptography.Pkcs.dll",
+            "system.security.cryptography.pkcs",
+            "win",
+            "lib",
+        ),
+        (
+            "System.Diagnostics.EventLog.dll",
+            "system.diagnostics.eventlog",
+            "win",
+            "lib",
+        ),
+        (
+            "Microsoft.Data.SqlClient.SNI.dll",
+            "microsoft.data.sqlclient.sni.runtime",
+            "win-x64",
+            "native",
+        ),
+    ],
+}
 
 
 def read_csproj_version(csproj: Path) -> str:
@@ -318,18 +368,45 @@ def extract_hello_world_snippet(readme_text: str) -> str:
 
 
 def format_contents_from_allowlist(entries: list[str]) -> str:
-    """Format allowlist paths for the README Contents line (no README.txt self-ref).
+    """Format allowlist paths for the Full README Contents line.
+
+    Lists top-level DLLs and license files only. Satellite resource DLLs under
+    language folders are summarized in one phrase (not each file). Does not use
+    the word ``flat``.
 
     Args:
         entries: Sorted relative paths from an allowlist file.
 
     Returns:
-        Comma-separated file list excluding ``README.txt``.
+        Contents text: layout sentence plus comma-separated top-level files and
+        a language-folder mention when satellites are present.
+
+    Raises:
+        ValueError: The allowlist has no top-level payload besides ``README.txt``.
     """
-    files = [name for name in entries if name != "README.txt"]
-    if not files:
-        raise ValueError("allowlist has no contents besides README.txt")
-    return ", ".join(files)
+    top_level = sorted(
+        name
+        for name in entries
+        if name != "README.txt" and "/" not in name and "\\" not in name
+    )
+    if not top_level:
+        raise ValueError("allowlist has no top-level contents besides README.txt")
+    lang_folders = sorted(
+        {
+            name.split("/", 1)[0] + "/"
+            for name in entries
+            if "/" in name.replace("\\", "/")
+        }
+    )
+    layout = (
+        "DLLs in one folder, plus language folders (de/, cs/, …) "
+        "for translated SqlClient messages"
+    )
+    files = ", ".join(top_level)
+    if lang_folders:
+        folders = ", ".join(lang_folders)
+        return f"{layout}. Files: {files}; language folders: {folders}"
+    return f"{layout}. Files: {files}"
 
 
 def build_readme_text(version: str, kind: str, *, allowlist_dir: Path | None = None) -> str:
@@ -540,3 +617,278 @@ def epoch_to_zip_timestamp(epoch: int) -> tuple[int, int, int, int, int, int]:
         moment.minute,
         moment.second,
     )
+
+
+def sha256_file(path: Path) -> str:
+    """Return the hex SHA-256 digest of one file.
+
+    Args:
+        path: File to hash.
+
+    Returns:
+        Lowercase hex digest.
+
+    Raises:
+        OSError: The file cannot be read.
+    """
+    digest = hashlib.sha256()
+    digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def is_publish_excluded(rel_path: str) -> bool:
+    """True when a publish-relative path is an intentional Full-zip exclusion.
+
+    Exclusions are only host binaries (``ReleaseZipHost*``), ``*.pdb``,
+    ``*.deps.json``, and ``*.runtimeconfig.json``.
+
+    Args:
+        rel_path: Path relative to the publish directory, using ``/`` separators.
+
+    Returns:
+        True when the file must not appear in the allowlist comparison.
+    """
+    normalized = rel_path.replace("\\", "/")
+    name = normalized.rsplit("/", 1)[-1]
+    if name.startswith(PUBLISH_EXCLUSION_HOST_PREFIX):
+        return True
+    for suffix in PUBLISH_EXCLUSION_SUFFIXES:
+        if name.endswith(suffix):
+            return True
+    return False
+
+
+def list_publish_payload_files(publish_dir: Path) -> list[str]:
+    """List publish files that must match the Full allowlist payload.
+
+    Args:
+        publish_dir: ``dotnet publish -r`` output directory.
+
+    Returns:
+        Sorted relative paths (``/`` separators), excluding host/pdb/deps/runtimeconfig.
+
+    Raises:
+        NotADirectoryError: ``publish_dir`` is not a directory.
+        OSError: The tree cannot be walked.
+    """
+    if not publish_dir.is_dir():
+        raise NotADirectoryError(f"publish directory missing: {publish_dir}")
+    found: list[str] = []
+    for path in publish_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(publish_dir).as_posix()
+        if is_publish_excluded(rel):
+            continue
+        found.append(rel)
+    return sorted(found)
+
+
+def compare_publish_to_allowlist(publish_dir: Path, allowlist: list[str]) -> None:
+    """Require publish payload ≡ allowlist minus LICENSE/NOTICE/README.txt.
+
+    Runs before staging so an extra DLL in ``dotnet publish -r`` output (for
+    example Newtonsoft.Json.dll) fails the build instead of being silently dropped.
+
+    Args:
+        publish_dir: ``dotnet publish -r`` output directory.
+        allowlist: Loaded allowlist paths for this Full RID.
+
+    Raises:
+        ValueError: Extra or missing files versus the allowlist payload.
+        OSError: The publish tree cannot be read.
+    """
+    expected = sorted(
+        name.replace("\\", "/")
+        for name in allowlist
+        if name.replace("\\", "/") not in STAGE_ONLY_NAMES
+    )
+    actual = list_publish_payload_files(publish_dir)
+    expected_set = set(expected)
+    actual_set = set(actual)
+    missing = sorted(expected_set - actual_set)
+    extra = sorted(actual_set - expected_set)
+    if missing or extra:
+        parts: list[str] = []
+        if extra:
+            parts.append("extra: " + ", ".join(extra))
+        if missing:
+            parts.append("missing: " + ", ".join(missing))
+        raise ValueError(
+            "publish output does not match allowlist payload (before staging); "
+            + "; ".join(parts)
+        )
+
+
+def default_nuget_packages_root() -> Path:
+    """Resolve the local NuGet package cache root.
+
+    Returns:
+        ``NUGET_PACKAGES`` when set, otherwise ``~/.nuget/packages``.
+    """
+    override = os.environ.get("NUGET_PACKAGES", "").strip()
+    if override:
+        return Path(override)
+    return Path.home() / ".nuget" / "packages"
+
+
+def find_nuget_rid_assets(
+    package_id: str,
+    rid_family: str,
+    kind: str,
+    filename: str,
+    nuget_root: Path,
+) -> list[Path]:
+    """Find RID-specific assets for one DLL under the NuGet cache.
+
+    Args:
+        package_id: Lowercase package folder name (for example
+            ``microsoft.data.sqlclient``).
+        rid_family: ``unix``, ``win``, or ``win-x64`` (SNI native).
+        kind: ``lib`` or ``native``.
+        filename: File name such as ``Microsoft.Data.SqlClient.dll``.
+        nuget_root: NuGet packages root.
+
+    Returns:
+        Matching file paths under ``runtimes/<rid_family>/<kind>/…``.
+
+    Raises:
+        FileNotFoundError: The package folder is missing under ``nuget_root``.
+    """
+    package_root = nuget_root / package_id.lower()
+    if not package_root.is_dir():
+        raise FileNotFoundError(f"NuGet package folder missing: {package_root}")
+    needle = f"runtimes/{rid_family}/{kind}/"
+    matches: list[Path] = []
+    for path in package_root.rglob(filename):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(package_root).as_posix()
+        if needle not in rel:
+            continue
+        if kind == "lib" and "/lib/" not in rel:
+            continue
+        if kind == "native" and "/native/" not in rel:
+            continue
+        matches.append(path)
+    return matches
+
+
+def verify_rid_nuget_hashes(
+    publish_dir: Path,
+    rid: str,
+    *,
+    nuget_root: Path | None = None,
+) -> None:
+    """Require RID-specific publish DLLs match NuGet ``runtimes/…`` assets by SHA-256.
+
+    Checks SqlClient for every Full RID. On ``win-x64`` also checks Pkcs, EventLog,
+    and SNI. A size-only stub gate is not enough: the published digest must equal a
+    file under ``runtimes/<rid-family>/lib/…`` (or ``native/`` for SNI).
+
+    Args:
+        publish_dir: ``dotnet publish -r`` output directory.
+        rid: ``linux-x64`` or ``win-x64``.
+        nuget_root: Optional NuGet packages root; defaults to the local cache.
+
+    Raises:
+        ValueError: Unknown RID, missing publish file, no NuGet RID asset, or hash mismatch.
+        OSError: A file cannot be read.
+    """
+    checks = RID_NUGET_HASH_CHECKS.get(rid)
+    if checks is None:
+        raise ValueError(f"unsupported RID for NuGet hash check: {rid}")
+    root = nuget_root if nuget_root is not None else default_nuget_packages_root()
+    for filename, package_id, family, kind in checks:
+        published = publish_dir / filename
+        if not published.is_file():
+            raise ValueError(f"published output missing RID DLL {filename} for {rid}")
+        published_hash = sha256_file(published)
+        assets = find_nuget_rid_assets(package_id, family, kind, filename, root)
+        if not assets:
+            raise ValueError(
+                f"no NuGet RID asset for {filename} under "
+                f"runtimes/{family}/{kind}/ in {root / package_id}"
+            )
+        asset_by_hash = {sha256_file(path): path for path in assets}
+        match = asset_by_hash.get(published_hash)
+        if match is None:
+            sample = assets[0]
+            raise ValueError(
+                f"{filename} SHA-256 {published_hash} does not match any "
+                f"runtimes/{family}/{kind}/ asset in NuGet cache "
+                f"(example {sample}: {sha256_file(sample)})"
+            )
+        print(
+            f"RID hash ok {rid} {filename}: matches {match.relative_to(root).as_posix()}"
+        )
+
+
+def check_full_publish_output(
+    publish_dir: Path,
+    allowlist_path: Path,
+    rid: str,
+    *,
+    nuget_root: Path | None = None,
+) -> None:
+    """Run allowlist-before-stage and RID NuGet hash checks on one publish tree.
+
+    Args:
+        publish_dir: ``dotnet publish -r`` output directory.
+        allowlist_path: ``Full-<rid>.txt`` allowlist path.
+        rid: ``linux-x64`` or ``win-x64``.
+        nuget_root: Optional NuGet packages root.
+
+    Raises:
+        ValueError: Allowlist or RID hash check failed.
+        OSError: Inputs cannot be read.
+    """
+    allowlist = load_allowlist(allowlist_path)
+    compare_publish_to_allowlist(publish_dir, allowlist)
+    verify_rid_nuget_hashes(publish_dir, rid, nuget_root=nuget_root)
+
+
+def workflow_run_blocks_with_expressions(workflow_text: str) -> list[str]:
+    """Return ``run:`` block snippets that still embed ``${{`` expressions.
+
+    GitHub Actions interpolates ``${{ }}`` before the shell sees the script, so
+    values used inside ``run:`` must arrive via ``env:`` instead.
+
+    Args:
+        workflow_text: Full YAML text of a workflow file.
+
+    Returns:
+        One snippet per offending ``run:`` block (truncated), empty when clean.
+    """
+    offenders: list[str] = []
+    lines = workflow_text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.lstrip(" ")
+        indent = len(line) - len(stripped)
+        if not stripped.startswith("run:"):
+            index += 1
+            continue
+        block_lines = [line]
+        rest = stripped[len("run:") :].strip()
+        if rest in ("|", ">", "|-", ">-", "") or rest.startswith("|") or rest.startswith(">"):
+            index += 1
+            while index < len(lines):
+                nxt = lines[index]
+                if not nxt.strip():
+                    block_lines.append(nxt)
+                    index += 1
+                    continue
+                nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+                if nxt_indent <= indent:
+                    break
+                block_lines.append(nxt)
+                index += 1
+        else:
+            index += 1
+        block = "\n".join(block_lines)
+        # Only the script body after ``run:`` counts; ``if:`` keys are elsewhere.
+        if "${{" in block.split("run:", 1)[1]:
+            offenders.append(block if len(block) < 240 else block[:240] + "…")
+    return offenders

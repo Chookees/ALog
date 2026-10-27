@@ -2,6 +2,7 @@
 # PR/push: build-zips + release-smoke only (contents: read).
 # Tag v*: guard → build-zips → release-smoke → publish (write only on publish).
 # A red run creates no release and no draft.
+# Values used inside run: scripts arrive only via env: (no ${{ }} in run bodies).
 
 name: Release zips
 
@@ -17,6 +18,8 @@ on:
       - "eng/test_release_zips.py"
       - "ALog/**"
       - "ALog.Extensions.Logging/**"
+      - "CHANGELOG.md"
+      - "README.md"
       - "global.json"
       - "Directory.Build.props"
       - ".github/workflows/release-zips.yml"
@@ -39,7 +42,10 @@ jobs:
 
       - name: Tag release guard
         if: startsWith(github.ref, 'refs/tags/v')
-        run: bash eng/release-zips/guard_tag.sh "${{ github.ref }}" "${{ github.sha }}"
+        env:
+          TAG_REF: ${{ github.ref }}
+          TAG_SHA: ${{ github.sha }}
+        run: bash eng/release-zips/guard_tag.sh "$TAG_REF" "$TAG_SHA"
 
       - name: Non-tag guard skip
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
@@ -150,10 +156,12 @@ jobs:
       - name: Smoke Lite and Full-linux-x64
         if: matrix.target == 'linux'
         shell: bash
+        env:
+          ZIP_ARTIFACTS: ${{ runner.temp }}/zip-artifacts
         run: |
           set -euo pipefail
-          lite=$(find "${{ runner.temp }}/zip-artifacts" -name 'ALog-v*-Lite.zip' -print)
-          full=$(find "${{ runner.temp }}/zip-artifacts" -name 'ALog-v*-Full-linux-x64.zip' -print)
+          lite=$(find "$ZIP_ARTIFACTS" -name 'ALog-v*-Lite.zip' -print)
+          full=$(find "$ZIP_ARTIFACTS" -name 'ALog-v*-Full-linux-x64.zip' -print)
           test -n "$lite"
           test -n "$full"
           bash eng/release-smoke/run-smoke.sh lite "$lite"
@@ -162,9 +170,11 @@ jobs:
       - name: Smoke Full-win-x64
         if: matrix.target == 'win'
         shell: bash
+        env:
+          ZIP_ARTIFACTS: ${{ runner.temp }}/zip-artifacts
         run: |
           set -euo pipefail
-          full=$(find "${{ runner.temp }}/zip-artifacts" -name 'ALog-v*-Full-win-x64.zip' -print)
+          full=$(find "$ZIP_ARTIFACTS" -name 'ALog-v*-Full-win-x64.zip' -print)
           test -n "$full"
           bash eng/release-smoke/run-smoke.sh full "$full" win-x64
 
@@ -187,4 +197,6 @@ jobs:
       - name: Publish GitHub release
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: bash eng/release-zips/publish_release.sh "${{ github.ref }}" "${{ runner.temp }}/publish-artifacts"
+          TAG_REF: ${{ github.ref }}
+          PUBLISH_ARTIFACTS: ${{ runner.temp }}/publish-artifacts
+        run: bash eng/release-zips/publish_release.sh "$TAG_REF" "$PUBLISH_ARTIFACTS"

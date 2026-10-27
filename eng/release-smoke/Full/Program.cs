@@ -1,4 +1,5 @@
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
 using ALog;
 using ALog.Config;
@@ -13,10 +14,15 @@ using Microsoft.Extensions.Logging;
 /// <summary>
 /// Smoke-tests an unpacked Full zip: AddALog/ILogger, AWS region ctor, Azure App Insights, and SQL.
 /// On linux-x64 writes a real row and SELECTs it back. On win-x64, ctor plus connect
-/// where SqlException for a missing server is success.
+/// where SqlException for a missing server is success only for expected error numbers.
 /// </summary>
 internal static class Program
 {
+    /// <summary>
+    /// SqlException numbers observed (or accepted) when no SQL Server is listening on Windows.
+    /// </summary>
+    private static readonly HashSet<int> ExpectedNoServerNumbers = new() { 258, 2, 53, -2 };
+
     /// <summary>
     /// Non-static category type for <see cref="ILogger{TCategoryName}"/> (static Program cannot be T).
     /// </summary>
@@ -34,6 +40,8 @@ internal static class Program
         try
         {
             var rid = ResolveRid(args);
+            RequireOsMatchesRid(rid);
+            RequireSniMatchesRid(rid);
             RunAddALog();
             RunAwsRegionCtor();
             RunAzureListener();
@@ -79,6 +87,51 @@ internal static class Program
         }
 
         return OperatingSystem.IsWindows() ? "win-x64" : "linux-x64";
+    }
+
+    /// <summary>
+    /// Fail when the process OS does not match the zip RID under test.
+    /// </summary>
+    /// <param name="rid">Expected zip RID.</param>
+    private static void RequireOsMatchesRid(string rid)
+    {
+        if (rid == "win-x64" && !OperatingSystem.IsWindows())
+        {
+            throw new InvalidOperationException(
+                $"RID win-x64 requires Windows; OSDescription={RuntimeInformation.OSDescription}");
+        }
+
+        if (rid == "linux-x64" && !OperatingSystem.IsLinux())
+        {
+            throw new InvalidOperationException(
+                $"RID linux-x64 requires Linux; OSDescription={RuntimeInformation.OSDescription}");
+        }
+
+        Console.WriteLine(
+            $"FULL-SMOKE OS ok rid={rid} os={RuntimeInformation.OSDescription}");
+    }
+
+    /// <summary>
+    /// Fail when SNI presence in the app base directory does not match the RID.
+    /// </summary>
+    /// <param name="rid">Expected zip RID.</param>
+    private static void RequireSniMatchesRid(string rid)
+    {
+        var sni = Path.Combine(AppContext.BaseDirectory, "Microsoft.Data.SqlClient.SNI.dll");
+        var present = File.Exists(sni);
+        if (rid == "win-x64" && !present)
+        {
+            throw new InvalidOperationException(
+                "win-x64 Full smoke requires Microsoft.Data.SqlClient.SNI.dll beside the app");
+        }
+
+        if (rid == "linux-x64" && present)
+        {
+            throw new InvalidOperationException(
+                "linux-x64 Full smoke must not load Microsoft.Data.SqlClient.SNI.dll");
+        }
+
+        Console.WriteLine($"FULL-SMOKE SNI ok rid={rid} present={present}");
     }
 
     /// <summary>
@@ -213,21 +266,22 @@ internal static class Program
     }
 
     /// <summary>
-    /// Constructs SqlLogWriter and opens a SqlConnection. SqlException (no server) is success;
-    /// PlatformNotSupportedException or FileNotFoundException is failure.
+    /// Constructs SqlLogWriter and opens a SqlConnection with no server.
+    /// Success is a SqlException whose number is in <see cref="ExpectedNoServerNumbers"/>.
     /// </summary>
     private static void RunSqlWindowsConnect()
     {
         const string cs =
             "Server=127.0.0.1,1433;User Id=sa;Password=ALogSmoke_NoServer_1;TrustServerCertificate=True;Encrypt=False;Connect Timeout=3;";
+
+        // Ctor may or may not open a connection; only unexpected exception types fail here.
         try
         {
             using var writer = new SqlLogWriter(cs, "ALogReleaseSmokeWin", autoCreateTable: true);
-            Console.WriteLine("FULL-SMOKE win sql writer constructed (server reachable)");
         }
         catch (SqlException ex)
         {
-            Console.WriteLine($"FULL-SMOKE win sql-ctor SqlException ok: {ex.Number}");
+            RequireExpectedNoServerNumber(ex, "sql-ctor");
         }
         catch (PlatformNotSupportedException ex)
         {
@@ -242,11 +296,14 @@ internal static class Program
         {
             using var connection = new SqlConnection(cs);
             connection.Open();
-            Console.WriteLine("FULL-SMOKE win sql-open connected");
+            throw new InvalidOperationException(
+                "expected SqlException for missing server, but SqlConnection.Open succeeded");
         }
         catch (SqlException ex)
         {
-            Console.WriteLine($"FULL-SMOKE win sql-open SqlException ok: {ex.Number}");
+            RequireExpectedNoServerNumber(ex, "sql-open");
+            Console.WriteLine(
+                $"FULL-SMOKE win sql constructed, connect failed as expected: SqlException {ex.Number}");
         }
         catch (PlatformNotSupportedException ex)
         {
@@ -255,6 +312,22 @@ internal static class Program
         catch (FileNotFoundException ex)
         {
             throw new InvalidOperationException("SqlConnection FileNotFoundException on win-x64", ex);
+        }
+    }
+
+    /// <summary>
+    /// Fail unless <paramref name="ex"/> carries an accepted no-server error number.
+    /// </summary>
+    /// <param name="ex">SqlException from ctor or Open.</param>
+    /// <param name="phase">Short label for diagnostics.</param>
+    private static void RequireExpectedNoServerNumber(SqlException ex, string phase)
+    {
+        if (!ExpectedNoServerNumbers.Contains(ex.Number))
+        {
+            throw new InvalidOperationException(
+                $"unexpected SqlException number {ex.Number} during {phase}; "
+                + $"accepted: {string.Join(", ", ExpectedNoServerNumbers.OrderBy(n => n))}",
+                ex);
         }
     }
 }

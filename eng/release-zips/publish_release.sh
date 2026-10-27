@@ -4,6 +4,7 @@
 # Expects exactly three zip assets whose names are derived from the tag version.
 # SHA256SUMS may appear in the notes text but is never uploaded as a fourth asset.
 # Aborts when the release already exists (no --clobber). Uses gh + GITHUB_TOKEN.
+# On create/upload failure, deletes the release this run created (tag kept).
 #
 # Usage:
 #   bash eng/release-zips/publish_release.sh <tag-ref> <artifacts-dir>
@@ -120,7 +121,45 @@ print(notes_path)
 PY
 }
 
-# Create the GitHub release or abort when it already exists.
+# Normalize a tag ref to the bare tag name (strip refs/tags/).
+# Args: tag ref. Prints the bare tag.
+bare_tag() {
+  local tag="$1"
+  case "$tag" in
+    refs/tags/*) tag="${tag#refs/tags/}" ;;
+  esac
+  printf '%s\n' "$tag"
+}
+
+# Require that no GitHub release exists for the tag.
+# Only a clear "release not found" from gh means absent; auth/network/other → fail.
+# Args: bare tag name.
+require_release_absent() {
+  local tag="$1"
+  local err
+  local rc
+  set +e
+  err=$(gh release view "$tag" 2>&1)
+  rc=$?
+  set -e
+  if [ "$rc" -eq 0 ]; then
+    fail "release $tag already exists; refusing to overwrite (no --clobber)"
+  fi
+  if printf '%s\n' "$err" | grep -qi 'release not found'; then
+    return 0
+  fi
+  fail "gh release view failed (not a clear 'release not found'): $err"
+}
+
+# Delete a release created by this run. Keeps the git tag (no --cleanup-tag).
+# Args: bare tag name.
+delete_release_keep_tag() {
+  local tag="$1"
+  echo "publish_release: rolling back release $tag (keeping tag; no --cleanup-tag)" >&2
+  gh release delete "$tag" --yes
+}
+
+# Create the GitHub release or abort when it already exists / create fails.
 # Args: tag ref, version, notes file, three zip paths.
 create_release() {
   local tag_ref="$1"
@@ -137,21 +176,26 @@ create_release() {
     fail "gh is not on PATH"
   fi
 
-  local tag="$tag_ref"
-  case "$tag" in
-    refs/tags/*) tag="${tag#refs/tags/}" ;;
-  esac
-
-  if gh release view "$tag" >/dev/null 2>&1; then
-    fail "release $tag already exists; refusing to overwrite (no --clobber)"
-  fi
+  local tag
+  tag=$(bare_tag "$tag_ref")
+  require_release_absent "$tag"
 
   # --verify-tag aborts when the tag is missing on the remote (does not create one).
+  # On any create/upload failure, delete exactly this release and keep the tag.
+  set +e
   gh release create "$tag" \
     --verify-tag \
     --title "ALog v${version}" \
     --notes-file "$notes" \
     "$lite" "$win" "$linux"
+  local create_rc=$?
+  set -e
+  if [ "$create_rc" -ne 0 ]; then
+    set +e
+    delete_release_keep_tag "$tag"
+    set -e
+    fail "gh release create/upload failed for $tag (rc=$create_rc); rolled back release, tag kept"
+  fi
   echo "publish_release: created $tag with 3 assets"
 }
 
