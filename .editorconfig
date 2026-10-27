@@ -49,9 +49,6 @@ dotnet_diagnostic.CA2007.severity = none
 [DemoApp/**.cs]
 dotnet_diagnostic.CA2007.severity = none
 
-[samples/**.cs]
-dotnet_diagnostic.CA2007.severity = none
-
 [ALog.Benchmarks/**.cs]
 dotnet_diagnostic.CA2007.severity = none
 

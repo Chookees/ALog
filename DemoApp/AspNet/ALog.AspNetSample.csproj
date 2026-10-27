@@ -3,7 +3,7 @@
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <IsPackable>false</IsPackable>
-    <!-- DC-Z2: samples opt out of TreatWarningsAsErrors. Libraries and tests keep the CI gate. -->
+    <!-- DC-Z2: DemoApp samples opt out of TreatWarningsAsErrors. Libraries and tests keep the CI gate. -->
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
 
