@@ -75,10 +75,13 @@ Workflow: `.github/workflows/release-zips.yml`.
 3. **release-smoke**: matrix unpacks those artifacts, builds consumers only against
    zip DLLs, compiles the README Hello World snippet, runs Lite (HTTP + Azure
    listeners) and Full SQL checks.
-4. **publish** (tag only, after both RIDs are green): creates the GitHub release
-   with `gh release create --verify-tag` and exactly the three zips. `SHA256SUMS`
-   is inlined in the notes, not uploaded as a fourth asset. If the release already
+4. **publish** (tag only, after both RIDs are green): creates a **draft** with
+   `gh release create --draft --verify-tag` (no assets), uploads the three zips,
+   then `gh release edit --draft=false`. `SHA256SUMS` is inlined in the notes, not
+   uploaded as a fourth asset. Upload/edit failure or TERM/INT deletes the owned
+   draft (`gh release delete --yes`, never `--cleanup-tag`). If the release already
    exists, or the tag is missing on the remote, publish aborts (no clobber).
 
-A red run creates neither a release nor a draft. Do not push a real tag from this
-folder to test publish; use `python3 eng/test_release_zips.py` for guard/notes logic.
+A normal red run leaves no draft. A draft can remain only after SIGKILL or runner
+loss (Repo Manager checks for leftover drafts after each run). Do not push a real
+tag from this folder to test publish; use `python3 eng/test_release_zips.py`.

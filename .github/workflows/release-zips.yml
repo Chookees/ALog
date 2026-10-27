@@ -1,8 +1,11 @@
 # Release zip build, smoke, and tag publish for ALog.
 # PR/push: build-zips + release-smoke only (contents: read).
 # Tag v*: guard → build-zips → release-smoke → publish (write only on publish).
-# A red run creates no release and no draft.
-# Values used inside run: scripts arrive only via env: (no ${{ }} in run bodies).
+# Publish creates a draft, uploads assets, then publishes (edit --draft=false).
+# An owned draft is deleted on upload/edit failure or TERM/INT; OWNED_DRAFT is
+# cleared immediately after a successful edit so a published release is never
+# rolled back. A draft can remain only after SIGKILL or runner loss. Values used
+# inside run: arrive via env:.
 
 name: Release zips
 
@@ -16,6 +19,7 @@ on:
       - "eng/release-smoke/**"
       - "eng/build-release-zips.sh"
       - "eng/test_release_zips.py"
+      - "eng/start-sql.sh"
       - "ALog/**"
       - "ALog.Extensions.Logging/**"
       - "CHANGELOG.md"

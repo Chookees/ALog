@@ -8,6 +8,7 @@ without building zips or talking to GitHub. Next: ``make_zips.py``, ``guard_tag.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from pathlib import Path
@@ -272,7 +273,8 @@ def extract_changelog_section(changelog_text: str, version: str) -> str:
         The section including its heading, trimmed, with a trailing newline.
 
     Raises:
-        ValueError: The heading is missing or the section body is empty.
+        ValueError: The heading is missing, the section body is empty, or the
+            section has no bullet line starting with ``- ``.
     """
     pattern = changelog_heading_pattern(version)
     lines = changelog_text.splitlines()
@@ -282,7 +284,7 @@ def extract_changelog_section(changelog_text: str, version: str) -> str:
             start = index
             break
     if start is None:
-        raise ValueError(f"CHANGELOG.md has no '## {version}' section")
+        raise ValueError(f"error: CHANGELOG.md has no '## {version}' section")
     end = len(lines)
     for index in range(start + 1, len(lines)):
         if lines[index].startswith("## "):
@@ -290,12 +292,17 @@ def extract_changelog_section(changelog_text: str, version: str) -> str:
             break
     section = "\n".join(lines[start:end]).strip()
     if not section:
-        raise ValueError(f"CHANGELOG.md section '## {version}' is empty")
+        raise ValueError(f"error: CHANGELOG.md section '## {version}' is empty")
+    if not any(line.startswith("- ") for line in section.splitlines()):
+        raise ValueError(
+            f"error: CHANGELOG.md section '## {version}' has no bullet line "
+            f"starting with '- '"
+        )
     return section + "\n"
 
 
 def require_changelog_section(repo: Path, version: str) -> str:
-    """Read CHANGELOG.md and require a section for ``version``.
+    """Read CHANGELOG.md and require a section with at least one ``- `` bullet.
 
     Used by the tag guard so a missing section fails before build-zips, not
     only at publish.
@@ -309,7 +316,7 @@ def require_changelog_section(repo: Path, version: str) -> str:
         ``extract_changelog_section``).
 
     Raises:
-        ValueError: The section is missing or empty.
+        ValueError: The section is missing, empty, or has no ``- `` bullet.
         OSError: CHANGELOG.md cannot be read.
     """
     text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
@@ -774,53 +781,110 @@ def find_nuget_rid_assets(
     return matches
 
 
+def resolve_assets_rid_package_path(
+    assets_json: Path,
+    rid: str,
+    filename: str,
+) -> tuple[str, str, str]:
+    """Return the package path ``project.assets.json`` selected for one RID DLL.
+
+    Args:
+        assets_json: Host ``project.assets.json`` after ``dotnet publish -r``.
+        rid: ``linux-x64`` or ``win-x64``.
+        filename: DLL file name such as ``Microsoft.Data.SqlClient.dll``.
+
+    Returns:
+        ``(package_id_lower, package_version, package_relative_path)`` where the
+        relative path is the exact ``runtime`` / ``runtimeTargets`` / ``native``
+        entry NuGet selected (includes ``runtimes/<family>/lib/<tfm>/…``).
+
+    Raises:
+        ValueError: The assets file has no matching target or DLL entry.
+        OSError: The assets file cannot be read.
+        json.JSONDecodeError: The assets file is not valid JSON.
+    """
+    data = json.loads(assets_json.read_text(encoding="utf-8"))
+    targets = data.get("targets") or {}
+    target_key = None
+    suffix = "/" + rid
+    for key in targets:
+        if key.endswith(suffix):
+            target_key = key
+            break
+    if target_key is None:
+        raise ValueError(
+            f"project.assets.json has no target for RID {rid} in {assets_json}"
+        )
+    packages = targets[target_key]
+    for package_key, package in packages.items():
+        if "/" not in package_key:
+            continue
+        package_id, package_version = package_key.split("/", 1)
+        for field in ("runtime", "runtimeTargets", "native"):
+            entries = package.get(field) or {}
+            for rel_path in entries:
+                normalized = rel_path.replace("\\", "/")
+                if not normalized.endswith("/" + filename) and normalized != filename:
+                    continue
+                if not normalized.startswith("runtimes/"):
+                    continue
+                return package_id.lower(), package_version, normalized
+    raise ValueError(
+        f"project.assets.json target {target_key} has no runtimes path for {filename}"
+    )
+
+
 def verify_rid_nuget_hashes(
     publish_dir: Path,
     rid: str,
     *,
+    assets_json: Path,
     nuget_root: Path | None = None,
 ) -> None:
-    """Require RID-specific publish DLLs match NuGet ``runtimes/…`` assets by SHA-256.
+    """Require RID publish DLLs match the exact ``project.assets.json`` NuGet path.
 
     Checks SqlClient for every Full RID. On ``win-x64`` also checks Pkcs, EventLog,
-    and SNI. A size-only stub gate is not enough: the published digest must equal a
-    file under ``runtimes/<rid-family>/lib/…`` (or ``native/`` for SNI).
+    and SNI. The digest must equal the file at the package-relative path NuGet
+    selected for this RID (including the TFM folder under ``runtimes/…/lib/``).
 
     Args:
         publish_dir: ``dotnet publish -r`` output directory.
         rid: ``linux-x64`` or ``win-x64``.
+        assets_json: Host ``project.assets.json`` for this publish.
         nuget_root: Optional NuGet packages root; defaults to the local cache.
 
     Raises:
-        ValueError: Unknown RID, missing publish file, no NuGet RID asset, or hash mismatch.
+        ValueError: Unknown RID, missing file, assets path missing, or hash/TFM mismatch.
         OSError: A file cannot be read.
     """
     checks = RID_NUGET_HASH_CHECKS.get(rid)
     if checks is None:
         raise ValueError(f"unsupported RID for NuGet hash check: {rid}")
+    if not assets_json.is_file():
+        raise ValueError(f"project.assets.json missing: {assets_json}")
     root = nuget_root if nuget_root is not None else default_nuget_packages_root()
-    for filename, package_id, family, kind in checks:
+    for filename, _package_id, _family, _kind in checks:
         published = publish_dir / filename
         if not published.is_file():
             raise ValueError(f"published output missing RID DLL {filename} for {rid}")
-        published_hash = sha256_file(published)
-        assets = find_nuget_rid_assets(package_id, family, kind, filename, root)
-        if not assets:
+        package_id, package_version, rel_path = resolve_assets_rid_package_path(
+            assets_json, rid, filename
+        )
+        expected = root / package_id / package_version / rel_path
+        if not expected.is_file():
             raise ValueError(
-                f"no NuGet RID asset for {filename} under "
-                f"runtimes/{family}/{kind}/ in {root / package_id}"
+                f"NuGet asset missing for assets.json path: {expected.as_posix()}"
             )
-        asset_by_hash = {sha256_file(path): path for path in assets}
-        match = asset_by_hash.get(published_hash)
-        if match is None:
-            sample = assets[0]
+        published_hash = sha256_file(published)
+        expected_hash = sha256_file(expected)
+        if published_hash != expected_hash:
             raise ValueError(
-                f"{filename} SHA-256 {published_hash} does not match any "
-                f"runtimes/{family}/{kind}/ asset in NuGet cache "
-                f"(example {sample}: {sha256_file(sample)})"
+                f"{filename} SHA-256 {published_hash} does not match assets.json "
+                f"selected {rel_path} ({expected_hash}) for RID {rid}"
             )
         print(
-            f"RID hash ok {rid} {filename}: matches {match.relative_to(root).as_posix()}"
+            f"RID hash ok {rid} {filename}: matches "
+            f"{package_id}/{package_version}/{rel_path}"
         )
 
 
@@ -829,6 +893,7 @@ def check_full_publish_output(
     allowlist_path: Path,
     rid: str,
     *,
+    assets_json: Path,
     nuget_root: Path | None = None,
 ) -> None:
     """Run allowlist-before-stage and RID NuGet hash checks on one publish tree.
@@ -837,6 +902,7 @@ def check_full_publish_output(
         publish_dir: ``dotnet publish -r`` output directory.
         allowlist_path: ``Full-<rid>.txt`` allowlist path.
         rid: ``linux-x64`` or ``win-x64``.
+        assets_json: Host ``project.assets.json`` for this publish.
         nuget_root: Optional NuGet packages root.
 
     Raises:
@@ -845,7 +911,37 @@ def check_full_publish_output(
     """
     allowlist = load_allowlist(allowlist_path)
     compare_publish_to_allowlist(publish_dir, allowlist)
-    verify_rid_nuget_hashes(publish_dir, rid, nuget_root=nuget_root)
+    verify_rid_nuget_hashes(
+        publish_dir, rid, assets_json=assets_json, nuget_root=nuget_root
+    )
+
+
+def azure_track_request_ok(method: str, path: str, body: str) -> None:
+    """Require an Azure App Insights track request shape used by release smoke.
+
+    Args:
+        method: HTTP method (must be ``POST``).
+        path: URL absolute path (must be ``/v2/track``).
+        body: Raw request body (must be non-empty JSON).
+
+    Raises:
+        ValueError: Method, path, or JSON body is invalid.
+    """
+    if method.upper() != "POST":
+        raise ValueError(f"error: Azure track method must be POST, got {method!r}")
+    normalized = path.split("?", 1)[0]
+    if normalized != "/v2/track":
+        raise ValueError(
+            f"error: Azure track path must be /v2/track, got {path!r}"
+        )
+    if not body or not body.strip():
+        raise ValueError("error: Azure track body is empty")
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"error: Azure track body is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, (dict, list)):
+        raise ValueError("error: Azure track body JSON must be an object or array")
 
 
 def workflow_run_blocks_with_expressions(workflow_text: str) -> list[str]:

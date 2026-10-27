@@ -4,9 +4,12 @@
 # Expects exactly three zip assets whose names are derived from the tag version.
 # SHA256SUMS may appear in the notes text but is never uploaded as a fourth asset.
 # Aborts when the release already exists (no --clobber). Uses gh + GITHUB_TOKEN.
-# Creates the release first, then uploads assets. Rolls back with
-# ``gh release delete <tag> --yes`` (no --cleanup-tag) only when upload fails
-# after this run's create succeeded. Concurrent "already exists" never deletes.
+#
+# Flow: create a --draft release (no assets) → upload zips → gh release edit
+# --draft=false. OWNED_DRAFT is set only after our create succeeds and cleared
+# immediately after publish edit succeeds. A TERM/INT/EXIT trap deletes the
+# draft (gh release delete --yes, never --cleanup-tag) while OWNED_DRAFT is set.
+# Concurrent "already exists" and other create failures never delete.
 #
 # Usage:
 #   bash eng/release-zips/publish_release.sh <tag-ref> <artifacts-dir>
@@ -14,6 +17,10 @@
 # artifacts-dir must contain the three zips (and preferably SHA256SUMS).
 
 set -euo pipefail
+
+# Set when this run successfully created a draft release; cleared after publish.
+OWNED_DRAFT=0
+OWNED_TAG=""
 
 # Resolve repository root from this script.
 # Prints the absolute repo path.
@@ -145,28 +152,79 @@ require_release_absent() {
   rc=$?
   set -e
   if [ "$rc" -eq 0 ]; then
-    fail "release $tag already exists; refusing to overwrite (no --clobber)"
+    fail "error: release $tag already exists; refusing to overwrite (no --clobber)"
   fi
   if printf '%s\n' "$err" | grep -qi 'release not found'; then
     return 0
   fi
-  fail "gh release view failed (not a clear 'release not found'): $err"
+  fail "error: gh release view failed (not a clear 'release not found'): $err"
 }
 
-# Delete a release created by this run. Keeps the git tag (no --cleanup-tag).
+# Delete the draft this run owns. Never passes --cleanup-tag (tag stays).
 # Args: bare tag name.
-delete_release_keep_tag() {
+# Returns: 0 when delete succeeds; non-zero when gh delete fails.
+delete_owned_draft() {
   local tag="$1"
-  echo "publish_release: rolling back release $tag (keeping tag; no --cleanup-tag)" >&2
+  echo "publish_release: deleting owned draft $tag (keeping tag; no --cleanup-tag)" >&2
   gh release delete "$tag" --yes
 }
 
-# Create the GitHub release (no assets), then upload the three zips.
+# Roll back an owned draft after upload/edit failure or signal.
+# Args: bare tag name, reason words for a successful delete path.
+# On delete failure prints the exact FAILED message and exits 1 (never "rolled back").
+rollback_owned_draft() {
+  local tag="$1"
+  shift
+  local reason="$*"
+  OWNED_DRAFT=0
+  OWNED_TAG=""
+  set +e
+  delete_owned_draft "$tag"
+  local del_rc=$?
+  set -e
+  if [ "$del_rc" -ne 0 ]; then
+    fail "error: rollback FAILED for $tag, manual cleanup needed"
+  fi
+  fail "error: $reason; rolled back draft $tag, tag kept"
+}
+
+# TERM/INT/EXIT handler: delete owned draft if still marked, then exit non-zero on signals.
+# No args; uses OWNED_DRAFT / OWNED_TAG.
+on_owned_draft_trap() {
+  local signal="${1:-EXIT}"
+  if [ "${OWNED_DRAFT}" != "1" ] || [ -z "${OWNED_TAG}" ]; then
+    if [ "$signal" = "TERM" ] || [ "$signal" = "INT" ]; then
+      exit 143
+    fi
+    return 0
+  fi
+  local tag="$OWNED_TAG"
+  OWNED_DRAFT=0
+  OWNED_TAG=""
+  set +e
+  delete_owned_draft "$tag"
+  local del_rc=$?
+  set -e
+  if [ "$del_rc" -ne 0 ]; then
+    echo "publish_release: error: rollback FAILED for $tag, manual cleanup needed" >&2
+    exit 1
+  fi
+  if [ "$signal" = "TERM" ] || [ "$signal" = "INT" ]; then
+    echo "publish_release: error: interrupted ($signal); deleted owned draft $tag" >&2
+    exit 143
+  fi
+}
+
+# Install TERM/INT/EXIT traps that roll back an owned draft.
+# No args.
+install_owned_draft_traps() {
+  trap 'on_owned_draft_trap TERM' TERM
+  trap 'on_owned_draft_trap INT' INT
+  trap 'on_owned_draft_trap EXIT' EXIT
+}
+
+# Create a draft release, upload assets, then publish (edit --draft=false).
 # Args: tag ref, version, notes file, three zip paths.
-#
-# Rollback (gh release delete --yes, no --cleanup-tag) runs only when this run's
-# create succeeded and a later upload failed. Create failures — including a
-# concurrent "already exists" — never delete (that release is not ours to remove).
 create_release() {
   local tag_ref="$1"
   local version="$2"
@@ -176,23 +234,24 @@ create_release() {
   local linux="$6"
 
   if [ -z "${GITHUB_TOKEN:-}" ] && [ -z "${GH_TOKEN:-}" ]; then
-    fail "GITHUB_TOKEN (or GH_TOKEN) is required"
+    fail "error: GITHUB_TOKEN (or GH_TOKEN) is required"
   fi
   if ! command -v gh >/dev/null 2>&1; then
-    fail "gh is not on PATH"
+    fail "error: gh is not on PATH"
   fi
 
   local tag
   tag=$(bare_tag "$tag_ref")
   require_release_absent "$tag"
+  install_owned_draft_traps
 
-  # Create without assets first so we know when THIS run owns the release.
-  # --verify-tag aborts when the tag is missing on the remote (does not create one).
+  # Draft create without assets. --verify-tag does not create a missing tag.
   local create_out
   local create_rc
   set +e
   create_out=$(
     gh release create "$tag" \
+      --draft \
       --verify-tag \
       --title "ALog v${version}" \
       --notes-file "$notes" 2>&1
@@ -204,13 +263,15 @@ create_release() {
       fail "error: release $tag already exists (created concurrently?); not rolling back"
     fi
     printf '%s\n' "$create_out" >&2
-    fail "gh release create failed for $tag (rc=$create_rc); not rolling back"
+    fail "error: gh release create failed for $tag (rc=$create_rc); not rolling back"
   fi
   if [ -n "$create_out" ]; then
     printf '%s\n' "$create_out"
   fi
 
-  # Upload assets only after our create succeeded; roll back this release on failure.
+  OWNED_DRAFT=1
+  OWNED_TAG="$tag"
+
   local upload_out
   local upload_rc
   set +e
@@ -219,14 +280,29 @@ create_release() {
   set -e
   if [ "$upload_rc" -ne 0 ]; then
     printf '%s\n' "$upload_out" >&2
-    set +e
-    delete_release_keep_tag "$tag"
-    set -e
-    fail "gh release upload failed for $tag (rc=$upload_rc); rolled back release, tag kept"
+    rollback_owned_draft "$tag" "gh release upload failed for $tag (rc=$upload_rc)"
   fi
   if [ -n "$upload_out" ]; then
     printf '%s\n' "$upload_out"
   fi
+
+  local edit_out
+  local edit_rc
+  set +e
+  edit_out=$(gh release edit "$tag" --draft=false 2>&1)
+  edit_rc=$?
+  set -e
+  if [ "$edit_rc" -ne 0 ]; then
+    printf '%s\n' "$edit_out" >&2
+    rollback_owned_draft "$tag" "gh release edit --draft=false failed for $tag (rc=$edit_rc)"
+  fi
+  if [ -n "$edit_out" ]; then
+    printf '%s\n' "$edit_out"
+  fi
+
+  # Disarm immediately after publish succeeds so EXIT/TERM cannot delete a live release.
+  OWNED_DRAFT=0
+  OWNED_TAG=""
   echo "publish_release: created $tag with 3 assets"
 }
 
@@ -242,7 +318,7 @@ main() {
   local tag_ref="$1"
   local artifacts="$2"
   if [ ! -d "$artifacts" ]; then
-    fail "artifacts directory missing: $artifacts"
+    fail "error: artifacts directory missing: $artifacts"
   fi
 
   local collected

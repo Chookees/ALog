@@ -231,22 +231,28 @@ stage_lite() {
   check_versions "$repo" "$reader" "$version" "$dest/ALog.dll"
 }
 
-# Fail when publish output ≠ allowlist payload or RID DLL hashes ≠ NuGet runtimes/.
-# Args: repo, publish directory, allowlist path, rid.
+# Fail when publish output ≠ allowlist payload or RID DLL hashes ≠ assets.json path.
+# Args: repo, publish directory, allowlist path, rid, project.assets.json path.
 check_publish_before_stage() {
   local repo="$1"
   local publish="$2"
   local allowlist="$3"
   local rid="$4"
-  python3 - "$repo" "$publish" "$allowlist" "$rid" <<'PY'
+  local assets_json="$5"
+  python3 - "$repo" "$publish" "$allowlist" "$rid" "$assets_json" <<'PY'
 import sys
 from pathlib import Path
 
-repo, publish, allowlist, rid = sys.argv[1:5]
+repo, publish, allowlist, rid, assets_json = sys.argv[1:6]
 sys.path.insert(0, str(Path(repo) / "eng" / "release-zips"))
 from release_lib import check_full_publish_output
 
-check_full_publish_output(Path(publish), Path(allowlist), rid)
+check_full_publish_output(
+    Path(publish),
+    Path(allowlist),
+    rid,
+    assets_json=Path(assets_json),
+)
 print(f"publish allowlist + RID NuGet hash ok for {rid}")
 PY
 }
@@ -274,9 +280,13 @@ stage_full() {
 
   # Compare full publish output to the allowlist BEFORE staging (BUG-51-2).
   # Exclusions: host files, *.pdb, *.deps.json, *.runtimeconfig.json only.
-  # RID DLLs must SHA-256-match NuGet runtimes/<family>/lib|native assets.
+  # RID DLLs must SHA-256-match the exact project.assets.json NuGet path (TFM).
   local allowlist="$repo/eng/release-zips/allowlists/${kind}.txt"
-  check_publish_before_stage "$repo" "$publish" "$allowlist" "$rid"
+  local assets_json="$host_dir/obj/project.assets.json"
+  if [ ! -f "$assets_json" ]; then
+    fail "project.assets.json missing after publish: $assets_json"
+  fi
+  check_publish_before_stage "$repo" "$publish" "$allowlist" "$rid" "$assets_json"
 
   # Copy only allowlisted payload: top-level DLLs + SqlClient satellite folders.
   while IFS= read -r rel || [ -n "$rel" ]; do

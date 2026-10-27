@@ -5,8 +5,10 @@
 #   1) the tagged commit is not an ancestor of origin/master, or
 #   2) the tag version (without leading v) differs from <Version> in both
 #      ALog.csproj and ALog.Extensions.Logging.csproj, or
-#   3) CHANGELOG.md has no section for that version (plain or dated heading).
+#   3) CHANGELOG.md has no section for that version, or the section has no
+#      bullet line starting with "- ".
 #
+# Python failures print a single ``error: …`` line (no traceback) and exit 1.
 # Requires a checkout with enough history to fetch origin/master.
 # Usage: bash eng/release-zips/guard_tag.sh <tag-ref> [commit-sha]
 # Next: .github/workflows/release-zips.yml publish job.
@@ -24,7 +26,7 @@ repo_root() {
 # Print an error and exit 1.
 # Args: message words.
 fail() {
-  echo "guard_tag: $*" >&2
+  echo "error: $*" >&2
   exit 1
 }
 
@@ -45,7 +47,7 @@ require_on_master() {
 require_version_match() {
   local repo="$1"
   local tag_ref="$2"
-  python3 - "$repo" "$tag_ref" <<'PY'
+  if ! python3 - "$repo" "$tag_ref" <<'PY'
 import sys
 from pathlib import Path
 
@@ -54,22 +56,28 @@ tag_ref = sys.argv[2]
 sys.path.insert(0, str(repo / "eng" / "release-zips"))
 from release_lib import parse_tag_version, require_matching_package_versions
 
-tag_version = parse_tag_version(tag_ref)
-package_version = require_matching_package_versions(repo)
+try:
+    tag_version = parse_tag_version(tag_ref)
+    package_version = require_matching_package_versions(repo)
+except (ValueError, OSError) as exc:
+    raise SystemExit(f"error: {exc}") from None
 if tag_version != package_version:
     raise SystemExit(
-        f"tag version {tag_version} does not match package Version {package_version}"
+        f"error: tag version {tag_version} does not match package Version {package_version}"
     )
 print(f"guard: tag {tag_version} matches package Version")
 PY
+  then
+    exit 1
+  fi
 }
 
-# Ensure CHANGELOG.md has a section for the tag version (fails before build-zips).
+# Ensure CHANGELOG.md has a section with at least one "- " bullet.
 # Args: repo, tag ref.
 require_changelog_section() {
   local repo="$1"
   local tag_ref="$2"
-  python3 - "$repo" "$tag_ref" <<'PY'
+  if ! python3 - "$repo" "$tag_ref" <<'PY'
 import sys
 from pathlib import Path
 
@@ -78,11 +86,20 @@ tag_ref = sys.argv[2]
 sys.path.insert(0, str(repo / "eng" / "release-zips"))
 from release_lib import parse_tag_version, require_changelog_section
 
-version = parse_tag_version(tag_ref)
-section = require_changelog_section(repo, version)
+try:
+    version = parse_tag_version(tag_ref)
+    section = require_changelog_section(repo, version)
+except (ValueError, OSError) as exc:
+    message = str(exc)
+    if not message.startswith("error:"):
+        message = f"error: {message}"
+    raise SystemExit(message) from None
 first = section.splitlines()[0]
 print(f"guard: CHANGELOG section present ({first})")
 PY
+  then
+    exit 1
+  fi
 }
 
 # CLI entry.

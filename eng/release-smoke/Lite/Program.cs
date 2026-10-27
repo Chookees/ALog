@@ -1,5 +1,6 @@
 using System.Net;
 using System.Text;
+using System.Text.Json;
 using ALog;
 using ALog.Config;
 using ALog.Writers.Cloud;
@@ -150,6 +151,7 @@ internal static class Program
 
     /// <summary>
     /// Posts one Application Insights track payload through <see cref="AzureLogWriter"/> to a local listener.
+    /// Requires POST, path <c>/v2/track</c>, and a valid JSON body with track fields.
     /// </summary>
     private static void RunAzureListener()
     {
@@ -160,9 +162,13 @@ internal static class Program
         listener.Prefixes.Add(prefix);
         listener.Start();
         string? body = null;
+        string? method = null;
+        string? path = null;
         var receive = Task.Run(() =>
         {
             var context = listener.GetContext();
+            method = context.Request.HttpMethod;
+            path = context.Request.Url?.AbsolutePath;
             using var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8);
             body = reader.ReadToEnd();
             context.Response.StatusCode = 200;
@@ -182,20 +188,57 @@ internal static class Program
                 throw new TimeoutException("HttpListener did not receive a Lite Azure post");
             }
 
-            if (body is null
-                || !body.Contains(marker, StringComparison.Ordinal)
-                || !body.Contains("\"baseType\":\"MessageData\"", StringComparison.Ordinal)
-                || !body.Contains("\"iKey\":\"lite-smoke-ikey\"", StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"AzureLogWriter body missing expected track fields. body={body ?? "<null>"}");
-            }
-
+            RequireAzureTrackRequest(method, path, body, marker);
             Console.WriteLine($"LITE-SMOKE azure ok port={port}");
         }
         finally
         {
             listener.Stop();
+        }
+    }
+
+    /// <summary>
+    /// Fail unless the Azure listener saw POST <c>/v2/track</c> with valid JSON track fields.
+    /// </summary>
+    /// <param name="method">HTTP method from the listener.</param>
+    /// <param name="path">Absolute path from the listener.</param>
+    /// <param name="body">Raw body text.</param>
+    /// <param name="marker">Log marker that must appear in the JSON body.</param>
+    private static void RequireAzureTrackRequest(
+        string? method, string? path, string? body, string marker)
+    {
+        if (!string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Azure track method must be POST, got {method ?? "<null>"}");
+        }
+
+        if (!string.Equals(path, "/v2/track", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Azure track path must be /v2/track, got {path ?? "<null>"}");
+        }
+
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            throw new InvalidOperationException("Azure track body is empty");
+        }
+
+        try
+        {
+            using var _ = JsonDocument.Parse(body);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException("Azure track body is not valid JSON", ex);
+        }
+
+        if (!body.Contains(marker, StringComparison.Ordinal)
+            || !body.Contains("\"baseType\":\"MessageData\"", StringComparison.Ordinal)
+            || !body.Contains("\"iKey\":\"lite-smoke-ikey\"", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"AzureLogWriter body missing expected track fields. body={body}");
         }
     }
 

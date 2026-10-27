@@ -99,13 +99,23 @@ require_sni_for_rid() {
   fi
 }
 
+# Remove smoke temp dirs (zip unpack work and alog-readme-hello.* under SMOKE_TMPDIR).
+# No args; uses RELEASE_SMOKE_WORK / README_HELLO_WORK / SMOKE_TMPDIR globals.
+cleanup_smoke_temps() {
+  rm -rf "${RELEASE_SMOKE_WORK:-}"
+  rm -rf "${README_HELLO_WORK:-}"
+  local tmp_root="${SMOKE_TMPDIR:-${TMPDIR:-/tmp}}"
+  # shellcheck disable=SC2086
+  rm -rf "${tmp_root}"/alog-readme-hello.*
+}
+
 # Compile the Hello World snippet from the zip README.txt against ALog.dll in ZipDir.
 # Args: repo, unpacked folder containing ALog.dll and README.txt.
 compile_readme_hello() {
   local repo="$1"
   local zip_dir="$2"
-  local work
-  work=$(mktemp -d "${TMPDIR:-/tmp}/alog-readme-hello.XXXXXX")
+  README_HELLO_WORK=$(mktemp -d "${SMOKE_TMPDIR:-${TMPDIR:-/tmp}}/alog-readme-hello.XXXXXX")
+  local work="$README_HELLO_WORK"
   python3 - "$repo" "$zip_dir" "$work" <<'PY'
 import sys
 from pathlib import Path
@@ -141,7 +151,16 @@ snippet = extract_hello_world_snippet(readme)
 )
 print(f"readme-hello snippet written under {work}")
 PY
+  # Keep NuGet/dotnet scratch under RELEASE_SMOKE_WORK so SMOKE_TMPDIR stays clean.
+  local saved_tmpdir="${TMPDIR:-}"
+  export TMPDIR="${RELEASE_SMOKE_WORK}/dotnet-tmp"
+  mkdir -p "$TMPDIR"
   dotnet build "$work/HelloFromReadme.csproj" -c Release --nologo
+  if [ -n "$saved_tmpdir" ]; then
+    export TMPDIR="$saved_tmpdir"
+  else
+    unset TMPDIR
+  fi
   echo "README-HELLO compile ok"
 }
 
@@ -152,10 +171,18 @@ run_lite() {
   local zip_dir="$2"
   local project="$repo/eng/release-smoke/Lite/LiteSmoke.csproj"
   compile_readme_hello "$repo" "$zip_dir"
+  local saved_tmpdir="${TMPDIR:-}"
+  export TMPDIR="${RELEASE_SMOKE_WORK}/dotnet-tmp"
+  mkdir -p "$TMPDIR"
   dotnet build "$project" -c Release -p:ZipDir="$zip_dir" --nologo
   local out
   out="$repo/eng/release-smoke/Lite/bin/Release/net10.0"
   dotnet exec "$out/LiteSmoke.dll"
+  if [ -n "$saved_tmpdir" ]; then
+    export TMPDIR="$saved_tmpdir"
+  else
+    unset TMPDIR
+  fi
 }
 
 # Build and run the Full smoke project; copy zip payload beside the output.
@@ -168,12 +195,20 @@ run_full() {
   require_zip_name_matches_rid "$source" "$rid"
   require_sni_for_rid "$zip_dir" "$rid"
   local project="$repo/eng/release-smoke/Full/FullSmoke.csproj"
+  local saved_tmpdir="${TMPDIR:-}"
+  export TMPDIR="${RELEASE_SMOKE_WORK}/dotnet-tmp"
+  mkdir -p "$TMPDIR"
   dotnet build "$project" -c Release -p:ZipDir="$zip_dir" --nologo
   local out
   out="$repo/eng/release-smoke/Full/bin/Release/net10.0"
   # Overlay zip DLLs and satellite folders so runtime probing finds SqlClient/AWS.
   cp -a "$zip_dir"/. "$out"/
   ALOG_RELEASE_SMOKE_RID="$rid" dotnet exec "$out/FullSmoke.dll" "$rid"
+  if [ -n "$saved_tmpdir" ]; then
+    export TMPDIR="$saved_tmpdir"
+  else
+    unset TMPDIR
+  fi
 }
 
 # CLI entry.
@@ -188,9 +223,13 @@ main() {
   fi
   local mode="$1"
   local source="$2"
-  # Global so the EXIT trap still sees the path after main's locals are discarded (set -u).
+  # Globals so the EXIT trap still sees paths after main's locals are discarded (set -u).
+  # SMOKE_TMPDIR is the caller's TMPDIR (for alog-readme-hello.*); nuget/dotnet scratch
+  # is redirected under RELEASE_SMOKE_WORK so a test TMPDIR can end empty.
+  SMOKE_TMPDIR="${TMPDIR:-/tmp}"
   RELEASE_SMOKE_WORK="${RUNNER_TEMP:-/tmp}/alog-release-smoke-$$"
-  trap 'rm -rf "${RELEASE_SMOKE_WORK:-}"' EXIT
+  README_HELLO_WORK=""
+  trap cleanup_smoke_temps EXIT
   local zip_dir
   zip_dir=$(prepare_zip_dir "$source" "$RELEASE_SMOKE_WORK")
   echo "zip dir: $zip_dir"

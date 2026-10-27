@@ -1,6 +1,7 @@
 using System.Net;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using ALog;
 using ALog.Config;
 using ALog.Extensions.Logging;
@@ -19,9 +20,11 @@ using Microsoft.Extensions.Logging;
 internal static class Program
 {
     /// <summary>
-    /// SqlException numbers observed (or accepted) when no SQL Server is listening on Windows.
+    /// SqlException numbers that all mean "server unreachable" on Windows (no SQL listener).
+    /// Kept as one named set: 258 (timeout), 2 / 53 (network), -2 (timeout variant).
     /// </summary>
-    private static readonly HashSet<int> ExpectedNoServerNumbers = new() { 258, 2, 53, -2 };
+    private static readonly HashSet<int> ServerUnreachableSqlExceptionNumbers =
+        new() { 258, 2, 53, -2 };
 
     /// <summary>
     /// Non-static category type for <see cref="ILogger{TCategoryName}"/> (static Program cannot be T).
@@ -166,6 +169,7 @@ internal static class Program
 
     /// <summary>
     /// Posts one Application Insights track payload through <see cref="AzureLogWriter"/> to a local listener.
+    /// Requires POST, path <c>/v2/track</c>, and a valid JSON body that contains the marker.
     /// </summary>
     private static void RunAzureListener()
     {
@@ -176,9 +180,13 @@ internal static class Program
         listener.Prefixes.Add(prefix);
         listener.Start();
         string? body = null;
+        string? method = null;
+        string? path = null;
         var receive = Task.Run(() =>
         {
             var context = listener.GetContext();
+            method = context.Request.HttpMethod;
+            path = context.Request.Url?.AbsolutePath;
             using var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8);
             body = reader.ReadToEnd();
             context.Response.StatusCode = 200;
@@ -198,17 +206,56 @@ internal static class Program
                 throw new TimeoutException("HttpListener did not receive a Full Azure post");
             }
 
-            if (body is null || !body.Contains(marker, StringComparison.Ordinal))
-            {
-                throw new InvalidOperationException(
-                    $"AzureLogWriter body missing marker. body={body ?? "<null>"}");
-            }
-
+            RequireAzureTrackRequest(method, path, body, marker);
             Console.WriteLine($"FULL-SMOKE azure ok port={port}");
         }
         finally
         {
             listener.Stop();
+        }
+    }
+
+    /// <summary>
+    /// Fail unless the Azure listener saw POST <c>/v2/track</c> with valid JSON containing
+    /// <paramref name="marker"/>.
+    /// </summary>
+    /// <param name="method">HTTP method from the listener.</param>
+    /// <param name="path">Absolute path from the listener.</param>
+    /// <param name="body">Raw body text.</param>
+    /// <param name="marker">Log marker that must appear in the JSON body.</param>
+    private static void RequireAzureTrackRequest(
+        string? method, string? path, string? body, string marker)
+    {
+        if (!string.Equals(method, "POST", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"Azure track method must be POST, got {method ?? "<null>"}");
+        }
+
+        if (!string.Equals(path, "/v2/track", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"Azure track path must be /v2/track, got {path ?? "<null>"}");
+        }
+
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            throw new InvalidOperationException("Azure track body is empty");
+        }
+
+        try
+        {
+            using var _ = JsonDocument.Parse(body);
+        }
+        catch (JsonException ex)
+        {
+            throw new InvalidOperationException("Azure track body is not valid JSON", ex);
+        }
+
+        if (!body.Contains(marker, StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"AzureLogWriter body missing marker. body={body}");
         }
     }
 
@@ -267,7 +314,7 @@ internal static class Program
 
     /// <summary>
     /// Constructs SqlLogWriter and opens a SqlConnection with no server.
-    /// Success is a SqlException whose number is in <see cref="ExpectedNoServerNumbers"/>.
+    /// Success is a SqlException in <see cref="ServerUnreachableSqlExceptionNumbers"/>.
     /// </summary>
     private static void RunSqlWindowsConnect()
     {
@@ -281,7 +328,7 @@ internal static class Program
         }
         catch (SqlException ex)
         {
-            RequireExpectedNoServerNumber(ex, "sql-ctor");
+            RequireServerUnreachableNumber(ex, "sql-ctor");
         }
         catch (PlatformNotSupportedException ex)
         {
@@ -301,7 +348,7 @@ internal static class Program
         }
         catch (SqlException ex)
         {
-            RequireExpectedNoServerNumber(ex, "sql-open");
+            RequireServerUnreachableNumber(ex, "sql-open");
             Console.WriteLine(
                 $"FULL-SMOKE win sql constructed, connect failed as expected: SqlException {ex.Number}");
         }
@@ -316,17 +363,18 @@ internal static class Program
     }
 
     /// <summary>
-    /// Fail unless <paramref name="ex"/> carries an accepted no-server error number.
+    /// Fail unless <paramref name="ex"/> is in <see cref="ServerUnreachableSqlExceptionNumbers"/>.
     /// </summary>
     /// <param name="ex">SqlException from ctor or Open.</param>
     /// <param name="phase">Short label for diagnostics.</param>
-    private static void RequireExpectedNoServerNumber(SqlException ex, string phase)
+    private static void RequireServerUnreachableNumber(SqlException ex, string phase)
     {
-        if (!ExpectedNoServerNumbers.Contains(ex.Number))
+        if (!ServerUnreachableSqlExceptionNumbers.Contains(ex.Number))
         {
             throw new InvalidOperationException(
                 $"unexpected SqlException number {ex.Number} during {phase}; "
-                + $"accepted: {string.Join(", ", ExpectedNoServerNumbers.OrderBy(n => n))}",
+                + $"accepted server-unreachable: "
+                + $"{string.Join(", ", ServerUnreachableSqlExceptionNumbers.OrderBy(n => n))}",
                 ex);
         }
     }
