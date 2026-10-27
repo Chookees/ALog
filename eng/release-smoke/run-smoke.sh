@@ -188,11 +188,11 @@ main() {
   fi
   local mode="$1"
   local source="$2"
-  local work="${RUNNER_TEMP:-/tmp}/alog-release-smoke-$$"
-  # shellcheck disable=SC2064
-  trap 'rm -rf "$work"' EXIT
+  # Global so the EXIT trap still sees the path after main's locals are discarded (set -u).
+  RELEASE_SMOKE_WORK="${RUNNER_TEMP:-/tmp}/alog-release-smoke-$$"
+  trap 'rm -rf "${RELEASE_SMOKE_WORK:-}"' EXIT
   local zip_dir
-  zip_dir=$(prepare_zip_dir "$source" "$work")
+  zip_dir=$(prepare_zip_dir "$source" "$RELEASE_SMOKE_WORK")
   echo "zip dir: $zip_dir"
 
   case "$mode" in
