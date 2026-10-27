@@ -4,7 +4,9 @@
 # Expects exactly three zip assets whose names are derived from the tag version.
 # SHA256SUMS may appear in the notes text but is never uploaded as a fourth asset.
 # Aborts when the release already exists (no --clobber). Uses gh + GITHUB_TOKEN.
-# On create/upload failure, deletes the release this run created (tag kept).
+# Creates the release first, then uploads assets. Rolls back with
+# ``gh release delete <tag> --yes`` (no --cleanup-tag) only when upload fails
+# after this run's create succeeded. Concurrent "already exists" never deletes.
 #
 # Usage:
 #   bash eng/release-zips/publish_release.sh <tag-ref> <artifacts-dir>
@@ -159,8 +161,12 @@ delete_release_keep_tag() {
   gh release delete "$tag" --yes
 }
 
-# Create the GitHub release or abort when it already exists / create fails.
+# Create the GitHub release (no assets), then upload the three zips.
 # Args: tag ref, version, notes file, three zip paths.
+#
+# Rollback (gh release delete --yes, no --cleanup-tag) runs only when this run's
+# create succeeded and a later upload failed. Create failures — including a
+# concurrent "already exists" — never delete (that release is not ours to remove).
 create_release() {
   local tag_ref="$1"
   local version="$2"
@@ -180,21 +186,46 @@ create_release() {
   tag=$(bare_tag "$tag_ref")
   require_release_absent "$tag"
 
+  # Create without assets first so we know when THIS run owns the release.
   # --verify-tag aborts when the tag is missing on the remote (does not create one).
-  # On any create/upload failure, delete exactly this release and keep the tag.
+  local create_out
+  local create_rc
   set +e
-  gh release create "$tag" \
-    --verify-tag \
-    --title "ALog v${version}" \
-    --notes-file "$notes" \
-    "$lite" "$win" "$linux"
-  local create_rc=$?
+  create_out=$(
+    gh release create "$tag" \
+      --verify-tag \
+      --title "ALog v${version}" \
+      --notes-file "$notes" 2>&1
+  )
+  create_rc=$?
   set -e
   if [ "$create_rc" -ne 0 ]; then
+    if printf '%s\n' "$create_out" | grep -qi 'already exists'; then
+      fail "error: release $tag already exists (created concurrently?); not rolling back"
+    fi
+    printf '%s\n' "$create_out" >&2
+    fail "gh release create failed for $tag (rc=$create_rc); not rolling back"
+  fi
+  if [ -n "$create_out" ]; then
+    printf '%s\n' "$create_out"
+  fi
+
+  # Upload assets only after our create succeeded; roll back this release on failure.
+  local upload_out
+  local upload_rc
+  set +e
+  upload_out=$(gh release upload "$tag" "$lite" "$win" "$linux" 2>&1)
+  upload_rc=$?
+  set -e
+  if [ "$upload_rc" -ne 0 ]; then
+    printf '%s\n' "$upload_out" >&2
     set +e
     delete_release_keep_tag "$tag"
     set -e
-    fail "gh release create/upload failed for $tag (rc=$create_rc); rolled back release, tag kept"
+    fail "gh release upload failed for $tag (rc=$upload_rc); rolled back release, tag kept"
+  fi
+  if [ -n "$upload_out" ]; then
+    printf '%s\n' "$upload_out"
   fi
   echo "publish_release: created $tag with 3 assets"
 }

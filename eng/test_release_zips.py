@@ -291,6 +291,11 @@ class ReleaseZipHelperTests(unittest.TestCase):
         self.assertIn('"$TAG_SHA"', text)
         self.assertIn("PUBLISH_ARTIFACTS:", text)
         self.assertIn("ZIP_ARTIFACTS:", text)
+        publish_at = text.index("publish:")
+        publish_block = text[publish_at : publish_at + 500]
+        self.assertIn("concurrency:", publish_block)
+        self.assertIn("group: release-${{ github.ref }}", publish_block)
+        self.assertIn("cancel-in-progress: false", publish_block)
 
     def test_license_is_apache_20(self) -> None:
         """Zip README claims Apache-2.0 only when LICENSE is Apache 2.0."""
@@ -470,7 +475,7 @@ class ReleaseZipHelperTests(unittest.TestCase):
             self.assertNotIn("release create", log_path.read_text(encoding="utf-8"))
 
     def test_publish_fake_gh_upload_failure_deletes_without_cleanup_tag(self) -> None:
-        """Create/upload failure rolls back with gh release delete --yes (no --cleanup-tag)."""
+        """Upload failure after our create rolls back with delete --yes (no --cleanup-tag)."""
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             artifacts = work / "artifacts"
@@ -491,6 +496,10 @@ class ReleaseZipHelperTests(unittest.TestCase):
                       exit 1
                     fi
                     if [[ "$1" == "release" && "$2" == "create" ]]; then
+                      echo "created release"
+                      exit 0
+                    fi
+                    if [[ "$1" == "release" && "$2" == "upload" ]]; then
                       echo "upload failed" >&2
                       exit 1
                     fi
@@ -518,8 +527,65 @@ class ReleaseZipHelperTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("rolled back release", result.stderr)
             log = log_path.read_text(encoding="utf-8")
+            self.assertIn("release create v0.2.1", log)
+            self.assertIn("release upload v0.2.1", log)
             self.assertIn("release delete v0.2.1 --yes", log)
             self.assertNotIn("--cleanup-tag", log)
+
+    def test_publish_fake_gh_already_exists_does_not_delete(self) -> None:
+        """Concurrent create 'already exists' fails red without calling gh release delete."""
+        with tempfile.TemporaryDirectory() as raw:
+            work = Path(raw)
+            artifacts = work / "artifacts"
+            artifacts.mkdir()
+            for name in self.lib.expected_asset_names("0.2.1"):
+                (artifacts / name).write_bytes(b"zip")
+            bin_dir = work / "bin"
+            bin_dir.mkdir()
+            log_path = work / "gh.log"
+            fake_gh = bin_dir / "gh"
+            fake_gh.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/bash
+                    echo "$@" >> {log_path!s}
+                    if [[ "$1" == "release" && "$2" == "view" ]]; then
+                      echo "release not found" >&2
+                      exit 1
+                    fi
+                    if [[ "$1" == "release" && "$2" == "create" ]]; then
+                      echo "HTTP 422: Release already exists" >&2
+                      exit 1
+                    fi
+                    if [[ "$1" == "release" && "$2" == "delete" ]]; then
+                      echo "delete must not be called" >&2
+                      exit 0
+                    fi
+                    echo "unexpected gh invocation: $*" >&2
+                    exit 99
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_gh.chmod(fake_gh.stat().st_mode | stat.S_IXUSR)
+            env = os.environ.copy()
+            env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
+            env["GITHUB_TOKEN"] = "fake-token"
+            result = subprocess.run(
+                ["bash", str(PUBLISH_SCRIPT), "v0.2.1", str(artifacts)],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=str(ROOT),
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            combined = result.stdout + result.stderr
+            self.assertIn("already exists (created concurrently?); not rolling back", combined)
+            log = log_path.read_text(encoding="utf-8")
+            self.assertIn("release create v0.2.1", log)
+            self.assertNotIn("release delete", log)
+            self.assertNotIn("release upload", log)
 
 
 def main() -> int:
