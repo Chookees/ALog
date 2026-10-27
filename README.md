@@ -46,15 +46,15 @@ How ALog's main package compares with the three most used .NET logging libraries
 | Windows Event Log output | —[^11] | [`Serilog.Sinks.EventLog`](https://www.nuget.org/packages/Serilog.Sinks.EventLog) | [`NLog.WindowsEventLog`](https://www.nuget.org/packages/NLog.WindowsEventLog) | ✔️ |
 | Syslog output | —[^11] | [`Serilog.Sinks.SyslogMessages`](https://www.nuget.org/packages/Serilog.Sinks.SyslogMessages)[^2] | [`NLog.Targets.Network`](https://www.nuget.org/packages/NLog.Targets.Network) | ✔️ |
 
-Checked on 2026-10-27 against Serilog 4.4.0, NLog 6.2.2, and log4net 3.5.0 (latest stable on NuGet). Where no official package exists, the most used maintained community package is listed and marked.
+Checked on 2026-10-27 against Serilog 4.4.0, NLog 6.2.2, and log4net 3.5.0 (latest stable on NuGet). Community packages are marked in the footnotes.
 
-[^1]: log4net has no message templates (structured events) in its main package or an official package, see [ILog](https://github.com/apache/logging-log4net/blob/master/src/log4net/ILog.cs).
+[^1]: log4net has no message templates (structured events) in its main package, an official package, or a maintained community package, see [ILog](https://github.com/apache/logging-log4net/blob/master/src/log4net/ILog.cs).
 [^2]: Community package, not maintained by the Serilog project.
-[^3]: log4net has no HTTP writer in its main package or an official package; community packages exist, see [Appenders](https://logging.apache.org/log4net/manual/configuration/appenders.html).
+[^3]: log4net has no HTTP writer in its main package, an official package, or a maintained community package, see [Appenders](https://logging.apache.org/log4net/manual/configuration/appenders.html).
 [^4]: Community package, not maintained by the NLog project.
 [^5]: Community package, not maintained by the log4net project.
-[^6]: log4net has no background queue that drops and counts, or blocks, when full in its main package or an official package; community packages exist, see [BufferingForwardingAppender](https://logging.apache.org/log4net/manual/configuration/appenders/bufferingforwardingappender.html).
-[^7]: log4net has no JSON configuration in its main package or an official package, see [Configuration](https://logging.apache.org/log4net/manual/configuration.html).
+[^6]: log4net has no background queue that drops and counts, or blocks, when full in its main package, an official package, or a maintained community package, see [BufferingForwardingAppender](https://logging.apache.org/log4net/manual/configuration/appenders/bufferingforwardingappender.html).
+[^7]: log4net has no JSON configuration in its main package, an official package, or a maintained community package, see [Configuration](https://logging.apache.org/log4net/manual/configuration.html).
 [^8]: ALog rotates files by size only, see [Size rotation](#size-rotation).
 [^9]: ALog keeps rotated files until you delete them, see [Size rotation](#size-rotation).
 [^10]: ALog reads JSON configuration only, see [Configuration](#configuration).
@@ -77,7 +77,7 @@ Time and memory per event when writing to a file, with each library's own async 
 
 ALog is behind NLog in three measurements: memory per event with message templates (632 B vs. 457 B), memory per event with exceptions (16,400 B vs. 13,300 B), and the BenchmarkDotNet time for logging an exception that was already thrown (197 ns vs. 64.8 ns).
 
-Measured on 2026-10-27 with ALog 0.2.1, Serilog 4.4.0 (Serilog.Sinks.File 7.0.0), NLog 6.2.2, and log4net 3.5.0 on .NET 10.0.14, GitHub Actions ubuntu-24.04 (AMD EPYC 7763, 4 cores), mean of 5 runs. Every row shown here also held in 9 further runs on a separate Linux machine, with ALog at least 5% ahead of each library in every environment. Commit b3daa7c. Harness, method, and all results, including where ALog is behind: [the harness at b3daa7c](https://github.com/Chookees/ALog/tree/b3daa7c77a743809fa09854aa760d81896b618b9/eng/comparison-bench) and [RESULTS.md](eng/comparison-bench/RESULTS.md).
+Measured on 2026-10-27 with ALog 0.2.1, Serilog 4.4.0 (Serilog.Sinks.File 7.0.0), NLog 6.2.2, and log4net 3.5.0 on .NET 10.0.14, GitHub Actions ubuntu-24.04 (AMD EPYC 7763, 4 cores), mean of 5 runs. Every row shown here also held in 9 further runs on a separate Linux machine, with ALog at least 5% ahead of each library in every environment, all on commit b3daa7c. Harness, method, and all results, including where ALog is behind: [the harness at b3daa7c](https://github.com/Chookees/ALog/tree/b3daa7c77a743809fa09854aa760d81896b618b9/eng/comparison-bench) and [RESULTS.md](eng/comparison-bench/RESULTS.md).
 
 [^12]: log4net has no message templates or named properties.
 [^13]: log4net has no built-in JSON layout.
