@@ -212,9 +212,9 @@ BDN: T1Plain alloc, T4Threads alloc
 
 ## Sensitivity: with vs without suspect runs
 
-Suspect (box paused during the run, load-log gaps of 18 to 51 min): `repo-manager-20261027T134742Z`, `repo-manager-20261027T152721Z`, `repo-manager-20261027T161838Z`, `architecture-designer-20261027T172540Z`, `architecture-designer-20261027T184207Z`. Full detail: `summary_without_suspect.md`.
+Suspect (box paused during the run, load-log gaps of 18 to 51 min): `repo-manager-20261027T134742Z`, `repo-manager-20261027T152721Z`, `repo-manager-20261027T161838Z`, `architecture-designer-20261027T172540Z`, `architecture-designer-20261027T184207Z`.
 
-Not counted at all: `architecture-designer-20261027T175053Z` (AD run 4, exit 1: serilog T7 hit the 1800 s hang guard during the 18:54-19:32 box pause). Tester and UX slots dropped by Artur's decision (2026-10-27 ~20:17); box majority = both owners (RM, AD).
+Not counted: one run (exit 1) in which Serilog T7 hit the 1800 s hang guard while the machine was paused.
 
 - process: no pair verdict changes
 - bdn: no pair verdict changes
