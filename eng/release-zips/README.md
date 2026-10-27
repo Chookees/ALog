@@ -60,14 +60,18 @@ changes the Full publish graph, update the matching `Full-*.txt` and re-run
 Workflow: `.github/workflows/release-zips.yml`.
 
 1. **Guard** (tag pushes only): tagged commit must be an ancestor of
-   `origin/master`, and the tag version (without `v`) must equal both package
-   `<Version>` values.
+   `origin/master`; the tag version (without `v`) must equal both package
+   `<Version>` values; and `CHANGELOG.md` must have a section for that version
+   (`## 0.2.1` or `## 0.2.1 - YYYY-MM-DD`). A missing section fails here, before
+   build-zips.
 2. **build-zips**: matrix builds Lite+linux-x64 on Ubuntu and win-x64 on Windows.
 3. **release-smoke**: matrix unpacks those artifacts, builds consumers only against
-   zip DLLs, runs Lite (incl. HTTP listener) and Full SQL checks.
+   zip DLLs, compiles the README Hello World snippet, runs Lite (HTTP + Azure
+   listeners) and Full SQL checks.
 4. **publish** (tag only, after both RIDs are green): creates the GitHub release
-   with exactly the three zips. `SHA256SUMS` is inlined in the notes, not uploaded
-   as a fourth asset. If the release already exists, publish aborts (no clobber).
+   with `gh release create --verify-tag` and exactly the three zips. `SHA256SUMS`
+   is inlined in the notes, not uploaded as a fourth asset. If the release already
+   exists, or the tag is missing on the remote, publish aborts (no clobber).
 
 A red run creates neither a release nor a draft. Do not push a real tag from this
 folder to test publish; use `python3 eng/test_release_zips.py` for guard/notes logic.

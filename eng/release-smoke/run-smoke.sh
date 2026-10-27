@@ -55,12 +55,59 @@ PY
   dirname "$alog"
 }
 
+# Compile the Hello World snippet from the zip README.txt against ALog.dll in ZipDir.
+# Args: repo, unpacked folder containing ALog.dll and README.txt.
+compile_readme_hello() {
+  local repo="$1"
+  local zip_dir="$2"
+  local work
+  work=$(mktemp -d "${TMPDIR:-/tmp}/alog-readme-hello.XXXXXX")
+  python3 - "$repo" "$zip_dir" "$work" <<'PY'
+import sys
+from pathlib import Path
+
+repo, zip_dir, work = map(Path, sys.argv[1:4])
+sys.path.insert(0, str(repo / "eng" / "release-zips"))
+from release_lib import extract_hello_world_snippet
+
+readme = (zip_dir / "README.txt").read_text(encoding="utf-8")
+snippet = extract_hello_world_snippet(readme)
+(work / "Program.cs").write_text(snippet, encoding="utf-8", newline="\n")
+(work / "HelloFromReadme.csproj").write_text(
+    """<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <Reference Include="ALog">
+      <HintPath>"""
+    + str(zip_dir / "ALog.dll").replace("\\", "/")
+    + """</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
+""",
+    encoding="utf-8",
+    newline="\n",
+)
+print(f"readme-hello snippet written under {work}")
+PY
+  dotnet build "$work/HelloFromReadme.csproj" -c Release --nologo
+  echo "README-HELLO compile ok"
+}
+
 # Build and run the Lite smoke project against ZipDir.
 # Args: repo, unpacked folder containing ALog.dll.
 run_lite() {
   local repo="$1"
   local zip_dir="$2"
   local project="$repo/eng/release-smoke/Lite/LiteSmoke.csproj"
+  compile_readme_hello "$repo" "$zip_dir"
   dotnet build "$project" -c Release -p:ZipDir="$zip_dir" --nologo
   local out
   out="$repo/eng/release-smoke/Lite/bin/Release/net10.0"

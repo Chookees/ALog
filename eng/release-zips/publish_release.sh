@@ -146,7 +146,9 @@ create_release() {
     fail "release $tag already exists; refusing to overwrite (no --clobber)"
   fi
 
+  # --verify-tag aborts when the tag is missing on the remote (does not create one).
   gh release create "$tag" \
+    --verify-tag \
     --title "ALog v${version}" \
     --notes-file "$notes" \
     "$lite" "$win" "$linux"

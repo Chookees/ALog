@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """Local tests for release-zip guard and notes helpers (no real tag/publish).
 
-Covers CHANGELOG extraction, package/tag version equality, and the exact
-three asset names. Run from repo root: ``python3 eng/test_release_zips.py``.
+Covers CHANGELOG extraction (plain and dated headings), package/tag version
+equality, asset names, README wording, and guard changelog failure.
+Run from repo root: ``python3 eng/test_release_zips.py``.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LIB_PATH = ROOT / "eng" / "release-zips" / "release_lib.py"
+CLEANUP_CHANGELOG = ROOT / "eng" / "testdata" / "release-zips" / "changelog-cleanup-v0.2.1.md"
 
 
 def load_lib():
@@ -34,7 +38,7 @@ def load_lib():
 
 
 class ReleaseZipHelperTests(unittest.TestCase):
-    """Unit tests for changelog, versions, and asset name contracts."""
+    """Unit tests for changelog, versions, README, and asset name contracts."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -42,18 +46,97 @@ class ReleaseZipHelperTests(unittest.TestCase):
         cls.lib = load_lib()
 
     def test_changelog_extracts_version_section(self) -> None:
-        """``## 0.2.1`` is found and does not include ``## 0.2.0``."""
+        """Repo CHANGELOG has a 0.2.1 section that stops before 0.2.0 / Unreleased."""
         text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
         section = self.lib.extract_changelog_section(text, "0.2.1")
-        self.assertTrue(section.startswith("## 0.2.1\n"))
+        self.assertTrue(self.lib.changelog_heading_pattern("0.2.1").fullmatch(
+            section.splitlines()[0].strip()
+        ))
         self.assertIn("Microsoft.Data.SqlClient", section)
         self.assertNotIn("## 0.2.0", section)
         self.assertNotIn("## Unreleased", section)
+
+    def test_changelog_plain_heading(self) -> None:
+        """A plain ``## 0.2.1`` heading is accepted."""
+        text = "# Changelog\n\n## 0.2.1\n\n- plain bullet\n\n## 0.2.0\n\n- old\n"
+        section = self.lib.extract_changelog_section(text, "0.2.1")
+        self.assertEqual(section.splitlines()[0], "## 0.2.1")
+        self.assertIn("- plain bullet", section)
+        self.assertNotIn("## 0.2.0", section)
+
+    def test_changelog_dated_heading_fixture(self) -> None:
+        """Dated heading from the cleanup PR #50 CHANGELOG shape is accepted."""
+        self.assertTrue(CLEANUP_CHANGELOG.is_file(), CLEANUP_CHANGELOG)
+        text = CLEANUP_CHANGELOG.read_text(encoding="utf-8")
+        section = self.lib.extract_changelog_section(text, "0.2.1")
+        self.assertEqual(section.splitlines()[0], "## 0.2.1 - 2026-10-27")
+        self.assertIn("DemoApp", section)
+        self.assertNotIn("## 0.2.0", section)
+        self.assertNotIn("## Unreleased", section)
+
+    def test_changelog_dated_heading_inline_fixture(self) -> None:
+        """Inline fixture equal to the #50 head form matches the dated heading."""
+        text = (
+            "# Changelog\n\n"
+            "## Unreleased\n\n"
+            "## 0.2.1 - 2026-10-27\n\n"
+            "- Docs: samples merged into DemoApp/\n"
+            "- Breaking (dependency): Microsoft.Data.SqlClient\n\n"
+            "## 0.2.0\n\n"
+            "- older release\n"
+        )
+        section = self.lib.extract_changelog_section(text, "0.2.1")
+        self.assertEqual(section.splitlines()[0], "## 0.2.1 - 2026-10-27")
+        self.assertIn("DemoApp", section)
+        self.assertNotIn("## 0.2.0", section)
 
     def test_changelog_missing_section_fails(self) -> None:
         """A missing heading raises ValueError."""
         with self.assertRaises(ValueError):
             self.lib.extract_changelog_section("# Changelog\n\n## 1.0.0\n\n- x\n", "9.9.9")
+
+    def test_changelog_does_not_match_longer_patch(self) -> None:
+        """``## 0.2.10`` must not satisfy a request for version ``0.2.1``."""
+        text = "# Changelog\n\n## 0.2.10\n\n- ten\n\n## 0.2.0\n\n- old\n"
+        with self.assertRaises(ValueError):
+            self.lib.extract_changelog_section(text, "0.2.1")
+
+    def test_guard_fails_when_changelog_section_missing(self) -> None:
+        """require_changelog_section fails when CHANGELOG has no matching heading."""
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            (repo / "CHANGELOG.md").write_text(
+                "# Changelog\n\n## 1.0.0\n\n- only other version\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError) as ctx:
+                self.lib.require_changelog_section(repo, "0.2.1")
+            self.assertIn("0.2.1", str(ctx.exception))
+
+    def test_guard_script_fails_on_missing_changelog_section(self) -> None:
+        """guard_tag.sh exits non-zero when only the changelog check is exercised.
+
+        Runs the Python body of require_changelog_section against a temp repo so
+        the guard contract does not need a fake origin/master fetch.
+        """
+        with tempfile.TemporaryDirectory() as raw:
+            repo = Path(raw)
+            (repo / "CHANGELOG.md").write_text("# Changelog\n\n## 9.9.9\n\n- x\n", encoding="utf-8")
+            script = (
+                "import sys\n"
+                f"sys.path.insert(0, {str(ROOT / 'eng' / 'release-zips')!r})\n"
+                "from pathlib import Path\n"
+                "from release_lib import require_changelog_section\n"
+                f"require_changelog_section(Path({str(repo)!r}), '0.2.1')\n"
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("0.2.1", result.stderr)
 
     def test_package_versions_match_and_equal_tag(self) -> None:
         """Both csproj Version values match, and parse_tag_version agrees."""
@@ -84,16 +167,53 @@ class ReleaseZipHelperTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.lib.build_asset_table("0.2.1", {"ALog-v0.2.1-Lite.zip": 1})
 
-    def test_readme_lite_has_edge_cases_full_has_rid_sentence(self) -> None:
-        """Lite README includes edge cases; Full names the RID and NuGet sentence."""
-        lite = self.lib.build_readme_text("0.2.1", "Lite")
+    def test_asset_table_writers_include_azure(self) -> None:
+        """Release-notes Writers column names Azure App Insights for Lite and Full."""
+        names = self.lib.expected_asset_names("0.2.1")
+        table = self.lib.build_asset_table(
+            "0.2.1",
+            {names[0]: 1, names[1]: 2, names[2]: 3},
+        )
+        self.assertIn("Azure App Insights", table)
+        self.assertIn(
+            "Console, File, HTTP, Azure App Insights, SQL Server, AWS CloudWatch, ILogger provider",
+            table,
+        )
+
+    def test_readme_lite_and_full_wording(self) -> None:
+        """Lite/Full README wording: Azure, NuGet lines, Contents, Hello World usings."""
+        allowlist_dir = ROOT / "eng" / "release-zips" / "allowlists"
+        lite = self.lib.build_readme_text("0.2.1", "Lite", allowlist_dir=allowlist_dir)
+        self.assertIn("Works: Console, File, HTTP, Azure App Insights", lite)
         self.assertIn("Known edge cases (Lite):", lite)
-        self.assertIn("Apache-2.0", lite)
+        self.assertIn("HTTP and Azure are configured in code", lite)
+        self.assertIn("JSON config supports Console and File only", lite)
+        self.assertIn("Other platforms or SQL/AWS: use NuGet", lite)
         self.assertNotIn("For other platforms, use the NuGet packages.", lite)
-        full = self.lib.build_readme_text("0.2.1", "Full-linux-x64")
+        self.assertIn("using ALog;", lite)
+        self.assertIn("using ALog.Config;", lite)
+        self.assertIn("using ALog.Writers.Console;", lite)
+        snippet = self.lib.extract_hello_world_snippet(lite)
+        self.assertEqual(snippet, self.lib.hello_world_snippet())
+
+        full = self.lib.build_readme_text(
+            "0.2.1", "Full-linux-x64", allowlist_dir=allowlist_dir
+        )
         self.assertIn("Full (linux-x64)", full)
+        self.assertIn(
+            "Works: Console, File, HTTP, Azure App Insights, SQL Server, "
+            "AWS CloudWatch, ILogger provider",
+            full,
+        )
         self.assertIn("For other platforms, use the NuGet packages.", full)
+        self.assertNotIn("Other platforms or SQL/AWS:", full)
+        self.assertNotIn("allowlist", full)
+        self.assertIn("Microsoft.Data.SqlClient.dll", full)
         self.assertNotIn("Known edge cases (Lite):", full)
+        self.assertEqual(
+            self.lib.extract_hello_world_snippet(full),
+            self.lib.hello_world_snippet(),
+        )
 
     def test_informational_and_file_version_matchers(self) -> None:
         """InformationalVersion may carry +git; FileVersion may use .0."""
@@ -110,6 +230,17 @@ class ReleaseZipHelperTests(unittest.TestCase):
             self.assertGreater(len(entries), 0)
             self.assertIn("ALog.dll", entries)
             self.assertIn("LICENSE", entries)
+
+    def test_publish_uses_verify_tag(self) -> None:
+        """publish_release.sh passes --verify-tag and never passes --clobber to gh."""
+        text = (ROOT / "eng" / "release-zips" / "publish_release.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--verify-tag", text)
+        # Comments may mention --clobber; the gh invocation must not pass it.
+        create_block = text[text.index("gh release create") :]
+        create_block = create_block[: create_block.index("echo")]
+        self.assertNotIn("--clobber", create_block)
 
     def test_workflow_default_read_and_publish_write(self) -> None:
         """release-zips.yml defaults to contents:read; only publish writes."""

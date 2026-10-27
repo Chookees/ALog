@@ -190,94 +190,201 @@ def version_at_least(actual: str, minimum: tuple[int, ...]) -> bool:
     return tuple(left) >= tuple(right)
 
 
+def changelog_heading_pattern(version: str) -> re.Pattern[str]:
+    """Build the regex that matches a version heading, optionally with a date.
+
+    Args:
+        version: Package version such as ``0.2.1``. Escaped so ``0.2.1`` does
+            not match ``0.2.10``.
+
+    Returns:
+        Compiled pattern for a full stripped line:
+        ``^## {version}( - YYYY-MM-DD)?$``.
+    """
+    return re.compile(
+        rf"^## {re.escape(version)}( - \d{{4}}-\d{{2}}-\d{{2}})?$"
+    )
+
+
 def extract_changelog_section(changelog_text: str, version: str) -> str:
     """Extract the ``## {version}`` section body from CHANGELOG.md.
 
+    The heading may be plain (``## 0.2.1``) or dated (``## 0.2.1 - 2026-10-27``).
+    Matching uses a stripped line against
+    ``^## {re.escape(version)}( - \\d{4}-\\d{2}-\\d{2})?$`` so ``## 0.2.10``
+    does not match version ``0.2.1``. The section ends at the next ``## `` line.
+
     Args:
         changelog_text: Full changelog file text.
-        version: Section heading without ``## ``, such as ``0.2.1``.
+        version: Section version without ``## ``, such as ``0.2.1``.
 
     Returns:
-        The section including the ``## {version}`` heading, trimmed, without
-        following version sections.
+        The section including its heading, trimmed, with a trailing newline.
 
     Raises:
-        ValueError: The heading is missing.
+        ValueError: The heading is missing or the section body is empty.
     """
-    heading = f"## {version}"
+    pattern = changelog_heading_pattern(version)
     lines = changelog_text.splitlines()
     start = None
     for index, line in enumerate(lines):
-        if line.strip() == heading:
+        if pattern.fullmatch(line.strip()):
             start = index
             break
     if start is None:
-        raise ValueError(f"CHANGELOG.md has no '{heading}' section")
+        raise ValueError(f"CHANGELOG.md has no '## {version}' section")
     end = len(lines)
     for index in range(start + 1, len(lines)):
-        if lines[index].startswith("## ") and lines[index].strip() != heading:
+        if lines[index].startswith("## "):
             end = index
             break
     section = "\n".join(lines[start:end]).strip()
     if not section:
-        raise ValueError(f"CHANGELOG.md section '{heading}' is empty")
+        raise ValueError(f"CHANGELOG.md section '## {version}' is empty")
     return section + "\n"
 
 
-def build_readme_text(version: str, kind: str) -> str:
+def require_changelog_section(repo: Path, version: str) -> str:
+    """Read CHANGELOG.md and require a section for ``version``.
+
+    Used by the tag guard so a missing section fails before build-zips, not
+    only at publish.
+
+    Args:
+        repo: Repository root that contains ``CHANGELOG.md``.
+        version: Package version without a leading ``v``.
+
+    Returns:
+        The extracted section text (same contract as
+        ``extract_changelog_section``).
+
+    Raises:
+        ValueError: The section is missing or empty.
+        OSError: CHANGELOG.md cannot be read.
+    """
+    text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    return extract_changelog_section(text, version)
+
+
+def hello_world_snippet() -> str:
+    """Return the compilable Hello World block for zip README.txt files.
+
+    Returns:
+        Usings plus Init/Write matching the README Quickstart namespaces, each
+        line suitable for copy-paste into a top-level-statements program.
+    """
+    return (
+        "using ALog;\n"
+        "using ALog.Config;\n"
+        "using ALog.Writers.Console;\n"
+        "\n"
+        "Log.Init(new LoggerConfig().AddWriter(new ConsoleLogWriter()));\n"
+        'Log.Write("Hello");\n'
+    )
+
+
+def extract_hello_world_snippet(readme_text: str) -> str:
+    """Pull the Hello World source from a generated README.txt body.
+
+    Args:
+        readme_text: Full README.txt contents.
+
+    Returns:
+        The C# snippet after ``Hello World:`` and before ``License:``.
+
+    Raises:
+        ValueError: The markers are missing or the block is empty.
+    """
+    marker = "Hello World:\n"
+    start = readme_text.find(marker)
+    if start < 0:
+        raise ValueError("README.txt has no Hello World: marker")
+    rest = readme_text[start + len(marker) :]
+    end = rest.find("License:")
+    if end < 0:
+        raise ValueError("README.txt has no License: marker after Hello World")
+    block = rest[:end].strip("\n")
+    # Drop a single level of leading two-space indent used in the README layout.
+    lines = []
+    for line in block.splitlines():
+        if line.startswith("  "):
+            lines.append(line[2:])
+        else:
+            lines.append(line)
+    snippet = "\n".join(lines).strip() + "\n"
+    if "Log.Init" not in snippet or "using ALog;" not in snippet:
+        raise ValueError("Hello World snippet is incomplete")
+    return snippet
+
+
+def format_contents_from_allowlist(entries: list[str]) -> str:
+    """Format allowlist paths for the README Contents line (no README.txt self-ref).
+
+    Args:
+        entries: Sorted relative paths from an allowlist file.
+
+    Returns:
+        Comma-separated file list excluding ``README.txt``.
+    """
+    files = [name for name in entries if name != "README.txt"]
+    if not files:
+        raise ValueError("allowlist has no contents besides README.txt")
+    return ", ".join(files)
+
+
+def build_readme_text(version: str, kind: str, *, allowlist_dir: Path | None = None) -> str:
     """Build the English README.txt for one zip using the fixed UX template.
 
     Args:
         version: Package version without a leading ``v``.
         kind: ``Lite``, ``Full-win-x64``, or ``Full-linux-x64``.
+        allowlist_dir: Directory of ``Lite.txt`` / ``Full-*.txt``. Defaults to
+            ``eng/release-zips/allowlists`` next to this module.
 
     Returns:
         README.txt body ending with a newline.
 
     Raises:
         ValueError: ``kind`` is not one of the three shipped shapes.
+        OSError: An allowlist file cannot be read for a Full zip.
     """
+    if allowlist_dir is None:
+        allowlist_dir = Path(__file__).resolve().parent / "allowlists"
+
+    hello = hello_world_snippet()
+    hello_indented = "\n".join(
+        ("  " + line) if line else "" for line in hello.rstrip("\n").splitlines()
+    ) + "\n"
+
     if kind == "Lite":
         title = "Lite"
         contents = "ALog.dll"
-        works = (
-            "Console, File, HTTP, background queue, SelfLog, enrichers, "
-            "formatters, Log.Init(ALogOptions)"
-        )
+        works = "Console, File, HTTP, Azure App Insights"
         missing = "SQL, AWS, ILogger provider"
         edge = (
             "Known edge cases (Lite): SqlLogWriter and the AWS region constructor "
             "throw FileNotFoundException;\n"
             "  Assembly.GetTypes() throws ReflectionTypeLoadException; "
+            "HTTP and Azure are configured in code; "
             "JSON config supports Console and File only.\n"
         )
-        other_platforms = ""
-    elif kind == "Full-win-x64":
-        title = "Full (win-x64)"
-        contents = (
-            "ALog.dll, ALog.Extensions.Logging.dll, and RID-specific dependencies "
-            "(flat; see allowlist Full-win-x64.txt)"
+        nuget_line = (
+            "Other platforms or SQL/AWS: use NuGet "
+            "(dotnet add package ALog / ALog.Extensions.Logging).\n"
+        )
+    elif kind in ("Full-win-x64", "Full-linux-x64"):
+        title = "Full (win-x64)" if kind == "Full-win-x64" else "Full (linux-x64)"
+        allowlist_name = f"{kind}.txt"
+        contents = format_contents_from_allowlist(
+            load_allowlist(allowlist_dir / allowlist_name)
         )
         works = (
-            "Console, File, HTTP, SQL (SqlClient + SNI), AWS CloudWatch, "
-            "ILogger provider (AddALog), background queue, SelfLog"
+            "Console, File, HTTP, Azure App Insights, SQL Server, "
+            "AWS CloudWatch, ILogger provider"
         )
         missing = "other platforms"
         edge = ""
-        other_platforms = "For other platforms, use the NuGet packages.\n"
-    elif kind == "Full-linux-x64":
-        title = "Full (linux-x64)"
-        contents = (
-            "ALog.dll, ALog.Extensions.Logging.dll, and RID-specific dependencies "
-            "(flat; see allowlist Full-linux-x64.txt)"
-        )
-        works = (
-            "Console, File, HTTP, SQL (unix SqlClient), AWS CloudWatch, "
-            "ILogger provider (AddALog), background queue, SelfLog"
-        )
-        missing = "other platforms"
-        edge = ""
-        other_platforms = "For other platforms, use the NuGet packages.\n"
+        nuget_line = "For other platforms, use the NuGet packages.\n"
     else:
         raise ValueError(f"unknown zip kind: {kind}")
 
@@ -287,17 +394,12 @@ def build_readme_text(version: str, kind: str) -> str:
         f"Works: {works}\n"
         f"Not included: {missing}\n"
         f"{edge}"
-        "Other platforms or SQL/AWS: use NuGet "
-        "(dotnet add package ALog / ALog.Extensions.Logging).\n"
-        f"{other_platforms}"
+        f"{nuget_line}"
         "Hello World:\n"
-        "  Log.Init(new LoggerConfig().AddWriter(new ConsoleLogWriter()));\n"
-        '  Log.Write("Hello");\n'
-        "  await Log.FlushAsync();\n"
+        f"{hello_indented}"
         "License: Apache-2.0, see LICENSE and NOTICE.\n"
     )
     return body
-
 
 def asset_table_row(
     asset: str, platform: str, writers: str, dependencies: str, size_bytes: int
@@ -343,21 +445,21 @@ def build_asset_table(version: str, sizes: dict[str, int]) -> str:
         asset_table_row(
             names[0],
             "portable",
-            "Console, File, HTTP, Queue, SelfLog",
+            "Console, File, HTTP, Azure App Insights",
             "ALog.dll only",
             sizes[names[0]],
         ),
         asset_table_row(
             names[1],
             "win-x64",
-            "Console, File, HTTP, SQL, AWS, ILogger",
+            "Console, File, HTTP, Azure App Insights, SQL Server, AWS CloudWatch, ILogger provider",
             "Full graph + SNI",
             sizes[names[1]],
         ),
         asset_table_row(
             names[2],
             "linux-x64",
-            "Console, File, HTTP, SQL, AWS, ILogger",
+            "Console, File, HTTP, Azure App Insights, SQL Server, AWS CloudWatch, ILogger provider",
             "Full graph (unix SqlClient)",
             sizes[names[2]],
         ),

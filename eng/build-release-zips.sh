@@ -193,7 +193,8 @@ from pathlib import Path
 repo, version, kind, dest = sys.argv[1:5]
 sys.path.insert(0, str(Path(repo) / "eng" / "release-zips"))
 from release_lib import build_readme_text
-text = build_readme_text(version, kind)
+allowlist_dir = Path(repo) / "eng" / "release-zips" / "allowlists"
+text = build_readme_text(version, kind, allowlist_dir=allowlist_dir)
 Path(dest, "README.txt").write_text(text, encoding="utf-8", newline="\n")
 PY
 }

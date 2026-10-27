@@ -1,3 +1,5 @@
+using System.Net;
+using System.Text;
 using ALog;
 using ALog.Config;
 using ALog.Extensions.Logging;
@@ -9,7 +11,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 
 /// <summary>
-/// Smoke-tests an unpacked Full zip: AddALog/ILogger, AWS region ctor, and SQL.
+/// Smoke-tests an unpacked Full zip: AddALog/ILogger, AWS region ctor, Azure App Insights, and SQL.
 /// On linux-x64 writes a real row and SELECTs it back. On win-x64, ctor plus connect
 /// where SqlException for a missing server is success.
 /// </summary>
@@ -34,6 +36,7 @@ internal static class Program
             var rid = ResolveRid(args);
             RunAddALog();
             RunAwsRegionCtor();
+            RunAzureListener();
             if (rid == "linux-x64")
             {
                 RunSqlRoundTrip();
@@ -106,6 +109,67 @@ internal static class Program
     {
         using var writer = new AwsCloudWatchWriter("alog-smoke", "stream", "eu-central-1");
         Console.WriteLine("FULL-SMOKE aws-region ok");
+    }
+
+    /// <summary>
+    /// Posts one Application Insights track payload through <see cref="AzureLogWriter"/> to a local listener.
+    /// </summary>
+    private static void RunAzureListener()
+    {
+        var marker = $"full-azure-{Guid.NewGuid():N}";
+        using var listener = new HttpListener();
+        var port = FindFreePort();
+        var prefix = $"http://127.0.0.1:{port}/";
+        listener.Prefixes.Add(prefix);
+        listener.Start();
+        string? body = null;
+        var receive = Task.Run(() =>
+        {
+            var context = listener.GetContext();
+            using var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8);
+            body = reader.ReadToEnd();
+            context.Response.StatusCode = 200;
+            context.Response.Close();
+        });
+
+        try
+        {
+            var config = new LoggerConfig()
+                .AddWriter(new AzureLogWriter("full-smoke-ikey", endpoint: prefix + "v2/track"));
+            Log.Init(config);
+            Log.Write(marker);
+            Log.FlushAsync().GetAwaiter().GetResult();
+            Log.Shutdown();
+            if (!receive.Wait(TimeSpan.FromSeconds(10)))
+            {
+                throw new TimeoutException("HttpListener did not receive a Full Azure post");
+            }
+
+            if (body is null || !body.Contains(marker, StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"AzureLogWriter body missing marker. body={body ?? "<null>"}");
+            }
+
+            Console.WriteLine($"FULL-SMOKE azure ok port={port}");
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    /// <summary>
+    /// Binds a temporary TCP listener on 127.0.0.1:0 and returns the assigned port.
+    /// </summary>
+    /// <returns>A free TCP port on the loopback interface.</returns>
+    private static int FindFreePort()
+    {
+        var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
     }
 
     /// <summary>

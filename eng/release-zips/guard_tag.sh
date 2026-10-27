@@ -4,7 +4,8 @@
 # Aborts when:
 #   1) the tagged commit is not an ancestor of origin/master, or
 #   2) the tag version (without leading v) differs from <Version> in both
-#      ALog.csproj and ALog.Extensions.Logging.csproj.
+#      ALog.csproj and ALog.Extensions.Logging.csproj, or
+#   3) CHANGELOG.md has no section for that version (plain or dated heading).
 #
 # Requires a checkout with enough history to fetch origin/master.
 # Usage: bash eng/release-zips/guard_tag.sh <tag-ref> [commit-sha]
@@ -63,6 +64,27 @@ print(f"guard: tag {tag_version} matches package Version")
 PY
 }
 
+# Ensure CHANGELOG.md has a section for the tag version (fails before build-zips).
+# Args: repo, tag ref.
+require_changelog_section() {
+  local repo="$1"
+  local tag_ref="$2"
+  python3 - "$repo" "$tag_ref" <<'PY'
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+tag_ref = sys.argv[2]
+sys.path.insert(0, str(repo / "eng" / "release-zips"))
+from release_lib import parse_tag_version, require_changelog_section
+
+version = parse_tag_version(tag_ref)
+section = require_changelog_section(repo, version)
+first = section.splitlines()[0]
+print(f"guard: CHANGELOG section present ({first})")
+PY
+}
+
 # CLI entry.
 # Args: tag-ref, optional commit sha (defaults to HEAD).
 main() {
@@ -79,6 +101,7 @@ main() {
   fi
   require_on_master "$repo" "$sha"
   require_version_match "$repo" "$tag_ref"
+  require_changelog_section "$repo" "$tag_ref"
 }
 
 main "$@"

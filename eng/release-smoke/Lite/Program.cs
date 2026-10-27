@@ -2,14 +2,15 @@ using System.Net;
 using System.Text;
 using ALog;
 using ALog.Config;
+using ALog.Writers.Cloud;
 using ALog.Writers.Console;
 using ALog.Writers.File;
 using ALog.Writers.Http;
 using ALog.Writers.Sql;
 
 /// <summary>
-/// Smoke-tests an unpacked Lite zip: Console, File, Queue, SelfLog, HTTP, Init(ALogOptions),
-/// and a SqlLogWriter FileNotFoundException negative case.
+/// Smoke-tests an unpacked Lite zip: Console, File, Queue, SelfLog, HTTP, Azure App Insights,
+/// Init(ALogOptions), and a SqlLogWriter FileNotFoundException negative case.
 /// </summary>
 internal static class Program
 {
@@ -25,6 +26,7 @@ internal static class Program
             RunMainPath();
             RunOptionsInit();
             RunHttpListener();
+            RunAzureListener();
             RunSqlNegative();
             Console.WriteLine("LITE-SMOKE ok");
             return 0;
@@ -139,6 +141,57 @@ internal static class Program
             }
 
             Console.WriteLine($"LITE-SMOKE http ok port={port}");
+        }
+        finally
+        {
+            listener.Stop();
+        }
+    }
+
+    /// <summary>
+    /// Posts one Application Insights track payload through <see cref="AzureLogWriter"/> to a local listener.
+    /// </summary>
+    private static void RunAzureListener()
+    {
+        var marker = $"lite-azure-{Guid.NewGuid():N}";
+        using var listener = new HttpListener();
+        var port = FindFreePort();
+        var prefix = $"http://127.0.0.1:{port}/";
+        listener.Prefixes.Add(prefix);
+        listener.Start();
+        string? body = null;
+        var receive = Task.Run(() =>
+        {
+            var context = listener.GetContext();
+            using var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8);
+            body = reader.ReadToEnd();
+            context.Response.StatusCode = 200;
+            context.Response.Close();
+        });
+
+        try
+        {
+            var config = new LoggerConfig()
+                .AddWriter(new AzureLogWriter("lite-smoke-ikey", endpoint: prefix + "v2/track"));
+            Log.Init(config);
+            Log.Write(marker);
+            Log.FlushAsync().GetAwaiter().GetResult();
+            Log.Shutdown();
+            if (!receive.Wait(TimeSpan.FromSeconds(10)))
+            {
+                throw new TimeoutException("HttpListener did not receive a Lite Azure post");
+            }
+
+            if (body is null
+                || !body.Contains(marker, StringComparison.Ordinal)
+                || !body.Contains("\"baseType\":\"MessageData\"", StringComparison.Ordinal)
+                || !body.Contains("\"iKey\":\"lite-smoke-ikey\"", StringComparison.Ordinal))
+            {
+                throw new InvalidOperationException(
+                    $"AzureLogWriter body missing expected track fields. body={body ?? "<null>"}");
+            }
+
+            Console.WriteLine($"LITE-SMOKE azure ok port={port}");
         }
         finally
         {
