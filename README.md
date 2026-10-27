@@ -35,7 +35,7 @@ How ALog's main package compares with the three most used .NET logging libraries
 | Azure Application Insights writer | ✔️ | [`Serilog.Sinks.ApplicationInsights`](https://www.nuget.org/packages/Serilog.Sinks.ApplicationInsights)[^2] | [`Microsoft.ApplicationInsights.NLogTarget`](https://www.nuget.org/packages/Microsoft.ApplicationInsights.NLogTarget)[^4] | [`Microsoft.ApplicationInsights.Log4NetAppender`](https://www.nuget.org/packages/Microsoft.ApplicationInsights.Log4NetAppender)[^5] |
 | AWS CloudWatch writer | ✔️ | [`Serilog.Sinks.AwsCloudWatch`](https://www.nuget.org/packages/Serilog.Sinks.AwsCloudWatch)[^2] | [`AWS.Logger.NLog`](https://www.nuget.org/packages/AWS.Logger.NLog)[^4] | [`AWS.Logger.Log4net`](https://www.nuget.org/packages/AWS.Logger.Log4net)[^5] |
 | Background queue that drops and counts, or blocks, when full | ✔️ | [`Serilog.Sinks.Async`](https://www.nuget.org/packages/Serilog.Sinks.Async) | ✔️ | —[^6] |
-| Microsoft.Extensions.Logging provider | [`ALog.Extensions.Logging`](https://www.nuget.org/packages/ALog.Extensions.Logging) | [`Serilog.Extensions.Logging`](https://www.nuget.org/packages/Serilog.Extensions.Logging) | [`NLog.Extensions.Logging`](https://www.nuget.org/packages/NLog.Extensions.Logging) | [`Microsoft.Extensions.Logging.Log4Net.AspNetCore`](https://www.nuget.org/packages/Microsoft.Extensions.Logging.Log4Net.AspNetCore)[^5] |
+| Microsoft.Extensions.Logging provider | ✔️ ([separate project in this repo](ALog.Extensions.Logging/)) | [`Serilog.Extensions.Logging`](https://www.nuget.org/packages/Serilog.Extensions.Logging) | [`NLog.Extensions.Logging`](https://www.nuget.org/packages/NLog.Extensions.Logging) | [`Microsoft.Extensions.Logging.Log4Net.AspNetCore`](https://www.nuget.org/packages/Microsoft.Extensions.Logging.Log4Net.AspNetCore)[^5] |
 | JSON configuration | ✔️ (Console and File only, [see Configuration](#configuration)) | [`Serilog.Settings.Configuration`](https://www.nuget.org/packages/Serilog.Settings.Configuration) | [`NLog.Extensions.Logging`](https://www.nuget.org/packages/NLog.Extensions.Logging) | —[^7] |
 | Scopes and enrichers | ✔️ | ✔️ | ✔️ | ✔️ |
 | Size-based file rotation | ✔️ | [`Serilog.Sinks.File`](https://www.nuget.org/packages/Serilog.Sinks.File) | ✔️ | ✔️ |
@@ -44,15 +44,16 @@ How ALog's main package compares with the three most used .NET logging libraries
 | XML configuration | —[^10] | [`Serilog.Settings.AppSettings`](https://www.nuget.org/packages/Serilog.Settings.AppSettings) | ✔️ | ✔️ |
 | Email output | —[^11] | [`Serilog.Sinks.Email`](https://www.nuget.org/packages/Serilog.Sinks.Email) | [`NLog.MailKit`](https://www.nuget.org/packages/NLog.MailKit) | ✔️ |
 | Windows Event Log output | —[^11] | [`Serilog.Sinks.EventLog`](https://www.nuget.org/packages/Serilog.Sinks.EventLog) | [`NLog.WindowsEventLog`](https://www.nuget.org/packages/NLog.WindowsEventLog) | ✔️ |
+| Syslog output | —[^11] | [`Serilog.Sinks.SyslogMessages`](https://www.nuget.org/packages/Serilog.Sinks.SyslogMessages)[^2] | [`NLog.Targets.Network`](https://www.nuget.org/packages/NLog.Targets.Network) | ✔️ |
 
-Checked on 2026-10-27 against Serilog 4.4.0, NLog 6.2.2, and log4net 3.5.0 (latest stable on NuGet). Community packages are marked in the footnotes.
+Checked on 2026-10-27 against Serilog 4.4.0, NLog 6.2.2, and log4net 3.5.0 (latest stable on NuGet). Where no official package exists, the most used maintained community package is listed and marked.
 
 [^1]: log4net has no message templates (structured events) in its main package or an official package, see [ILog](https://github.com/apache/logging-log4net/blob/master/src/log4net/ILog.cs).
 [^2]: Community package, not maintained by the Serilog project.
-[^3]: log4net has no HTTP writer in its main package or an official package, see [Appenders](https://logging.apache.org/log4net/manual/configuration/appenders.html).
+[^3]: log4net has no HTTP writer in its main package or an official package; community packages exist, see [Appenders](https://logging.apache.org/log4net/manual/configuration/appenders.html).
 [^4]: Community package, not maintained by the NLog project.
 [^5]: Community package, not maintained by the log4net project.
-[^6]: log4net has no background queue that drops and counts, or blocks, when full in its main package or an official package, see [BufferingForwardingAppender](https://logging.apache.org/log4net/manual/configuration/appenders/bufferingforwardingappender.html).
+[^6]: log4net has no background queue that drops and counts, or blocks, when full in its main package or an official package; community packages exist, see [BufferingForwardingAppender](https://logging.apache.org/log4net/manual/configuration/appenders/bufferingforwardingappender.html).
 [^7]: log4net has no JSON configuration in its main package or an official package, see [Configuration](https://logging.apache.org/log4net/manual/configuration.html).
 [^8]: ALog rotates files by size only, see [Size rotation](#size-rotation).
 [^9]: ALog keeps rotated files until you delete them, see [Size rotation](#size-rotation).
@@ -66,8 +67,8 @@ Time and memory per event when writing to a file, with each library's own async 
 | | ALog | Serilog | NLog | log4net |
 |---|---|---|---|---|
 | Plain message, 1M events (ns per event) | 600 | 1,450 | 1,020 | 1,400 |
-| Message template, 1M events (ns per event) | 1,050 | 1,800 | 1,320 | n/a[^12] |
-| JSON output, 1M events (ns per event) | 1,300 | 5,450 | 1,700 | n/a[^13] |
+| Message template, 1M events (ns per event) | 1,050 | 1,800 | 1,320 | n/a[^13] |
+| JSON output, 1M events (ns per event) | 1,300 | 5,450 | 1,700 | n/a[^14] |
 | Exception with 3-level chain, 100k events (ns per event) | 22,400 | 30,700 | 28,800 | 31,800 |
 | 8 threads, 1M events (ns per event) | 720 | 2,540 | 1,360 | 1,690 |
 | Cold start to first event written (ms) | 26.0 | 128 | 102 | 94.8 |
@@ -76,10 +77,10 @@ Time and memory per event when writing to a file, with each library's own async 
 
 ALog is behind NLog in three measurements: memory per event with message templates (632 B vs. 457 B), memory per event with exceptions (16,400 B vs. 13,300 B), and the BenchmarkDotNet time for logging an exception that was already thrown (197 ns vs. 64.8 ns).
 
-Measured on 2026-10-27 with ALog 0.2.1, Serilog 4.4.0 (Serilog.Sinks.File 7.0.0), NLog 6.2.2, and log4net 3.5.0 on .NET 10.0.14, GitHub Actions ubuntu-24.04 (AMD EPYC 7763, 4 cores), mean of 5 runs. Every row shown here also held in 9 further runs on a separate Linux machine. Harness, method, and all results, including where ALog is behind: [the harness at b3daa7c](https://github.com/Chookees/ALog/tree/b3daa7c77a743809fa09854aa760d81896b618b9/eng/comparison-bench) and [RESULTS.md](eng/comparison-bench/RESULTS.md).
+Measured on 2026-10-27 with ALog 0.2.1, Serilog 4.4.0 (Serilog.Sinks.File 7.0.0), NLog 6.2.2, and log4net 3.5.0 on .NET 10.0.14, GitHub Actions ubuntu-24.04 (AMD EPYC 7763, 4 cores), mean of 5 runs. Every row shown here also held in 9 further runs on a separate Linux machine, with ALog at least 5% ahead of each library in every environment. Commit b3daa7c. Harness, method, and all results, including where ALog is behind: [the harness at b3daa7c](https://github.com/Chookees/ALog/tree/b3daa7c77a743809fa09854aa760d81896b618b9/eng/comparison-bench) and [RESULTS.md](eng/comparison-bench/RESULTS.md).
 
-[^12]: log4net has no message templates or named properties.
-[^13]: log4net has no built-in JSON layout.
+[^13]: log4net has no message templates or named properties.
+[^14]: log4net has no built-in JSON layout.
 
 ---
 
