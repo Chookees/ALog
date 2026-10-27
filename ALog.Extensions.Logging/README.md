@@ -12,4 +12,4 @@ builder.Logging.AddALog(builder.Configuration);
 
 ALog writes to the console only when `ALog:Console:Enabled` is true. See **Console output** in the repository README. The sample turns that flag on.
 
-See the repository `samples/ALog.AspNetSample` for a full example.
+See the `ALog.AspNetSample` project in [`DemoApp/AspNet`](https://github.com/Chookees/ALog/tree/master/DemoApp/AspNet) for a full example.

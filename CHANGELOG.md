@@ -2,20 +2,15 @@
 
 ## Unreleased
 
-- Docs: README UX overhaul (Hello World, SelfLog catalog, configuration example, file reliability section, known issues rewrite).
+## 0.2.1 - 2026-10-27
+
+- Docs: samples merged into `DemoApp/` (`Quickstart`, `AspNet`); README UX overhaul (Hello World, SelfLog catalog, configuration example, file reliability section, known issues rewrite); release zip notes and `docs/RELEASE_v0.2.1.md`.
 - Fixed: when a log file ends without a line ending (for example after a crash), the next writer starts a new line instead of appending to the leftover fragment.
 - Changed: logging through the background queue is faster. Adding an event usually no longer takes a lock.
 - Changed: each logger with a background queue now uses one dedicated thread.
 - Changed: FileLogWriter writes simple events from PlainTextFormatter and JsonFormatter through a faster path. The written text stays the same.
 - Added: on Windows, `File.ReadAllText` can read the log file while the logger is running: after `Flush`, when the flush interval passes with no new lines (not with `FileFlushInterval` 0), and after dispose. While lines are being written, the write handle stays open, also with `FileFlushInterval` 0. To read the file at any time, open it with `FileShare.ReadWrite`.
 - Changed: message templates are cached, up to 1024 entries.
-
-### Security
-
-- SDK pin raised to 10.0.403 (runtime 10.0.14) for CVE-2026-111497.
-
-## 0.2.1
-
 - Breaking (dependency): `Microsoft.Data.SqlClient` moves from 6.0.2 to 7.1.1. If your app references `Microsoft.Data.SqlClient` directly, upgrade it to 7.x as well.
 - Changed: ALog is now licensed under the Apache License 2.0 instead of MIT. Versions up to and including 0.2.0 stay under the MIT License.
 - Fixed: inner scope wins on duplicate keys; scopes are isolated across parallel tasks; dispose restores the correct parent
@@ -43,6 +38,10 @@
 - Fixed: `ConsoleLogWriter` and `FileLogWriter` write the line even when the `ToString()` of a property or scope value throws. That value shows `[capture failed: ExceptionType]`.
 - Breaking (dependency): `AWSSDK.CloudWatchLogs` moves from 3.7.509.3 (AWS SDK for .NET V3, end of support since 2026-06-01) to 4.0.106 (V4). If your app references other `AWSSDK.*` packages, upgrade all of them to V4 together; otherwise restore fails with NU1107 (version conflict on `AWSSDK.Core`), or it succeeds with warning NU1608 and the app throws `MissingMethodException` at runtime.
 - Fixed: `AwsCloudWatchWriter` now sends the message-template properties and the context with each event, not only the rendered message.
+
+### Security
+
+- SDK pin raised to 10.0.403 (runtime 10.0.14) for CVE-2026-111497.
 
 ### Breaking (output)
 

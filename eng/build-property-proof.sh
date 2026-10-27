@@ -2,7 +2,7 @@
 # Prints the Build-Basis MSBuild properties for every solution project.
 # BB-01: EnforceCodeStyleInBuild is true for each project.
 # BB-02: TreatWarningsAsErrors is true only when CI=true, and only for the
-# libraries, the tests, and the consumer. DemoApp, the sample, and the
+# libraries, the tests, and the consumer. DemoApp samples and the
 # benchmarks stay false (DC-Z2) even when CI=true.
 # BB-07: the two libraries enable the trim, AOT, and single-file analyzers,
 # and neither IsTrimmable nor IsAotCompatible is true.
@@ -61,7 +61,7 @@ check_property() {
 }
 
 # Projects that keep TreatWarningsAsErrors when CI=true.
-# DemoApp, the samples, and the benchmarks are the DC-Z2 opt-out and are not listed here.
+# DemoApp samples and the benchmarks are the DC-Z2 opt-out and are not listed here.
 gated='ALog/ALog.csproj
 ALog.Extensions.Logging/ALog.Extensions.Logging.csproj
 ALog.Tests/ALog.Tests.csproj
@@ -95,9 +95,8 @@ ALog/ALog.csproj
 ALog.Extensions.Logging/ALog.Extensions.Logging.csproj
 ALog.Tests/ALog.Tests.csproj
 eng/consumer-smoke/console/ALog.ConsumerSmoke.csproj
-DemoApp/DemoApp.csproj
-samples/ALog.AspNetSample/ALog.AspNetSample.csproj
-samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj
+DemoApp/AspNet/ALog.AspNetSample.csproj
+DemoApp/Quickstart/ALog.QuickstartSample.csproj
 ALog.Benchmarks/ALog.Benchmarks.csproj
 EOF
 

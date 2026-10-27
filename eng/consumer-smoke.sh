@@ -414,8 +414,8 @@ PY
 # Returns the dotnet restore status.
 restore_quickstart() {
   local work="$1"
-  rm -rf samples/ALog.QuickstartSample/obj
-  dotnet restore samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj \
+  rm -rf DemoApp/Quickstart/obj
+  dotnet restore DemoApp/Quickstart/ALog.QuickstartSample.csproj \
     -p:ALogSmokeFromFeed=true --configfile "$work/nuget.config" --nologo
 }
 
@@ -423,7 +423,7 @@ restore_quickstart() {
 # The property stays on so the build cannot switch back to the project reference.
 # Returns the dotnet build status.
 build_quickstart() {
-  dotnet build samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj \
+  dotnet build DemoApp/Quickstart/ALog.QuickstartSample.csproj \
     -c Release -p:ALogSmokeFromFeed=true --no-restore --nologo
 }
 
@@ -436,7 +436,7 @@ run_quickstart_in_empty_dir() {
   local work="$1"
   local empty="$work/empty"
   local project
-  project="$(pwd)/samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj"
+  project="$(pwd)/DemoApp/Quickstart/ALog.QuickstartSample.csproj"
   mkdir -p "$empty"
   clear_inherited_alog_keys
   local status=0
@@ -445,7 +445,7 @@ run_quickstart_in_empty_dir() {
     dotnet run --project "$project" -c Release --no-build -p:ALogSmokeFromFeed=true
   ) >"$work/process-stdout.txt" 2>"$work/stderr.txt" || status=$?
   {
-    printf '%s\n' '$ dotnet run --project samples/ALog.QuickstartSample'
+    printf '%s\n' '$ dotnet run --project DemoApp/Quickstart'
     cat "$work/process-stdout.txt"
   } > "$work/stdout.txt"
   if [ -f "$empty/logs/app.log" ]; then
@@ -486,13 +486,13 @@ run_quickstart_mode() {
     echo "quickstart mode needs the packed version." >&2
     return 1
   fi
-  assert_quickstart_project "samples/ALog.QuickstartSample/ALog.QuickstartSample.csproj" "$version"
+  assert_quickstart_project "DemoApp/Quickstart/ALog.QuickstartSample.csproj" "$version"
   local work
   work=$(prepare_work_dir)
   export NUGET_PACKAGES="$work/packages"
   pack_packages "$work" "$version"
   restore_quickstart "$work"
-  prove_feed_package "samples/ALog.QuickstartSample/obj/project.assets.json" "$version" "$work/feed"
+  prove_feed_package "DemoApp/Quickstart/obj/project.assets.json" "$version" "$work/feed"
   build_quickstart
   local status=0
   run_quickstart_in_empty_dir "$work" || status=$?
