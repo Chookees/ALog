@@ -42,8 +42,10 @@ fail() {
 }
 
 # Remove the write_notes mktemp file when set.
-# No args; uses NOTES_FILE.
+# No args; uses NOTES_FILE. Waits for any child (for example the notes writer)
+# before unlinking so a still-running writer cannot recreate or race the remove.
 cleanup_notes_file() {
+  wait 2>/dev/null || true
   if [ -n "${NOTES_FILE:-}" ]; then
     rm -f "$NOTES_FILE"
     NOTES_FILE=""
@@ -194,8 +196,10 @@ trim_is_draft_token() {
 # Read isDraft for a tag via gh. Prints exactly true or false on success.
 # Args: bare tag name.
 # Returns: 0 when trimmed stdout is exactly true or false; non-zero on gh
-# failure or unexpected stdout. stderr is logged separately and never mixed
-# into the parsed value. Keeps errexit off across non-zero returns.
+# failure, timeout (124/137), or unexpected stdout. stderr is logged separately
+# and never mixed into the parsed value. Runs under ``timeout -k 5 30`` because
+# TERM/INT traps ignore further signals and gh inherits that mask, so -k 5 is
+# required to escalate a stuck view. Keeps errexit off across non-zero returns.
 query_release_is_draft() {
   local tag="$1"
   local out
@@ -204,12 +208,14 @@ query_release_is_draft() {
   err_file="${TMPDIR:-/tmp}/publish-isdraft-err.$$"
   set +e
   # stdout only into out; stderr to a side file then the script log.
-  out=$(gh release view "$tag" --json isDraft -q .isDraft 2>"$err_file")
+  # timeout -k 5 30: 30s soft limit, SIGKILL 5s later if gh ignores TERM.
+  out=$(timeout -k 5 30 gh release view "$tag" --json isDraft -q .isDraft 2>"$err_file")
   rc=$?
   if [ -s "$err_file" ]; then
     cat "$err_file" >&2
   fi
   rm -f "$err_file"
+  # 124 = timeout SIGTERM; 137 = SIGKILL after -k; any other non-zero = fail.
   if [ "$rc" -ne 0 ]; then
     return 1
   fi
@@ -483,8 +489,13 @@ main() {
 
   # Install notes cleanup BEFORE mktemp so SIGTERM during write_notes still
   # removes the file. NOTES_FILE is set in this shell (not a $(…) subshell).
+  # Prefer RUNNER_TEMP on Actions so the notes file is not left under /tmp.
   trap 'rc=$?; cleanup_notes_file; exit "$rc"' EXIT
-  NOTES_FILE=$(mktemp)
+  if [ -n "${RUNNER_TEMP:-}" ]; then
+    NOTES_FILE=$(mktemp -p "$RUNNER_TEMP")
+  else
+    NOTES_FILE=$(mktemp)
+  fi
   write_notes "$repo" "$version" "$lite" "$win" "$linux" "$sums" "$NOTES_FILE"
   create_release "$tag_ref" "$version" "$NOTES_FILE" "$lite" "$win" "$linux"
 }
