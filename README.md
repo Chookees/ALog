@@ -21,6 +21,64 @@ An optional background queue can drop and count events when full (`QueueFullMode
 - Writers: Console, File, HTTP, SQL, Azure App Insights, AWS CloudWatch
 - Benchmarks: `ALog.Benchmarks`
 
+## How ALog compares
+
+How ALog's main package compares with the three most used .NET logging libraries. Links go to each project on GitHub.
+
+| | ALog | [Serilog](https://github.com/serilog/serilog) | [NLog](https://github.com/NLog/NLog) | [log4net](https://github.com/apache/logging-log4net) |
+|---|---|---|---|---|
+| License | Apache-2.0 | Apache-2.0 | BSD-3-Clause | Apache-2.0 |
+| Message templates (structured events) | ✔️ | ✔️ | ✔️ | —[^1] |
+| Console and file output | ✔️ | [`Serilog.Sinks.Console`](https://www.nuget.org/packages/Serilog.Sinks.Console), [`Serilog.Sinks.File`](https://www.nuget.org/packages/Serilog.Sinks.File) | ✔️ | ✔️ |
+| SQL Server writer | ✔️ | —[^2] | [`NLog.Database`](https://www.nuget.org/packages/NLog.Database) | ✔️ |
+| HTTP writer | ✔️ | —[^3] | [`NLog.Targets.WebService`](https://www.nuget.org/packages/NLog.Targets.WebService) | —[^4] |
+| Azure Application Insights writer | ✔️ | —[^5] | —[^6] | —[^7] |
+| AWS CloudWatch writer | ✔️ | —[^8] | —[^9] | —[^10] |
+| Background queue that drops and counts, or blocks, when full | ✔️ | [`Serilog.Sinks.Async`](https://www.nuget.org/packages/Serilog.Sinks.Async) | ✔️ | —[^11] |
+| Microsoft.Extensions.Logging provider | [`ALog.Extensions.Logging`](https://www.nuget.org/packages/ALog.Extensions.Logging) | [`Serilog.Extensions.Logging`](https://www.nuget.org/packages/Serilog.Extensions.Logging) | [`NLog.Extensions.Logging`](https://www.nuget.org/packages/NLog.Extensions.Logging) | —[^12] |
+| JSON configuration | ✔️ (Console and File only, [see Configuration](#configuration)) | [`Serilog.Settings.Configuration`](https://www.nuget.org/packages/Serilog.Settings.Configuration) | [`NLog.Extensions.Logging`](https://www.nuget.org/packages/NLog.Extensions.Logging) | —[^13] |
+| Date-based file rolling and archive retention | —[^14] | [`Serilog.Sinks.File`](https://www.nuget.org/packages/Serilog.Sinks.File) | ✔️ | ✔️ |
+| Windows Event Log output | —[^15] | [`Serilog.Sinks.EventLog`](https://www.nuget.org/packages/Serilog.Sinks.EventLog) | [`NLog.WindowsEventLog`](https://www.nuget.org/packages/NLog.WindowsEventLog) | ✔️ |
+| Email output | —[^16] | [`Serilog.Sinks.Email`](https://www.nuget.org/packages/Serilog.Sinks.Email) | [`NLog.MailKit`](https://www.nuget.org/packages/NLog.MailKit) | ✔️ |
+| XML configuration file | —[^17] | [`Serilog.Settings.AppSettings`](https://www.nuget.org/packages/Serilog.Settings.AppSettings) | ✔️ | ✔️ |
+| Syslog output | —[^18] | —[^19] | [`NLog.Targets.Network`](https://www.nuget.org/packages/NLog.Targets.Network) | ✔️ |
+
+Checked on 2026-10-27 against Serilog 4.4.0, NLog 6.2.2, and log4net 3.5.0 (latest stable on NuGet). Third-party packages are not listed.
+
+[^1]: log4net has no message templates (structured events) in its main package or an official package, see [ILog](https://github.com/apache/logging-log4net/blob/master/src/log4net/ILog.cs).
+[^2]: Serilog has no SQL Server writer in its main package or an official package, see [serilog-mssql/serilog-sinks-mssqlserver](https://github.com/serilog-mssql/serilog-sinks-mssqlserver).
+[^3]: Serilog has no HTTP writer in its main package or an official package, see [FantasticFiasco/serilog-sinks-http](https://github.com/FantasticFiasco/serilog-sinks-http).
+[^4]: log4net has no HTTP writer in its main package or an official package, see [Appenders](https://logging.apache.org/log4net/manual/configuration/appenders.html).
+[^5]: Serilog has no Azure Application Insights writer in its main package or an official package, see [serilog-contrib/serilog-sinks-applicationinsights](https://github.com/serilog-contrib/serilog-sinks-applicationinsights).
+[^6]: NLog has no Azure Application Insights writer in its main package or an official package, see [NLog packages](https://github.com/NLog/NLog/blob/dev/packages-and-status.md).
+[^7]: log4net has no Azure Application Insights writer in its main package or an official package, see [Appenders](https://logging.apache.org/log4net/manual/configuration/appenders.html).
+[^8]: Serilog has no AWS CloudWatch writer in its main package or an official package, see [Cimpress-MCP/serilog-sinks-awscloudwatch](https://github.com/Cimpress-MCP/serilog-sinks-awscloudwatch).
+[^9]: NLog has no AWS CloudWatch writer in its main package or an official package, see [NLog packages](https://github.com/NLog/NLog/blob/dev/packages-and-status.md).
+[^10]: log4net has no AWS CloudWatch writer in its main package or an official package, see [Appenders](https://logging.apache.org/log4net/manual/configuration/appenders.html).
+[^11]: log4net has no background queue that drops and counts, or blocks, when full in its main package or an official package, see [BufferingForwardingAppender](https://logging.apache.org/log4net/manual/configuration/appenders/bufferingforwardingappender.html).
+[^12]: log4net has no Microsoft.Extensions.Logging provider in its main package or an official package, see [logging-log4net](https://github.com/apache/logging-log4net).
+[^13]: log4net has no JSON configuration in its main package or an official package, see [Configuration](https://logging.apache.org/log4net/manual/configuration.html).
+[^14]: ALog has no date-based file rolling and archive retention in its main package or an official package, see [Size rotation](https://github.com/Chookees/ALog/blob/b3daa7c77a743809fa09854aa760d81896b618b9/README.md#size-rotation).
+[^15]: ALog has no Windows Event Log output in its main package or an official package, see [Writers](https://github.com/Chookees/ALog/blob/b3daa7c77a743809fa09854aa760d81896b618b9/README.md#writers).
+[^16]: ALog has no email output in its main package or an official package, see [Writers](https://github.com/Chookees/ALog/blob/b3daa7c77a743809fa09854aa760d81896b618b9/README.md#writers).
+[^17]: ALog has no XML configuration file in its main package or an official package, see [Configuration](https://github.com/Chookees/ALog/blob/b3daa7c77a743809fa09854aa760d81896b618b9/README.md#configuration).
+[^18]: ALog has no syslog output in its main package or an official package, see [Writers](https://github.com/Chookees/ALog/blob/b3daa7c77a743809fa09854aa760d81896b618b9/README.md#writers).
+[^19]: Serilog has no syslog output in its main package or an official package, see [Provided Sinks](https://github.com/serilog/serilog/wiki/Provided-Sinks).
+
+| | ALog | NLog | Serilog | log4net |
+|---|---|---|---|---|
+| Plain logging (ns per event, lower is better) | 600 | 1,020 | 1,450 | 1,400 |
+| Structured logging (ns per event, lower is better) | 1,050 | 1,320 | 1,800 | n/a[^20] |
+| Exception logging (ns per event, lower is better) | 22,400 | 28,800 | 30,700 | 31,800 |
+| Multi-threaded logging (ns per event, lower is better) | 720 | 1,360 | 2,540 | 1,690 |
+| JSON logging (ns per event, lower is better) | 1,300 | 1,700 | 5,450 | n/a[^20] |
+| Startup time (ms, lower is better) | 26.0 | 102 | 128 | 94.8 |
+| Memory allocated (B per event, lower is better) | 152 | 193 | 680 | 923 |
+
+Measured on 2026-10-27 with ALog 0.2.1, Serilog 4.4.0, NLog 6.2.2, and log4net 3.5.0, commit b3daa7c, harness [eng/comparison-bench](https://github.com/Chookees/ALog/tree/b3daa7c77a743809fa09854aa760d81896b618b9/eng/comparison-bench), GitHub Actions ubuntu-24.04 runner (AMD EPYC 7763) plus 2 box machines, pair rule 0.95/1.05. Harness and all raw results, including the cases where ALog is slower: [the harness at b3daa7c](https://github.com/Chookees/ALog/tree/b3daa7c77a743809fa09854aa760d81896b618b9/eng/comparison-bench).
+
+[^20]: log4net T2/T7 are n/a: no message templates or named properties, and no built-in JSON layout (log4net 3.5.0).
+
 ---
 
 ## Installation
