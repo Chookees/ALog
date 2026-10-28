@@ -1,10 +1,12 @@
 namespace ALog.Writers.Cloud;
 
 using System.Net.Http;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using ALog.Core;
 using ALog.Public.Interfaces;
+using SelfLog = ALog.SelfLog;
 
 /// <summary>
 /// Azure Application Insights writer using the public <c>/v2/track</c> ingestion protocol.
@@ -45,6 +47,7 @@ public class AzureLogWriter : ILogWriter, IFormattableLogWriter
     /// That exception stays on this writer's error path. Callers do not see it.
     /// The call blocks the caller for the HTTP round trip. Safe on a thread that owns a
     /// <see cref="SynchronizationContext"/> because no continuation is posted back to it.
+    /// The track send lives in <see cref="SendSync"/> so transport failures surface in this catch.
     /// </remarks>
     public void Write(LogEvent logEvent)
     {
@@ -53,9 +56,7 @@ public class AzureLogWriter : ILogWriter, IFormattableLogWriter
             if (logEvent is null)
                 throw new ArgumentNullException(nameof(logEvent));
 
-            using var request = CreateRequest(logEvent);
-            using var response = _httpClient.Send(request, CancellationToken.None);
-            response.EnsureSuccessStatusCode();
+            SendSync(logEvent);
         }
         catch (Exception ex)
         {
@@ -69,8 +70,8 @@ public class AzureLogWriter : ILogWriter, IFormattableLogWriter
     /// <param name="logEvent">Event to send. Null is reported and the task still completes.</param>
     /// <returns>A task that completes after the post, including when the post fails.</returns>
     /// <remarks>
-    /// Failures are written to the error stream. The task does not fault.
-    /// The await uses <c>ConfigureAwait(false)</c>.
+    /// Failures go to SelfLog and the error stream. The task does not fault.
+    /// The await uses <c>ConfigureAwait(false)</c>. The track send lives in <see cref="SendAsyncCore"/>.
     /// </remarks>
     public async Task WriteAsync(LogEvent logEvent)
     {
@@ -79,9 +80,7 @@ public class AzureLogWriter : ILogWriter, IFormattableLogWriter
             if (logEvent is null)
                 throw new ArgumentNullException(nameof(logEvent));
 
-            using var request = CreateRequest(logEvent);
-            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
+            await SendAsyncCore(logEvent).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -90,10 +89,42 @@ public class AzureLogWriter : ILogWriter, IFormattableLogWriter
     }
 
     /// <summary>
+    /// Posts one track payload with synchronous <c>Send</c>.
+    /// </summary>
+    /// <param name="logEvent">Event to send. Not null.</param>
+    /// <remarks>
+    /// Marked no-inline so the Application Insights track I/O stays out of <see cref="Write"/>.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void SendSync(LogEvent logEvent)
+    {
+        using var request = CreateRequest(logEvent);
+        using var response = _httpClient.Send(request, CancellationToken.None);
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>
+    /// Posts one track payload with <c>SendAsync</c>.
+    /// </summary>
+    /// <param name="logEvent">Event to send. Not null.</param>
+    /// <returns>A task that completes after the post attempt.</returns>
+    /// <remarks>
+    /// Marked no-inline so the Application Insights track I/O stays out of <see cref="WriteAsync"/>.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private async Task SendAsyncCore(LogEvent logEvent)
+    {
+        using var request = CreateRequest(logEvent);
+        using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>
     /// Builds the track POST for one event.
     /// </summary>
     /// <param name="logEvent">Event whose payload is the body. Must not be null.</param>
     /// <returns>The request. The caller disposes it, which disposes the body.</returns>
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private HttpRequestMessage CreateRequest(LogEvent logEvent)
     {
         var payload = BuildTrackPayload(logEvent);
@@ -102,11 +133,16 @@ public class AzureLogWriter : ILogWriter, IFormattableLogWriter
     }
 
     /// <summary>
-    /// Writes one Azure failure to the error stream. The event is dropped.
+    /// Writes one Azure failure to SelfLog and to the error stream. The event is dropped.
     /// </summary>
     /// <param name="ex">Failure from payload building or the HTTP call. Must not be null.</param>
+    /// <remarks>
+    /// Matches <c>AwsCloudWatchWriter.Report</c>: <see cref="SelfLog.Report"/> with the writer type name,
+    /// then the existing stderr line. No new catalog id. Neither path throws.
+    /// </remarks>
     private static void Report(Exception ex)
     {
+        SelfLog.Report("AzureLogWriter", ex);
         System.Console.Error.WriteLine($"[AzureLogWriter] Application Insights write failed: {ex}");
     }
 

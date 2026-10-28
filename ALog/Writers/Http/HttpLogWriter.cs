@@ -3,12 +3,14 @@ namespace ALog.Writers.Http;
 using System;
 using System.Collections.Generic;
 using System.Net.Http;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using ALog.Core;
 using ALog.Formatters;
 using ALog.Public.Interfaces;
+using SelfLog = ALog.SelfLog;
 
 /// <summary>
 /// HTTP-based log writer for sending logs to web endpoints
@@ -59,7 +61,7 @@ public class HttpLogWriter : ILogWriter, IFormattableLogWriter
     /// A handler without synchronous <c>Send</c> throws <see cref="NotSupportedException"/>.
     /// That stays on this writer's error path. The caller does not see it and the call does not hang.
     /// The caller blocks for the HTTP round trip. No continuation is posted to a
-    /// <see cref="SynchronizationContext"/>.
+    /// <see cref="SynchronizationContext"/>. The send body lives in <see cref="SendSync"/>.
     /// </remarks>
     public void Write(LogEvent logEvent)
     {
@@ -68,9 +70,7 @@ public class HttpLogWriter : ILogWriter, IFormattableLogWriter
             if (logEvent is null)
                 throw new ArgumentNullException(nameof(logEvent));
 
-            using var request = CreateRequest(logEvent);
-            using var response = _httpClient.Send(request, CancellationToken.None);
-            response.EnsureSuccessStatusCode();
+            SendSync(logEvent);
         }
         catch (Exception ex)
         {
@@ -84,8 +84,8 @@ public class HttpLogWriter : ILogWriter, IFormattableLogWriter
     /// <param name="logEvent">Event to send. Null is reported and the task still completes.</param>
     /// <returns>A task that completes after the post, including when the post fails.</returns>
     /// <remarks>
-    /// Failures are written to the error stream. The task does not fault.
-    /// The await uses <c>ConfigureAwait(false)</c>.
+    /// Failures go to SelfLog and the error stream. The task does not fault.
+    /// The await uses <c>ConfigureAwait(false)</c>. The send body lives in <see cref="SendAsyncCore"/>.
     /// </remarks>
     public async Task WriteAsync(LogEvent logEvent)
     {
@@ -94,9 +94,7 @@ public class HttpLogWriter : ILogWriter, IFormattableLogWriter
             if (logEvent is null)
                 throw new ArgumentNullException(nameof(logEvent));
 
-            using var request = CreateRequest(logEvent);
-            using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
-            response.EnsureSuccessStatusCode();
+            await SendAsyncCore(logEvent).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -105,10 +103,38 @@ public class HttpLogWriter : ILogWriter, IFormattableLogWriter
     }
 
     /// <summary>
+    /// Posts one event with synchronous <c>Send</c>.
+    /// </summary>
+    /// <param name="logEvent">Event to send. Not null.</param>
+    /// <remarks>Marked no-inline so the HTTP I/O stays out of <see cref="Write"/>.</remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void SendSync(LogEvent logEvent)
+    {
+        using var request = CreateRequest(logEvent);
+        using var response = _httpClient.Send(request, CancellationToken.None);
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>
+    /// Posts one event with <c>SendAsync</c>.
+    /// </summary>
+    /// <param name="logEvent">Event to send. Not null.</param>
+    /// <returns>A task that completes after the post attempt.</returns>
+    /// <remarks>Marked no-inline so the HTTP I/O stays out of <see cref="WriteAsync"/>.</remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private async Task SendAsyncCore(LogEvent logEvent)
+    {
+        using var request = CreateRequest(logEvent);
+        using var response = await _httpClient.SendAsync(request).ConfigureAwait(false);
+        response.EnsureSuccessStatusCode();
+    }
+
+    /// <summary>
     /// Builds the outbound request, including per-request headers.
     /// </summary>
     /// <param name="logEvent">Event to format. Must not be null.</param>
     /// <returns>The request. The caller disposes it, which disposes the body.</returns>
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private HttpRequestMessage CreateRequest(LogEvent logEvent)
     {
         var content = PrepareContent(logEvent);
@@ -152,11 +178,16 @@ public class HttpLogWriter : ILogWriter, IFormattableLogWriter
     }
 
     /// <summary>
-    /// Writes one HTTP failure to the error stream. The event is dropped.
+    /// Writes one HTTP failure to SelfLog and to the error stream. The event is dropped.
     /// </summary>
     /// <param name="ex">Failure from formatting or the HTTP call. Must not be null.</param>
+    /// <remarks>
+    /// Matches <c>AwsCloudWatchWriter.Report</c>: <see cref="SelfLog.Report"/> with the writer type name,
+    /// then the existing stderr line. No new catalog id. Neither path throws.
+    /// </remarks>
     private static void Report(Exception ex)
     {
+        SelfLog.Report("HttpLogWriter", ex);
         Console.Error.WriteLine($"[HttpLogWriter] HTTP write failed: {ex}");
     }
 

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed: `SqlLogWriter`, `HttpLogWriter`, and `AzureLogWriter` report write failures through SelfLog (same pattern as `AwsCloudWatchWriter`), including a missing Microsoft.Data.SqlClient assembly in Lite and unreachable HTTP/Azure endpoints.
+
 ## 0.2.1 - 2026-10-27
 
 - Docs: samples merged into `DemoApp/` (`Quickstart`, `AspNet`); README UX overhaul (Hello World, SelfLog catalog, configuration example, file reliability section, known issues rewrite); release zip notes and `docs/RELEASE_v0.2.1.md`.

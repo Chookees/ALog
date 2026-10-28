@@ -2,11 +2,13 @@ namespace ALog.Writers.Sql;
 
 using System;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using ALog.Core;
 using ALog.Public.Interfaces;
 using Microsoft.Data.SqlClient;
+using SelfLog = ALog.SelfLog;
 
 /// <summary>
 /// SQL Server-based log writer for storing logs in database
@@ -21,6 +23,29 @@ public class SqlLogWriter : ILogWriter
     private readonly string _tableName;
     private readonly bool _autoCreateTable;
 
+    /// <summary>
+    /// Builds a connection for one insert or table create. Tests may replace this.
+    /// </summary>
+    /// <remarks>
+    /// Null is not allowed after construction. The default opens a real <see cref="SqlConnection"/>.
+    /// A test seam throws <see cref="FileNotFoundException"/> for Microsoft.Data.SqlClient to mirror Lite.
+    /// Invoked only from <see cref="MethodImplOptions.NoInlining"/> helpers so a missing assembly
+    /// surfaces in the caller's try/catch, not as an uncaught JIT failure on <see cref="Write"/>.
+    /// </remarks>
+    internal Func<string, SqlConnection> CreateConnection { get; set; }
+
+    /// <summary>
+    /// Stores the connection string and optionally creates the table.
+    /// </summary>
+    /// <param name="connectionString">SQL Server connection string. Null is rejected.</param>
+    /// <param name="tableName">Simple table identifier. Default is <c>Logs</c>.</param>
+    /// <param name="autoCreateTable">When true, attempts to create the table during construction.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="connectionString"/> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="tableName"/> is not a simple identifier.</exception>
+    /// <remarks>
+    /// Does not throw for a missing Microsoft.Data.SqlClient assembly when <paramref name="autoCreateTable"/> is true;
+    /// that failure is reported. Construction with <paramref name="autoCreateTable"/> false does not touch SqlClient.
+    /// </remarks>
     public SqlLogWriter(
         string connectionString,
         string tableName = "Logs",
@@ -29,6 +54,7 @@ public class SqlLogWriter : ILogWriter
         _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
         _tableName = ValidateTableName(tableName);
         _autoCreateTable = autoCreateTable;
+        CreateConnection = static cs => new SqlConnection(cs);
 
         if (_autoCreateTable)
         {
@@ -36,6 +62,13 @@ public class SqlLogWriter : ILogWriter
         }
     }
 
+    /// <summary>
+    /// Rejects a null, empty, overlong, or non-identifier table name.
+    /// </summary>
+    /// <param name="tableName">Candidate name. Null throws.</param>
+    /// <returns>The same string when it is valid.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="tableName"/> is null.</exception>
+    /// <exception cref="ArgumentException">The name fails the identifier rule or length cap.</exception>
     internal static string ValidateTableName(string tableName)
     {
         if (tableName is null)
@@ -52,12 +85,12 @@ public class SqlLogWriter : ILogWriter
     }
 
     /// <summary>
-    /// Inserts one event with <see cref="SqlConnection.Open"/> and <see cref="SqlCommand.ExecuteNonQuery"/>.
+    /// Inserts one event synchronously. Failures are reported and not thrown to the caller.
     /// </summary>
     /// <param name="logEvent">Event to insert. Null is reported and dropped.</param>
     /// <remarks>
-    /// Does not call an async method and does not wait on a task. The caller blocks for the round trip.
-    /// Failures are written to the error stream and are not thrown to the caller.
+    /// Does not reference Microsoft.Data.SqlClient types. The insert body lives in <see cref="InsertSync"/>.
+    /// A missing SqlClient assembly, connection failure, or command failure is reported via <see cref="Report"/>.
     /// </remarks>
     public void Write(LogEvent logEvent)
     {
@@ -66,11 +99,7 @@ public class SqlLogWriter : ILogWriter
             if (logEvent is null)
                 throw new ArgumentNullException(nameof(logEvent));
 
-            using var connection = new SqlConnection(_connectionString);
-            connection.Open();
-            using var command = CreateInsert(connection, logEvent);
-            // The insert is best-effort. A driver exception is the failure signal, not the row count.
-            _ = command.ExecuteNonQuery();
+            InsertSync(logEvent);
         }
         catch (Exception ex)
         {
@@ -79,13 +108,13 @@ public class SqlLogWriter : ILogWriter
     }
 
     /// <summary>
-    /// Inserts one event with <c>OpenAsync</c> and <c>ExecuteNonQueryAsync</c>.
+    /// Inserts one event asynchronously. Failures are reported and the task still completes.
     /// </summary>
     /// <param name="logEvent">Event to insert. Null is reported and the task still completes.</param>
-    /// <returns>A task that completes after the insert, including when the insert fails.</returns>
+    /// <returns>A task that completes after the insert attempt, including when the insert fails.</returns>
     /// <remarks>
-    /// Both awaits use <c>ConfigureAwait(false)</c>, so the method does not resume on the caller
-    /// <see cref="SynchronizationContext"/>. Failures are written to the error stream.
+    /// Does not reference Microsoft.Data.SqlClient types. The insert body lives in <see cref="InsertAsync"/>.
+    /// Awaits use <c>ConfigureAwait(false)</c>. Failures go to SelfLog and the error stream.
     /// </remarks>
     public async Task WriteAsync(LogEvent logEvent)
     {
@@ -94,11 +123,7 @@ public class SqlLogWriter : ILogWriter
             if (logEvent is null)
                 throw new ArgumentNullException(nameof(logEvent));
 
-            using var connection = new SqlConnection(_connectionString);
-            await connection.OpenAsync().ConfigureAwait(false);
-            using var command = CreateInsert(connection, logEvent);
-            // Same best-effort contract as <see cref="Write"/>. The row count is not a second signal.
-            _ = await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+            await InsertAsync(logEvent).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -107,11 +132,48 @@ public class SqlLogWriter : ILogWriter
     }
 
     /// <summary>
+    /// Opens a connection and inserts one row. Kept out of <see cref="Write"/> so a missing SqlClient
+    /// assembly fails here and is caught by the caller.
+    /// </summary>
+    /// <param name="logEvent">Event to insert. Not null.</param>
+    /// <remarks>
+    /// Does not call an async method. The insert is best-effort; the row count is not a second signal.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void InsertSync(LogEvent logEvent)
+    {
+        using var connection = CreateConnection(_connectionString);
+        connection.Open();
+        using var command = CreateInsert(connection, logEvent);
+        _ = command.ExecuteNonQuery();
+    }
+
+    /// <summary>
+    /// Opens a connection and inserts one row asynchronously. Kept out of <see cref="WriteAsync"/>
+    /// so a missing SqlClient assembly fails here and is caught by the caller.
+    /// </summary>
+    /// <param name="logEvent">Event to insert. Not null.</param>
+    /// <returns>A task that completes after the insert attempt.</returns>
+    /// <remarks>Both awaits use <c>ConfigureAwait(false)</c>.</remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private async Task InsertAsync(LogEvent logEvent)
+    {
+        using var connection = CreateConnection(_connectionString);
+        await connection.OpenAsync().ConfigureAwait(false);
+        using var command = CreateInsert(connection, logEvent);
+        _ = await command.ExecuteNonQueryAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Builds the insert command for one event. The caller disposes it.
     /// </summary>
     /// <param name="connection">Open connection. Must not be null.</param>
     /// <param name="logEvent">Event to bind. Must not be null.</param>
     /// <returns>A command whose parameters are bound to <paramref name="logEvent"/>.</returns>
+    /// <remarks>
+    /// Marked no-inline so SqlClient types stay out of <see cref="Write"/> and <see cref="WriteAsync"/>.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
     private SqlCommand CreateInsert(SqlConnection connection, LogEvent logEvent)
     {
         var sql = $@"
@@ -144,19 +206,48 @@ public class SqlLogWriter : ILogWriter
         => DateTime.UtcNow;
 
     /// <summary>
-    /// Writes one SQL failure to the error stream. The event is dropped.
+    /// Writes one SQL failure to SelfLog and to the error stream. The event is dropped.
     /// </summary>
-    /// <param name="ex">Failure from the connection or the command. Must not be null.</param>
+    /// <param name="ex">Failure from the connection, the command, or a missing optional assembly. Must not be null.</param>
+    /// <remarks>
+    /// Matches <c>AwsCloudWatchWriter.Report</c>: <see cref="SelfLog.Report"/> with the writer type name,
+    /// then the existing stderr line. No new catalog id. Neither path throws.
+    /// </remarks>
     private static void Report(Exception ex)
     {
+        SelfLog.Report("SqlLogWriter", ex);
         Console.Error.WriteLine($"[SqlLogWriter] SQL write failed: {ex}");
     }
 
+    /// <summary>
+    /// Creates the log table when it is missing. Failures are reported and do not escape construction.
+    /// </summary>
+    /// <remarks>
+    /// Does not reference Microsoft.Data.SqlClient types. The create body lives in <see cref="CreateTableCore"/>.
+    /// A missing SqlClient assembly is reported the same way as a write failure.
+    /// </remarks>
     private void EnsureTableExists()
     {
         try
         {
-            var createTableSql = $@"
+            CreateTableCore();
+        }
+        catch (Exception ex)
+        {
+            SelfLog.Report("SqlLogWriter", ex);
+            Console.Error.WriteLine($"[SqlLogWriter] Failed to create table: {ex}");
+        }
+    }
+
+    /// <summary>
+    /// Runs the create-table SQL. Kept out of <see cref="EnsureTableExists"/> so a missing SqlClient
+    /// assembly fails here and is caught by the caller.
+    /// </summary>
+    /// <remarks>Does not throw past the caller when SqlClient is absent; that is the caller's catch.</remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void CreateTableCore()
+    {
+        var createTableSql = $@"
                 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{_tableName}' AND xtype='U')
                 CREATE TABLE [{_tableName}] (
                     Id BIGINT IDENTITY(1,1) PRIMARY KEY,
@@ -170,18 +261,17 @@ public class SqlLogWriter : ILogWriter
                     INDEX IX_{_tableName}_Level (Level)
                 )";
 
-            using var connection = new SqlConnection(_connectionString);
-            connection.Open();
+        using var connection = CreateConnection(_connectionString);
+        connection.Open();
 
-            using var command = new SqlCommand(createTableSql, connection);
-            command.ExecuteNonQuery();
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"[SqlLogWriter] Failed to create table: {ex}");
-        }
+        using var command = new SqlCommand(createTableSql, connection);
+        command.ExecuteNonQuery();
     }
 
+    /// <summary>
+    /// No-op. Connections are opened per write.
+    /// </summary>
+    /// <remarks>Does not throw.</remarks>
     public void Dispose()
     {
         // connections are per-write

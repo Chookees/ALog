@@ -412,9 +412,9 @@ Catalog codes (some lines include the code text; others are identified only in s
 
 ### Cloud writers fail closed
 
-- **Symptom:** Cloud sink errors appear on stderr; the app keeps running.
-- **When it happens:** Credentials or endpoints reject the request.
-- **Workaround:** Fix credentials/endpoints; watch stderr / SelfLog.
+- **Symptom:** Cloud sink errors appear on stderr and in SelfLog (`[ALog] {WriterName} failed: …`); the app keeps running.
+- **When it happens:** Credentials or endpoints reject the request, or (Lite) Microsoft.Data.SqlClient is missing on the first `SqlLogWriter` write / table create.
+- **Workaround:** Fix credentials/endpoints or deploy the optional dependency; watch stderr / SelfLog.
 
 <a id="observations-during-testing"></a>
 ### Silent loss: flush I/O failure (ENOSPC / EIO)
