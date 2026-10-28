@@ -1,5 +1,0 @@
-bin/
-obj/
-BenchmarkDotNet.Artifacts/
-results/_smoke/
-results/*/_work/
