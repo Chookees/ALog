@@ -1,13 +1,13 @@
 namespace ALog.Writers.Sql;
 
 using System;
+using System.Data.Common;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using ALog.Core;
 using ALog.Public.Interfaces;
-using Microsoft.Data.SqlClient;
 using SelfLog = ALog.SelfLog;
 
 /// <summary>
@@ -24,15 +24,15 @@ public class SqlLogWriter : ILogWriter
     private readonly bool _autoCreateTable;
 
     /// <summary>
-    /// Builds a connection for one insert or table create. Tests may replace this.
+    /// Optional connection factory for tests. Null uses Microsoft.Data.SqlClient via <see cref="NewSqlConnection"/>.
     /// </summary>
     /// <remarks>
-    /// Null is not allowed after construction. The default opens a real <see cref="SqlConnection"/>.
+    /// Not assigned in the constructor so construction never resolves SqlClient types.
     /// A test seam throws <see cref="FileNotFoundException"/> for Microsoft.Data.SqlClient to mirror Lite.
-    /// Invoked only from <see cref="MethodImplOptions.NoInlining"/> helpers so a missing assembly
-    /// surfaces in the caller's try/catch, not as an uncaught JIT failure on <see cref="Write"/>.
+    /// Invoked only from <see cref="MethodImplOptions.NoInlining"/> helpers.
+    /// The signature uses <see cref="DbConnection"/> so this property does not mention SqlClient.
     /// </remarks>
-    internal Func<string, SqlConnection> CreateConnection { get; set; }
+    internal Func<string, DbConnection>? CreateConnectionOverride { get; set; }
 
     /// <summary>
     /// Stores the connection string and optionally creates the table.
@@ -43,8 +43,9 @@ public class SqlLogWriter : ILogWriter
     /// <exception cref="ArgumentNullException"><paramref name="connectionString"/> is null.</exception>
     /// <exception cref="ArgumentException"><paramref name="tableName"/> is not a simple identifier.</exception>
     /// <remarks>
-    /// Does not throw for a missing Microsoft.Data.SqlClient assembly when <paramref name="autoCreateTable"/> is true;
-    /// that failure is reported. Construction with <paramref name="autoCreateTable"/> false does not touch SqlClient.
+    /// Does not reference Microsoft.Data.SqlClient types. Construction with
+    /// <paramref name="autoCreateTable"/> false does not touch SqlClient.
+    /// When <paramref name="autoCreateTable"/> is true, a missing SqlClient assembly is reported, not thrown.
     /// </remarks>
     public SqlLogWriter(
         string connectionString,
@@ -54,7 +55,6 @@ public class SqlLogWriter : ILogWriter
         _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
         _tableName = ValidateTableName(tableName);
         _autoCreateTable = autoCreateTable;
-        CreateConnection = static cs => new SqlConnection(cs);
 
         if (_autoCreateTable)
         {
@@ -138,11 +138,12 @@ public class SqlLogWriter : ILogWriter
     /// <param name="logEvent">Event to insert. Not null.</param>
     /// <remarks>
     /// Does not call an async method. The insert is best-effort; the row count is not a second signal.
+    /// Uses <see cref="DbConnection"/> / <see cref="DbCommand"/>; SqlClient appears only in <see cref="NewSqlConnection"/>.
     /// </remarks>
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void InsertSync(LogEvent logEvent)
     {
-        using var connection = CreateConnection(_connectionString);
+        using var connection = OpenConnection();
         connection.Open();
         using var command = CreateInsert(connection, logEvent);
         _ = command.ExecuteNonQuery();
@@ -158,11 +159,34 @@ public class SqlLogWriter : ILogWriter
     [MethodImpl(MethodImplOptions.NoInlining)]
     private async Task InsertAsync(LogEvent logEvent)
     {
-        using var connection = CreateConnection(_connectionString);
+        using var connection = OpenConnection();
         await connection.OpenAsync().ConfigureAwait(false);
         using var command = CreateInsert(connection, logEvent);
         _ = await command.ExecuteNonQueryAsync().ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Returns the override connection when set; otherwise opens a real SqlClient connection.
+    /// </summary>
+    /// <returns>An openable <see cref="DbConnection"/>. Not null.</returns>
+    /// <remarks>
+    /// Marked no-inline. Does not name SqlClient types; <see cref="NewSqlConnection"/> holds that reference.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private DbConnection OpenConnection()
+        => CreateConnectionOverride?.Invoke(_connectionString) ?? NewSqlConnection(_connectionString);
+
+    /// <summary>
+    /// Creates a Microsoft.Data.SqlClient connection. The only method that names SqlClient types.
+    /// </summary>
+    /// <param name="connectionString">SQL Server connection string. Not null.</param>
+    /// <returns>A new SqlConnection as <see cref="DbConnection"/>.</returns>
+    /// <remarks>
+    /// Marked no-inline so a missing Microsoft.Data.SqlClient assembly fails here and is caught by the caller.
+    /// </remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static DbConnection NewSqlConnection(string connectionString)
+        => new Microsoft.Data.SqlClient.SqlConnection(connectionString);
 
     /// <summary>
     /// Builds the insert command for one event. The caller disposes it.
@@ -171,26 +195,50 @@ public class SqlLogWriter : ILogWriter
     /// <param name="logEvent">Event to bind. Must not be null.</param>
     /// <returns>A command whose parameters are bound to <paramref name="logEvent"/>.</returns>
     /// <remarks>
-    /// Marked no-inline so SqlClient types stay out of <see cref="Write"/> and <see cref="WriteAsync"/>.
+    /// Marked no-inline. Uses <see cref="DbCommand"/> so SqlClient types stay in <see cref="NewSqlConnection"/>.
     /// </remarks>
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private SqlCommand CreateInsert(SqlConnection connection, LogEvent logEvent)
+    private DbCommand CreateInsert(DbConnection connection, LogEvent logEvent)
     {
-        var sql = $@"
+        var command = connection.CreateCommand();
+        command.CommandText = $@"
                 INSERT INTO [{_tableName}] 
                 (Timestamp, Level, Message, Exception, Context, CreatedAt)
                 VALUES 
                 (@Timestamp, @Level, @Message, @Exception, @Context, @CreatedAt)";
-        var command = new SqlCommand(sql, connection);
-        command.Parameters.AddWithValue("@Timestamp", logEvent.Timestamp);
-        command.Parameters.AddWithValue("@Level", logEvent.Level.ToString());
-        command.Parameters.AddWithValue("@Message", logEvent.Message);
-        command.Parameters.AddWithValue("@Exception",
-            logEvent.Exception != null ? $"{logEvent.Exception.GetType().FullName}: {logEvent.Exception.Message}" : (object)DBNull.Value);
-        command.Parameters.AddWithValue("@Context",
-            logEvent.Context != null ? System.Text.Json.JsonSerializer.Serialize(logEvent.Context) : (object)DBNull.Value);
-        command.Parameters.AddWithValue("@CreatedAt", CreatedAtStamp());
+        AddParameter(command, "@Timestamp", logEvent.Timestamp);
+        AddParameter(command, "@Level", logEvent.Level.ToString());
+        AddParameter(command, "@Message", logEvent.Message);
+        AddParameter(
+            command,
+            "@Exception",
+            logEvent.Exception != null
+                ? $"{logEvent.Exception.GetType().FullName}: {logEvent.Exception.Message}"
+                : DBNull.Value);
+        AddParameter(
+            command,
+            "@Context",
+            logEvent.Context != null
+                ? System.Text.Json.JsonSerializer.Serialize(logEvent.Context)
+                : DBNull.Value);
+        AddParameter(command, "@CreatedAt", CreatedAtStamp());
         return command;
+    }
+
+    /// <summary>
+    /// Adds one named parameter to <paramref name="command"/>.
+    /// </summary>
+    /// <param name="command">Command that receives the parameter. Not null.</param>
+    /// <param name="name">Parameter name including the <c>@</c> prefix.</param>
+    /// <param name="value">Parameter value. May be <see cref="DBNull.Value"/>.</param>
+    /// <remarks>Does not throw for ordinary values. Uses the provider's <see cref="DbParameter"/>.</remarks>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void AddParameter(DbCommand command, string name, object value)
+    {
+        var parameter = command.CreateParameter();
+        parameter.ParameterName = name;
+        parameter.Value = value;
+        command.Parameters.Add(parameter);
     }
 
     /// <summary>
@@ -243,11 +291,18 @@ public class SqlLogWriter : ILogWriter
     /// Runs the create-table SQL. Kept out of <see cref="EnsureTableExists"/> so a missing SqlClient
     /// assembly fails here and is caught by the caller.
     /// </summary>
-    /// <remarks>Does not throw past the caller when SqlClient is absent; that is the caller's catch.</remarks>
+    /// <remarks>
+    /// Does not throw past the caller when SqlClient is absent; that is the caller's catch.
+    /// Uses <see cref="DbConnection"/> / <see cref="DbCommand"/> only.
+    /// </remarks>
     [MethodImpl(MethodImplOptions.NoInlining)]
     private void CreateTableCore()
     {
-        var createTableSql = $@"
+        using var connection = OpenConnection();
+        connection.Open();
+
+        using var command = connection.CreateCommand();
+        command.CommandText = $@"
                 IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='{_tableName}' AND xtype='U')
                 CREATE TABLE [{_tableName}] (
                     Id BIGINT IDENTITY(1,1) PRIMARY KEY,
@@ -260,11 +315,6 @@ public class SqlLogWriter : ILogWriter
                     INDEX IX_{_tableName}_Timestamp (Timestamp),
                     INDEX IX_{_tableName}_Level (Level)
                 )";
-
-        using var connection = CreateConnection(_connectionString);
-        connection.Open();
-
-        using var command = new SqlCommand(createTableSql, connection);
         command.ExecuteNonQuery();
     }
 

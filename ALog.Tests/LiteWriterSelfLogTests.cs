@@ -24,8 +24,9 @@ public sealed class LiteWriterSelfLogTests
     /// <see cref="SqlLogWriter"/> reports a simulated missing Microsoft.Data.SqlClient assembly via SelfLog.
     /// </summary>
     /// <remarks>
-    /// The test project loads SqlClient, so the seam throws <see cref="FileNotFoundException"/> from
-    /// <see cref="SqlLogWriter.CreateConnection"/> instead of removing the assembly.
+    /// The test project loads SqlClient, so <see cref="SqlLogWriter.CreateConnectionOverride"/> throws
+    /// <see cref="FileNotFoundException"/> instead of removing the assembly. Construction with
+    /// <c>autoCreateTable: false</c> must succeed before the seam is set.
     /// </remarks>
     [Fact(Timeout = 30000)]
     public async Task SqlWrite_MissingSqlClient_ReportsSelfLog()
@@ -34,7 +35,7 @@ public sealed class LiteWriterSelfLogTests
         using var writer = new SqlLogWriter(
             "Server=127.0.0.1,1;User ID=sa;Password=unused;Connect Timeout=1;Encrypt=False;TrustServerCertificate=True;Pooling=false",
             autoCreateTable: false);
-        writer.CreateConnection = static _ =>
+        writer.CreateConnectionOverride = static _ =>
             throw new FileNotFoundException(
                 "Could not load file or assembly 'Microsoft.Data.SqlClient, Version=0.0.0.0, Culture=neutral, PublicKeyToken=23ec7fc2d6eaa4a5'.");
 
