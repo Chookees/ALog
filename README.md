@@ -410,9 +410,10 @@ Catalog codes (some lines include the code text; others are identified only in s
 - **When it happens:** You injected `HttpClient` into `HttpLogWriter` / `AzureLogWriter`, or `IAwsCloudWatchLogsTransport` into `AwsCloudWatchWriter`.
 - **Workaround:** Dispose those injections yourself; ALog does not dispose them.
 
-### Cloud writers fail closed
+<a id="cloud-writers-fail-closed"></a>
+### Network and database writers fail closed
 
-- **Symptom:** Cloud sink errors appear on stderr and in SelfLog (`[ALog] {WriterName} failed: …`); the app keeps running.
+- **Symptom:** Errors from the SQL, HTTP, and cloud writers appear on stderr and in SelfLog (`[ALog] {WriterName} failed: …`); the app keeps running.
 - **When it happens:** Credentials or endpoints reject the request, or (Lite) Microsoft.Data.SqlClient is missing on the first `SqlLogWriter` write / table create.
 - **Workaround:** Fix credentials/endpoints or deploy the optional dependency; watch stderr / SelfLog.
 
