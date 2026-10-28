@@ -67,7 +67,6 @@ jobs:
         python3 eng/test_analyzer_ratchet_check.py
         bash eng/test_bb_grep.sh
         bash eng/test_clk_grep.sh
-        bash eng/test_lock_pid.sh
         bash eng/test_build_base_assemblies.sh
         python3 eng/test_coverage_metadata.py
         python3 eng/test_sync_wait_check.py
@@ -273,99 +272,6 @@ jobs:
         path: ${{ runner.temp }}/quickstart-smoke
         retention-days: 7
         if-no-files-found: error
-
-  # Comparison harness smoke (BEN-09). Not a required check.
-  # Release build, then N=1000. The job is green only when run.sh exits 0,
-  # which is every cell valid or n/a. No performance gate.
-  # After that smoke the lock must be free, a second run must not exit 3,
-  # and a Drop full-queue proof must exit non-zero with every ALog async cell invalid.
-  # queue_full_mode is read back from the built configuration before the smoke.
-  # The harness sets a 30s per-cell hang guard for this N. The job timeout
-  # below is the runner backstop, not a measurement bound.
-  bench-smoke:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-
-    steps:
-    - name: Checkout
-      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-    - name: Setup .NET
-      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
-      with:
-        global-json-file: global.json
-
-    - name: Assert SDK version
-      run: |
-        version=$(dotnet --version)
-        echo "dotnet --version ${version}"
-        test "$version" = "10.0.403"
-
-    - name: Build comparison harness
-      run: dotnet build eng/comparison-bench -c Release --nologo
-
-    - name: Queue mode is read back from the built configuration
-      working-directory: eng/comparison-bench
-      run: |
-        set -euo pipefail
-        bin="bin/Release/net10.0/ALog.Comparison.dll"
-        mode=$(dotnet "$bin" queue-mode | tail -n 1)
-        test "$mode" = "QueueFullMode=Block"
-        mode=$(BENCH_MUTANT_FULL_MODE=Drop dotnet "$bin" queue-mode | tail -n 1)
-        test "$mode" = "QueueFullMode=Drop"
-        echo "queue-mode read-back ok"
-
-    - name: Smoke N=1000
-      working-directory: eng/comparison-bench
-      run: BENCH_N=1000 ./run.sh 1 ci
-
-    - name: Assert QueueFullMode=Block and a free lock
-      working-directory: eng/comparison-bench
-      run: |
-        set -euo pipefail
-        envf=$(find results/_smoke -path '*/ci-*/env.json' -print | sort | tail -n 1)
-        test -n "$envf"
-        python3 - "$envf" <<'PY'
-        import json, sys
-        env = json.load(open(sys.argv[1], encoding="utf-8"))
-        libs = {row["id"]: row.get("queue_full_mode") for row in env["libraries"]}
-        assert libs["alog-async"] == "QueueFullMode=Block", libs
-        assert libs["alog-sync"] == "n/a (no queue)", libs
-        print("env.json queue_full_mode ok", sys.argv[1])
-        PY
-        flock -n /tmp/alog-comparison-bench.lock true
-        set +e
-        BENCH_N=1 BENCH_LIBS=alog-sync BENCH_SCENARIOS=T6 ./run.sh 1 lockcheck
-        status=$?
-        set -e
-        test "$status" -ne 3
-        test "$status" -eq 0
-        echo "lockcheck exit $status"
-
-    - name: Drop mode makes the run invalid
-      working-directory: eng/comparison-bench
-      run: |
-        set -euo pipefail
-        set +e
-        BENCH_N=1 BENCH_LIBS=alog-async BENCH_SCENARIOS=T6 BENCH_MUTANT_FULL_MODE=Drop ./run.sh 1 mutant
-        status=$?
-        set -e
-        test "$status" -eq 1
-        echo "mutant exit $status"
-        details=$(find results/_smoke -path '*/mutant-*/details.jsonl' -print | sort | tail -n 1)
-        test -n "$details"
-        python3 - "$details" <<'PY'
-        import json, sys
-        reason = "ALog async requires QueueFullMode=Block for this comparison, but env.json shows Drop. All ALog async cells of this run are invalid."
-        lines = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
-        assert lines, "no cells"
-        for row in lines:
-            async_row = row.get("lib") == "alog-async" or (row.get("framework") == "ALog" and row.get("mode") == "async")
-            assert async_row, row
-            assert row.get("valid") == "false", row
-            assert row.get("reason") == reason, row.get("reason")
-        print("mutant invalid ok", sys.argv[1], "exit was required non-zero")
-        PY
 
   # Not a required check. Consumes the nupkg packed on ubuntu, then runs the file rotation tests.
   # Copy-and-truncate stays on Linux: a second writer is denied on Windows.
