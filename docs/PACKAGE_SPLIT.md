@@ -19,8 +19,9 @@ Do **not** split in 0.2.1 — publish the current monolith (and Full/Lite zip la
 
 Edge cases when the optional DLLs are missing:
 
-- `SqlLogWriter` with `autoCreateTable: true` (the default) and the AWS region constructor throw `FileNotFoundException` at construction.
-- With `autoCreateTable: false`, the first write reports `FileNotFoundException` on stderr (not through SelfLog).
+- `SqlLogWriter` with `autoCreateTable: true` (the default) reports a missing Microsoft.Data.SqlClient assembly through SelfLog (and stderr) during construction; it does not throw into the caller. The AWS region constructor still throws `FileNotFoundException` at construction.
+- With `autoCreateTable: false`, the first write reports `FileNotFoundException` through SelfLog (and stderr), matching `AwsCloudWatchWriter`.
+- `HttpLogWriter` and `AzureLogWriter` report unreachable endpoints through SelfLog (and stderr) the same way.
 - `Assembly.GetTypes()` throws `ReflectionTypeLoadException` (three AWS types fail to load); `GetExportedTypes()` succeeds.
 - JSON / `ALogOptions` config still creates only Console and File, so config init does not pull SQL, AWS, HTTP, or Azure.
 

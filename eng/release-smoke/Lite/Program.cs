@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using ALog;
 using ALog.Config;
+using ALog.Core;
 using ALog.Writers.Cloud;
 using ALog.Writers.Console;
 using ALog.Writers.File;
@@ -11,7 +12,7 @@ using ALog.Writers.Sql;
 
 /// <summary>
 /// Smoke-tests an unpacked Lite zip: Console, File, Queue, SelfLog, HTTP, Azure App Insights,
-/// Init(ALogOptions), and a SqlLogWriter FileNotFoundException negative case.
+/// Init(ALogOptions), and a SqlLogWriter missing-SqlClient SelfLog negative case.
 /// </summary>
 internal static class Program
 {
@@ -243,21 +244,71 @@ internal static class Program
     }
 
     /// <summary>
-    /// Expects <see cref="SqlLogWriter"/> construction (autoCreateTable true) to throw FileNotFoundException.
+    /// Expects <see cref="SqlLogWriter"/> on Lite to report a missing Microsoft.Data.SqlClient via SelfLog,
+    /// without throwing into the caller (autoCreateTable true and false).
     /// </summary>
+    /// <remarks>
+    /// Construction with <c>autoCreateTable: false</c> must succeed. Table create and the first write
+    /// each produce one SelfLog line naming SqlLogWriter and FileNotFoundException.
+    /// </remarks>
     private static void RunSqlNegative()
     {
+        const string connection =
+            "Server=127.0.0.1,1433;User Id=sa;Password=x;TrustServerCertificate=True;Encrypt=False;";
+        var selfLog = new List<string>();
+        SelfLog.Enable(selfLog.Add);
         try
         {
-            using var writer = new SqlLogWriter(
-                "Server=127.0.0.1,1433;User Id=sa;Password=x;TrustServerCertificate=True;Encrypt=False;",
-                "LiteSmokeLogs",
-                autoCreateTable: true);
-            throw new InvalidOperationException("SqlLogWriter should FileNotFoundException on Lite");
+            using (var noCreate = new SqlLogWriter(connection, "LiteSmokeLogs", autoCreateTable: false))
+            {
+                var beforeWrite = selfLog.Count;
+                noCreate.Write(new LogEvent(
+                    DateTime.UtcNow,
+                    LogLevel.Info,
+                    "lite-sql-write",
+                    null,
+                    null));
+                RequireSqlSelfLog(selfLog, beforeWrite, "Write with autoCreateTable:false");
+            }
+
+            var beforeCreate = selfLog.Count;
+            using (var withCreate = new SqlLogWriter(connection, "LiteSmokeLogs", autoCreateTable: true))
+            {
+                RequireSqlSelfLog(selfLog, beforeCreate, "construct with autoCreateTable:true");
+            }
+
+            Console.WriteLine("LITE-SMOKE sql-negative ok SelfLog FileNotFoundException");
         }
-        catch (FileNotFoundException ex) when (ex.Message.Contains("Microsoft.Data.SqlClient", StringComparison.Ordinal))
+        finally
         {
-            Console.WriteLine("LITE-SMOKE sql-negative ok FileNotFoundException");
+            SelfLog.Disable();
+        }
+    }
+
+    /// <summary>
+    /// Asserts exactly one new SelfLog line for a missing SqlClient assembly.
+    /// </summary>
+    /// <param name="selfLog">Captured SelfLog lines. Not null.</param>
+    /// <param name="beforeCount">Line count before the failing call.</param>
+    /// <param name="label">Failure label for the exception message.</param>
+    /// <exception cref="InvalidOperationException">The SelfLog delta is wrong or the line is incomplete.</exception>
+    private static void RequireSqlSelfLog(List<string> selfLog, int beforeCount, string label)
+    {
+        var delta = selfLog.Count - beforeCount;
+        if (delta != 1)
+        {
+            throw new InvalidOperationException(
+                $"SqlLogWriter {label}: expected 1 SelfLog line, got {delta} [{string.Join(" | ", selfLog.Skip(beforeCount))}]");
+        }
+
+        var line = selfLog[beforeCount];
+        if (!line.Contains("SqlLogWriter", StringComparison.Ordinal)
+            || !line.Contains("FileNotFoundException", StringComparison.Ordinal)
+            || !line.Contains("Microsoft.Data.SqlClient", StringComparison.Ordinal)
+            || !line.StartsWith("[ALog] SqlLogWriter failed:", StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException(
+                $"SqlLogWriter {label}: unexpected SelfLog line: {line}");
         }
     }
 

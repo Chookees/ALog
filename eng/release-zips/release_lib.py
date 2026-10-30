@@ -446,8 +446,9 @@ def build_readme_text(version: str, kind: str, *, allowlist_dir: Path | None = N
         works = "Console, File, HTTP, Azure App Insights"
         missing = "SQL, AWS, ILogger provider"
         edge = (
-            "Known edge cases (Lite): SqlLogWriter and the AWS region constructor "
-            "throw FileNotFoundException;\n"
+            "Known edge cases (Lite): SqlLogWriter reports a missing Microsoft.Data.SqlClient "
+            "through SelfLog (does not throw); "
+            "the AWS region constructor throws FileNotFoundException;\n"
             "  Assembly.GetTypes() throws ReflectionTypeLoadException; "
             "HTTP and Azure are configured in code; "
             "JSON config supports Console and File only.\n"
