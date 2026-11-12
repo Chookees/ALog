@@ -200,10 +200,10 @@ else
   pass "no trim or aot compatibility promise"
 fi
 
-if ! grep -F -q '"version": "10.0.403"' global.json; then
-  fail "global.json version is not 10.0.403"
+if ! grep -F -q '"version": "10.0.404"' global.json; then
+  fail "global.json version is not 10.0.404"
 else
-  pass "sdk pin 10.0.403"
+  pass "sdk pin 10.0.404"
 fi
 if ! grep -F -q '"rollForward": "disable"' global.json; then
   fail "rollForward is not disable"
