@@ -55,7 +55,7 @@ EOF
 cat > "$work/global.json" <<'EOF'
 {
   "sdk": {
-    "version": "10.0.403",
+    "version": "10.0.404",
     "rollForward": "disable"
   }
 }

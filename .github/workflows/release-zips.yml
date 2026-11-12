@@ -82,7 +82,7 @@ jobs:
         run: |
           version=$(dotnet --version)
           echo "dotnet --version ${version}"
-          test "$version" = "10.0.403"
+          test "$version" = "10.0.404"
 
       - name: Helper tests
         if: matrix.target == 'linux'
@@ -145,7 +145,7 @@ jobs:
         run: |
           version=$(dotnet --version)
           echo "dotnet --version ${version}"
-          test "$version" = "10.0.403"
+          test "$version" = "10.0.404"
 
       - name: Download zip artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
