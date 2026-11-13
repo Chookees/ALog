@@ -45,6 +45,11 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    ignore:
+      # bleibt auf .NET 10, kein SDK-Major-Sprung
+      - dependency-name: "dotnet-sdk"
+        update-types:
+          - "version-update:semver-major"
 
   - package-ecosystem: pip
     directory: "/eng"
