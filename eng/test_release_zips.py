@@ -381,43 +381,61 @@ class ReleaseZipHelperTests(unittest.TestCase):
             self.assertIn("Newtonsoft.Json.dll", str(ctx.exception))
             self.assertIn("extra:", str(ctx.exception))
 
-    def _ensure_sqlclient_nuget_assets(self) -> Path:
-        """Restore the release-zip host so SqlClient NuGet assets exist for hash tests.
+    def test_publish_optional_dll_may_be_absent(self) -> None:
+        """The four transitive Full DLLs may be missing from the current publish."""
+        allowlist = self.lib.load_allowlist(
+            ROOT / "eng" / "release-zips" / "allowlists" / "Full-linux-x64.txt"
+        )
+        with tempfile.TemporaryDirectory() as raw:
+            publish = Path(raw)
+            for name in allowlist:
+                if name in self.lib.STAGE_ONLY_NAMES:
+                    continue
+                if name in self.lib.OPTIONAL_FULL_DLLS:
+                    continue
+                path = publish / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"payload")
+            self.lib.compare_publish_to_allowlist(publish, allowlist)
+
+    def _host_assets_json(self) -> Path:
+        """Return the release-zip host ``project.assets.json`` path.
 
         Returns:
-            The NuGet packages root used by ``release_lib``.
+            Path under ``eng/release-zips/host/obj``.
         """
-        nuget = self.lib.default_nuget_packages_root()
-        stub = (
-            nuget
-            / "microsoft.data.sqlclient"
-            / "7.1.1"
-            / "lib"
-            / "net9.0"
-            / "Microsoft.Data.SqlClient.dll"
-        )
-        unix9 = (
-            nuget
-            / "microsoft.data.sqlclient"
-            / "7.1.1"
-            / "runtimes"
-            / "unix"
-            / "lib"
-            / "net9.0"
-            / "Microsoft.Data.SqlClient.dll"
-        )
-        unix8 = (
-            nuget
-            / "microsoft.data.sqlclient"
-            / "7.1.1"
-            / "runtimes"
-            / "unix"
-            / "lib"
-            / "net8.0"
-            / "Microsoft.Data.SqlClient.dll"
-        )
-        if stub.is_file() and unix9.is_file() and unix8.is_file():
-            return nuget
+        return ROOT / "eng" / "release-zips" / "host" / "obj" / "project.assets.json"
+
+    def _read_sqlclient_version(self, assets: Path) -> str:
+        """Read the restored Microsoft.Data.SqlClient version from assets.json.
+
+        Args:
+            assets: Host ``project.assets.json`` after restore or publish.
+
+        Returns:
+            The package version selected for ``Microsoft.Data.SqlClient``.
+
+        Raises:
+            AssertionError: The libraries object does not name exactly one version.
+        """
+        data = json.loads(assets.read_text(encoding="utf-8"))
+        libraries = data.get("libraries")
+        self.assertIsInstance(libraries, dict, f"libraries missing in {assets}")
+        prefix = "Microsoft.Data.SqlClient/"
+        found = [
+            key[len(prefix):]
+            for key in libraries
+            if key.startswith(prefix)
+        ]
+        self.assertEqual(len(found), 1, f"expected one SqlClient version, got {found}")
+        return found[0]
+
+    def _restore_release_zip_host(self) -> None:
+        """Restore the release-zip host so NuGet writes ``project.assets.json``.
+
+        Raises:
+            AssertionError: ``dotnet restore`` exits non-zero.
+        """
         host = ROOT / "eng" / "release-zips" / "host" / "ReleaseZipHost.csproj"
         result = subprocess.run(
             ["dotnet", "restore", str(host), "--nologo", "-v", "q"],
@@ -430,22 +448,63 @@ class ReleaseZipHelperTests(unittest.TestCase):
             0,
             "dotnet restore host failed:\n" + result.stdout + result.stderr,
         )
+
+    def _sqlclient_asset_paths(self, nuget: Path, version: str) -> tuple[Path, Path, Path]:
+        """Return stub, unix net9, and unix net8 SqlClient DLL paths for one version.
+
+        Args:
+            nuget: NuGet packages root.
+            version: Restored ``Microsoft.Data.SqlClient`` version.
+
+        Returns:
+            ``(stub, unix net9.0, unix net8.0)`` paths under the package folder.
+        """
+        root = nuget / "microsoft.data.sqlclient" / version
+        stub = root / "lib" / "net9.0" / "Microsoft.Data.SqlClient.dll"
+        unix9 = root / "runtimes" / "unix" / "lib" / "net9.0" / "Microsoft.Data.SqlClient.dll"
+        unix8 = root / "runtimes" / "unix" / "lib" / "net8.0" / "Microsoft.Data.SqlClient.dll"
+        return stub, unix9, unix8
+
+    def _ensure_sqlclient_nuget_assets(self) -> tuple[Path, str]:
+        """Restore the release-zip host so SqlClient NuGet assets exist for hash tests.
+
+        The version is the one ``project.assets.json`` selected. The tests do not
+        pin a package version.
+
+        Returns:
+            The NuGet packages root and the restored SqlClient version.
+        """
+        assets = self._host_assets_json()
+        if not assets.is_file():
+            self._restore_release_zip_host()
+        version = self._read_sqlclient_version(assets)
+        nuget = self.lib.default_nuget_packages_root()
+        stub, unix9, unix8 = self._sqlclient_asset_paths(nuget, version)
+        if stub.is_file() and unix9.is_file() and unix8.is_file():
+            return nuget, version
+        self._restore_release_zip_host()
+        version = self._read_sqlclient_version(assets)
+        stub, unix9, unix8 = self._sqlclient_asset_paths(nuget, version)
         self.assertTrue(stub.is_file(), f"SqlClient stub still missing after restore: {stub}")
         self.assertTrue(unix9.is_file(), f"unix net9 SqlClient missing: {unix9}")
         self.assertTrue(unix8.is_file(), f"unix net8 SqlClient missing: {unix8}")
-        return nuget
+        return nuget, version
 
-    def _write_linux_sqlclient_assets_json(self, path: Path, rel_runtime: str) -> None:
+    def _write_linux_sqlclient_assets_json(
+        self, path: Path, version: str, rel_runtime: str
+    ) -> None:
         """Write a minimal project.assets.json selecting one SqlClient runtime path.
 
         Args:
             path: Destination assets.json path.
+            version: Restored ``Microsoft.Data.SqlClient`` version.
             rel_runtime: Package-relative runtime path under runtimes/.
         """
+        package_key = "Microsoft.Data.SqlClient/" + version
         payload = {
             "targets": {
                 "net10.0/linux-x64": {
-                    "Microsoft.Data.SqlClient/7.1.1": {
+                    package_key: {
                         "runtime": {rel_runtime: {}},
                     }
                 }
@@ -455,22 +514,17 @@ class ReleaseZipHelperTests(unittest.TestCase):
 
     def test_rid_hash_rejects_wrong_nuget_source(self) -> None:
         """Published SqlClient matching only the stub lib/ asset fails RID hash check."""
-        nuget = self._ensure_sqlclient_nuget_assets()
-        stub = (
-            nuget
-            / "microsoft.data.sqlclient"
-            / "7.1.1"
-            / "lib"
-            / "net9.0"
-            / "Microsoft.Data.SqlClient.dll"
-        )
+        nuget, version = self._ensure_sqlclient_nuget_assets()
+        stub, _unix9, _unix8 = self._sqlclient_asset_paths(nuget, version)
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             publish = work / "publish"
             publish.mkdir()
             assets = work / "project.assets.json"
             self._write_linux_sqlclient_assets_json(
-                assets, "runtimes/unix/lib/net9.0/Microsoft.Data.SqlClient.dll"
+                assets,
+                version,
+                "runtimes/unix/lib/net9.0/Microsoft.Data.SqlClient.dll",
             )
             shutil.copy2(stub, publish / "Microsoft.Data.SqlClient.dll")
             with self.assertRaises(ValueError) as ctx:
@@ -483,24 +537,17 @@ class ReleaseZipHelperTests(unittest.TestCase):
 
     def test_rid_hash_rejects_wrong_tfm_net8(self) -> None:
         """A net8.0 RID asset fails when assets.json selected net9.0 for the RID."""
-        nuget = self._ensure_sqlclient_nuget_assets()
-        unix8 = (
-            nuget
-            / "microsoft.data.sqlclient"
-            / "7.1.1"
-            / "runtimes"
-            / "unix"
-            / "lib"
-            / "net8.0"
-            / "Microsoft.Data.SqlClient.dll"
-        )
+        nuget, version = self._ensure_sqlclient_nuget_assets()
+        _stub, _unix9, unix8 = self._sqlclient_asset_paths(nuget, version)
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             publish = work / "publish"
             publish.mkdir()
             assets = work / "project.assets.json"
             self._write_linux_sqlclient_assets_json(
-                assets, "runtimes/unix/lib/net9.0/Microsoft.Data.SqlClient.dll"
+                assets,
+                version,
+                "runtimes/unix/lib/net9.0/Microsoft.Data.SqlClient.dll",
             )
             shutil.copy2(unix8, publish / "Microsoft.Data.SqlClient.dll")
             with self.assertRaises(ValueError) as ctx:
@@ -512,24 +559,17 @@ class ReleaseZipHelperTests(unittest.TestCase):
 
     def test_rid_hash_accepts_assets_json_selected_tfm(self) -> None:
         """Published SqlClient matching the assets.json-selected TFM path passes."""
-        nuget = self._ensure_sqlclient_nuget_assets()
-        unix9 = (
-            nuget
-            / "microsoft.data.sqlclient"
-            / "7.1.1"
-            / "runtimes"
-            / "unix"
-            / "lib"
-            / "net9.0"
-            / "Microsoft.Data.SqlClient.dll"
-        )
+        nuget, version = self._ensure_sqlclient_nuget_assets()
+        _stub, unix9, _unix8 = self._sqlclient_asset_paths(nuget, version)
         with tempfile.TemporaryDirectory() as raw:
             work = Path(raw)
             publish = work / "publish"
             publish.mkdir()
             assets = work / "project.assets.json"
             self._write_linux_sqlclient_assets_json(
-                assets, "runtimes/unix/lib/net9.0/Microsoft.Data.SqlClient.dll"
+                assets,
+                version,
+                "runtimes/unix/lib/net9.0/Microsoft.Data.SqlClient.dll",
             )
             shutil.copy2(unix9, publish / "Microsoft.Data.SqlClient.dll")
             self.lib.verify_rid_nuget_hashes(

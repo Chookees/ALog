@@ -194,7 +194,9 @@ repo, version, kind, dest = sys.argv[1:5]
 sys.path.insert(0, str(Path(repo) / "eng" / "release-zips"))
 from release_lib import build_readme_text
 allowlist_dir = Path(repo) / "eng" / "release-zips" / "allowlists"
-text = build_readme_text(version, kind, allowlist_dir=allowlist_dir)
+text = build_readme_text(
+    version, kind, allowlist_dir=allowlist_dir, staged_dir=Path(dest)
+)
 Path(dest, "README.txt").write_text(text, encoding="utf-8", newline="\n")
 PY
 }
@@ -288,20 +290,17 @@ stage_full() {
   fi
   check_publish_before_stage "$repo" "$publish" "$allowlist" "$rid" "$assets_json"
 
-  # Copy only allowlisted payload: top-level DLLs + SqlClient satellite folders.
-  while IFS= read -r rel || [ -n "$rel" ]; do
-    rel=${rel//$'\r'/}
-    [ -z "$rel" ] && continue
-    case "$rel" in
-      LICENSE|NOTICE|README.txt) continue ;;
-    esac
-    local src="$publish/$rel"
-    if [ ! -f "$src" ]; then
-      fail "published output missing $rel for $rid"
-    fi
-    mkdir -p "$dest/$(dirname "$rel")"
-    cp "$src" "$dest/$rel"
-  done < "$allowlist"
+  # Copy allowlisted payload that publish produced. Optional DLLs may be absent.
+  python3 - "$repo" "$publish" "$allowlist" "$dest" <<'PY'
+import sys
+from pathlib import Path
+
+repo, publish, allowlist, dest = sys.argv[1:5]
+sys.path.insert(0, str(Path(repo) / "eng" / "release-zips"))
+from release_lib import copy_allowlisted_payload
+
+copy_allowlisted_payload(Path(publish), Path(allowlist), Path(dest))
+PY
 
   # Refuse host leftovers and stub SqlClient.
   if [ -e "$dest/ReleaseZipHost.dll" ] || [ -e "$dest/ReleaseZipHost.exe" ] || [ -e "$dest/ReleaseZipHost" ]; then

@@ -15,7 +15,12 @@ import sys
 import zipfile
 from pathlib import Path
 
-from release_lib import epoch_to_zip_timestamp, load_allowlist, zip_folder_name
+from release_lib import (
+    OPTIONAL_FULL_DLLS,
+    epoch_to_zip_timestamp,
+    load_allowlist,
+    zip_folder_name,
+)
 
 
 def list_stage_files(stage: Path) -> list[str]:
@@ -40,18 +45,25 @@ def list_stage_files(stage: Path) -> list[str]:
 
 
 def require_allowlist_match(stage: Path, allowlist: list[str]) -> None:
-    """Fail when the stage tree is not exactly the allowlist.
+    """Fail when the stage tree is not the allowlist.
+
+    Names in ``OPTIONAL_FULL_DLLS`` may be absent. Every other allowlist path
+    must be present, and the stage must not contain any other file.
 
     Args:
         stage: Staged directory.
-        allowlist: Exact relative paths that must be present.
+        allowlist: Relative paths that must be present, aside from optional DLLs.
 
     Raises:
-        ValueError: A file is missing or an unexpected file is present.
+        ValueError: A required file is missing or an unexpected file is present.
     """
     actual = list_stage_files(stage)
     expected = sorted(allowlist)
-    missing = [name for name in expected if name not in actual]
+    missing = [
+        name
+        for name in expected
+        if name not in actual and name not in OPTIONAL_FULL_DLLS
+    ]
     extra = [name for name in actual if name not in expected]
     if missing or extra:
         parts = []
