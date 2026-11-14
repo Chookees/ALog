@@ -2,6 +2,7 @@ ALog.Extensions.Logging.dll
 ALog.dll
 AWSSDK.CloudWatchLogs.dll
 AWSSDK.Core.dll
+AWSSDK.Extensions.Numerics.dll
 LICENSE
 Microsoft.Bcl.Cryptography.dll
 Microsoft.Data.SqlClient.Extensions.Abstractions.dll
@@ -31,9 +32,12 @@ Microsoft.SqlServer.Server.dll
 NOTICE
 README.txt
 System.Configuration.ConfigurationManager.dll
+System.Diagnostics.DiagnosticSource.dll
 System.Diagnostics.EventLog.Messages.dll
 System.Diagnostics.EventLog.dll
+System.Formats.Asn1.dll
 System.IdentityModel.Tokens.Jwt.dll
+System.IO.Hashing.dll
 System.Security.Cryptography.Pkcs.dll
 System.Security.Cryptography.ProtectedData.dll
 System.Threading.RateLimiting.dll

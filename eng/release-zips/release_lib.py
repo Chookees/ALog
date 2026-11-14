@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 
 # Stub SqlClient reference assemblies are ~93 KiB. Real RID implementations are ~1.67 MiB.
@@ -25,6 +26,16 @@ PUBLISH_EXCLUSION_SUFFIXES = (".pdb", ".deps.json", ".runtimeconfig.json")
 
 # Added by the builder after publish staging; not present in publish output.
 STAGE_ONLY_NAMES = frozenset({"LICENSE", "NOTICE", "README.txt"})
+
+# Transitive Full-zip DLLs from dependency bumps that are not in every graph yet.
+# Publish may omit them. When publish contains one, the allowlist must name it.
+# Any other extra file still fails the build.
+OPTIONAL_FULL_DLLS = frozenset({
+    "AWSSDK.Extensions.Numerics.dll",
+    "System.Diagnostics.DiagnosticSource.dll",
+    "System.Formats.Asn1.dll",
+    "System.IO.Hashing.dll",
+})
 
 # RID-specific DLLs whose SHA-256 must match a NuGet ``runtimes/<family>/…`` asset.
 # Kind ``lib`` → ``runtimes/<family>/lib/net*/<file>``; ``native`` → ``…/native/<file>``.
@@ -416,7 +427,13 @@ def format_contents_from_allowlist(entries: list[str]) -> str:
     return f"{layout}. Files: {files}"
 
 
-def build_readme_text(version: str, kind: str, *, allowlist_dir: Path | None = None) -> str:
+def build_readme_text(
+    version: str,
+    kind: str,
+    *,
+    allowlist_dir: Path | None = None,
+    staged_dir: Path | None = None,
+) -> str:
     """Build the English README.txt for one zip using the fixed UX template.
 
     Args:
@@ -424,6 +441,9 @@ def build_readme_text(version: str, kind: str, *, allowlist_dir: Path | None = N
         kind: ``Lite``, ``Full-win-x64``, or ``Full-linux-x64``.
         allowlist_dir: Directory of ``Lite.txt`` / ``Full-*.txt``. Defaults to
             ``eng/release-zips/allowlists`` next to this module.
+        staged_dir: When set, the Full contents line lists only files that are
+            already in this directory. Optional DLLs that this publish omitted
+            stay out of the README.
 
     Returns:
         README.txt body ending with a newline.
@@ -460,9 +480,14 @@ def build_readme_text(version: str, kind: str, *, allowlist_dir: Path | None = N
     elif kind in ("Full-win-x64", "Full-linux-x64"):
         title = "Full (win-x64)" if kind == "Full-win-x64" else "Full (linux-x64)"
         allowlist_name = f"{kind}.txt"
-        contents = format_contents_from_allowlist(
-            load_allowlist(allowlist_dir / allowlist_name)
-        )
+        entries = load_allowlist(allowlist_dir / allowlist_name)
+        if staged_dir is not None:
+            entries = [
+                name
+                for name in entries
+                if name == "README.txt" or (staged_dir / name).is_file()
+            ]
+        contents = format_contents_from_allowlist(entries)
         works = (
             "Console, File, HTTP, Azure App Insights, SQL Server, "
             "AWS CloudWatch, ILogger provider"
@@ -695,6 +720,9 @@ def list_publish_payload_files(publish_dir: Path) -> list[str]:
 def compare_publish_to_allowlist(publish_dir: Path, allowlist: list[str]) -> None:
     """Require publish payload ≡ allowlist minus LICENSE/NOTICE/README.txt.
 
+    Names in ``OPTIONAL_FULL_DLLS`` may be absent. They are not extra when the
+    allowlist names them and publish copied them. Any other extra file fails.
+
     Runs before staging so an extra DLL in ``dotnet publish -r`` output (for
     example Newtonsoft.Json.dll) fails the build instead of being silently dropped.
 
@@ -714,7 +742,9 @@ def compare_publish_to_allowlist(publish_dir: Path, allowlist: list[str]) -> Non
     actual = list_publish_payload_files(publish_dir)
     expected_set = set(expected)
     actual_set = set(actual)
-    missing = sorted(expected_set - actual_set)
+    missing = sorted(
+        name for name in (expected_set - actual_set) if name not in OPTIONAL_FULL_DLLS
+    )
     extra = sorted(actual_set - expected_set)
     if missing or extra:
         parts: list[str] = []
@@ -726,6 +756,39 @@ def compare_publish_to_allowlist(publish_dir: Path, allowlist: list[str]) -> Non
             "publish output does not match allowlist payload (before staging); "
             + "; ".join(parts)
         )
+
+
+def copy_allowlisted_payload(publish_dir: Path, allowlist_path: Path, dest: Path) -> None:
+    """Copy allowlisted publish files into the stage directory.
+
+    Skips LICENSE, NOTICE, and README.txt. Names in ``OPTIONAL_FULL_DLLS`` may
+    be absent. Every other allowlist path must exist under ``publish_dir``.
+
+    Args:
+        publish_dir: ``dotnet publish -r`` output directory.
+        allowlist_path: ``Full-<rid>.txt`` path.
+        dest: Stage directory that receives the payload.
+
+    Raises:
+        ValueError: A required allowlist file is missing from publish.
+        OSError: A file cannot be copied.
+    """
+    allowlist = load_allowlist(allowlist_path)
+    missing: list[str] = []
+    for name in allowlist:
+        if name in STAGE_ONLY_NAMES:
+            continue
+        src = publish_dir / name
+        if not src.is_file():
+            if name in OPTIONAL_FULL_DLLS:
+                continue
+            missing.append(name)
+            continue
+        target = dest / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+    if missing:
+        raise ValueError("published output missing " + ", ".join(missing))
 
 
 def default_nuget_packages_root() -> Path:

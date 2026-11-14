@@ -40,8 +40,12 @@ python3 eng/test_release_zips.py
 ## Allowlists
 
 Exact file lists live in `allowlists/`. The packer fails when the stage is
-missing a listed file or contains anything else. After a dependency bump that
-changes the Full publish graph, update the matching `Full-*.txt` and re-run
+missing a listed file or contains anything else. Four transitive DLLs may be
+absent until the dependency that brings them is restored:
+`AWSSDK.Extensions.Numerics.dll`, `System.Diagnostics.DiagnosticSource.dll`,
+`System.Formats.Asn1.dll`, and `System.IO.Hashing.dll`. Any other extra file
+still fails the build. After a dependency bump that changes the Full publish
+graph, update the matching `Full-*.txt` and re-run
 `bash eng/build-release-zips.sh full <rid>`.
 
 ## Checks in the builder
