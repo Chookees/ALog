@@ -9,17 +9,20 @@ updates:
     schedule:
       interval: weekly
     groups:
-      microsoft-extensions:
+      microsoft-extensions-lib:
         patterns:
           - "Microsoft.Extensions.*"
-      aws:
+        update-types:
+          - "minor"
+          - "patch"
+      aws-lib:
         patterns:
           - "AWSSDK.*"
-      sql:
+      sql-lib:
         patterns:
           - "Microsoft.Data.SqlClient"
           - "System.Security.Cryptography.Pkcs"
-      test:
+      test-lib:
         patterns:
           - "Microsoft.CodeAnalysis.*"
     ignore:
@@ -41,17 +44,17 @@ updates:
     schedule:
       interval: weekly
     groups:
-      microsoft-extensions:
+      microsoft-extensions-tests:
         patterns:
           - "Microsoft.Extensions.*"
-      aws:
+      aws-tests:
         patterns:
           - "AWSSDK.*"
-      sql:
+      sql-tests:
         patterns:
           - "Microsoft.Data.SqlClient"
           - "System.Security.Cryptography.Pkcs"
-      test:
+      test-tools:
         patterns:
           - "xunit*"
           - "coverlet*"
@@ -62,6 +65,27 @@ updates:
     ignore:
       # bis v3/MTP
       - dependency-name: "coverlet.*"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "System.Security.Cryptography.Pkcs"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "Microsoft.Extensions.Configuration.Abstractions"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "Microsoft.Extensions.Configuration.Binder"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "Microsoft.Extensions.DependencyInjection.Abstractions"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "Microsoft.Extensions.Logging"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "Microsoft.Extensions.Logging.Configuration"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "Microsoft.Extensions.Options"
         update-types:
           - "version-update:semver-major"
 
