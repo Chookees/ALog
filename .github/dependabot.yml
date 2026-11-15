@@ -1,10 +1,40 @@
 # Weekly grouped updates. The SQL image digest is not a package Dependabot can see.
 version: 2
 updates:
+  # Libraries stay on Microsoft.Extensions 10.0.x. Tests and smoke keep majors.
   - package-ecosystem: nuget
     directories:
-      - "/"
+      - "/ALog"
+      - "/ALog.Extensions.Logging"
+    schedule:
+      interval: weekly
+    groups:
+      microsoft-extensions:
+        patterns:
+          - "Microsoft.Extensions.*"
+      aws:
+        patterns:
+          - "AWSSDK.*"
+      sql:
+        patterns:
+          - "Microsoft.Data.SqlClient"
+          - "System.Security.Cryptography.Pkcs"
+      test:
+        patterns:
+          - "Microsoft.CodeAnalysis.*"
+    ignore:
+      - dependency-name: "Microsoft.Extensions.*"
+        update-types:
+          - "version-update:semver-major"
+
+  - package-ecosystem: nuget
+    directories:
+      - "/ALog.Tests"
+      - "/ALog.Benchmarks"
+      - "/eng/c4-hang-probe"
+      - "/eng/exf-toplevel"
       - "/eng/consumer-smoke/console"
+      - "/DemoApp/Quickstart"
     schedule:
       interval: weekly
     groups:
