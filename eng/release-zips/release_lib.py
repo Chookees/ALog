@@ -14,8 +14,11 @@ import re
 import shutil
 from pathlib import Path
 
-# Stub SqlClient reference assemblies are ~93 KiB. Real RID implementations are ~1.67 MiB.
+# netstandard2.0 SqlClient is the small reference assembly (~93 KiB).
+# The net10.0 lib asset is the real implementation (~1.7 MiB). There is no
+# runtimes/{unix,win}/lib copy in SqlClient 8.
 SQLCLIENT_MIN_BYTES = 500_000
+SQLCLIENT_MANAGED_ASSET = "lib/net10.0/Microsoft.Data.SqlClient.dll"
 PKCS_MIN_VERSION = (10, 0, 13)
 
 # Files in ``dotnet publish -r`` output that are not part of the Full zip payload.
@@ -37,14 +40,18 @@ OPTIONAL_FULL_DLLS = frozenset({
     "System.IO.Hashing.dll",
 })
 
-# RID-specific DLLs whose SHA-256 must match a NuGet ``runtimes/<family>/…`` asset.
-# Kind ``lib`` → ``runtimes/<family>/lib/net*/<file>``; ``native`` → ``…/native/<file>``.
+# DLLs whose SHA-256 must match the asset ``project.assets.json`` selected.
+# SqlClient 8 publishes ``lib/net10.0/Microsoft.Data.SqlClient.dll`` (no RID lib).
+# Kind ``lib`` is that managed asset; ``native`` stays under ``runtimes/…/native/``.
+# The family field is the RID family for native/runtime assets, or ``net10.0``
+# for the managed SqlClient DLL. ``verify_rid_nuget_hashes`` reads the path
+# from assets.json; these tuples name the files to check.
 RID_NUGET_HASH_CHECKS: dict[str, list[tuple[str, str, str, str]]] = {
     "linux-x64": [
         (
             "Microsoft.Data.SqlClient.dll",
             "microsoft.data.sqlclient",
-            "unix",
+            "net10.0",
             "lib",
         ),
     ],
@@ -52,7 +59,7 @@ RID_NUGET_HASH_CHECKS: dict[str, list[tuple[str, str, str, str]]] = {
         (
             "Microsoft.Data.SqlClient.dll",
             "microsoft.data.sqlclient",
-            "win",
+            "net10.0",
             "lib",
         ),
         (
@@ -860,7 +867,8 @@ def resolve_assets_rid_package_path(
     Returns:
         ``(package_id_lower, package_version, package_relative_path)`` where the
         relative path is the exact ``runtime`` / ``runtimeTargets`` / ``native``
-        entry NuGet selected (includes ``runtimes/<family>/lib/<tfm>/…``).
+        entry NuGet selected. RID assets stay under ``runtimes/…``. The managed
+        SqlClient DLL is ``lib/net10.0/Microsoft.Data.SqlClient.dll``.
 
     Raises:
         ValueError: The assets file has no matching target or DLL entry.
@@ -880,6 +888,7 @@ def resolve_assets_rid_package_path(
             f"project.assets.json has no target for RID {rid} in {assets_json}"
         )
     packages = targets[target_key]
+    managed: tuple[str, str, str] | None = None
     for package_key, package in packages.items():
         if "/" not in package_key:
             continue
@@ -890,11 +899,19 @@ def resolve_assets_rid_package_path(
                 normalized = rel_path.replace("\\", "/")
                 if not normalized.endswith("/" + filename) and normalized != filename:
                     continue
-                if not normalized.startswith("runtimes/"):
-                    continue
-                return package_id.lower(), package_version, normalized
+                if normalized.startswith("runtimes/"):
+                    return package_id.lower(), package_version, normalized
+                if (
+                    managed is None
+                    and filename == "Microsoft.Data.SqlClient.dll"
+                    and package_id.lower() == "microsoft.data.sqlclient"
+                    and normalized == SQLCLIENT_MANAGED_ASSET
+                ):
+                    managed = (package_id.lower(), package_version, normalized)
+    if managed is not None:
+        return managed
     raise ValueError(
-        f"project.assets.json target {target_key} has no runtimes path for {filename}"
+        f"project.assets.json target {target_key} has no selected asset for {filename}"
     )
 
 
@@ -907,9 +924,9 @@ def verify_rid_nuget_hashes(
 ) -> None:
     """Require RID publish DLLs match the exact ``project.assets.json`` NuGet path.
 
-    Checks SqlClient for every Full RID. On ``win-x64`` also checks Pkcs, EventLog,
-    and SNI. The digest must equal the file at the package-relative path NuGet
-    selected for this RID (including the TFM folder under ``runtimes/…/lib/``).
+    Checks SqlClient for every Full RID against ``lib/net10.0``. On ``win-x64``
+    also checks Pkcs, EventLog, and SNI under their ``runtimes/`` assets. The
+    digest must equal the file at the package-relative path NuGet selected.
 
     Args:
         publish_dir: ``dotnet publish -r`` output directory.

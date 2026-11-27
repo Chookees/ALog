@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Breaking (dependency): `Microsoft.Data.SqlClient` moves from 7.1.2 to 8.0.0 (`AssemblyVersion` 8.0.0.0). Apps that reference `Microsoft.Data.SqlClient` directly must move to 8.x. Pool waits share the connection timeout by default. ALog references `Microsoft.Data.SqlClient.Extensions.Azure` 8.0.0 so the Full zip still contains Entra / Azure AD authentication.
 - Fixed: `SqlLogWriter`, `HttpLogWriter`, and `AzureLogWriter` report write failures through SelfLog (same pattern as `AwsCloudWatchWriter`), including a missing Microsoft.Data.SqlClient assembly in Lite and unreachable HTTP/Azure endpoints.
 
 ## 0.2.1 - 2026-10-27
