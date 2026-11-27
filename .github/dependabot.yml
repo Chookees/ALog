@@ -21,6 +21,7 @@ updates:
       sql-lib:
         patterns:
           - "Microsoft.Data.SqlClient"
+          - "Microsoft.Data.SqlClient.*"
           - "System.Security.Cryptography.Pkcs"
       test-lib:
         patterns:
@@ -53,6 +54,7 @@ updates:
       sql-tests:
         patterns:
           - "Microsoft.Data.SqlClient"
+          - "Microsoft.Data.SqlClient.*"
           - "System.Security.Cryptography.Pkcs"
       test-tools:
         patterns:
