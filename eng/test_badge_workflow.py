@@ -367,7 +367,7 @@ class BadgeWorkflowTests(unittest.TestCase):
         self.assertLess(install, scripts)
         self.assertIn("python3 -m venv", workflow[:install])
         requirements = (ROOT / "requirements-ci.txt").read_text(encoding="utf-8")
-        self.assertIn("PyYAML==6.0.3", requirements)
+        self.assertIn("PyYAML==6.0.4", requirements)
         self.assertGreaterEqual(requirements.count("--hash=sha256:"), 2)
         dependabot = (ROOT.parent / ".github" / "dependabot.yml").read_text(encoding="utf-8")
         self.assertIn("package-ecosystem: pip", dependabot)
